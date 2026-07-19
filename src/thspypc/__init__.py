@@ -26,6 +26,9 @@ from .protocol import (
     generate_imei, generate_mac64,
     # 行情查询（个股列表）
     build_list_quote_query, parse_hd1_response, parse_hd3_response, decode_ths_float,
+    # 股票列表（全市场代码表）
+    build_stock_list_query, parse_stock_list_response, STOCK_LIST_DATATYPE,
+    build_init_query, parse_init_response,
     # 短线精灵（异动）
     build_qurealorder_query, parse_qurealorder_response, read_frame_realorder,
     build_subreal_query, build_subrealorder_query, parse_pushrealorder_response,
@@ -50,6 +53,8 @@ __all__ = [
     "build_login_body_pc", "parse_login_response", "parse_passport_fields",
     "generate_imei", "generate_mac64",
     "build_list_quote_query", "parse_hd1_response", "parse_hd3_response", "decode_ths_float",
+    "build_stock_list_query", "parse_stock_list_response", "STOCK_LIST_DATATYPE",
+    "build_init_query", "parse_init_response",
     "build_qurealorder_query", "parse_qurealorder_response", "read_frame_realorder",
     "build_subreal_query", "build_subrealorder_query", "parse_pushrealorder_response",
     "SUBREAL_CHANNELS", "SUBREALORDER_MARKETS",

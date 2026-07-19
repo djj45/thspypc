@@ -534,7 +534,8 @@ def build_list_quote_query(
     """
     if datatype is None:
         datatype = LIST_QUOTE_DATATYPE_DEFAULT
-    codes_str = ",".join(codes) + ","
+    # 空 codes 时生成 "市场()"（不是 "市场(,)"），用于请求全市场代码表
+    codes_str = ",".join(codes) + ("," if codes else "")
     market_str = f"{market}({codes_str})"
     dt_str = ",".join(str(d) for d in datatype) + ","
     # 文本：行分隔 \r\n，末尾 \r（抓包真值，frame11/17/40 均如此）
@@ -553,6 +554,367 @@ def build_list_quote_query(
     struct.pack_into("<H", hdr, 19, len(text) + 1)  # 抓包：文本长度+1
     body = bytes(hdr) + text
     return encode_frame(body)
+
+
+# 股票列表请求的默认市场组合（抓包帧3898确认：hexin 用 17/22/151 拉沪+深A+北交所）
+# ⚠ 深市 A 股主板的市场码是 22（不是 33）—— 抓包确认。
+#   33 是深市的另一个分类（创业板/基金等），hexin 用单独一条并发连接拉 33。
+#   默认 (17, 22, 151) 覆盖沪 A + 深 A + 北交所，与 hexin 主连接一致。
+STOCK_LIST_MARKETS = [(17, "沪"), (22, "深"), (151, "北交所")]
+# DataType=199112 = 返回代码表（抓包帧3898确认：DataType=199112, 末尾只有一个逗号，不带 55）
+STOCK_LIST_DATATYPE = [199112]
+
+
+def build_stock_list_query(
+    markets: list[int] | tuple[int, ...] = (17, 22, 151),
+    sort_begin: int = 0,
+    sort_count: int = 29,
+    datatype: list[int] | None = None,
+    pageid: int = 1334,
+    seq: int = 0x0025,
+) -> bytes:
+    """构造股票列表查询请求（空 CodeList + DataType=199112，8901端口）。
+
+    同花顺在用户打开「沪深A股」列表界面时发此请求（抓包帧3898确认）。
+    注意：这不是启动时拉全量代码表的请求 —— 启动时走 init/qustocklink。
+    本请求是「排序代码表查询」，服务器按 SortBy 排序后返回前 SortCount 条。
+
+    请求文本（抓包帧3898真值）：
+      CodeList=17();22();151();   ← 空括号 = 该市场全部（17=沪 22=深A 151=北交所）
+      DataType=199112,            ← 199112 返回代码表（不带 ,55）
+      SortType=Sort
+      SortBy=199112
+      SortDir=D                   ← 降序
+      SortAppend=YC
+      SortBegin=0                 ← 抓包确认：恒为 0（不是真翻页游标）
+      SortCount=29                ← 本次要的条数（hexin 逐步放大直到拿到全量）
+      FuncPeriod=0
+      DateTime=0(0-0)
+      LackTime=0,0,0,0,0,0,0,0
+      pageid=1334
+
+    ⚠ 翻页模型（抓包帧3898→4967确认）：hexin 不是用 SortBegin 递增翻页，
+    而是固定 SortBegin=0，把 SortCount 从 29 逐步放大（29→261→2538→2645），
+    直到服务器返回的 SortDataCount == SortTotal（一次性拿全量）。
+
+    Args:
+        markets: 市场码列表。17=沪 22=深A 151=北交所（默认）。
+            抓包确认深 A 市场码是 22（不是 33；33 是深市另一类，hexin 单独拉）。
+        sort_begin: 抓包恒为 0（保留参数仅为兼容）。
+        sort_count: 本次要的条数。hexin 从 29 开始逐步放大。
+        datatype: DataType 列表，默认 [199112]（抓包真值，不带 55）。
+        pageid: 固定 1334。
+        seq: 序列标签。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic），可直接 sendall。
+    """
+    if datatype is None:
+        datatype = STOCK_LIST_DATATYPE
+    # 多市场空 CodeList：17();22();151();
+    codelist = "".join(f"{m}();" for m in markets)
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    text = (
+        f"CodeList={codelist}\r\nDataType={dt_str}\r\n"
+        f"SortType=Sort\r\nSortBy=199112\r\nSortDir=D\r\nSortAppend=YC\r\n"
+        f"SortBegin={sort_begin}\r\nSortCount={sort_count}\r\n"
+        f"FuncPeriod=0\r\nDateTime=0(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    # 子帧类型 0x000f（排序代码表查询，区别于行情查询的 0x0009；抓包帧3898确认）
+    # 路由标签 0x0156（抓包真值；行情查询用 0x0001）
+    hdr[7:11] = b"\x12\x00\x0f\x00"
+    hdr[11:13] = b"\x56\x01"
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+def parse_stock_list_response(body: bytes) -> dict:
+    """解析股票列表响应（文本头 + hd3.1 16-bit 变体帧），返回分页元数据 + 代码列表。
+
+    响应结构（抓包帧3900确认）：
+        SortTotal=2645          ← 全市场代码总数
+        SortTop=1900544
+        SortBegin=0             ← 恒为 0
+        SortCount=29            ← 本次请求的条数（= 请求里的 SortCount）
+        SortCalcProgress=1
+        SortDataFirst=0
+        SortDataCount=29        ← 数据区实际条数（min(SortCount, SortTotal)）
+        OrderList=
+        hd3.1\\0 + 16-bit 变体头 + 字段表 + BitRLE流
+
+    ⚠ 注意：此响应**不含股票名称**。DataType=199112 只返回代码表，
+    名称要靠另外的请求（DataType=10 之类行情字段）拿。
+    因此 stocks 里每条的 name 字段为空字符串。
+
+    Args:
+        body: 完整 TCP 帧体（含文本头 + hd3.1）。注意必须传完整帧，截断会导致
+              BitRLE 解码数据不足、后半记录代码为空。
+
+    Returns:
+        dict: ``{sort_total, sort_begin, sort_count, sort_data_count, stocks}``，
+        stocks 为 ``[{code, name}, ...]``。name 恒为 ""（响应不含名称）。
+        hd3.1 解码失败时 stocks 为空列表（但 sort_total 等元数据仍可用）。
+    """
+    text = body.decode("gbk", errors="replace")
+    meta = {"sort_total": 0, "sort_begin": 0, "sort_count": 0,
+            "sort_data_count": 0, "stocks": []}
+    # 提取分页元数据（字段名驼峰：SortTotal/SortBegin/SortCount/SortDataCount）
+    for key, field in (("sort_total", "SortTotal"), ("sort_begin", "SortBegin"),
+                       ("sort_count", "SortCount"),
+                       ("sort_data_count", "SortDataCount")):
+        m = re.search(rf"(?:^|[^0-9A-Za-z_-]){field}=(\d+)", text)
+        if m:
+            meta[key] = int(m.group(1))
+    # 解码 hd3.1 16-bit 变体（DataType=199112 响应专用格式）
+    meta["stocks"] = _parse_stock_list_hd31_variant(body)
+    return meta
+
+
+def _parse_stock_list_hd31_variant(body: bytes) -> list[dict]:
+    """解析 stock_list 响应的 hd3.1 16-bit 变体（DataType=199112 响应）。
+
+    抓包帧3900确认的头格式（区别于标准 hd3.1 的 dc(LE32)+unk(LE16)）：
+        hd3.1\\0
+        dc(LE16)            ← 记录数（= SortDataCount，16-bit 不是 32-bit！）
+        flag(LE16=0x0100)   ← 变体标记（同 hd1.0 分页变体）
+        +2B(LE16=0x001c)    ← 含义未知
+        hs(LE16)            ← 单条记录字节长度（实测=11）
+        fc(LE16)            ← 字段数（实测=2）
+        字段表: fc × 4B（dt, fmt, flags, width）
+        preamble(8B!)       ← 标准 hd3.1 是 4B，这里是 8B
+        BitRLE头(BE32=dc*hs)+位流
+
+    字段表（帧3900实测）：dt5(width=7) + dt200(width=4)，hs=7+4=11
+    记录布局（每条 11B）：
+        [0]    市场码（0x11=沪 0x16=深22 0x21=深33 0x97=北交所）
+        [1:7]  6B ASCII 代码（如 "920305"/"600227"）
+        [7:11] 4B 其他数据（dt200，含义未知）
+
+    Returns:
+        ``[{code, name, market}, ...]``。name 恒为 ""（响应不含名称）。
+        market 是市场码整数（用于区分沪深北）。
+    """
+    pos = body.find(b"hd3.1\x00")
+    if pos < 0:
+        return []
+    base = pos + 6
+    if len(body) < base + 10:
+        return []
+    dc = struct.unpack("<H", body[base:base+2])[0]
+    flag = struct.unpack("<H", body[base+2:base+4])[0]
+    if flag != 0x0100:
+        return []  # 非 stock_list 变体
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if dc == 0 or hs == 0 or fc == 0:
+        return []
+    fields = _parse_hd_field_table(body, base + 10, fc)
+    # 16-bit 变体 preamble 是 8B（不是标准 hd3.1 的 4B），然后 BitRLE 头 BE32=dc*hs
+    bitrle_off = base + 10 + fc * 4 + 8
+    if len(body) < bitrle_off + 4:
+        return []
+    expect = dc * hs
+    bitrle_head = struct.unpack(">I", body[bitrle_off:bitrle_off+4])[0]
+    if bitrle_head != expect:
+        logger.debug("stock_list hd3.1 变体 BitRLE 头不匹配: got=0x%x expect=0x%x(dc*hs=%d)",
+                     bitrle_head, expect, expect)
+        return []
+    bitplane = _decode_bitrle_0x13746d0(body[bitrle_off:], expect)
+    if len(bitplane) < expect:
+        return []
+    recs = _transpose_bitplane_0x1763410(bitplane, hs, dc)
+    # 按 dt5 字段定位代码偏移（dt5 宽度=7，代码在 chunk[1:7]，跳过 1B 市场码）
+    # 找 dt5 字段的偏移
+    dt5_off = 0
+    for dt, fmt, width in fields:
+        if dt == 5:
+            break
+        dt5_off += width
+    else:
+        dt5_off = 0  # 无 dt5 字段（异常），从头开始
+    stocks = []
+    for i in range(dc):
+        row = recs[i*hs: (i+1)*hs]
+        if len(row) < hs:
+            break
+        # dt5: [1B market][6B ASCII code]
+        market = row[dt5_off]
+        code_b = row[dt5_off+1: dt5_off+7]
+        if not all(48 <= b <= 57 for b in code_b):
+            continue  # 非 ASCII 数字，跳过
+        stocks.append({
+            "code": code_b.decode("ascii"),
+            "name": "",  # 响应不含名称
+            "market": market,
+        })
+    return stocks
+
+
+# init 请求的默认配置（抓包帧1090确认）
+# C-Modules=MEQT 是同花顺方案的标准模块集；MarketCode=16;144; 是沪市+创业板
+INIT_C_MODULES = "MEQT"
+INIT_MARKET_CODE = "16;144;"
+
+# init 控制字节（StockLinkVer 字段用，抓包确认）
+_B_BLOCK = b"\x02"   # ^b 块开始
+_B_SECT = b"\x01"    # ^B 节开始
+_B_REC = b"\x0e"     # ^n 记录/行结束
+_B_KEY = b"\x05"     # ^e 键值分隔
+_B_RT = b"\x12"      # ^r （成对出现）
+
+# 28 个 Stock 配置项（StockLinkVer 里客户端声明的全部板块）
+INIT_STOCK_LINKS = [
+    "Stock_176_H_QC", "Stock_176_H_QP", "Stock_16_A_SO", "Stock_16_F_SO",
+    "Stock_16_B_SO", "Stock_16_Z_SO", "Stock_32_A_SO", "Stock_32_B_SO",
+    "Stock_32_F_SO", "Stock_32_Z_SO", "Stock_68_C_DO", "Stock_69_C_ZO",
+    "Stock_64_C_SO", "Stock_64_C_DO", "Stock_64_C_ZO", "Stock_144_P_SC",
+    "Stock_144_Y_SC", "Stock_16_X_IO", "Stock_176_H_BULL", "Stock_176_H_BEAR",
+    "Stock_88_H_QC", "Stock_88_H_QP", "Stock_88_H_BULL", "Stock_88_H_BEAR",
+    "Stock_UGFF_F_O", "Stock_32_X_IO", "Stock_64_F_OS", "Stock_112_H_HF",
+    "Stock_64_F_DL",
+]
+
+
+def build_init_query(
+    config_ver: str = "0",
+    market_code: str = INIT_MARKET_CODE,
+    c_modules: str = INIT_C_MODULES,
+    seq: int = 0x0000,
+) -> bytes:
+    """构造 init 请求（启动时拿全量代码表，8901端口）。
+
+    同花顺登录后第一个请求就是 init，服务器响应里夹带 dc=7524 全量代码表
+    （hd3.1 unk=0x18 标准 BitRLE，含 code + dt55 名称）。这是获取完整 A 股
+    列表的正道（DataType=199112 只返回变体分页小帧）。
+
+    请求结构（抓包帧1090确认）：
+      - 二进制头：子帧类型 0x0001，路由 0x0000（区别于 list_quote 的 0x0009）
+      - 文本（\\r\\n 分隔，无 method= 字段）：
+        C-Language=2052
+        C-Version=E029.60.20.0031
+        C-Config=同花顺方案
+        C-Modules=MEQT
+        C-UACS=20120716#0#
+        MarketCode=16;144;
+        MarketDate=16(...);144(...);
+        StockLinkVer=^bConfigInfo^B^r^nConfigVer^e{ver}^r^n^bStock_16_A_SO^B...
+
+    Args:
+        config_ver: StockLinkVer 的 ConfigVer。"0" 表示本地无缓存，骗服务器发全量。
+        market_code: 市场码（默认 "16;144;" 沪市+创业板）。
+        c_modules: 模块集（默认 MEQT）。
+        seq: 序列标签。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic），可直接 sendall。
+    """
+    # 构造 StockLinkVer（含控制字节）
+    slv_parts = [_B_BLOCK + b"ConfigInfo" + _B_SECT + _B_RT + _B_REC
+                 + b"ConfigVer" + _B_KEY + config_ver.encode("gbk") + _B_RT + _B_REC]
+    for stock in INIT_STOCK_LINKS:
+        slv_parts.append(_B_BLOCK + stock.encode("gbk") + _B_SECT + _B_RT + _B_REC
+                         + b"ConfigVer" + _B_KEY + config_ver.encode("gbk") + _B_RT + _B_REC)
+    stocklinkver = b"".join(slv_parts)
+
+    text = (
+        f"C-Language=2052\r\n"
+        f"C-Version=E029.60.20.0031\r\n"
+        f"C-Config=同花顺方案\r\n"
+        f"C-Modules={c_modules}\r\n"
+        f"C-UACS=20120716#0#\r\n"
+        f"MarketCode={market_code}\r\n"
+        f"MarketDate=16(0);144(0);\r\n"
+    ).encode("gbk") + b"StockLinkVer=" + stocklinkver
+
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x01\x00"   # 子帧类型 0x0001（init）
+    hdr[11:13] = b"\x00\x00"           # 路由 0x0000
+    hdr[13:15] = b"\x00\x20"           # 抓包真值（init 特有）
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+def parse_init_response(body: bytes) -> dict:
+    """解析 init 响应，提取全量代码表 + 配置信息。
+
+    init 响应夹带多个 hd3.1 帧，其中 unk=0x18 的大帧（dc≈7526）是全量代码表
+    （冷启动抓包 stream 44 帧2390 确认，dc=7526, hs=71, fc=2）。
+    字段：dt5(code, w7) + dt55(w64)。注意 dt55 在此帧里**不含名称**（全 0），
+    名称走单独的 upstockname 请求，故返回的 stocks 里 name 恒为 ""。
+
+    解码用标准 parse_hd3_response（unk=0x18 = BitRLE 变体，preamble 4B，
+    BE32 头==dc*hs）。不要用 parse_stock_list_response（那个专解
+    DataType=199112 的 16-bit dc 变体）。
+
+    Args:
+        body: 完整 TCP 帧体（read_frame 读出的单帧，或拼接的多帧）。
+
+    Returns:
+        dict: ``{stocks: [{code, name, market}, ...], server_info: {...},
+        hd31_frames: [...]}``。stocks 为全量代码列表（dc 最大的 unk=0x18 帧）；
+        server_info 含 S-OS/S-Version 等服务器信息；hd31_frames 列出所有
+        hd3.1 帧的元数据（dc/unk/hs/fc），便于调试其他子帧。
+    """
+    result = {"stocks": [], "server_info": {}, "hd31_frames": []}
+    text = body.decode("gbk", errors="replace")
+    # 提取服务器信息
+    for key in ("S-OS", "S-Version", "S-Name", "S-Time", "S-ClientIP", "S-WebPort"):
+        m = re.search(rf"{key}=([^\r\n]+)", text)
+        if m:
+            result["server_info"][key] = m.group(1).strip()
+
+    # 遍历所有 hd3.1\x00 标记，记录元数据，解码 unk=0x18 的标准 BitRLE 帧
+    best_recs: list[dict] = []
+    for m in re.finditer(rb"hd3\.1\x00", body):
+        pos = m.start()
+        base = pos + 6
+        if base + 10 > len(body):
+            continue
+        dc = struct.unpack("<I", body[base:base+4])[0]
+        unk = struct.unpack("<H", body[base+4:base+6])[0]
+        hs = struct.unpack("<H", body[base+6:base+8])[0]
+        fc = struct.unpack("<H", body[base+8:base+10])[0]
+        # 跳过明显异常的（解析错位产生的超大 dc）
+        if dc == 0 or dc > 100000 or hs == 0:
+            continue
+        result["hd31_frames"].append({
+            "pos": pos, "dc": dc, "unk": unk, "hs": hs, "fc": fc,
+        })
+        # 只解码 unk=0x18 的标准 BitRLE 全量帧
+        if unk != 0x18:
+            continue
+        # 从这个 hd3.1 标记到 body 末尾交给 parse_hd3_response
+        # （它会自己定位 BitRLE 流，且要求 BE32 头==dc*hs）
+        recs = parse_hd3_response(body[pos:])
+        if len(recs) > len(best_recs):
+            best_recs = [
+                {"code": r.get("code", ""), "name": "", "market": _dt5_market(r)}
+                for r in recs if r.get("code")
+            ]
+
+    result["stocks"] = best_recs
+    return result
+
+
+def _dt5_market(rec: dict) -> int:
+    """从 parse_hd3_response 的记录里提取 dt5 首字节（市场码）。
+
+    parse_hd3_response 经 _parse_hd_records 处理后，dt5 被解析为 code 字段
+    （取 chunk[1:7]），但市场码（chunk[0]）丢失了。这里无法恢复，返回 0。
+    如需市场码，应直接用底层 _transpose_bitplane + 手动解析。
+    """
+    return 0  # parse_hd3_response 不暴露 dt5[0]，留空
 
 
 # -----------------------------------------------------------------------------

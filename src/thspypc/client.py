@@ -19,13 +19,16 @@ from .protocol import (
     MARKET_PORT,
     REALORDER_HOST,
     REALORDER_PORT,
+    STOCK_LIST_DATATYPE,
     SUBREAL_CHANNELS,
     build_heartbeat_8901,
     build_heartbeat_9601,
+    build_init_query,
     build_list_quote_query,
     build_login_body_pc,
     build_passport64,
     build_qurealorder_query,
+    build_stock_list_query,
     build_subreal_query,
     encode_frame,
     full_http_auth,
@@ -33,10 +36,12 @@ from .protocol import (
     generate_mac64,
     parse_hd1_response,
     parse_hd3_response,
+    parse_init_response,
     parse_login_response,
     parse_passport_fields,
     parse_qurealorder_response,
     parse_pushrealorder_response,
+    parse_stock_list_response,
     read_frame,
     read_frame_realorder,
 )
@@ -434,6 +439,106 @@ class THSClient:
                          resp[:40].decode("gbk", errors="replace")[:40])
         logger.warning("list_quotes: 8 帧内未找到 hd 数据帧")
         return []
+
+    def stock_list(
+        self,
+        timeout: float = 30.0,
+    ) -> list[dict]:
+        """获取全市场股票代码列表（沪深+北交所+新三板+基金，~7400 条）。
+
+        通过重放 hexin 启动序列的关键请求段（subreal×8 + CodeList 1B0987 + init），
+        触发服务器下发全量代码表（dc≈7422, unk=0x18, hs=71 的 hd3.1 帧）。
+        这是 hexin 启动时加载全量代码表的同一机制（冷启动抓包 stream 44 确认）。
+
+        ⚠ 单独发 init 请求**不会**触发全量下发（服务器只返回配置帧）。
+        必须重放完整的 subreal + 特殊 CodeList 订阅序列，服务器才会在登录连接上
+        推送 dc≈7422 的全量 hd3.1 帧。本方法用 ``data/stock_list_replay.bin``
+        里固化的 4 个请求段（提取自 cold_start.pcap stream 44 帧1619/1965/2308/2481）。
+
+        ⚠ 响应**不含股票名称**（dt55 字段全 0）。名称走单独的 upstockname 请求，
+        尚未实现。返回的 stocks 里 name 恒为 ""。
+
+        Args:
+            timeout: 收尾读取的总时长（秒）。重放后服务器陆续推送，需等全量帧到达。
+
+        Returns:
+            list[dict]，每项 ``{"code": "600000", "name": ""}``。
+            约 7400 条，按 dt5 代码字段顺序（通常代码升序）。
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        if self._sock is None:
+            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+
+        # 加载重放段（4 个请求 segment，提取自 cold_start.pcap stream 44）
+        replay_path = os.path.join(os.path.dirname(__file__), "data",
+                                   "stock_list_replay.bin")
+        if not os.path.exists(replay_path):
+            logger.error("stock_list: 重放数据文件不存在 %s", replay_path)
+            return []
+        with open(replay_path, "rb") as f:
+            data = f.read()
+        n = int.from_bytes(data[:4], "little")
+        off = 4
+        segments = []
+        for _ in range(n):
+            ln = int.from_bytes(data[off:off+4], "little")
+            off += 4
+            segments.append(data[off:off+ln])
+            off += ln
+
+        best_stocks: list[dict] = []
+        full_dc = 0
+        # 重放期间持锁，并临时禁用心跳避免干扰（如果心跳开着）
+        with self._sock_lock:
+            sock = self._sock
+            # 发送 4 个请求段（间隔 0.3s 模拟 hexin 节奏）
+            for i, seg in enumerate(segments):
+                if sock:
+                    sock.sendall(seg)
+                time.sleep(0.3)
+            # 读响应：短超时轮询，直到 timeout 到或拿到全量帧后再读 3s 确认
+            sock.settimeout(2.0)
+            t0 = time.time()
+            got_full_at = None
+            while True:
+                if got_full_at and (time.time() - got_full_at > 3):
+                    break  # 拿到全量后再读 3s 确认无更大帧
+                if not got_full_at and (time.time() - t0 > timeout):
+                    break  # 总超时
+                try:
+                    resp = read_frame(sock)
+                    if not resp:
+                        continue
+                except (socket.timeout, OSError):
+                    continue
+                except ValueError:
+                    # read_frame 偶尔在推送帧中间解析失败（魔数碰撞），跳过
+                    try:
+                        sock.settimeout(1.0)
+                        sock.recv(8192)
+                        sock.settimeout(2.0)
+                    except Exception:
+                        pass
+                    continue
+                meta = parse_init_response(resp)
+                if len(meta["stocks"]) > len(best_stocks):
+                    best_stocks = meta["stocks"]
+                    # 检查这一帧是否有 dc>5000 的全量帧
+                    for f in meta.get("hd31_frames", []):
+                        if f["unk"] == 0x18 and f["dc"] > 5000:
+                            full_dc = f["dc"]
+                            got_full_at = time.time()
+                            break
+
+        if best_stocks:
+            logger.info("stock_list 获取 %d 条代码（全量帧 dc=%d）",
+                        len(best_stocks), full_dc)
+        else:
+            logger.warning("stock_list: 重放后未收到全量代码表帧 "
+                           "（可能服务器实例未响应，重连换 IP 重试）")
+        return best_stocks
 
     # ── 自定义板块/自选股管理（门面方法，委托给 BlockManager）──
 

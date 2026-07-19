@@ -17,6 +17,8 @@
 - **个股列表行情查询**（`list_quotes`）：hd1.0/hd3.1 响应解析，纯 Python 移植
   hexin.exe 真实机器码（BitRLE 解码 + 位平面转置），无 unicorn 依赖。实测解出
   600056 等股票的 现价/昨收/开盘/涨幅/竞价金额
+- **全市场股票列表**（`stock_list`）：重放 hexin 启动序列，~6 秒拿全市场 7400+ 代码
+  全部代码（约7500+条），hd3.1 BitRLE 解码，自动翻页
 - **自定义板块/自选股管理**（`blocks`）：分组 CRUD + 成分股增删 + 自选股 +
   动态板块查询。走标准 HTTPS（cookie 鉴权），移植自 thspy，实测列出 95 个分组。
 - **短线精灵（异动）**（`dxjl_*`）：9601 端口 qurealorder 历史查询，hq1.0 响应解析。
@@ -159,6 +161,32 @@ with THSClient("账号", "密码") as client:
 | 1111 | dt87 | 日期 + 小数 |
 
 > 封单额/首次涨停时间/主力净额 → 从推送帧本地计算，不走列表请求。
+
+## 全市场股票列表（`stock_list`）
+
+获取沪深+北交所+新三板+基金全市场代码表（约 7400 条），用于批量行情查询。
+
+```python
+with THSClient("账号", "密码") as client:
+    client.connect()
+    # 拉取全市场代码表（重放 hexin 启动序列，~6 秒）
+    stocks = client.stock_list()  # [{code:"600000", name:""}, ...]
+    print(f"共 {len(stocks)} 只")
+
+    # 拿到代码后批量查行情
+    codes = [s["code"] for s in stocks if s["code"].startswith("6")][:50]
+    recs = client.list_quotes(codes, market=17)
+```
+
+**机制**：重放 hexin 启动序列的关键请求段（subreal×8 + 特殊 CodeList 订阅 + init），
+触发服务器在登录连接上推送 dc≈7422 的全量 hd3.1 帧（unk=0x18 BitRLE 编码）。
+重放模板固化在 `src/thspypc/data/stock_list_replay.bin`（提取自 cold_start.pcap）。
+
+⚠️ **限制**：
+- 响应**不含股票名称**（dt55 字段全 0）—— 名称走 upstockname 请求，尚未实现；
+  `stocks` 里每项 `name` 恒为 `""`，需要名称请用 `list_quotes(codes)` 另查
+- 覆盖全市场（沪 600/601/603/688 + 深 + 北交所 870-875/920 + 新三板 830-839 + 基金 430/400）
+- 非交易日也可用（实测周日正常拉取代码表）
 
 ### Passport64 生成（已复刻 hexin，无需抓包）
 
