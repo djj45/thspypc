@@ -22,4 +22,7 @@ requires = ["uv_build>=0.11.23,<0.12.0"]
 build-backend = "uv_build"
 
 [tool.uv]
-package = true
+# package = false：不把 thspypc 当包构建安装（避免 uv_build 子进程被
+# Windows AppLocker/WDAC 应用控制策略拦截，WinError 4551）。
+# 测试脚本靠 sys.path.insert(0, "src") 找到源码，无需 editable 安装。
+package = false

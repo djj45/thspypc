@@ -24,6 +24,7 @@
 
 ⚠️ 必须盘中运行（周一~周五 9:30-15:00），否则 matched.csv=0。
 """
+import argparse
 import csv
 import datetime
 import json
@@ -125,23 +126,41 @@ def match_pushes_with_history(pushes: list[dict], history: list[dict],
 
 
 def main():
+    ap = argparse.ArgumentParser(description="采集推送+历史对照样本（破解数值字段）")
+    ap.add_argument("--user", default=None,
+                    help="账号（默认读 .env 的 THS_USERNAME）")
+    ap.add_argument("--pwd", default=None,
+                    help="密码（默认读 .env 的 THS_PASSWORD）")
+    ap.add_argument("--rounds", type=int, default=6,
+                    help="采集轮数（每轮 ~9s），默认 6（≈54s）."
+                         "和抓包同时跑建议 30+（≈5 分钟，对齐抓包时长）")
+    ap.add_argument("--push-secs", type=int, default=5,
+                    help="每轮收推送时长（秒），默认 5")
+    ap.add_argument("--hist-pages", type=int, default=3,
+                    help="每轮翻历史页数，默认 3")
+    args = ap.parse_args()
+
     load_dotenv()
     os.makedirs(DATA_DIR, exist_ok=True)
-    username = os.environ.get("THS_USERNAME", "").strip()
-    password = os.environ.get("THS_PASSWORD", "").strip()
+    # 命令行参数优先于 .env（支持用另一个账号，不和 hexin 客户端冲突）
+    username = (args.user or os.environ.get("THS_USERNAME", "")).strip()
+    password = (args.pwd or os.environ.get("THS_PASSWORD", "")).strip()
     imei = os.environ.get("THS_IMEI", "").strip() or None
 
-    # 采集参数
-    rounds = 6
-    push_secs = 5
-    hist_pages = 3
-    duration = rounds * (push_secs + 4)  # 每轮推送 5s + 历史翻页 ~4s
+    rounds = args.rounds
+    push_secs = args.push_secs
+    hist_pages = args.hist_pages
+    duration = rounds * (push_secs + 4)  # 每轮推送 + 历史翻页 ~4s
 
     print("=" * 60)
     print("推送 + 历史对照采集（带锁交替，盘中运行）")
     print("=" * 60)
     print(f"当前: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    print(f"账号: {username[:3]}***（{'命令行指定' if args.user else '来自 .env'}）")
     print(f"采集 {duration}s（{rounds} 轮 × 推送 {push_secs}s + 历史 {hist_pages}页）→ {DATA_DIR}")
+    if not username or not password:
+        print("✗ 缺账号/密码：用 --user/--pwd 或在 .env 配 THS_USERNAME/THS_PASSWORD")
+        return 1
 
     client = THSClient(username, password, imei)
     r = client.connect()
