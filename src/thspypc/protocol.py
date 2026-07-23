@@ -35,13 +35,26 @@ AUTH_PORT = 80
 # PC 远航版主行情服务器（8901）。多 IP 冗余，抓包实测。
 # 登录时按顺序尝试，任一成功即可。
 # 注意：实测部分 IP 只做登录网关、对行情请求(CodeList)无响应（timeout），
-# 行情查询需要连到真正处理 CodeList 的服务器（标 ★ 的是 2026-07-17 实测能返回
+# 行情查询需要连到真正处理 CodeList 的服务器（标 ★ 的是实测能返回
 # hd1.0/hd3.1 数据的 IP）。把这些排在前面提高 list_quotes 命中率。
+#
+# ⚠ 2026-07-23 重大发现：旧的 IP（122.9.202.190 等）已退化为纯登录网关，
+# login 成功但 list_quotes/stock_list_hot(199112) 全部超时。hexin 客户端
+# 实际连的是新集群（122.9.115.201 等），行情查询正常。把新集群 IP 排在
+# 最前面。（hexin 抓包确认 login + 199112 在同一条连接上，无需额外握手。）
 MARKET_PORT = 8901
 MARKET_HOSTS = [
-    "122.9.202.190",   # ★ 2026-07-17 实测：登录+行情查询均可用
-    "122.9.125.190",   # ★ 2026-07-17 实测：登录+行情查询均可用
-    "116.63.108.136",  # 登录可用，行情查询可能 timeout
+    # 2026-07-23 新集群（hexin 抓包实测，login+行情查询+199112 均可用）
+    "122.9.115.201",   # ★ 2026-07-23 实测：login+199112(SortTotal=264)+dc=7606 全量代码表
+    "8.134.101.39",    # ★ 2026-07-23 实测
+    "8.134.146.31",    # ★ 2026-07-23 实测
+    "47.101.161.13",   # 2026-07-23 hexin 连过
+    "139.159.135.214", # 2026-07-23 hexin 连过
+    "122.9.204.225",   # 2026-07-23 实测：dc=7606 全量代码表
+    # 旧集群（2026-07-17，已退化为纯登录网关，行情查询超时）
+    "122.9.202.190",   # 2026-07-17 旧：登录可用，2026-07-23 实测行情查询超时
+    "122.9.125.190",   # 旧
+    "116.63.108.136",  # 旧：登录可用，行情查询 timeout
     "8.134.98.163",
     "121.37.31.87",
     "8.138.46.177",
@@ -423,9 +436,11 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     """
     构造 PC 远航版 login 帧 body。
 
-    抓包实测字段集（D:\\code\\ths\\login_lv2.pcapng，8901 端口）：
+    抓包实测字段集（2026-07-23 hexin 冷启动抓包，8901 端口）：
         Ask=login
         C-Version=E029.60.20.0031
+        UserName=thsuser          ← 匿名占位（真实身份在 Passport64 里）
+        Password=thsuser          ← 匿名占位
         VerifyType=1
         Mac64=<base64>
         C-SupportPushVer=1.0
@@ -433,12 +448,21 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
         C-SupPushDataVer=hq6.0
         Passport64=<票据>
 
-    注意：PC 版 login 帧的 account/userclass/M_qs/qsid 等字段全部 absent
-    （身份信息都封装在 Passport64 里），比 thspy 的 Mac 版 login 帧更简洁。
+    UserName/Password 恒为 thsuser/thsuser（匿名占位）。真实账号身份封装在
+    Passport64 里（account=mx_... 字段）。
+
+    ⚠ 校验字节（zh_CN.GBK 后的 1 字节）：是 body 内容的函数。2026-07-23 暴力
+    扫描 256 个值定位：带 UserName/Password 时 = 0xc9（新集群 VerifyCode=0），
+    不带时 = 0xaa（旧集群）。新行情集群（122.9.115.201 等）要求带 UserName/
+    Password + 0xc9 才接受 login 并提供行情查询；旧集群（122.9.202.190 等）
+    接受 0xaa 无 UserName 的 login 但已退化为纯登录网关（行情查询超时）。
+    算法本身（sum/xor 等不匹配）未逆向，0xc9 为暴力扫描实测值。
     """
     parts = [
         ("Ask", "login"),
         ("C-Version", C_VERSION_PC),
+        ("UserName", "thsuser"),
+        ("Password", "thsuser"),
         ("VerifyType", "1"),
         ("Mac64", mac_b64),
         ("C-SupportPushVer", "1.0"),
@@ -449,12 +473,8 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     fields = "\n".join(f"{k}={v}" for k, v in parts)
     # 帧头前缀：\t A \t \x00 zh_CN.GBK <校验字节> \t
     # (PROTOCOL.md §2.2)
-    #
-    # 校验字节：抓包实测 7 个 login 帧里 6 个 = 0xaa、1 个 = 0xcc，是 body
-    # 内容的某种函数，但 xor/sum 等常见算法均不匹配，未逆向出确切算法。
-    # thspy 用 0x15 0x06（Mac 版值）能登录 9602，推测服务器不严格校验此字节。
-    # 先用最常见的 0xaa 实测 8901；若被拒再深究（可能需 hook hexin.exe）。
-    return b"\x09\x41\x09\x00" + b"zh_CN.GBK\xAA\x09" + fields.encode("gbk")
+    # 校验字节 0xc9：带 UserName/Password 时的暴力扫描实测值（见 docstring）。
+    return b"\x09\x41\x09\x00" + b"zh_CN.GBK\xC9\x09" + fields.encode("gbk")
 
 
 def parse_login_response(body: bytes) -> dict:
@@ -738,8 +758,11 @@ def parse_stock_list_response(body: bytes) -> dict:
         m = re.search(rf"(?:^|[^0-9A-Za-z_-]){field}=(\d+)", text)
         if m:
             meta[key] = int(m.group(1))
-    # 解码 hd3.1 16-bit 变体（DataType=199112 响应专用格式）
-    meta["stocks"] = _parse_stock_list_hd31_variant(body)
+    # 解码数据帧：优先 hd3.1 16-bit 变体（BitRLE），回退 hd1.0 变体（明文）
+    stocks = _parse_stock_list_hd31_variant(body)
+    if not stocks:
+        stocks = _parse_stock_list_hd10_variant(body)
+    meta["stocks"] = stocks
     return meta
 
 
@@ -819,6 +842,65 @@ def _parse_stock_list_hd31_variant(body: bytes) -> list[dict]:
             "code": code_b.decode("ascii"),
             "name": "",  # 响应不含名称
             "market": market,
+        })
+    return stocks
+
+
+def _parse_stock_list_hd10_variant(body: bytes) -> list[dict]:
+    """解析 stock_list 响应的 hd1.0 明文变体（DataType=199112 小批量响应）。
+
+    当 SortCount 较小（如 20）时，服务器返回 hd1.0 明文而非 hd3.1 BitRLE。
+    结构和 hd3.1 16-bit 变体相同，只是记录区是明文（无 BitRLE 编码）：
+
+        hd1.0\\0
+        dc(LE16)            ← 记录数（= SortDataCount）
+        flag(LE16=0x0100)   ← 变体标记
+        +2B(LE16)           ← 含义未知
+        hs(LE16)            ← 单条记录字节长度（实测=11）
+        fc(LE16)            ← 字段数（实测=2）
+        字段表: fc × 4B
+        记录区: dc 条，每条 hs 字节，行主序明文
+
+    记录布局（字段表 dt5(7)+dt200(4)，但实际 dt200 在前）：
+        [0:4]   dt200 数据（4B）
+        [4]     市场码（0x11=沪/深）
+        [5:11]  6B ASCII 代码
+
+    注意：字段表声明 dt5 在前、dt200 在后，但实测记录里 dt200 数据在前、
+    代码(dt5)在后。因此不能直接用字段表顺序切分，而是固定按 [dt200:4B][市场:1B][代码:6B]。
+
+    Returns:
+        ``[{code, name, market}, ...]``。name 恒为 ""。
+    """
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return []
+    base = pos + 6  # 跳过 hd1.0\0
+    if len(body) < base + 10:
+        return []
+    dc = struct.unpack("<H", body[base:base+2])[0]
+    flag = struct.unpack("<H", body[base+2:base+4])[0]
+    if flag != 0x0100:
+        return []  # 非 stock_list 变体
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if dc == 0 or hs == 0 or fc == 0:
+        return []
+    rec_off = base + 10 + fc * 4
+    stocks = []
+    for i in range(dc):
+        row = body[rec_off + i*hs: rec_off + (i+1)*hs]
+        if len(row) < hs:
+            break
+        # 固定布局：[dt200:4B][市场:1B][代码:6B]
+        # dt200 在前 4B，然后 1B 市场码，最后 6B ASCII 代码
+        code_b = row[5:11]
+        if len(code_b) < 6 or not all(48 <= b <= 57 for b in code_b):
+            continue  # 非 ASCII 数字，跳过
+        stocks.append({
+            "code": code_b.decode("ascii"),
+            "name": "",  # 响应不含名称
+            "market": row[4],
         })
     return stocks
 

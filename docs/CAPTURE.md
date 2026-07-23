@@ -6,7 +6,7 @@
 
 | 项 | 路径 |
 |----|------|
-| **Wireshark 启动器** | `D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\WiresharkPortable64.exe` |
+| **Wireshark 启动器** | `D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\WiresharkPortable64.exe` |
 | **tshark（命令行解析）** | `...\App\Wireshark\tshark.exe` |
 | **dumpcap（命令行抓包）** | `...\App\Wireshark\dumpcap.exe` |
 
@@ -15,7 +15,7 @@
 
 下方 `WS` 代指：
 ```
-D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark
+D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark
 ```
 
 ## 网卡选择
@@ -67,7 +67,7 @@ tcp port 8901 or tcp port 9601
 **抓包命令**：
 ```bash
 cd D:/code/ths_takehome/thspypc
-WS="D:/software/Wireshark_4.6.7_Portable/Wireshark/WiresharkPortable64/App/Wireshark"
+WS="D:/软件/Wireshark-4.4.7-x64-with-Npcap-1.50-Portable/Wireshark/App/Wireshark"
 
 # 先确认网卡
 "$WS/tshark.exe" -D
@@ -129,8 +129,21 @@ WS="D:/software/Wireshark_4.6.7_Portable/Wireshark/WiresharkPortable64/App/Wires
 
 | 脚本 | 用途 | 依赖 |
 |------|------|------|
+| `tests/capture_market_open.py` | **开盘二合一**：批量请求 7000 股（启动序列+代码表+快照）+ 盘中实时推送 | dumpcap + tshark |
 | `tests/capture_hexin_start.py` | 抓启动序列（login + subreal + 推送），自动分析 | dumpcap + tshark |
+| `tests/capture_stock_list.py` | 抓股票列表请求（聚焦 stock_list 分页/参数真值） | dumpcap + tshark |
 | `tests/collect_push_samples.py` | 采集推送+历史对照样本（盘中） | 账号（.env） |
+
+### 场景：开盘批量请求 + 实时推送（推荐 `capture_market_open.py`）
+
+抓开盘瞬间客户端如何一次性拉全市场代码表 + 行情快照，以及盘中实时推送。
+
+```bash
+# 9:24 左右：先彻底退出同花顺，再运行（默认 180s，覆盖 9:25-9:30）
+uv run python tests/capture_market_open.py
+# 看到「开始抓包」后立即启动同花顺并登录
+# 登录后切到「短线精灵」页面（别最小化），等自动结束出两段报告
+```
 
 `capture_hexin_start.py` 里网卡编号硬编码为 `-i 4`（WLAN），**如果网卡变了要改这行**（脚本第 34 行）。
 

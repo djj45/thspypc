@@ -17,11 +17,11 @@ import subprocess
 import sys
 from collections import OrderedDict, defaultdict
 
-WS = r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"
+WS = r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark"
 TSHARK = os.path.join(WS, "tshark.exe")
 DEFAULT_PCAP = os.path.join(os.path.dirname(__file__), "..", "captures_live", "stock_list.pcap")
 
-MAGIC = b"\xfd\xdf\xdf\xfd"
+MAGIC = b"\xfd\xfd\xfd\xfd"  # 见 protocol.py FRAME_MAGIC
 
 
 def tshark(pcap, y_filter, fields, extra=None):

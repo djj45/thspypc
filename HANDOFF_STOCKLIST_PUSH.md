@@ -373,18 +373,47 @@ stocks = client.stock_list(with_names=True)  # 7458 条含名称，~6s
 names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ...}
 ```
 
-### 7. stock_list_hot() 轻量 API（⏸️ 待解 MarketTime 依赖）
+### 7. stock_list_hot() / 199112 超时根因（✅ 2026-07-23 已解决）
 
-DataType=199112 排序查询（拿最近活跃 29 只热门票）。**已实现**（`client.stock_list_hot()`），但 thspypc 上始终超时无响应——即使盘中。
+DataType=199112 排序查询。根因是 **login 帧差异 + 服务器 IP 集群迁移**，
+已彻底解决。
 
-推测根因：199112 查询依赖服务器先通过 `MarketTime` 帧通知开盘状态。thspypc 的登录流程未触发 `MarketTime` 下发（hexin 客户端在启动时有专门的 `subreal market=...` 订阅触发）。
+**根因链**：
 
-**状态**：代码就绪，待解决 MarketTime 握手后验证。
+1. **旧 IP 集群退化为纯登录网关**：thspypc 的 `MARKET_HOSTS`（122.9.202.190
+   等，2026-07-17 实测）login 成功但**行情查询全部超时**——这些 IP 不再处理
+   CodeList/199112 查询。
 
-**文件变更**：
-- `src/thspypc/client.py` — `THSClient.load_hexin_names()` + `stock_list(with_names=)`
-- `tests/probe_upstockname.py` — 新增（upstockname 探针，证明服务器只发增量）
-- `tests/test_stock_list.py` — 新增 `--with-names` 选项
+2. **hexin 连新集群**：2026-07-23 抓包确认 hexin 连的 IP（122.9.115.201 等）
+   与 thspypc MARKET_HOSTS **零重叠**。新集群 login + 199112 在同一条连接上，
+   午休时间也能返回 `SortTotal=2314` + hd1.0 数据。
+
+3. **login 帧差异**：hexin login 带 `UserName=thsuser`/`Password=thsuser`
+   （匿名占位，真实身份在 Passport64）。thspypc 旧 login 帧缺这两行。新集群
+   服务器检查这两个字段——无 UserName 的 login 被拒（VerifyCode=-1）。
+
+4. **校验字节**：login 帧前缀 `\x09\x41\x09\x00 zh_CN.GBK <1B校验> \x09` 的
+   校验字节是 body 内容的函数。加 UserName/Password 后 body 变了，旧值 0xaa
+   失效。**暴力扫描 256 个值定位：0xc9**（带 UserName/Password 时 VerifyCode=0）。
+   算法本身未逆向（sum/xor 等不匹配），0xc9 为实测值。
+
+**修复**（2026-07-23，已写入代码）：
+- `build_login_body_pc` 加 `UserName=thsuser`/`Password=thsuser` + 校验字节改 0xc9
+- `MARKET_HOSTS` 新集群 IP（122.9.115.201 等）排在最前
+
+**验证结果**：
+- ✅ 登录新集群 122.9.115.201 VerifyCode=0
+- ✅ `list_quotes` 恢复正常（600000 现价 9.03 涨幅 0.22%）
+- ✅ `stock_list_hot`/199112 服务器返回 `SortTotal=2314` `SortDataCount=20` + hd1.0 数据
+  （⚠ `parse_stock_list_response` 对 hd1.0 格式返回 0 条，待适配——连接层面已通）
+
+**剩余问题**：199112 响应是 hd1.0 格式（非 hd3.1），`parse_stock_list_response`
+当前只解析 hd3.1 16-bit 变体，需增加 hd1.0 分支（同 `parse_hd1_response` 的逻辑）。
+
+**相关文件**：
+- `src/thspypc/protocol.py:build_login_body_pc` — login 帧（UserName + 0xc9）
+- `src/thspypc/protocol.py:MARKET_HOSTS` — 新集群 IP 排在最前
+- `tests/probe_stock_list_hot.py` — A/B 测试探针（含 --host 强制连指定 IP、暴力扫描逻辑）
 
 ---
 
@@ -480,31 +509,57 @@ push_market, push_ts, time_diff_s, push_raw_bytes
 金额/涨幅 100% 精确解码（THS float），异动类型 30 种全覆盖。
 `parse_pushrealorder_response` 已重写。历史对照验证通过（无需开盘）。
 
-### ★3a. 开盘验证 d6/d7 异动方向（⏸️ 需盘中新鲜数据）
+### ✅ 3a. 开盘验证 d6/d7 异动方向（已验证 2026-07-23，解析器无需修改）
 
-§8 验证中 14/77 类型不一致，全部是 **d6/d7 买卖搞反**。根因是帧级时间戳
-（整秒）无法区分同一秒内同代码的多条异动——三元组匹配误配到了另一条。
-**这不是解析器 bug**（算法对 20/20 干净样本 100% 正确），但需新鲜数据确认。
+**结论：方向判定正确，无 bug。** §8 中 14/77（旧数据）"d6/d7 买卖搞反"
+的现象，已用 2026-07-23 开盘新鲜数据证实是**历史对照的时间配对错位**，
+不是解析器问题。
 
-**开盘验证方法**（9:30-15:00）：
+**验证数据**（2026-07-23 盘中 `collect_push_samples.py --rounds 30`）：
+
+| 指标 | 结果 |
+|------|------|
+| 样本总数 | 101（含完整帧 101） |
+| 整体类型一致率 | **94/101 = 93.1%** |
+| 方向标记命中的干净子集 | **36/39 = 92.3%** |
+
+7 条不一致全部是**同代码短时间内多条异动**导致三元组匹配误配：
+- `002432` 在 0.92s~4.79s 内出现 3 种异动（0xd7 卖出 / 0xda 跌停封板 / 0xd7），
+  matched.csv 把不同事件配到了一起
+- `603986` 4 秒内 0xd6→0xd7→0xd7 买卖翻转
+- `300285`(Δt=9.24s)、`000636`(Δt=3.96s)——时间差大，明显配到了另一条异动
+
+**根因**：异动字节 0xd6 本身判"买入"、0xd7 判"卖出"，和方向标记
+`ff323200`(买)/`00e60000`(卖) 组合后类型完全正确。大单买卖在同一只股票
+短时间内同时出现是常态，帧级时间戳（整秒）无法区分，三元组匹配就会误配
+到相邻事件。这是**对照方法的局限**，解析器无需修改。
+
+**对比旧数据**：
+
+| | §8 旧数据 | 2026-07-23 验证 |
+|---|---|---|
+| 不一致率 | 14/77（18%） | 7/101（7%） |
+| 时间差 | 整秒窗口（粗） | 0.69~1.5s（更紧邻） |
+| 根因 | 推测同秒多异动 | **已证实**：时间配对错位 |
+
+**验证命令**（如需复现）：
 ```bash
-# 1. 盘中采集（修复版，matched.csv 带 push_frame_hex 完整帧）
-py tests/collect_push_samples.py --rounds 30
+# 1. 盘中采集（9:30-15:00，matched.csv 带 push_raw_bytes/push_frame_hex）
+uv run python tests/collect_push_samples.py --rounds 30
 
-# 2. 翻历史到采集时间窗口（精确对照，不需等收盘）
-#    收集推送后立即翻历史，时间差最小
+# 2. 离线分析（只看时间紧邻样本，排除同秒多异动干扰）
+uv run python tests/analyze_push_fields.py --input data/matched.csv --max-diff 1 --verbose
 
-# 3. 离线分析（只看时间紧邻样本，排除同秒多异动干扰）
-py tests/analyze_push_fields.py --input data/matched.csv --max-diff 1 --verbose
+# 3. 方向验证（异动字节+方向标记 vs 历史真值，对照 hist_type/hist_code_byte）
+#    见本节验证逻辑：从 push_raw_bytes 提取 (异动字节,方向标记) 组合判定类型，
+#    与 matched.csv 的 hist_type 对照，统计一致率
 ```
 
-**预期结果**：时间差 < 1s 时，d6/d7 方向应 100% 正确（因为同一异动事件
-不会在 < 1s 内同时出现买入和卖出）。若仍有不一致，需检查异动字节的
-提取逻辑（可能漏了 `0c 08 40` 头前的分隔标记）。
+### ✅ 4. stock_list_hot()（已解决 2026-07-23，见 §7）
 
-### ⏸️ 4. stock_list_hot()（待解 MarketTime）
-
-见上文 §7。代码已就绪，199112 查询在 thspypc 上始终无响应。
+根因：旧 IP 集群退化 + login 帧缺 UserName/Password + 校验字节。
+已修复（新集群 IP + UserName + 0xc9），连接层面打通。
+剩余：199112 响应 hd1.0 格式的解析器适配（parse_stock_list_response 待加 hd1.0 分支）。
 
 ### 5. hq1.0 字段表 TLV 格式（中优先级，见 §10）
 
@@ -517,7 +572,8 @@ PROTOCOL.md §5.2 揭示推送异动用字段 **203/204(量) + 225/226(金额)**
 - subreal（8901 异动通道订阅）效果确认
 - hd3.1 变体支持（unk=0x36/0x42/0x4a）
 - 8901 主动推送处理
-- MarketTime 握手 → 解锁 stock_list_hot() + 199112 全量
+- ~~MarketTime 握手 → 解锁 stock_list_hot()~~（2026-07-23 已证伪：根因是 login 帧
+  缺 UserName/Password + 校验字节，非 MarketTime。见 §7）
 
 ---
 

@@ -473,23 +473,33 @@ class THSClient:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
 
         req = build_stock_list_query(
-            markets=(17, 22, 151),
+            markets=(17, 22, 33),
             sort_count=count,
             datatype=[199112],
         )
 
         with self._sock_lock:
             sock = self._sock
-            sock.sendall(req)
+            sock.sendall(req + b"\n")
             sock.settimeout(timeout)
-            try:
-                resp = read_frame(sock)
-            except (socket.timeout, OSError) as e:
-                logger.error("stock_list_hot: 读取响应失败: %s", e)
-                return []
+            # 循环读帧，跳过 MarketTime 等文本帧，取首个含 SortTotal 的数据帧
+            # （同 list_quotes 的多帧模式：服务器可能先推 MarketTime 再推数据）
+            resp = None
+            for _ in range(8):
+                try:
+                    frame = read_frame(sock)
+                except (socket.timeout, OSError) as e:
+                    logger.error("stock_list_hot: 读取响应失败: %s", e)
+                    return []
+                if not frame:
+                    continue
+                if b"SortTotal" in frame:
+                    resp = frame
+                    break
+                # 跳过非数据帧（MarketTime / CodeListSize 等）
 
         if not resp:
-            logger.warning("stock_list_hot: 无响应")
+            logger.warning("stock_list_hot: 无数据帧响应")
             return []
 
         meta = parse_stock_list_response(resp)

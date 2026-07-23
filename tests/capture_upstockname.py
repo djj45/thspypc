@@ -30,7 +30,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Wireshark portable 路径
-WS = r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"
+WS = r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark"
 DUMPCAP = os.path.join(WS, "dumpcap.exe")
 CAPTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "captures_live")
 os.makedirs(CAPTURE_DIR, exist_ok=True)

@@ -26,13 +26,13 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 
-WS = r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"
+WS = r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark"
 DUMPCAP = os.path.join(WS, "dumpcap.exe")
 TSHARK = os.path.join(WS, "tshark.exe")
 PCAP_DIR = os.path.join(os.path.dirname(__file__), "..", "captures_live")
 PCAP = os.path.join(PCAP_DIR, "hexin_full.pcap")
 
-MAGIC = b"\xfd\xdf\xdf\xfd"  # 9601 帧分隔符（同 8901）
+MAGIC = b"\xfd\xfd\xfd\xfd"  # 9601 帧分隔符（同 8901；见 protocol.py FRAME_MAGIC）
 
 
 def list_interfaces():
