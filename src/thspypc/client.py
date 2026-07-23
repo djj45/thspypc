@@ -798,19 +798,29 @@ class THSClient:
         count: int = 29,
         timeout: float = 10.0,
         with_names: bool | str = False,
+        sort_by: int = 199112,
+        sort_dir: str = "D",
     ) -> list[dict]:
-        """获取当前活跃的热门股票代码列表（轻量 API，~1s）。
+        """获取排序榜单（轻量 API，~1s）。
 
-        使用 DataType=199112 排序查询（同花顺打开 A 股列表时发的请求），
-        服务器返回按 SortBy 排序的前 N 条记录。由于无翻页，只拿一批。
+        发送排序代码表查询（同花顺打开 A 股列表时发的请求），服务器按 ``sort_by``
+        指定的字段排序后返回前 ``count`` 条。默认按涨幅降序（涨幅榜）。
 
-        ⚠ 此路径**不能拿全量**（约 29 条，且可能重复）。
+        ``sort_by`` 是 DataType 字段编号（见 :data:`protocol.SORT_BY_VALUES`）：
+        涨幅=199112、涨速=48、主力净流入=592890（均已抓包实测）；
+        成交量=13、成交额=19、换手率=1968584、量比=1771976（字段表确认，待活网验证）。
+        换成跌幅榜传 ``sort_by=199112, sort_dir="A"``（升序值 A 为推测，未实测）。
+
+        ⚠ 此路径**不能拿全量**（约 ``count`` 条，且可能重复）。
         拿全量代码表请用 ``stock_list()``。
 
         Args:
             count: 返回条数，默认 29（对齐 hexin 客户端第一页）。
             timeout: 超时时间（秒）。
             with_names: 是否填充中文名称（同 stock_list 的 with_names 参数）。
+            sort_by: 排序字段编号，默认 199112（涨幅）。见
+                :data:`protocol.SORT_BY_VALUES`。
+            sort_dir: 排序方向，``"D"``=降序（默认）、``"A"``=升序（推测，未实测）。
 
         Returns:
             list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``。
@@ -821,10 +831,14 @@ class THSClient:
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
 
+        # markets 对齐 hexin 抓包真值（stock_list.pcap）：17=沪 22=深A 151=北交所。
+        # 注意 33 是深市另一类（非深A 主板/创业板），抓包确认排序查询用的是 22 不是 33。
         req = build_stock_list_query(
-            markets=(17, 22, 33),
+            markets=(17, 22, 151),
             sort_count=count,
-            datatype=[199112],
+            datatype=[sort_by],
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
 
         with self._sock_lock:

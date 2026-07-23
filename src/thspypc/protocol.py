@@ -650,7 +650,396 @@ def build_list_quote_query(
     return encode_frame(body)
 
 
-# 全市场快照请求的默认市场码集（stock_list.pcap frame 1046 真值）
+# =============================================================================
+# 个股五档盘口（封单额）—— 8901 端口
+#
+# 2026-07-23 用 002353 杰瑞股份（涨停，封单额 11.37 亿）对照抓包破解确认：
+#   - 盘口请求的 DataType 是 [13,18,24,25,26,27,28,29,...,150,151,...,154,155,...]
+#     （**不是** [19,223-262]，后者是资金流数据：大/中/小单净额，dt227≈dt19）
+#   - 买盘字段对（价/量）：dt24/25=买一 dt26/27=买二 dt28/29=买三
+#                         dt150/151=买四 dt154/155=买五
+#   - ★ 封单额 = dt24(买一价) × dt25(买一量,单位:股)
+#     例：002353 → 135.11 × 8416876 = 1,137,204,116 元 ≈ 11.37 亿（与界面一致）
+#   - 涨停封死时卖盘字段（dt34/35 等）为 0（无卖盘挂单），符合预期
+# =============================================================================
+
+# 五档盘口请求的 DataType（2026-07-23 抓包 002353/688799 真值，26 字段）。
+# 含完整五档买卖盘 + 量。
+DEPTH_QUOTE_DATATYPE = [
+    13, 18,                          # 成交量, 涨幅
+    24, 25, 26, 27, 28, 29,          # 买一/二/三 价+量
+    30, 31, 32, 33, 34, 35,          # 卖一/二/三 价+量
+    122, 123, 124, 125,              # (扩展档位)
+    150, 151, 152, 153,              # 买四 价+量 + 卖四 价+量
+    154, 155, 156, 157,              # 买五 价+量 + 卖五 价+量
+]
+
+# 买盘五档字段对（价 dt, 量 dt）——2026-07-23 抓包确认
+# 002353 涨停股对照：买一 135.11/84169手 → 封单额=dt24×dt25=11.37亿
+BUY_LEVEL_FIELDS = [
+    ("买一", 24, 25), ("买二", 26, 27), ("买三", 28, 29),
+    ("买四", 150, 151), ("买五", 154, 155),
+]
+
+# 卖盘五档字段对（价 dt, 量 dt）——2026-07-23 抓包 688799 对照确认
+# 卖一 47.30/52手 卖二 47.31/45手 卖三 47.36/10手 卖四 47.37/10手 卖五 47.38/40手
+SELL_LEVEL_FIELDS = [
+    ("卖一", 30, 31), ("卖二", 32, 33), ("卖三", 34, 35),
+    ("卖四", 152, 153), ("卖五", 156, 157),
+]
+
+
+def build_depth_quote_query(
+    code: str,
+    market: int = 33,
+    datatype: list[int] | None = None,
+    pageid: int = 1333,
+    seq: int = 0x0000,
+    inner_seq: int = 0x0163,
+) -> bytes:
+    """构造个股五档盘口请求帧（fdfdfdfd magic + 8字节hex长度 + body）。
+
+    这是 hexin 在「个股详情页/分时图」打开时发的盘口请求（2026-07-23
+    抓包确认）。响应含五档买卖盘，**封单额 = dt24(买一价) × dt25(买一量,股)**。
+
+    请求是**嵌套子帧**结构（与 :func:`build_list_quote_query` 的单层不同，
+    抓包帧体逐字节对照确认）::
+
+        外层帧: cmd=0x09, 子帧类型 0x0002, 路由 0x001c
+                文本: CodeList=<m>(<code>,);\\r\\npageid=<pid>\\r
+        内层子帧(紧跟外层文本): 00 16 00 00 + inner_seq(LE16)
+                + 12 00 09 00(子帧0x0009) + 00 01(路由) + 00×5 + 00
+                + 文本长度(LE16) + 00 00
+                + CodeList=<m>(<code>,);\\r\\nDataType=...\\r\\n
+                  DateTime=0(0-0)\\r\\nLackTime=...\\r\\npageid=<pid>\\r
+
+    内层子帧就是标准的 list_quote 子帧（0x0009），外层 0x0002 壳多带一个
+    CodeList+pageid 前缀。服务器据此返回该股的 hd1.0 盘口帧。
+
+    Args:
+        code: 股票代码（6 位数字，如 ``"002353"``）。
+        market: 市场码。深市=33（002353 实测），沪市=17。注意深 A 在盘口请求
+            里用 33（与 stock_list 的 22 不同——盘口请求走 33 通道）。
+        datatype: DataType 字段列表，None 用 :data:`DEPTH_QUOTE_DATATYPE`。
+        pageid: 页面 id（抓包实测 1333）。
+        seq: 外层帧序列标签。
+        inner_seq: 内层子帧序列标签。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+
+    Note:
+        盘后（非交易时段）同花顺仍能显示盘口快照，故可盘后抓包验证。
+    """
+    if datatype is None:
+        datatype = DEPTH_QUOTE_DATATYPE
+    codes_str = code + ","
+    market_str = f"{market}({codes_str})"
+    dt_str = ",".join(str(d) for d in datatype) + ","
+
+    # 外层文本（行尾 \r\n；长度字段 = 文本字节数，无 +1）
+    outer_text = (
+        f"CodeList={market_str};\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    # 内层子帧文本（标准 list_quote 文本，行尾 \r）
+    inner_text = (
+        f"CodeList={market_str};\r\nDataType={dt_str}\r\n"
+        f"DateTime=0(0-0)\r\nLackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+
+    # 内层子帧头（22B，抓包逐字节确认）：
+    #   00 16 00 00 + inner_seq(LE16) + 12 00 09 00(子帧0x0009) + 00 01(路由)
+    #   + 00×6 + 文本长度(LE16, =字节数+1) + 00 00
+    inner_hdr = bytearray(22)
+    inner_hdr[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", inner_hdr, 4, inner_seq & 0xFFFF)
+    inner_hdr[6:10] = b"\x12\x00\x09\x00"
+    inner_hdr[10:12] = b"\x00\x01"
+    # [12:18] = 0
+    struct.pack_into("<H", inner_hdr, 18, len(inner_text) + 1)
+    # [20:22] = 00 00
+    inner_frame = bytes(inner_hdr) + inner_text
+
+    # 外层帧头（23B）：cmd 0x09 + 00 16 00 00 + seq + 12 00 02 00(子帧0x0002)
+    #   + 1c 00(路由) + 00×5 + 00 + 文本长度(LE16, =字节数) + 00 00
+    outer_hdr = bytearray(23)
+    outer_hdr[0] = 0x09
+    outer_hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", outer_hdr, 5, seq & 0xFFFF)
+    outer_hdr[7:11] = b"\x12\x00\x02\x00"   # 子帧类型 0x0002（盘口壳）
+    outer_hdr[11:13] = b"\x1c\x00"           # 路由 0x001c（抓包真值）
+    # [13:18]=0, [18]=0
+    struct.pack_into("<H", outer_hdr, 19, len(outer_text))   # 外层长度无 +1
+    body = bytes(outer_hdr) + outer_text + inner_frame
+    return encode_frame(body)
+
+
+def parse_depth_quote_response(body: bytes) -> dict:
+    """解析个股五档盘口响应，返回五档买卖盘 + 封单额（涨停/跌停自动判断）。
+
+    响应是 hd1.0 单股帧（dc=1），字段表含 dt24（买一价）。本函数定位该帧、
+    按字段表切分记录，并据买卖一档状态计算封单额。
+
+    封单额判断逻辑（2026-07-23 抓包对照确认）：
+      - **涨停**：卖一量(dt31)=0（无卖盘挂单），封单额 = dt24(买一价) × dt25(买一量)
+        例：002353 → 135.11 × 8416876 = 11.37 亿
+      - **跌停**：买一量(dt25)=0（无买盘挂单），封单额 = dt30(卖一价) × dt31(卖一量)
+      - **正常**：买卖一档都有量，无封单，seal_amount=0
+
+    Args:
+        body: 完整 TCP 帧体（含 hd1.0 标记，通常是 read_frame 读出的单帧）。
+
+    Returns:
+        dict::
+
+            {
+              "code": "002353",
+              "buy":  [{"level":"买一","price":..,"qty":..,"amount":..}, ...],
+              "sell": [{"level":"卖一","price":..,"qty":..,"amount":..}, ...],
+              "seal_amount": 1137204116.0,   # 封单额（元），正常股为 0
+              "seal_type": "涨停",            # "涨停"/"跌停"/None
+              "fields": {"dt13":..., "dt24":..., ...},
+            }
+
+        未找到盘口帧（字段表不含 dt24）时返回空 dict。
+    """
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return {}
+    base = pos + 6
+    if base + 10 > len(body):
+        return {}
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if not (0 < dc < 100 and 0 < hs < 500 and 0 < fc < 50):
+        return {}
+    ftoff = base + 10
+    ft = body[ftoff:ftoff + fc*4]
+    if len(ft) < fc*4:
+        return {}
+    fields = [(ft[i*4], ft[i*4+1], ft[i*4+3]) for i in range(fc)]  # (dt,fmt,width)
+    if not any(d == 24 for d, _, _ in fields):
+        return {}  # 非盘口帧
+    recoff = ftoff + fc*4
+    rec: dict = {}
+    for dt, fmt, width in fields:
+        chunk = body[recoff:recoff+width]
+        recoff += width
+        if len(chunk) < width:
+            break
+        if dt == 5 and fmt == 0x20:
+            rec["code"] = chunk[1:1+6].split(b"\x00")[0].decode("ascii", errors="replace")
+        elif width == 4:
+            rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+
+    # 组装五档买卖盘
+    def build_levels(level_fields):
+        out = []
+        for level, pk, qk in level_fields:
+            p = rec.get(f"dt{pk}")
+            q = rec.get(f"dt{qk}")
+            if p is not None and q is not None:
+                out.append({"level": level, "price": p, "qty": q,
+                            "amount": p * q if p else 0.0})
+        return out
+    buy = build_levels(BUY_LEVEL_FIELDS)
+    sell = build_levels(SELL_LEVEL_FIELDS)
+
+    # 封单额判断：涨停(卖一空) / 跌停(买一空) / 无封单
+    b1_qty = rec.get("dt25", 0)   # 买一量
+    s1_qty = rec.get("dt31", 0)   # 卖一量
+    seal = 0.0
+    seal_type = None
+    if s1_qty == 0 and b1_qty > 0 and "dt24" in rec:
+        # 涨停：封单 = 买一价 × 买一量
+        seal = rec["dt24"] * rec["dt25"]
+        seal_type = "涨停"
+    elif b1_qty == 0 and s1_qty > 0 and "dt30" in rec:
+        # 跌停：封单 = 卖一价 × 卖一量
+        seal = rec["dt30"] * rec["dt31"]
+        seal_type = "跌停"
+    # else: 正常股，买卖一档都有量，无封单
+
+    return {
+        "code": rec.get("code", ""),
+        "buy": buy,
+        "sell": sell,
+        "seal_amount": seal,
+        "seal_type": seal_type,
+        "fields": {k: v for k, v in rec.items() if k.startswith("dt")},
+    }
+
+
+# =============================================================================
+# 个股基本资料（行情统计 + 股本财务）—— 8901 端口
+#
+# 2026-07-23 多票对照界面值破解（002487/001317/600056）。请求是嵌套子帧
+# （外层 cmd=0x09 子帧0x0002 路由0x001c + 内层 0x0009），响应是 hd1.0 变体帧
+# （dc=0x01000001 嵌套壳标记，hs=159 fc=27）。
+#
+# 字段表含单值(fmt0x70)和双值(fmt0x61/0x62/0x66/0x68, 8字节=日期+数值)两类。
+#
+# ★ 已确认字段（三票界面对照，PE 公式精确验证 差异=0.00）：
+#   dt7=开盘 dt8=最高 dt9=最低 dt10=现价 dt13=成交量(股) dt14=外盘(股)
+#   dt19=成交额 dt66=涨幅% dt69=涨停价(昨收×1.1) dt70=跌停价(昨收×0.9)
+#   dt74=盘后量(股) dt75=盘后笔数
+#   dt146(fmt61)=总股本    dt151(fmt61)=流通股本
+#   dt151(fmt62)=TTM净利润(近4季之和,动态PE分母) dt107(fmt62)=上年年报净利润(静态PE分母)
+#   dt124(fmt61)=实际流通股(实换手分母,含义待细化)
+#   dt33(fmt68)=注册制上市日（001317=2024-08-29 已确认）
+#
+# PE 公式验证（600056 中国医药，差异 0.00）：
+#   动态PE = 总市值(dt146×现价) ÷ TTM净利(dt151_fmt62) = 141.21亿/4.83亿 = 29.24 ✓
+#   静态PE = 总市值(dt146×现价) ÷ 年报净利(dt107_fmt62) = 141.21亿/4.73亿 = 29.84 ✓
+#
+# ⚠ 待查字段：dt70(fmt66)=(19700101, 7.02) 非PE非EPS；dt45；dt90/dt92；dt130
+#
+# 本地计算（服务器不给）：换手=成交量÷流通股本 流通值=流通股本×现价
+#                          总市值=总股本×现价 动/静态PE 量比/委比需历史或盘口数据
+# =============================================================================
+
+# 基本资料请求的 DataType（2026-07-23 抓包 002487 真值，26 字段）
+QUOTE_INFO_DATATYPE = [
+    7, 8, 9, 10, 13, 14, 19, 69, 70, 74, 75, 85, 90, 92, 130,
+    6, 45, 66,
+    380, 402, 407, 663, 665, 1606, 2081, 262763,
+]
+
+
+def parse_quote_info_response(body: bytes) -> dict:
+    """解析个股基本资料响应（嵌套壳帧 dc=0x01000001），返回行情统计+股本财务。
+
+    这是盘口页"基本资料"区域的响应（2026-07-23 抓包确认）。含开/高/低/收、
+    涨跌停价、内外盘、盘后数据、股本、净利润等。响应是 hd1.0 变体帧
+   （dc=0x01000001 嵌套壳标记，字段表含 dt74 等基本资料字段）。
+
+    双值字段（fmt=0x61/0x62/0x66/0x68，width=8）= (日期, 数值)，日期如
+    20260331=季报日、19700101=哨兵（无数据）。单值字段（fmt=0x70，width=4）
+    用 decode_ths_float。
+
+    Args:
+        body: 完整 TCP 帧体（含 hd1.0 标记）。
+
+    Returns:
+        dict::
+
+            {
+              "code": "002487",
+              "fields": {  # 单值字段
+                "dt7": 37.12, "dt10": 39.55, "dt69": 40.83, "dt146": ...,
+                ...
+              },
+              "dual": {   # 双值字段 (日期, 值)
+                "dt146_61": (20260707, 740085850),  # 总股本
+                "dt151_61": (20260707, 630920270),  # 流通股本
+                ...
+              },
+              "derived": {  # 本地计算的派生字段
+                "inner": 14832495,      # 内盘(股) = dt13 - dt14
+                "turnover": 4.87,       # 换手% = 成交量/流通股本
+                "circ_mv": 24950000000, # 流通值 = 流通股本×现价
+                "total_mv": ...,        # 总市值 = 总股本×现价
+              },
+            }
+
+        未找到基本资料帧（字段表不含 dt74）时返回空 dict。
+    """
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return {}
+    base = pos + 6
+    if base + 10 > len(body):
+        return {}
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    # 基本资料帧: dc=0x01000001(嵌套壳) 或标准 dc=1，字段表含 dt74
+    if not (0 < hs < 500 and 0 < fc < 50):
+        return {}
+    ftoff = base + 10
+    ft = body[ftoff:ftoff + fc*4]
+    if len(ft) < fc*4:
+        return {}
+    fields = [(ft[i*4], ft[i*4+1], ft[i*4+3]) for i in range(fc)]  # (dt,fmt,width)
+    if not any(d == 74 for d, _, _ in fields):
+        return {}  # 非基本资料帧
+
+    # 嵌套壳帧的记录区前有一段壳头（全0 + 0004 0021 前缀），需定位代码标记
+    recoff = ftoff + fc*4
+    # 找记录起点：dt5 字段格式 [市场码1B][6B ASCII代码]，扫到 6 位 ASCII 数字
+    rec_start = -1
+    for off in range(recoff, min(recoff + hs, len(body) - 7)):
+        code_b = body[off+1:off+7]
+        if len(code_b) == 6 and all(48 <= b <= 57 for b in code_b):
+            rec_start = off
+            break
+    if rec_start < 0:
+        return {}
+
+    rec: dict = {}
+    dual: dict = {}
+    o = rec_start
+    for dt, fmt, width in fields:
+        chunk = body[o:o+width]
+        o += width
+        if len(chunk) < width:
+            break
+        if dt == 5 and fmt == 0x20:
+            rec["code"] = chunk[1:1+6].split(b"\x00")[0].decode("ascii", errors="replace")
+        elif width == 4:
+            rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+        elif width == 8:
+            v1 = decode_ths_float(struct.unpack("<I", chunk[:4])[0])
+            v2 = decode_ths_float(struct.unpack("<I", chunk[4:8])[0])
+            dual[f"dt{dt}_{fmt:02x}"] = (v1, v2)
+
+    # 派生字段（本地计算）
+    derived: dict = {}
+    dt13 = rec.get("dt13", 0)   # 成交量(股)
+    dt14 = rec.get("dt14", 0)   # 外盘(股)
+    if dt13:
+        derived["inner"] = dt13 - dt14  # 内盘 = 总量 - 外盘
+    # 流通股本 dt151(fmt61) 第二值
+    liutong = _dual_second(dual, 151, 0x61)
+    if liutong and rec.get("dt10"):
+        derived["circ_share"] = liutong
+        derived["circ_mv"] = liutong * rec["dt10"]   # 流通值
+        if dt13:
+            derived["turnover"] = (dt13/100) / (liutong/100) * 100  # 换手%
+    # 总股本 dt146(fmt61) 第二值
+    zong = _dual_second(dual, 146, 0x61)
+    if zong and rec.get("dt10"):
+        derived["total_share"] = zong
+        derived["total_mv"] = zong * rec["dt10"]     # 总市值
+    # 实际流通股 dt124(fmt61) -> 实换手
+    shiji = _dual_second(dual, 124, 0x61)
+    if shiji and dt13:
+        derived["real_turnover"] = (dt13/100) / (shiji/100) * 100
+
+    # 动/静态市盈率（600056 验证 差异=0.00）
+    # 动态PE = 总市值 ÷ TTM净利润(dt151_fmt62)
+    # 静态PE = 总市值 ÷ 上年年报净利润(dt107_fmt62)
+    total_mv = derived.get("total_mv")
+    if total_mv:
+        ttm = _dual_second(dual, 151, 0x62)   # TTM净利润(近4季)
+        if ttm and ttm > 0:   # 亏损时 PE 无意义，不计算
+            derived["pe_ttm"] = total_mv / ttm
+        ann = _dual_second(dual, 107, 0x62)   # 上年年报净利润
+        if ann and ann > 0:
+            derived["pe_annual"] = total_mv / ann
+
+    return {"code": rec.get("code", ""), "fields": rec, "dual": dual,
+            "derived": derived}
+
+
+def _dual_second(dual: dict, dt: int, fmt: int) -> float | None:
+    """从 dual 字典取指定 dt/fmt 的第二值（数值部分，第一值通常是日期）。"""
+    v = dual.get(f"dt{dt}_{fmt:02x}")
+    return v[1] if v else None
+
+
+
 # 16/17/18/19/20/22 = 沪深 A 股主板/创业板/科创板/B 股
 # 144/145/146/147/150/151 = 深圳系列市场（含北交所）
 MARKET_SNAPSHOT_MARKETS = [16, 17, 18, 19, 20, 22, 144, 145, 146, 147, 150, 151]
@@ -724,27 +1113,45 @@ STOCK_LIST_MARKETS = [(17, "沪"), (22, "深"), (151, "北交所")]
 # DataType=199112 = 返回代码表（抓包帧3898确认：DataType=199112, 末尾只有一个逗号，不带 55）
 STOCK_LIST_DATATYPE = [199112]
 
+# SortBy 字段编号 → 含义（来自 ths/PROTOCOL.md §5.3 字段表 + captures_live/stock_list.pcap 抓包）。
+# SortBy 就是 DataType 字段编号本身：抓包里每个排序请求的 SortBy 恒等于其 DataType 单值。
+# "实测"= 抓包命中过该 SortBy 值的请求；"字段表"= PROTOCOL.md 确认字段含义但未抓到请求。
+SORT_BY_VALUES = {
+    "涨幅":    {"sort_by": 199112,  "verified": True},   # 抓包命中 4 次（默认值）
+    "涨速":    {"sort_by": 48,      "verified": True},   # 抓包命中 2 次（4分钟涨幅）
+    "主力净流入": {"sort_by": 592890,  "verified": True},   # 抓包命中 2 次
+    "成交量":  {"sort_by": 13,      "verified": False},  # 字段表确认，未抓到请求
+    "成交额":  {"sort_by": 19,      "verified": False},  # 字段表确认（dt19=总金额）
+    "换手率":  {"sort_by": 1968584, "verified": False},  # 字段表确认，未抓到请求
+    "量比":    {"sort_by": 1771976, "verified": False},  # 字段表确认，未抓到请求
+    "价格":    {"sort_by": 10,      "verified": False},  # 字段表确认
+}
+# SortDir：D=降序（抓包 36 次全是 D）。升序值（A/U）未经抓包/文档证实，为推测。
+
 
 def build_stock_list_query(
     markets: list[int] | tuple[int, ...] = (17, 22, 151),
     sort_begin: int = 0,
     sort_count: int = 29,
     datatype: list[int] | None = None,
+    sort_by: int = 199112,
+    sort_dir: str = "D",
     pageid: int = 1334,
     seq: int = 0x0025,
 ) -> bytes:
-    """构造股票列表查询请求（空 CodeList + DataType=199112，8901端口）。
+    """构造股票列表查询请求（空 CodeList + 排序查询，8901端口）。
 
     同花顺在用户打开「沪深A股」列表界面时发此请求（抓包帧3898确认）。
-    注意：这不是启动时拉全量代码表的请求 —— 启动时走 init/qustocklink。
-    本请求是「排序代码表查询」，服务器按 SortBy 排序后返回前 SortCount 条。
+    本请求是「排序代码表查询」，服务器按 ``sort_by`` 指定的字段排序后返回前
+    ``sort_count`` 条。``sort_by`` 就是 DataType 字段编号本身（抓包铁证：每个
+    排序请求的 SortBy 恒等于其 DataType 单值），见 :data:`SORT_BY_VALUES`。
 
-    请求文本（抓包帧3898真值）：
+    请求文本（抓包帧3898真值，sort_by/sort_dir 已参数化）：
       CodeList=17();22();151();   ← 空括号 = 该市场全部（17=沪 22=深A 151=北交所）
-      DataType=199112,            ← 199112 返回代码表（不带 ,55）
+      DataType=199112,            ← 返回字段（排序查询里通常 = sort_by）
       SortType=Sort
-      SortBy=199112
-      SortDir=D                   ← 降序
+      SortBy=199112               ← 排序字段（= DataType 编号，见 SORT_BY_VALUES）
+      SortDir=D                   ← D=降序（抓包 36 次全是 D）
       SortAppend=YC
       SortBegin=0                 ← 抓包确认：恒为 0（不是真翻页游标）
       SortCount=29                ← 本次要的条数（hexin 逐步放大直到拿到全量）
@@ -763,6 +1170,10 @@ def build_stock_list_query(
         sort_begin: 抓包恒为 0（保留参数仅为兼容）。
         sort_count: 本次要的条数。hexin 从 29 开始逐步放大。
         datatype: DataType 列表，默认 [199112]（抓包真值，不带 55）。
+        sort_by: 排序字段编号，默认 199112（涨幅）。取值见 :data:`SORT_BY_VALUES`：
+            涨幅=199112、涨速=48、主力净流入=592890（均已抓包实测）；
+            成交量=13、成交额=19、换手率=1968584、量比=1771976（字段表确认，待活网验证）。
+        sort_dir: 排序方向，``"D"``=降序（默认，抓包确认）；升序值推测为 ``"A"``（未实测）。
         pageid: 固定 1334。
         seq: 序列标签。
 
@@ -776,7 +1187,7 @@ def build_stock_list_query(
     dt_str = ",".join(str(d) for d in datatype) + ","
     text = (
         f"CodeList={codelist}\r\nDataType={dt_str}\r\n"
-        f"SortType=Sort\r\nSortBy=199112\r\nSortDir=D\r\nSortAppend=YC\r\n"
+        f"SortType=Sort\r\nSortBy={sort_by}\r\nSortDir={sort_dir}\r\nSortAppend=YC\r\n"
         f"SortBegin={sort_begin}\r\nSortCount={sort_count}\r\n"
         f"FuncPeriod=0\r\nDateTime=0(0-0)\r\n"
         f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
