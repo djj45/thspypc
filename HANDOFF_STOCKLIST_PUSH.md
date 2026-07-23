@@ -459,12 +459,25 @@ names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ..
   ② 并发 TCP 握手测延迟（SYN→SYN-ACK），选最快的（最快 122.9.115.201=28ms）
 - thspypc 的 `_probe_fastest_hosts` 做同样的事：纯 TCP 握手不发 login，不触发 -1，70 个 IP 并发测完 ~1s
 
+**⚠ VerifyCode=-1 的两种类型（2026-07-23 最终澄清）**：
+- **A. login 帧内容**（已修复）：check 字节硬编码（0 字节 FIN）/ sk/sv 缺失（-6）。
+  正常使用不再触发。
+- **B. 账号级临时封禁**（无法绕过）：同账号短时间反复 connect，尤其集中撞同一批 IP，
+  触发服务器保护——所有 IP 秒回 -1，持续几分钟~十几分钟。**这是服务器行为，代码无法
+  绕过，只能等释放**。实测：反复 connect 同一批快 IP 几次即触发。
+- 应对 B 的措施：① connect 冷却复用（同进程内不重复 login）；② **测速缓存 + IP 轮换**
+  （`_probe_cache` 5 分钟复用测速结果；`_login_rr_offset` 每次推进，login 从快 IP 池
+  轮换取 7 个，分散到不同子集，避免集中撞同一批）；③ 连续 5 个 -1 提前返回
+  `error="global_rate_limited"` 提示等待，不傻试 60 个 IP。
+- **根本对策**：connect 一次保持长连接反复查，不要反复 connect。
+
 **仍需用户注意**：
 - 确保同花顺客户端已退出（同账号不能两个客户端同时在线）
-- 短时间反复 connect（如调试）可能触发账号级临时 -1（所有 IP 秒回 -1），等几分钟释放
+- 短时间反复 connect 会触发 B 类型 -1，等几分钟释放；测速（`_probe_fastest_hosts`）
+  纯 TCP 握手不发 login，可以放心跑
 
 **相关文件**：
-- `src/thspypc/client.py` — `_probe_fastest_hosts` / `_market_snapshot_on_main_sock` / `is_connected` / `ensure_connected` / `connect`（冷却）/ `_send_init_handshake`（优化）/ `_concurrent_login`（提前退出）
+- `src/thspypc/client.py` — `_probe_fastest_hosts`（含缓存）/ `_do_tcp_login_raw`（IP 轮换）/ `_market_snapshot_on_main_sock` / `is_connected` / `ensure_connected` / `connect`（冷却）/ `_send_init_handshake`（优化）/ `_concurrent_login`（提前退出）
 - `src/thspypc/protocol.py` — `MARKET_HOSTS` 注释纠正 / `_PASSPORT_DROP_FIELDS`（见 §2）
 - `tests/cli_ticker.py` — 去掉冗余 `time.sleep(2)`
 

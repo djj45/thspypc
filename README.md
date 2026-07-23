@@ -421,24 +421,32 @@ thspypc/
   用 `market_snapshot_with_quotes()`（stock_list + list_quotes 混合方案）覆盖全市场。
 - 终端 ASCII 二维码可能因字体宽高比扫不了，用 `qr_login.png` 图片扫更可靠。
 - passport 的 signdate/signvalid 用本地时间，和服务器时区可能差 1 小时（不影响登录）。
-- VerifyCode=-1 的**两个根因都已修复**（2026-07-23）：① login 帧校验字节动态计算
-  （曾硬编码 0xaa 导致 0 字节 FIN）；② sk/sv 必须保留（曾误过滤导致 PromptText=-6）。
-  **不是账号限流、不是连接频率**——同账号反复登录退出 hexin 客户端毫无问题
-  （抓包 21+14 次 login 全 VerifyCode=0）。详见「Passport64 生成」章节。
+- VerifyCode=-1 有**两种**（2026-07-23）：
+  - **A. login 帧内容**（已修复）：check 字节硬编码 / sk/sv 缺失。正常使用不再触发。
+  - **B. 账号级临时封禁**（无法绕过）：同账号短时间反复 connect（尤其集中撞同一批
+    IP）会触发服务器保护，所有 IP 秒回 -1，持续几分钟~十几分钟。**这是服务器行为，
+    代码无法绕过，只能等释放**。thspypc 检测到连续 5 个 -1 会提前返回
+    `error="global_rate_limited"` 并提示等待。
+  - **正确用法是长连接**：connect 一次保持反复查，不要反复 connect（见下文）。
+  - 确保同花顺客户端已退出（同账号不能两个客户端同时在线）。
 
-- 仍需注意：确保同花顺客户端已退出（同账号不能两个客户端同时在线）。
+## 连接治理（长连接复用 + 防 -1）
 
-## 连接治理（长连接复用）
+`THSClient` 复刻 hexin 客户端的长连接模式——**一条连接反复查询**（hexin 抓包零 FIN）：
 
-`THSClient` 复刻 hexin 客户端的长连接模式，一条连接反复查询（hexin 抓包零 FIN）：
-
-- `connect()` 成功后建议**保持长连接反复查询**，不要频繁 `disconnect()`/`connect()`。
-  连接还活着时重复调用 `connect()` 会自动复用（冷却期内不重新 login，
+- **强烈建议**：`connect()` 成功后保持长连接反复查询，**不要频繁 `disconnect()`/`connect()`**。
+  反复 connect 会触发账号级 VerifyCode=-1 封禁（见上）。
+- `connect()` 冷却复用：连接还活着时重复调用自动复用（冷却期内不重新 login，
   `error="reused_existing_connection"`）。
-- `is_connected` 属性：探测 8901 主连接是否仍活着（MSG_PEEK 非阻塞，不消费数据）。
-- `ensure_connected()` 方法：查询前的健康检查，连接断了返回 False（不自动重连，
-  把重连决策留给调用方）。
+- `is_connected` 属性：探测 8901 主连接是否仍活着（MSG_PEEK 非阻塞）。
+- `ensure_connected()` 方法：查询前健康检查，连接断了返回 False（不自动重连）。
 - `enable_heartbeat=True`（默认）：后台心跳维持长连接（8901 每 3s、9601 每 30s）。
+
+**测速缓存 + IP 轮换**（降低反复 connect 触发 -1 的概率）：
+- 测速结果在进程内缓存 5 分钟（`_PROBE_CACHE_TTL`），反复 connect 不重复测速。
+- login 从测速排序的 IP 池里**轮换取 7 个**（`_login_rr_offset` 每次推进），不固定
+  前 7 个。反复 connect 时 login 分散到不同 IP 子集，避免集中撞同一批触发封禁。
+- 测速纯 TCP 握手不发 login，**不触发 -1**——可以放心跑（`_probe_fastest_hosts`）。
 
 ## 服务器 IP 动态获取 + 测速选最优
 

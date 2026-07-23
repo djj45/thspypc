@@ -106,6 +106,10 @@ class THSClient:
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
+        # 测速缓存 + IP 轮换（避免反复 connect 集中撞同一批快 IP 触发账号级 -1）
+        self._probe_cache: tuple[float, list[str]] | None = None  # (ts, 按延迟排序的IP全表)
+        self._PROBE_CACHE_TTL = 300.0        # 测速缓存有效期（秒），5 分钟
+        self._login_rr_offset = 0            # login 轮换偏移（每次 connect 后推进）
 
     def connect(self) -> LoginResult:
         """账号密码登录：HTTP 鉴权 → 构造 PC login 帧 → 连 8901 → 验证。
@@ -405,19 +409,29 @@ class THSClient:
 
         # 测速选最快的 IP（复刻同花顺「测试 IP」功能）。
         # 并发 TCP 握手测延迟，选最快的 login，避免盲选到慢 IP（曾 46s 超时）。
-        # 测速纯 TCP 握手不发 login，不触发 -1。
-        fastest = self._probe_fastest_hosts(hosts, top_n=7, timeout=1.0)
-        if fastest:
-            batch = fastest
-            n_concurrent = len(batch)
+        # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
+        sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0)
+        if sorted_ips:
+            # 从测速排序的全表里轮换取 7 个（不固定前 7 个）。
+            # 每次连接后推进 _login_rr_offset，让反复连接时分散到不同 IP 子集，
+            # 避免集中撞同一批快 IP 触发账号级 VerifyCode=-1 封禁。
+            n_concurrent = min(7, len(sorted_ips))
+            offset = self._login_rr_offset % max(1, len(sorted_ips))
+            # 环形取 n_concurrent 个（offset 起，绕回）
+            batch = (sorted_ips[offset:] + sorted_ips[:offset])[:n_concurrent]
+            logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）: %s",
+                        len(batch), offset, batch[:3])
         else:
             # 测速全部超时（网络异常），回退到盲取前 7 个
             logger.warning("IP 测速全部超时，回退到盲取前 7 个")
             n_concurrent = min(7, len(hosts))
             batch = hosts[:n_concurrent]
-        logger.info("并发连接 %d 个 IP（测速排序后）: %s", len(batch), batch[:3])
 
         winner = self._concurrent_login(batch, login_body)
+        # 推进轮换偏移：下次 connect 用不同的 IP 子集，避免反复 connect 集中撞
+        # 同一批 IP 触发账号级 VerifyCode=-1 封禁。推进 n_concurrent 让下次
+        # 完全换一批（不与本次重叠）。
+        self._login_rr_offset = (self._login_rr_offset + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
         if winner:
             host, sock, result = winner
             self._sock = sock
@@ -434,9 +448,9 @@ class THSClient:
 
         # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）。
         # 加连续 -1 计数：账号若被全局封禁（所有 IP 秒回 -1），试更多 IP 无意义，
-        # 串行 fallback：测速排序后的剩余可达 IP（第 8 个起），再补原始列表里
+        # 串行 fallback：测速排序后的剩余可达 IP（跳过本次 batch），再补原始列表里
         # 测速超时但可能可用的 IP。加连续 -1 计数，避免傻试拖到几十秒。
-        fallback_hosts = fastest[n_concurrent:] if fastest else hosts[n_concurrent:]
+        fallback_hosts = [ip for ip in (sorted_ips or hosts) if ip not in set(batch)]
         # 补上测速时剔除的超时 IP（万一它们只是测速瞬间不可达）
         seen = set(batch) | set(fallback_hosts)
         for h in hosts:
@@ -556,27 +570,35 @@ class THSClient:
         except Exception as e:
             logger.warning("init 握手失败（行情查询可能超时）: %s", e)
 
-    def _probe_fastest_hosts(self, hosts: list[str], top_n: int = 7,
-                             timeout: float = 1.0) -> list[str]:
-        """并发 TCP 握手测每个 IP 的延迟，返回最快的 top_n 个。
+    def _probe_fastest_hosts(self, hosts: list[str], timeout: float = 1.0,
+                             use_cache: bool = True) -> list[str]:
+        """并发 TCP 握手测每个 IP 的延迟，返回**按延迟升序排列的全部可达 IP**。
 
         复刻同花顺客户端「测试 IP」功能的机制（2026-07-23 抓包确认）：并发对多个
         IP 发 TCP 连接，测 SYN→SYN-ACK 握手往返时间，选最快的 login。同花顺实测
         最快 122.9.115.201=28ms，最慢 74ms，超时的剔除。
 
         纯 TCP 握手测速——**不发 login**，连上立即关闭，不触发 VerifyCode=-1
-        （-1 是 login 帧内容触发的，TCP 连接不触发）。这避免了 thspypc 盲选前 7
-        个 IP 经常选到慢 IP（46s 超时）的问题。
+        （-1 是 login 帧内容/账号封禁触发的，TCP 连接不触发）。
+
+        **测速缓存**：5 分钟内（``_PROBE_CACHE_TTL``）复用上次测速结果，避免反复
+        connect 时重复测速。缓存命中时秒回。缓存只存按延迟排序的全表，调用方用
+        ``_login_rr_offset`` 轮换取 batch（见 :meth:`_do_tcp_login_raw`）。
 
         Args:
             hosts: 待测 IP 列表。
-            top_n: 返回最快的几个。
             timeout: 单个 TCP 连接超时（秒）。1s 足够区分（最快 28ms，1s 内必回）。
+            use_cache: 是否使用缓存（缓存未命中时测速并写入）。
 
         Returns:
-            按延迟升序排列的 IP 列表（最多 top_n 个）。全部超时返回空列表
-            （调用方应回退到盲选）。
+            按延迟升序排列的可达 IP 列表（全部，不截断）。全部超时返回空列表。
         """
+        # 缓存命中检查（避免反复 connect 重复测速）
+        if use_cache and self._probe_cache:
+            ts, cached = self._probe_cache
+            if time.time() - ts < self._PROBE_CACHE_TTL and cached:
+                logger.debug("IP 测速缓存命中（%d 个可达 IP）", len(cached))
+                return cached
         results: list[tuple[str, float]] = []  # (ip, rtt_seconds)
         lock = threading.Lock()
 
@@ -600,15 +622,17 @@ class THSClient:
             t.join(timeout=timeout + 0.5)  # 整体最多等 timeout+0.5s
 
         results.sort(key=lambda x: x[1])
-        fastest = [ip for ip, _ in results[:top_n]]
-        if fastest:
+        sorted_ips = [ip for ip, _ in results]  # 全部可达 IP，按延迟升序
+        if sorted_ips:
+            # 写缓存（按延迟排序的全表，供调用方轮换取 batch）
+            self._probe_cache = (time.time(), sorted_ips)
             logger.info("IP 测速完成（%.1fs）：最快 %s=%.0fms，共 %d/%d 个可达",
                         time.time() - t0,
-                        fastest[0], results[0][1] * 1000,
+                        sorted_ips[0], results[0][1] * 1000,
                         len(results), len(hosts))
             logger.debug("测速详情: %s",
                          ", ".join(f"{ip}={rtt*1000:.0f}ms" for ip, rtt in results[:7]))
-        return fastest
+        return sorted_ips
 
     def _concurrent_login(self, hosts: list[str],
                           login_body: bytes, timeout: float = 12.0):
@@ -1149,7 +1173,13 @@ class THSClient:
             all_by_code[code] = {"code": code, "name": s.get("name", "")}
 
         # 2. list_quotes 批量回填行情（在主连接上，安全）
-        datatype = [5, 7, 8, 9, 10, 13, 18, 19, 48, 49]
+        # DataType 字段集（2026-07-23 实测确认含义，见 tests/diag_field_mapping.py）：
+        #   dt5=代码 dt6=昨收 dt7=今开 dt8=最高 dt9=最低 dt10=最新价
+        #   dt13=成交股数(÷100=手) dt19=成交额(元) dt48=涨速 dt66=涨幅(盘中有效)
+        # ⚠ 必须含 dt6（昨收），否则涨跌幅无法本地计算（实测缺 dt6 时返回 None）。
+        # ⚠ 字段名必须用 r.get("dt10") 等原始键——list_quotes 返回 dt<N> 原始键，
+        #   不是 "price"/"change_pct" 等具名键（旧代码用具名键导致全部 None）。
+        datatype = [5, 6, 7, 8, 9, 10, 13, 18, 19, 48, 49]
         codes_all = list(all_by_code.keys())
         quote_count = 0
 
@@ -1163,15 +1193,15 @@ class THSClient:
                 for r in recs:
                     code = r.get("code", "")
                     if code and code in all_by_code:
+                        # 用 list_quotes 实际返回的 dt<N> 原始键回填
                         all_by_code[code].update({
-                            "price": r.get("price"),
-                            "change_pct": r.get("change_pct"),
-                            "high": r.get("high"),
-                            "low": r.get("low"),
-                            "open": r.get("open"),
-                            "amount": r.get("amount"),
-                            "volume": r.get("volume"),
-                            "prev_close": r.get("prev_close"),
+                            "price": r.get("dt10"),
+                            "prev_close": r.get("dt6"),
+                            "open": r.get("dt7"),
+                            "high": r.get("dt8"),
+                            "low": r.get("dt9"),
+                            "amount": r.get("dt19"),   # 成交额(元)，服务器直接返回
+                            "volume": r.get("dt13"),   # 成交股数(÷100=手)
                         })
                         quote_count += 1
             except Exception as e:
