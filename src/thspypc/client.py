@@ -411,28 +411,22 @@ class THSClient:
             with self._sock_lock:
                 self._sock.sendall(req + b"\n")
                 self._sock.settimeout(timeout)
-                for _ in range(20):
+                # 完整排空 init 响应——服务器推送完整 init 数据后才认为
+                # init 完成、激活行情通道。只读几帧不够（实测 list_quotes 会超时）。
+                n = 0
+                for _ in range(30):
                     try:
                         read_frame(self._sock)
+                        n += 1
                     except (socket.timeout, OSError):
                         break  # 无更多数据，排空完成
                     except ValueError:
                         try:
-                            self._sock.settimeout(2.0)
+                            self._sock.settimeout(3.0)
                             self._sock.recv(8192)
                         except Exception:
                             pass
-                # 彻底清空 socket 缓冲区残留字节（非阻塞 recv 直到无数据）
-                self._sock.setblocking(False)
-                while True:
-                    try:
-                        chunk = self._sock.recv(65536)
-                        if not chunk:
-                            break
-                    except (BlockingIOError, OSError):
-                        break
-                self._sock.setblocking(True)
-            logger.debug("init 握手完成（行情通道已激活）")
+                logger.debug("init 握手完成（排空 %d 帧，行情通道已激活）", n)
         except Exception as e:
             logger.warning("init 握手失败（行情查询可能超时）: %s", e)
 
