@@ -345,7 +345,8 @@ class THSClient:
                     self._sock = sock
                     self._start_heartbeat()
                     # login 后发 init 激活行情查询（hexin login 后紧跟 init 请求，
-                    # 不发则服务器不激活该连接的行情通道，list_quotes 超时）
+                    # 不发则服务器不激活该连接的行情通道，list_quotes 超时）。
+                    # init 响应含全量代码表（大帧多帧），需排空否则残留干扰后续查询。
                     self._send_init_handshake()
                     logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
                     return LoginResult(
@@ -382,33 +383,42 @@ class THSClient:
         return LoginResult(success=False, error="all_hosts_failed", detail=last_err)
 
     def _send_init_handshake(self, timeout: float = 8.0) -> None:
-        """login 后发 init 请求激活行情通道，排空响应（不解析，丢掉即可）。
+        """login 后发 init 请求激活行情通道，排空 init 响应。
 
         hexin 客户端 login 后紧跟 init 请求（subtype 0x0001），服务器据此
         激活该连接的行情查询通道。不发 init 直接 list_quotes 会超时
         （2026-07-23 抓包确认：hexin 每条连接 LOGIN→INIT→行情查询）。
 
-        init 响应含全量代码表（dc≈7400），但这里只激活连接、排空响应，
-        不解析（解析在 stock_list() 里做）。失败不影响登录状态（init 非必需
-        用于登录本身，只影响后续行情查询）。
+        init 响应含全量代码表（dc≈7400，多帧），必须排空否则残留帧会干扰
+        后续 list_quotes 的 read_frame。排空策略：循环读帧直到超时无数据，
+        单帧超时 8s（init 大帧传输需要几秒）。
         """
         try:
             req = build_init_query()
             with self._sock_lock:
                 self._sock.sendall(req + b"\n")
                 self._sock.settimeout(timeout)
-                # 排空 init 响应（可能多帧，含全量代码表大帧）
                 for _ in range(20):
                     try:
                         read_frame(self._sock)
                     except (socket.timeout, OSError):
-                        break
+                        break  # 无更多数据，排空完成
                     except ValueError:
                         try:
-                            self._sock.settimeout(1.0)
+                            self._sock.settimeout(2.0)
                             self._sock.recv(8192)
                         except Exception:
                             pass
+                # 彻底清空 socket 缓冲区残留字节（非阻塞 recv 直到无数据）
+                self._sock.setblocking(False)
+                while True:
+                    try:
+                        chunk = self._sock.recv(65536)
+                        if not chunk:
+                            break
+                    except (BlockingIOError, OSError):
+                        break
+                self._sock.setblocking(True)
             logger.debug("init 握手完成（行情通道已激活）")
         except Exception as e:
             logger.warning("init 握手失败（行情查询可能超时）: %s", e)
