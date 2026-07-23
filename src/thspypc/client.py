@@ -412,20 +412,21 @@ class THSClient:
         # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
         sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0)
         if sorted_ips:
-            # 从测速排序的全表里轮换取 7 个（不固定前 7 个）。
+            # 从测速排序的全表里轮换取 N 个（不固定前几个）。
             # 每次连接后推进 _login_rr_offset，让反复连接时分散到不同 IP 子集。
-            # 注：-1 是 level2 单点登录会话冲突（按账号不按 IP），轮换主要价值是
-            # 减少对同一 IP 的重复 login，根本对策仍是长连接不反复 connect。
-            n_concurrent = min(7, len(sorted_ips))
+            # 并发数取 5 而非 hexin 的 7：level2 单点登录下并发 login 只有 1 个能赢，
+            # 其余 N-1 个被服务器标 -1（"烧掉"）。降到 5 减少每次烧掉的 IP 数，
+            # 让快 IP 池更耐用；5 个并发仍保证足够容错（1 个超时还有 4 个备选）。
+            n_concurrent = min(5, len(sorted_ips))
             offset = self._login_rr_offset % max(1, len(sorted_ips))
             # 环形取 n_concurrent 个（offset 起，绕回）
             batch = (sorted_ips[offset:] + sorted_ips[:offset])[:n_concurrent]
             logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）: %s",
                         len(batch), offset, batch[:3])
         else:
-            # 测速全部超时（网络异常），回退到盲取前 7 个
-            logger.warning("IP 测速全部超时，回退到盲取前 7 个")
-            n_concurrent = min(7, len(hosts))
+            # 测速全部超时（网络异常），回退到盲取前 5 个
+            logger.warning("IP 测速全部超时，回退到盲取前 5 个")
+            n_concurrent = min(5, len(hosts))
             batch = hosts[:n_concurrent]
 
         winner = self._concurrent_login(batch, login_body)
