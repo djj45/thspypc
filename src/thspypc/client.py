@@ -48,6 +48,7 @@ from .protocol import (
     parse_stock_list_response,
     read_frame,
     read_frame_realorder,
+    resolve_market_hosts,
 )
 
 logger = logging.getLogger(__name__)
@@ -316,9 +317,20 @@ class THSClient:
         VerifyCode=-1 不是账号级限流（实测同账号连不同 IP 第2次 -1 但第3次 0），
         而是特定服务器实例的临时状态。遇到 -1 自动换下一个 host 重试。
         hexin 客户端连 7 个 IP 并发所以不受影响。
+
+        IP 列表优先用 passport M_hqdns 动态域名解析（服务器下发的最新 IP），
+        解析失败才回退到硬编码 MARKET_HOSTS（快照，可能过时）。
         """
+        # 动态解析 M_hqdns 域名拿 IP，回退到硬编码 MARKET_HOSTS
+        hosts = []
+        if self._auth:
+            hosts = resolve_market_hosts(self._auth.get("passport_bytes", b""))
+        if not hosts:
+            logger.info("M_hqdns 动态解析无结果，回退到硬编码 MARKET_HOSTS")
+            hosts = list(MARKET_HOSTS)
+
         last_err = ""
-        for host in MARKET_HOSTS:
+        for host in hosts:
             try:
                 logger.info("尝试连接 %s:%d ...", host, MARKET_PORT)
                 sock = socket.create_connection((host, MARKET_PORT), timeout=15)

@@ -61,6 +61,67 @@ MARKET_HOSTS = [
     "8.145.212.55",
 ]
 
+
+def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
+    """从 passport 的 M_hqdns 字段解析域名，DNS 查询得到 8901 服务器 IP 列表。
+
+    hexin 客户端不硬编码 IP——HTTP 鉴权返回的 passport 里有 M_hqdns 字段，
+    格式如 ``shlv2.123ths.com:8901:16;144;:,szlv2.123ths.com:8901:32;:,...``，
+    含多个域名。hexin DNS 解析这些域名拿到当前可用的 IP（DNS 轮询，每次可能
+    不同），并发连接。这是 thspypc 拿到最新可用 IP 的正确方式（硬编码快照
+    会过时——2026-07-23 实测旧 IP 退化为纯登录网关）。
+
+    Args:
+        passport_bytes: HTTP 鉴权返回的原始 passport_bytes（含 M_hqdns 字段）。
+
+    Returns:
+        去重后的 IP 列表。解析失败返回空列表（调用方回退到 MARKET_HOSTS）。
+    """
+    import socket as _socket
+    # M_hqdns 在 passport_bytes（| 分隔的字段流）里
+    text = passport_bytes.decode("latin-1", errors="replace")
+    m = re.search(r'M_hqdns="([^"]*)"', text)
+    if not m:
+        # 试试无引号的 | 分隔格式
+        for field in text.split("|"):
+            if field.startswith("M_hqdns="):
+                m_hqdns = field.split("=", 1)[1]
+                break
+        else:
+            return []
+    else:
+        m_hqdns = m.group(1)
+
+    # M_hqdns 格式: domain:port:markets;:,domain:port:markets;:,...
+    # 提取所有 :8901 的域名
+    domains = []
+    for entry in m_hqdns.split(","):
+        # entry 如 "shlv2.123ths.com:8901:16;144;:"
+        dm = re.match(r'([\w.]+):(\d+):', entry.strip())
+        if dm and dm.group(2) == str(MARKET_PORT):
+            domains.append(dm.group(1))
+
+    if not domains:
+        return []
+
+    # DNS 解析每个域名，收集所有 IP（去重，保序）
+    ips: list[str] = []
+    seen: set[str] = set()
+    for domain in domains:
+        try:
+            _, _, addrs = _socket.gethostbyname_ex(domain)
+            for ip in addrs:
+                if ip not in seen:
+                    seen.add(ip)
+                    ips.append(ip)
+        except OSError:
+            continue  # DNS 解析失败，跳过
+
+    if ips:
+        logger.info("M_hqdns 动态解析 %d 个域名 → %d 个 IP: %s",
+                    len(domains), len(ips), ips[:5])
+    return ips
+
 # --- 客户端身份参数（PC 远航版，从 login_lv2.pcapng 的 passport 实测）---
 # 首次测试用 Mac 参数被 8901 拒（VerifyCode=-1, PromptText=-6:），服务器返回
 # thshq-hwyeast-globalthsindex-gateway，判定 passport 身份（Mac）与 PC 网关不符。
@@ -436,11 +497,9 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     """
     构造 PC 远航版 login 帧 body。
 
-    抓包实测字段集（2026-07-23 hexin 冷启动抓包，8901 端口）：
+    抓包实测字段集（8901 端口，hexin 冷启动抓包确认）：
         Ask=login
         C-Version=E029.60.20.0031
-        UserName=thsuser          ← 匿名占位（真实身份在 Passport64 里）
-        Password=thsuser          ← 匿名占位
         VerifyType=1
         Mac64=<base64>
         C-SupportPushVer=1.0
@@ -448,21 +507,18 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
         C-SupPushDataVer=hq6.0
         Passport64=<票据>
 
-    UserName/Password 恒为 thsuser/thsuser（匿名占位）。真实账号身份封装在
-    Passport64 里（account=mx_... 字段）。
+    注意：PC 版 login 帧的 account/userclass/M_qs/qsid 等字段全部 absent
+    （身份信息都封装在 Passport64 里），比 thspy 的 Mac 版 login 帧更简洁。
 
-    ⚠ 校验字节（zh_CN.GBK 后的 1 字节）：是 body 内容的函数。2026-07-23 暴力
-    扫描 256 个值定位：带 UserName/Password 时 = 0xc9（新集群 VerifyCode=0），
-    不带时 = 0xaa（旧集群）。新行情集群（122.9.115.201 等）要求带 UserName/
-    Password + 0xc9 才接受 login 并提供行情查询；旧集群（122.9.202.190 等）
-    接受 0xaa 无 UserName 的 login 但已退化为纯登录网关（行情查询超时）。
-    算法本身（sum/xor 等不匹配）未逆向，0xc9 为暴力扫描实测值。
+    hexin 有时带 UserName=thsuser/Password=thsuser（匿名占位），有时不带——
+    两种都能登录。thspypc 不带（更简洁），实测与 hexin 不带时逐字段一致。
+
+    关键：行情查询能否工作取决于连的 IP（动态解析 M_hqdns），而非 login 帧
+    字段。旧 IP 集群退化为纯登录网关；新集群（M_hqdns 域名解析）行情正常。
     """
     parts = [
         ("Ask", "login"),
         ("C-Version", C_VERSION_PC),
-        ("UserName", "thsuser"),
-        ("Password", "thsuser"),
         ("VerifyType", "1"),
         ("Mac64", mac_b64),
         ("C-SupportPushVer", "1.0"),
@@ -473,8 +529,8 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     fields = "\n".join(f"{k}={v}" for k, v in parts)
     # 帧头前缀：\t A \t \x00 zh_CN.GBK <校验字节> \t
     # (PROTOCOL.md §2.2)
-    # 校验字节 0xc9：带 UserName/Password 时的暴力扫描实测值（见 docstring）。
-    return b"\x09\x41\x09\x00" + b"zh_CN.GBK\xC9\x09" + fields.encode("gbk")
+    # 校验字节 0xaa：hexin 不带 UserName 时的值（抓包确认）。
+    return b"\x09\x41\x09\x00" + b"zh_CN.GBK\xAA\x09" + fields.encode("gbk")
 
 
 def parse_login_response(body: bytes) -> dict:
