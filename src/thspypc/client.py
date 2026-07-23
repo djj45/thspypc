@@ -110,6 +110,13 @@ class THSClient:
         self._probe_cache: tuple[float, list[str]] | None = None  # (ts, 按延迟排序的IP全表)
         self._PROBE_CACHE_TTL = 300.0        # 测速缓存有效期（秒），5 分钟
         self._login_rr_offset = 0            # login 轮换偏移（每次 connect 后推进）
+        # 从磁盘加载跨进程共享的测速状态 + 轮换偏移（避免每个进程都 offset=0）
+        _disk = load_ip_state()
+        if _disk is not None:
+            _ips, self._login_rr_offset = _disk
+            self._probe_cache = (time.time(), _ips)
+            logger.debug("从磁盘加载 IP 状态：%d 个 IP，offset=%d",
+                         len(_ips), self._login_rr_offset)
 
     def connect(self) -> LoginResult:
         """账号密码登录：HTTP 鉴权 → 构造 PC login 帧 → 连 8901 → 验证。
@@ -414,25 +421,26 @@ class THSClient:
         if sorted_ips:
             # 从测速排序的全表里轮换取 N 个（不固定前几个）。
             # 每次连接后推进 _login_rr_offset，让反复连接时分散到不同 IP 子集。
-            # 并发数取 5 而非 hexin 的 7：level2 单点登录下并发 login 只有 1 个能赢，
-            # 其余 N-1 个被服务器标 -1（"烧掉"）。降到 5 减少每次烧掉的 IP 数，
-            # 让快 IP 池更耐用；5 个并发仍保证足够容错（1 个超时还有 4 个备选）。
-            n_concurrent = min(5, len(sorted_ips))
+            # 并发数取 7（复刻 hexin）：level2 单点登录下并发 login 只有 1 个能赢，
+            # 其余 6 个被服务器标 -1（"烧掉"），但 7 个并发提供足够容错（实测 5 个
+            # 在跨实例轮换失效时容错不足）。轮换偏移 + 测速结果持久化到磁盘，跨进程共享。
+            n_concurrent = min(7, len(sorted_ips))
             offset = self._login_rr_offset % max(1, len(sorted_ips))
             # 环形取 n_concurrent 个（offset 起，绕回）
             batch = (sorted_ips[offset:] + sorted_ips[:offset])[:n_concurrent]
             logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）: %s",
                         len(batch), offset, batch[:3])
         else:
-            # 测速全部超时（网络异常），回退到盲取前 5 个
-            logger.warning("IP 测速全部超时，回退到盲取前 5 个")
-            n_concurrent = min(5, len(hosts))
+            # 测速全部超时（网络异常），回退到盲取前 7 个
+            logger.warning("IP 测速全部超时，回退到盲取前 7 个")
+            n_concurrent = min(7, len(hosts))
             batch = hosts[:n_concurrent]
 
         winner = self._concurrent_login(batch, login_body)
-        # 推进轮换偏移：下次 connect 用不同的 IP 子集。注：-1 会话冲突按账号判断
-        # 不按 IP，轮换主要减少同 IP 重复 login；根本对策是长连接不反复 connect。
+        # 推进轮换偏移：下次 connect 用不同的 IP 子集。写盘持久化（跨进程共享）。
         self._login_rr_offset = (self._login_rr_offset + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
+        if sorted_ips:
+            save_ip_state(sorted_ips, self._login_rr_offset)
         if winner:
             host, sock, result = winner
             self._sock = sock
@@ -628,8 +636,9 @@ class THSClient:
         results.sort(key=lambda x: x[1])
         sorted_ips = [ip for ip, _ in results]  # 全部可达 IP，按延迟升序
         if sorted_ips:
-            # 写缓存（按延迟排序的全表，供调用方轮换取 batch）
+            # 写内存缓存 + 磁盘持久化（跨进程共享，避免每个进程都 offset=0）
             self._probe_cache = (time.time(), sorted_ips)
+            save_ip_state(sorted_ips, self._login_rr_offset)
             logger.info("IP 测速完成（%.1fs）：最快 %s=%.0fms，共 %d/%d 个可达",
                         time.time() - t0,
                         sorted_ips[0], results[0][1] * 1000,
@@ -1756,6 +1765,63 @@ class THSClient:
 # ── 全市场股票代码表本地缓存（有效期一天=自然日）──────────────────────────────
 # 仿 qr_login 的缓存模式：JSON 存 home 目录，saved_date 按自然日判断失效。
 # stock_list() 拉取 ~7400 条代码一次后写盘，当天重复查询直接读缓存。
+
+# ── IP 测速结果 + 轮换偏移的磁盘持久化（跨进程共享）─────────────────────────
+# 反复 connect（如每次新进程 cli_ticker）时，让测速结果和轮换偏移跨进程共享，
+# 避免每个进程都 offset=0 取前 7 个快 IP（集中撞同 IP 触发 -1）。
+
+def default_ip_state_path() -> str:
+    """IP 测速状态缓存的默认路径（用户 home 目录，跨平台）。"""
+    return os.path.join(os.path.expanduser("~"), ".ths_ip_state.json")
+
+
+def save_ip_state(sorted_ips: list[str], rr_offset: int,
+                  path: str | None = None) -> None:
+    """把测速排序结果 + 轮换偏移写盘（跨进程共享）。
+
+    Args:
+        sorted_ips: 按延迟升序排列的可达 IP 列表。
+        rr_offset: 当前轮换偏移。
+        path: 缓存路径，None 用 :func:`default_ip_state_path`。
+    """
+    path = path or default_ip_state_path()
+    data = {
+        "saved_at": int(time.time()),
+        "sorted_ips": sorted_ips,
+        "rr_offset": rr_offset,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError as e:
+        logger.debug("IP 状态写盘失败（不影响运行）: %s", e)
+
+
+def load_ip_state(path: str | None = None,
+                  max_age: float = 300.0) -> tuple[list[str], int] | None:
+    """读取磁盘缓存的 IP 测速状态（未过期返回，否则 None）。
+
+    Args:
+        path: 缓存路径，None 用 :func:`default_ip_state_path`。
+        max_age: 缓存最大有效期（秒），默认 300（5 分钟，与 _PROBE_CACHE_TTL 一致）。
+
+    Returns:
+        ``(sorted_ips, rr_offset)``，文件不存在/过期/损坏返回 None。
+    """
+    path = path or default_ip_state_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        saved_at = data["saved_at"]
+        if time.time() - saved_at > max_age:
+            return None
+        return data["sorted_ips"], data["rr_offset"]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        logger.debug("IP 状态缓存读取失败（将忽略）: %s", e)
+        return None
+
 
 def default_stock_cache_path() -> str:
     """股票代码表缓存的默认路径（用户 home 目录，跨平台）。"""

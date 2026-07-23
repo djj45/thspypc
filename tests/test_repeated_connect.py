@@ -49,7 +49,9 @@ def main():
     success_ips = []
     fail_streak = 0
     for i in range(1, args.rounds + 1):
-        # 每轮用新 client（模拟每次新进程 connect/disconnect）
+        # 每轮用新 client（模拟每次新进程 connect/disconnect）。
+        # IP 轮换偏移通过磁盘（~/.ths_ip_state.json）跨进程共享，所以新实例
+        # 也能读到上一轮的 offset，实现跨进程 IP 分散。
         client = THSClient(user, pwd)
         t0 = time.time()
         r = client.connect()
