@@ -310,16 +310,15 @@ class THSClient:
 
     def _do_tcp_login_raw(self, login_body: bytes,
                           passport_fields: dict) -> LoginResult:
-        """连 8901 发送已构造的 login 帧（多 IP 冗余，逐个尝试）。
+        """连 8901 发送已构造的 login 帧（并发连多 IP，用最先成功的）。
 
-        _do_tcp_login / connect_with_passport64 共用此方法。
+        复刻 hexin 客户端的策略：同时连 N 个不同 IP 并发 login，用最先返回
+        VerifyCode=0 的连接，其余关闭。这避免了串行逐个尝试时对同一 IP
+        重复登录导致 VerifyCode=-1（同账号会话冲突）。
 
-        VerifyCode=-1 不是账号级限流（实测同账号连不同 IP 第2次 -1 但第3次 0），
-        而是特定服务器实例的临时状态。遇到 -1 自动换下一个 host 重试。
-        hexin 客户端连 7 个 IP 并发所以不受影响。
+        hexin 抓包确认：每 ~20s 并发连 7 个 IP，全部 VerifyCode=0，从不 -1。
 
-        IP 列表优先用 passport M_hqdns 动态域名解析（服务器下发的最新 IP），
-        解析失败才回退到硬编码 MARKET_HOSTS（快照，可能过时）。
+        IP 列表优先用 passport M_hqdns 动态域名解析，回退到硬编码 MARKET_HOSTS。
         """
         # 动态解析 M_hqdns 域名拿 IP，回退到硬编码 MARKET_HOSTS
         hosts = []
@@ -329,8 +328,29 @@ class THSClient:
             logger.info("M_hqdns 动态解析无结果，回退到硬编码 MARKET_HOSTS")
             hosts = list(MARKET_HOSTS)
 
+        # 并发连 N 个 IP（hexin 用 7 个）
+        n_concurrent = min(7, len(hosts))
+        batch = hosts[:n_concurrent]
+        logger.info("并发连接 %d 个 IP: %s", len(batch), batch[:3])
+
+        winner = self._concurrent_login(batch, login_body)
+        if winner:
+            host, sock, result = winner
+            self._sock = sock
+            self._start_heartbeat()
+            self._send_init_handshake()
+            logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
+            return LoginResult(
+                success=True,
+                verify_code="0",
+                server=f"{host}:{MARKET_PORT}",
+                reply_fields=result,
+                passport_fields=passport_fields,
+            )
+
+        # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）
         last_err = ""
-        for host in hosts:
+        for host in hosts[n_concurrent:]:
             try:
                 logger.info("尝试连接 %s:%d ...", host, MARKET_PORT)
                 sock = socket.create_connection((host, MARKET_PORT), timeout=15)
@@ -344,9 +364,6 @@ class THSClient:
                 if verify_code == "0":
                     self._sock = sock
                     self._start_heartbeat()
-                    # login 后发 init 激活行情查询（hexin login 后紧跟 init 请求，
-                    # 不发则服务器不激活该连接的行情通道，list_quotes 超时）。
-                    # init 响应含全量代码表（大帧多帧），需排空否则残留干扰后续查询。
                     self._send_init_handshake()
                     logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
                     return LoginResult(
@@ -357,15 +374,11 @@ class THSClient:
                         passport_fields=passport_fields,
                     )
                 else:
-                    # 连上了、收到响应了，但 VerifyCode 非 0
                     sock.close()
-                    # VerifyCode=-1 不是账号级限流（实测同账号连不同 IP 第2次-1
-                    # 但第3次又 0），而是特定服务器实例的临时状态/会话冲突。
-                    # hexin 客户端连 7 个 IP 并发所以不限流。策略：换下一个 host 立即重试。
                     if verify_code == "-1":
                         logger.warning("%s:%d VerifyCode=-1，换下一个 host 重试...",
                                        host, MARKET_PORT)
-                        continue  # 尝试下一个 host，不直接失败
+                        continue
                     logger.warning("%s:%d 登录被拒 (VerifyCode=%s)", host, MARKET_PORT, verify_code)
                     return LoginResult(
                         success=False,
@@ -422,6 +435,58 @@ class THSClient:
             logger.debug("init 握手完成（行情通道已激活）")
         except Exception as e:
             logger.warning("init 握手失败（行情查询可能超时）: %s", e)
+
+    def _concurrent_login(self, hosts: list[str],
+                          login_body: bytes, timeout: float = 12.0):
+        """并发连多个 IP 发 login，返回最先 VerifyCode=0 的 (host, sock, result)。
+
+        复刻 hexin 的并发登录策略：同时连 N 个 IP，用最先成功的，其余关闭。
+        这避免了串行逐个尝试对同一 IP 重复登录导致 VerifyCode=-1。
+        """
+        results = [None] * len(hosts)  # 每个线程的 (host, sock, result) 或 None
+        errors = [None] * len(hosts)
+        done = threading.Event()
+
+        def _try_one(idx, host):
+            try:
+                sock = socket.create_connection((host, MARKET_PORT), timeout=timeout)
+                if done.is_set():
+                    sock.close(); return
+                sock.sendall(encode_frame(login_body) + b"\n")
+                sock.settimeout(timeout)
+                resp_body = read_frame(sock)
+                if done.is_set():
+                    sock.close(); return
+                result = parse_login_response(resp_body)
+                vc = result.get("VerifyCode", "?")
+                logger.info("%s:%d 响应 VerifyCode=%s", host, MARKET_PORT, vc)
+                if vc == "0":
+                    results[idx] = (host, sock, result)
+                    done.set()
+                else:
+                    sock.close()
+                    errors[idx] = f"VerifyCode={vc}"
+            except Exception as e:
+                errors[idx] = str(e)
+
+        threads = [threading.Thread(target=_try_one, args=(i, h),
+                                    daemon=True) for i, h in enumerate(hosts)]
+        for t in threads:
+            t.start()
+        done.wait(timeout=timeout + 2)
+        # 等所有线程结束（失败的会自己关闭 sock）
+        for t in threads:
+            t.join(timeout=1)
+
+        # 返回第一个成功的结果
+        for r in results:
+            if r:
+                return r
+        # 全部失败，记录错误
+        for i, h in enumerate(hosts):
+            if errors[i]:
+                logger.warning("  %s: %s", h, errors[i])
+        return None
 
     def list_quotes(
         self,
