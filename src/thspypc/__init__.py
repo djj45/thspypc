@@ -33,6 +33,10 @@ from .protocol import (
     generate_imei, generate_mac64,
     # 行情查询（个股列表）
     build_list_quote_query, parse_hd1_response, parse_hd3_response, decode_ths_float,
+    # K线（hd3.1 变体，flag=0x0042/0x0046）
+    parse_kline_hd3_response, build_kline_query, KLINE_DATATYPE,
+    KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
+    KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN, KLINE_PERIOD_60MIN,
     # 全市场快照（空括号单请求，hfd1.0 格式）
     build_market_snapshot_query, MARKET_SNAPSHOT_MARKETS, MARKET_SNAPSHOT_DATATYPE,
 
@@ -66,6 +70,9 @@ __all__ = [
     "build_login_body_pc", "parse_login_response", "parse_passport_fields",
     "generate_imei", "generate_mac64",
     "build_list_quote_query", "parse_hd1_response", "parse_hd3_response", "decode_ths_float",
+    "parse_kline_hd3_response", "build_kline_query", "KLINE_DATATYPE",
+    "KLINE_PERIOD_DAY", "KLINE_PERIOD_WEEK", "KLINE_PERIOD_MONTH",
+    "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN", "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",
     "build_market_snapshot_query", "MARKET_SNAPSHOT_MARKETS", "MARKET_SNAPSHOT_DATATYPE",
     "parse_hfd1_response",
     "build_stock_list_query", "parse_stock_list_response", "STOCK_LIST_DATATYPE",

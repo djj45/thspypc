@@ -650,6 +650,153 @@ def build_list_quote_query(
     return encode_frame(body)
 
 
+# K线周期码（PC 版 DateTime 第一参数，与 Mac 版 PERIOD_MAP 一致，文档 §14b）。
+# 1分=0x3001、5分=0x3005、15分=0x300F、30分=0x301E、60分=0x303C、120分=0x3078、
+# 日=0x4000、周=0x5001、月=0x6001、季=0x6003、年=0x7001。
+KLINE_PERIOD_DAY = 0x4000
+KLINE_PERIOD_WEEK = 0x5001
+KLINE_PERIOD_MONTH = 0x6001
+KLINE_PERIOD_5MIN = 0x3005
+KLINE_PERIOD_15MIN = 0x300F
+KLINE_PERIOD_30MIN = 0x301E
+KLINE_PERIOD_60MIN = 0x303C
+
+# K线标准 OHLCV 字段集（文档 §14a，与 Mac 版 datatype 一致）。
+# 时间(1)/开(7)/高(8)/低(9)/收(11)/量(13)/额(19)；响应里时间字段自带。
+KLINE_DATATYPE = [7, 8, 9, 11, 13, 19]
+
+
+def build_kline_query(
+    code: str,
+    market: int = 33,
+    period: int = KLINE_PERIOD_DAY,
+    fuquan: str = "Q",
+    count: int = 2146,
+    pageid: int = 9355,
+    seq: int = 0x0025,
+) -> bytes:
+    """构造 8901 端口 K线请求帧（PC 版 CodeList 文本格式）。
+
+    请求格式（2026-07-24 抓包 hexin 9.60.20 逐字节确认，文档 §14a）::
+
+        \\x09 + 23字节二进制头(子帧0x0009) + GBK 文本:
+          ReqFuquan=<复权>\\r\\n            Q=前复权 H=后复权 空=不复权
+          CodeList=<市场>(<代码>,);\\r\\n
+          DataType=7,8,9,11,13,19,\\r\\n
+          DateTime=<周期码>(<历史偏移>-0)\\r\\n   周期码见 KLINE_PERIOD_*，偏移负数=从最新往回取
+          LackTime=0,0,0,0,0,0,0,0\\r\\n
+          pageid=9355\\r                   9355=K线图（分时图是 9354）
+
+    二进制头关键字节随周期变化（抓包 16 个请求归纳，route=[11:13] LE16）：
+
+        ===========  ===========  =====  =====
+        周期          route        [17]   [18]
+        ===========  ===========  =====  =====
+        5分(0x3005)   0x0001       0x05   0x30
+        日(0x4000)    0x0001       0x00   0x40
+        周(0x5001)    0x014e       0x01   0x50
+        月(0x6001)    0x014e       0x01   0x60
+        ===========  ===========  =====  =====
+
+    日K/分K 用 route=0x0001；周K/月K 首次请求用 route=0x014e（翻页二次请求
+    回到 0x0001）。[18] = 周期码高字节（period>>8）。周/月 route=0x014e 是
+    必需的——用 0x0001 服务器只回 26B ACK 不下发数据。
+
+    Args:
+        code: 股票代码（纯数字，如 "000089"）
+        market: 市场码（33=深 17=沪）
+        period: 周期码（KLINE_PERIOD_DAY/WEEK/MONTH/...，见模块常量）
+        fuquan: 复权（"Q"=前复权 "H"=后复权 ""=不复权）
+        count: 取的根数（转成负的历史偏移，从最新往回取）
+        pageid: 页面 id（K线图=9355）
+        seq: 序列标签（hdr[5:7]）
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+    """
+    dt_str = ",".join(str(d) for d in KLINE_DATATYPE) + ","
+    text = (
+        f"ReqFuquan={fuquan}\r\nCodeList={market}({code},);\r\n"
+        f"DataType={dt_str}\r\nDateTime={period}({-count}-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x09\x00"   # 子帧类型 0x0009
+    # route[11:13] 随周期：周/月=0x014e（必需），日/分=0x0001
+    route = 0x014E if period >= 0x5000 else 0x0001
+    struct.pack_into("<H", hdr, 11, route)
+    hdr[17] = 0x01 if period >= 0x5000 else (0x05 if period < 0x4000 else 0x00)
+    hdr[18] = (period >> 8) & 0xFF      # 周期码高字节
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+# 分时图（当日逐点）周期码与字段集（文档 §14，2026-07-24 抓包 pageid=9354）。
+# 分时走与 K线不同的子帧：子帧类型 0x0002（K线是 0x0009），路由 0x000a。
+TIMELINE_PERIOD = 0x2000   # DateTime 第一参数（=8192）
+TIMELINE_PAGEID = 9354     # 分时图页面 id（K线图是 9355）
+# 分时 DataType（抓包 DataType=10,13,14,15,19,22,23,54,6,45）：
+# dt10=现价 dt13=量 dt14=均量价? dt15=? dt19=额 dt22/23=买卖盘 dt54=? dt6=昨收 dt45=?
+TIMELINE_DATATYPE = [10, 13, 14, 15, 19, 22, 23, 54, 6, 45]
+
+
+def build_timeline_query(
+    code: str,
+    market: int = 33,
+    datatype: list[int] | None = None,
+    pageid: int = TIMELINE_PAGEID,
+    seq: int = 0x0025,
+) -> bytes:
+    """构造 8901 端口分时图请求帧（PC 版，当日逐点行情）。
+
+    请求格式（2026-07-24 抓包 pageid=9354 逐字节确认）::
+
+        \\x09 + 23字节二进制头(子帧0x0002 路由0x000a) + GBK 文本:
+          CodeList=<市场>(<代码>,);\\r\\n
+          DataType=10,13,14,15,19,22,23,54,6,45,\\r\\n
+          DateTime=8192(0-0)\\r\\n         8192=0x2000 分时周期码
+          LackTime=0,0,0,0,0,0,0,0\\r\\n
+          pageid=9354\\r                  9354=分时图（K线图是 9355）
+
+    与 K线请求（build_kline_query）的区别：
+      - 子帧类型 0x0002（K线是 0x0009）
+      - 路由 0x000a（K线随周期 0x0001/0x014e）
+      - 无 ReqFuquan（分时是当日实时，不复权）
+      - DataType 是分时专用字段集（现价/量额/买卖盘/昨收）
+
+    Args:
+        code: 股票代码（纯数字）
+        market: 市场码（33=深 17=沪）
+        datatype: 字段集（默认 TIMELINE_DATATYPE）
+        pageid: 页面 id（分时图=9354）
+        seq: 序列标签
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+    """
+    if datatype is None:
+        datatype = TIMELINE_DATATYPE
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    text = (
+        f"CodeList={market}({code},);\r\nDataType={dt_str}\r\n"
+        f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x02\x00"   # 子帧类型 0x0002（分时专用，K线是 0x0009）
+    struct.pack_into("<H", hdr, 11, 0x000A)  # 路由 0x000a
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
 # =============================================================================
 # 个股五档盘口（封单额）—— 8901 端口
 #
@@ -1715,6 +1862,182 @@ def parse_hd3_response(body: bytes) -> list[dict]:
     bitplane = _decode_bitrle_0x13746d0(bitrle, expect)
     recs = _transpose_bitplane_0x1763410(bitplane, hs, dc)
     return _parse_hd_records(recs, fields, hs, dc)
+
+
+# K线 dt 字段编号 → 标准含义（与请求 DataType 对齐，同 Mac 版 thspy）
+KLINE_DT_OPEN = 7
+KLINE_DT_HIGH = 8
+KLINE_DT_LOW = 9
+KLINE_DT_CLOSE = 11
+KLINE_DT_VOL = 13
+KLINE_DT_AMT = 19
+
+
+def parse_kline_hd3_response(body: bytes) -> list[dict]:
+    """解析 K线响应的 hd3.1 变体（flag=0x0042/0x0046，PC 版 8901 端口 K线图）。
+
+    解码核心与标准 hd3.1 完全相同（``_decode_bitrle_0x13746d0`` BitRLE 解码 +
+    ``_transpose_bitplane_0x1763410`` 位平面转置，两者均经 Unicorn 逐字节验证），
+    区别仅在帧头布局：dc 是 LE32、字段表后有 26 字节壳头（含 ASCII 代码）。
+
+    头格式（抓包 kline_20260724_000441_resp_stream1.bin 三帧验证）::
+
+        hd3.1\\0
+        + dc(LE32)              ← 记录数（K线根数）
+        + flag(LE16=0x0042/0x0046)  ← 变体标记（0x0046=OHLC K线；0x0042=分笔/tick 类）
+        + hs(LE16)              ← 单条记录字节长度（= 字段表 width 累加）
+        + fc(LE16)              ← 字段数
+        + 字段表(fc×4B)         ← (dt, fmt, flags, width)，数值字段 fmt=0x70/0x64
+        + 26字节壳头            ← [0:2]市场码 + [4]0x21 + [5:11]6B ASCII 代码 + ...
+        + BitRLE头(BE32=dc*hs)  ← 大端，与标准 hd3.1 一致
+        + BitRLE位流
+
+    时间字段（dt1）格式随周期而变：分/日K 是 Unix 时间戳，周/月K 是 YYYYMMDD
+    紧凑整数。本函数用 ``dt1 < 100_000_000`` 判定为 YYYYMMDD（恒 < 10^8），
+    否则当 Unix 时间戳，两者都还原成 ``datetime`` 存入 ``time`` 字段。
+
+    Args:
+        body: 完整 TCP 帧体（含 ``hd3.1\\0`` 标记）。
+
+    Returns:
+        记录列表，每条 ``{code, time, open, high, low, close, volume, amount,
+        dt<N>...}``，按时间正序（最早在前）。
+        缺失字段不出现；无法定位 hd3.1 标记或 BitRLE 头不匹配返回 ``[]``。
+    """
+    pos = body.find(b"hd3.1\x00")
+    if pos < 0:
+        return []
+    base = pos + 6
+    if len(body) < base + 10:
+        return []
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    flag = struct.unpack("<H", body[base+4:base+6])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if dc == 0 or hs == 0 or fc == 0 or fc > 50:
+        return []
+    if flag not in (0x0042, 0x0046):
+        logger.debug("kline hd3.1 非 K线变体(flag=0x%x), 跳过", flag)
+        return []
+    fields = _parse_hd_field_table(body, base + 10, fc)
+    # K线变体壳头固定 26 字节（市场码 + 0x21 + 6B ASCII 代码 + padding）
+    shell_off = base + 10 + fc * 4
+    if len(body) < shell_off + 26:
+        return []
+    shell = body[shell_off: shell_off + 26]
+    code = shell[5:11].decode("ascii", errors="replace") if shell[4] == 0x21 else ""
+    bitrle_off = shell_off + 26
+    if len(body) < bitrle_off + 4:
+        return []
+    expect = dc * hs
+    bitrle_head = struct.unpack(">I", body[bitrle_off:bitrle_off+4])[0]
+    if bitrle_head != expect:
+        logger.debug("kline hd3.1 BitRLE 头不匹配: got=0x%x expect=0x%x(dc*hs=%d, flag=0x%x)",
+                     bitrle_head, expect, expect, flag)
+        return []
+    bitplane = _decode_bitrle_0x13746d0(body[bitrle_off:], expect)
+    if len(bitplane) < expect:
+        logger.debug("kline hd3.1 BitRLE 解码不足: got=%d expect=%d", len(bitplane), expect)
+        return []
+    recs = _transpose_bitplane_0x1763410(bitplane, hs, dc)
+    # 字段表 dt → 行内偏移（width 累加）
+    dt_offset: dict[int, tuple[int, int]] = {}  # dt -> (offset, width)
+    off = 0
+    for dt, fmt, width in fields:
+        dt_offset[dt] = (off, width)
+        off += width
+    # 先按首根 dt1 判定整帧的时间格式（同一帧所有行用同一种编码）。
+    # 分/日/周/月K 用 Unix 时间戳或 YYYYMMDD；日内 K（5分等）的 dt1 是绝对 bar
+    # 序号（连续递增，增量=周期分钟数），不是时间戳——用首根值能否解出合理
+    # 日期来区分（bar 序号当 Unix 解会落到 1970 年代，明显不合理）。
+    time_is_bar_index = False
+    if 1 in dt_offset and dc > 0:
+        o0, _ = dt_offset[1]
+        first_row = recs[0:hs]
+        tv0 = struct.unpack("<I", first_row[o0:o0+4])[0] if len(first_row[o0:o0+4]) == 4 else 0
+        time_is_bar_index = _kline_dt1_is_bar_index(tv0)
+    records: list[dict] = []
+    for i in range(dc):
+        row = recs[i*hs: (i+1)*hs]
+        if len(row) < hs:
+            break
+        rec: dict = {"code": code}
+        # 时间（dt1）
+        if 1 in dt_offset:
+            o, w = dt_offset[1]
+            tv = struct.unpack("<I", row[o:o+4])[0] if len(row[o:o+4]) == 4 else 0
+            if time_is_bar_index:
+                # 日内 K：dt1 是绝对 bar 序号，无法直接还原成时刻，保留原值
+                rec["time"] = None
+                rec["bar_index"] = tv
+            else:
+                rec["time"] = _kline_decode_time(tv)
+        # OHLCV 标准字段
+        for name, dt in (("open", KLINE_DT_OPEN), ("high", KLINE_DT_HIGH),
+                         ("low", KLINE_DT_LOW), ("close", KLINE_DT_CLOSE),
+                         ("volume", KLINE_DT_VOL), ("amount", KLINE_DT_AMT)):
+            if dt in dt_offset:
+                o, w = dt_offset[dt]
+                chunk = row[o:o+w]
+                if len(chunk) >= 4:
+                    rec[name] = decode_ths_float(struct.unpack("<I", chunk[:4])[0])
+        # 其余 dt 原样保留（fmt=0x70/0x64 当 THS float，否则 raw），供调试/扩展
+        for dt, (o, w) in dt_offset.items():
+            if dt in (1, KLINE_DT_OPEN, KLINE_DT_HIGH, KLINE_DT_LOW,
+                      KLINE_DT_CLOSE, KLINE_DT_VOL, KLINE_DT_AMT):
+                continue
+            chunk = row[o:o+w]
+            if w == 4 and len(chunk) == 4:
+                fields_ref = dict((d, f) for d, f, _ in fields)
+                if fields_ref.get(dt) in (0x70, 0x64):
+                    rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+                else:
+                    rec[f"dt{dt}_raw"] = chunk
+        records.append(rec)
+    return records
+
+
+def _kline_decode_time(tv: int) -> "datetime.datetime":
+    """K线时间字段还原：``<100_000_000`` 视为 YYYYMMDD 紧凑整数，否则当 Unix 时间戳。
+
+    抓包确认：5分K/日K 用 Unix 时间戳（如 1784789709 = 2026-07-23 14:55:09），
+    周/月K 用 YYYYMMDD（如 19980831 = 1998-08-31，000089 上市月）。
+    分界取 10^8：YYYYMMDD 恒 < 10^8（最大 99991231），Unix 时间戳恒 ≥ 10^8（1973+）。
+    """
+    import datetime
+    if tv < 100_000_000:
+        # YYYYMMDD 紧凑整数
+        y, md = divmod(tv, 10000)
+        m, d = divmod(md, 100)
+        try:
+            return datetime.datetime(y, m or 1, d or 1)
+        except ValueError:
+            return datetime.datetime.min
+    try:
+        return datetime.datetime.fromtimestamp(tv)
+    except (OSError, ValueError, OverflowError):
+        return datetime.datetime.min
+
+
+def _kline_dt1_is_bar_index(tv: int) -> bool:
+    """判断 dt1 首根值是否是日内 K 的「绝对 bar 序号」而非时间戳。
+
+    抓包确认两类时间编码（见文档 §14d）：
+      - 日/周/月K：Unix 时间戳（如 1784789709）或 YYYYMMDD（如 19980831，< 10^8）
+      - 日内 K（5分等）：dt1 是连续 bar 序号（如 132491944，增量=周期分钟数），
+        当 Unix 时间戳解会落到 1970 年代（中国股市 1990+ 才有），据此区分。
+
+    判定：值 ≥ 10^8 且当 Unix 时间戳解出的年份 < 1990（早于沪深交易所成立），
+    视为 bar 序号。
+    """
+    import datetime
+    if tv < 100_000_000:
+        return False  # YYYYMMDD
+    try:
+        dt = datetime.datetime.fromtimestamp(tv)
+    except (OSError, ValueError, OverflowError):
+        return True
+    return dt.year < 1990
 
 
 def _decode_bitrle_0x13746d0(src: bytes, expect: int) -> bytes:

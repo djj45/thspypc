@@ -26,6 +26,7 @@ from .protocol import (
     build_heartbeat_8901,
     build_heartbeat_9601,
     build_init_query,
+    build_kline_query,
     build_list_quote_query,
     build_login_body_pc,
     build_passport64,
@@ -38,8 +39,11 @@ from .protocol import (
     full_http_auth,
     generate_imei,
     generate_mac64,
+    KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN,
+    KLINE_PERIOD_60MIN, KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
     parse_hd1_response,
     parse_hd3_response,
+    parse_kline_hd3_response,
     parse_init_response,
     parse_login_response,
     parse_passport_fields,
@@ -792,6 +796,119 @@ class THSClient:
                          resp[:40].decode("gbk", errors="replace")[:40])
         logger.warning("list_quotes: 8 帧内未找到 hd 数据帧")
         return []
+
+    # K线周期名 → 周期码（kline/timeline 方法共用）
+    _KLINE_PERIOD_CODES = {
+        "5min": KLINE_PERIOD_5MIN, "15min": KLINE_PERIOD_15MIN,
+        "30min": KLINE_PERIOD_30MIN, "60min": KLINE_PERIOD_60MIN,
+        "day": KLINE_PERIOD_DAY, "week": KLINE_PERIOD_WEEK,
+        "month": KLINE_PERIOD_MONTH,
+    }
+
+    def kline(
+        self,
+        code: str,
+        period: str = "day",
+        count: int = 2146,
+        fuquan: str = "Q",
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 3,
+    ) -> list[dict]:
+        """查 K线（复用登录后的 8901 长连接，复刻 hexin 单连接连发模式）。
+
+        发送 ``build_kline_query`` 构造的 K线请求，解析 ``parse_kline_hd3_response``
+        返回的 hd3.1 变体响应（flag=0x0042/0x0046），返回 OHLCV 记录列表。
+
+        **连接复用**（关键）：抓包确认 hexin 在**同一条 TCP 长连接**上连发日/周/
+        月/5分K 请求（不轮换 IP）。本方法复用 ``self._sock``，首次调用触发 connect()，
+        后续调用复用同一条连接——这避免了每次重连新建短连接时的会话不稳定
+        （周/月K route=0x014e 在新连接上易被 RST，长连接复用则稳定）。
+
+        **重试**：连接断开或读超时时自动 ensure_connected + 重试（最多 ``retries`` 次）。
+        每次重试用 IP 轮换取新连接（测速缓存 + 轮换偏移），命中稳定 IP 即成功。
+
+        Args:
+            code: 股票代码（纯数字，如 "000089"）
+            period: 周期名（"5min"/"15min"/"30min"/"60min"/"day"/"week"/"month"）
+            count: 取的根数（服务器按实际数据返回，可能少于 count）
+            fuquan: 复权（"Q"=前复权 "H"=后复权 ""=不复权）
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）
+            timeout: 单次 read_frame 超时（秒）
+            retries: 连接失败时的重试次数（每次重连轮换 IP）
+
+        Returns:
+            记录列表，每条 ``{code, time, open, high, low, close, volume,
+            amount, bar_index?, dt<N>...}``，按时间正序。日内K（5分等）的
+            ``time`` 为 None、原 dt1 值存 ``bar_index``。
+
+        Raises:
+            ValueError: period 不在支持列表内。
+            RuntimeError: 重试 ``retries`` 次后仍失败。
+        """
+        if period not in self._KLINE_PERIOD_CODES:
+            raise ValueError(f"period 不支持: {period}，可选: {list(self._KLINE_PERIOD_CODES)}")
+        period_code = self._KLINE_PERIOD_CODES[period]
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+
+        last_err = ""
+        for attempt in range(retries + 1):
+            # ensure_connected 对从未登录会 raise；这里统一用 is_connected 判断，
+            # 连接不在则 connect()（首次登录 + 断线重连都走这里，IP 轮换取新连接）
+            if not self.is_connected:
+                logger.info("kline: 连接不可用，connect（attempt %d/%d，IP 轮换）",
+                            attempt + 1, retries)
+                lr = self.connect()
+                if not lr.success:
+                    last_err = f"connect 失败: {lr.error}"
+                    continue
+            try:
+                return self._kline_query_once(code, market, period_code, count,
+                                              fuquan, timeout)
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("kline %s %s 失败（attempt %d）: %s",
+                               code, period, attempt + 1, last_err)
+                # 连接已坏，强制下次重连
+                self._drop_connection()
+        raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
+
+    def _kline_query_once(self, code: str, market: int, period: int, count: int,
+                          fuquan: str, timeout: float) -> list[dict]:
+        """在当前 8901 连接上发一次 K线请求并解析响应（单次，不重试）。"""
+        if self._sock is None:
+            raise RuntimeError("未登录")
+        frame = build_kline_query(code, market=market, period=period,
+                                  fuquan=fuquan, count=count)
+        self._sock.settimeout(timeout)
+        with self._sock_lock:
+            if not self._sock:
+                raise ConnectionError("连接已关闭")
+            self._sock.sendall(frame + b"\n")
+        # 循环读帧，跳过文本/ACK 帧，取首个 hd3.1 K线数据帧
+        for _ in range(8):
+            resp = read_frame(self._sock)
+            if b"hd3.1\x00" in resp:
+                recs = parse_kline_hd3_response(resp)
+                if recs:
+                    return recs
+                logger.debug("kline: 收到 hd3.1 但解析为空，继续读")
+                continue
+            logger.debug("kline: 跳过非数据帧 %dB", len(resp))
+        logger.warning("kline: 8 帧内未找到 hd3.1 K线数据帧")
+        return []
+
+    def _drop_connection(self) -> None:
+        """标记当前 8901 连接为坏（强制下次 ensure_connected 触发重连）。"""
+        with self._sock_lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+        self.stop_heartbeat()
 
     def stock_list_hot(
         self,
