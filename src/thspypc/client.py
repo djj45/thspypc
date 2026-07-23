@@ -800,30 +800,39 @@ class THSClient:
         with_names: bool | str = False,
         sort_by: int = 199112,
         sort_dir: str = "D",
+        max_pages: int = 120,
     ) -> list[dict]:
-        """获取排序榜单（轻量 API，~1s）。
+        """获取排序榜单（自动翻页，可拿完整榜单）。
 
-        发送排序代码表查询（同花顺打开 A 股列表时发的请求），服务器按 ``sort_by``
-        指定的字段排序后返回前 ``count`` 条。默认按涨幅降序（涨幅榜）。
+        发送排序代码表查询（同花顺打开 A 股列表、切换排序列时发的请求），
+        服务器按 ``sort_by`` 指定的字段排序后返回。本方法自动用 SortBegin 游标
+        翻页，直到拿满 ``count`` 条或取完整个榜单。
 
-        ``sort_by`` 是 DataType 字段编号（见 :data:`protocol.SORT_BY_VALUES`）：
-        涨幅=199112、涨速=48、主力净流入=592890（均已抓包实测）；
-        成交量=13、成交额=19、换手率=1968584、量比=1771976（字段表确认，待活网验证）。
+        ``sort_by`` 是排序键编号（见 :data:`protocol.SORT_BY_VALUES`，均为活网验证）：
+        涨幅=199112、涨速=48、换手率=1968584、量比=1771976、主力净流入=592890、
+        竞价金额=68758、竞价涨幅=68762。默认按涨幅降序（涨幅榜）。
         换成跌幅榜传 ``sort_by=199112, sort_dir="A"``（升序值 A 为推测，未实测）。
 
-        ⚠ 此路径**不能拿全量**（约 ``count`` 条，且可能重复）。
-        拿全量代码表请用 ``stock_list()``。
+        ⚠ 成交量/成交额**不能**通过本方法拿——它们不走 SortBy 路径，而是客户端
+        订阅行情推送（dt13/dt19）后本地排序。详见 HANDOFF_STOCKLIST_PUSH.md。
+
+        翻页机制（2026-07-23 抓包确认）：SortBegin 是游标（首次 0，翻页递增到
+        已加载位置），每页 59 条（SortCount 恒 59）。``count`` 是想要的总条数，
+        本方法内部循环请求直到拿满。
 
         Args:
-            count: 返回条数，默认 29（对齐 hexin 客户端第一页）。
-            timeout: 超时时间（秒）。
+            count: 想要的总条数，默认 29（对齐 hexin 第一页，向后兼容）。
+                想要完整榜单（约 5200 条）传一个大数如 5300 即可。
+            timeout: 单次请求的超时时间（秒）。
             with_names: 是否填充中文名称（同 stock_list 的 with_names 参数）。
-            sort_by: 排序字段编号，默认 199112（涨幅）。见
+            sort_by: 排序键编号，默认 199112（涨幅）。见
                 :data:`protocol.SORT_BY_VALUES`。
             sort_dir: 排序方向，``"D"``=降序（默认）、``"A"``=升序（推测，未实测）。
+            max_pages: 翻页安全阀（默认 120，≈5300/59），防止死循环。
 
         Returns:
             list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``。
+            按 code 去重（页边界可能重叠）。
 
         Raises:
             RuntimeError: 未登录。
@@ -833,42 +842,74 @@ class THSClient:
 
         # markets 对齐 hexin 抓包真值（stock_list.pcap）：17=沪 22=深A 151=北交所。
         # 注意 33 是深市另一类（非深A 主板/创业板），抓包确认排序查询用的是 22 不是 33。
-        req = build_stock_list_query(
-            markets=(17, 22, 151),
-            sort_count=count,
-            datatype=[sort_by],
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-        )
+        PAGE = 59  # hexin 每页恒 59 条（抓包确认）
+        stocks: list[dict] = []
+        seen_codes: set[str] = set()
+        sort_total = 0
+        sort_begin = 0
+        target = count  # 想要的总条数
 
         with self._sock_lock:
             sock = self._sock
-            sock.sendall(req + b"\n")
-            sock.settimeout(timeout)
-            # 循环读帧，跳过 MarketTime 等文本帧，取首个含 SortTotal 的数据帧
-            # （同 list_quotes 的多帧模式：服务器可能先推 MarketTime 再推数据）
-            resp = None
-            for _ in range(8):
-                try:
-                    frame = read_frame(sock)
-                except (socket.timeout, OSError) as e:
-                    logger.error("stock_list_hot: 读取响应失败: %s", e)
-                    return []
-                if not frame:
-                    continue
-                if b"SortTotal" in frame:
-                    resp = frame
+            for page in range(max_pages):
+                req = build_stock_list_query(
+                    markets=(17, 22, 151),
+                    sort_begin=sort_begin,
+                    sort_count=PAGE,
+                    datatype=[sort_by],
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                )
+                sock.sendall(req + b"\n")
+                sock.settimeout(timeout)
+                # 循环读帧，跳过 MarketTime 等文本帧，取首个含 SortTotal 的数据帧
+                # （同 list_quotes 的多帧模式：服务器可能先推 MarketTime 再推数据）
+                resp = None
+                for _ in range(8):
+                    try:
+                        frame = read_frame(sock)
+                    except (socket.timeout, OSError) as e:
+                        logger.error("stock_list_hot: 读取响应失败: %s", e)
+                        return stocks
+                    if not frame:
+                        continue
+                    if b"SortTotal" in frame:
+                        resp = frame
+                        break
+                    # 跳过非数据帧（MarketTime / CodeListSize 等）
+
+                if not resp:
+                    logger.warning("stock_list_hot: 第 %d 页无数据帧响应", page + 1)
                     break
-                # 跳过非数据帧（MarketTime / CodeListSize 等）
 
-        if not resp:
-            logger.warning("stock_list_hot: 无数据帧响应")
-            return []
+                meta = parse_stock_list_response(resp)
+                if not sort_total:
+                    sort_total = meta.get("sort_total", 0)
+                page_stocks = meta.get("stocks", [])
+                # 按 code 去重合并（页边界可能重叠）
+                new_in_page = 0
+                for s in page_stocks:
+                    c = s.get("code", "")
+                    if c and c not in seen_codes:
+                        seen_codes.add(c)
+                        stocks.append(s)
+                        new_in_page += 1
 
-        meta = parse_stock_list_response(resp)
-        stocks = meta.get("stocks", [])
-        logger.info("stock_list_hot: 获取 %d 条（共 %d 条）",
-                    len(stocks), meta.get("sort_total", 0))
+                data_count = meta.get("sort_data_count", len(page_stocks))
+                logger.debug("stock_list_hot: 第 %d 页 SortBegin=%d 拿 %d 条"
+                             "（新增 %d），累计 %d/%d",
+                             page + 1, sort_begin, data_count, new_in_page,
+                             len(stocks), sort_total)
+
+                # 终止条件：已拿够 / 已取完整个榜单 / 本页无数据
+                if len(stocks) >= target or len(stocks) >= sort_total \
+                        or data_count == 0:
+                    break
+                # 推进游标：用累计已收条数作为下一页起点（对齐抓包 Begin≈已加载位置）
+                sort_begin = len(stocks)
+
+        logger.info("stock_list_hot: 共 %d 页，获取 %d 条（共 %d 条，目标 %d）",
+                    page + 1, len(stocks), sort_total, target)
 
         # 可选名称填充
         if with_names and stocks:

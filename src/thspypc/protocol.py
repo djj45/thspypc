@@ -1113,18 +1113,34 @@ STOCK_LIST_MARKETS = [(17, "沪"), (22, "深"), (151, "北交所")]
 # DataType=199112 = 返回代码表（抓包帧3898确认：DataType=199112, 末尾只有一个逗号，不带 55）
 STOCK_LIST_DATATYPE = [199112]
 
-# SortBy 字段编号 → 含义（来自 ths/PROTOCOL.md §5.3 字段表 + captures_live/stock_list.pcap 抓包）。
-# SortBy 就是 DataType 字段编号本身：抓包里每个排序请求的 SortBy 恒等于其 DataType 单值。
-# "实测"= 抓包命中过该 SortBy 值的请求；"字段表"= PROTOCOL.md 确认字段含义但未抓到请求。
+# SortBy 字段编号 → 含义。
+#
+# ★ 2026-07-23 三份抓包（list_quote_fields_20260723_232604/233238/233805.pcap）
+#   彻底澄清排序协议，纠正了旧文档的多处错误：
+#
+# 1. SortBy **不是** DataType 字段编号本身（旧文档错误结论）。两者是独立编号空间：
+#    SortBy=199112(涨幅) 的响应返回的是 dt200；SortBy=592890(主力净流入) 返回 dt250；
+#    SortBy=68762(竞价涨幅) 返回 dt154。不要把 SortBy 当 DataType 用。
+#
+# 2. 成交量/成交额**不走 SortBy 路径**（旧文档误标 sort_by=13/19）。
+#    它们走「CodeList+AddCode 增量订阅（子帧 0x0002）→ 行情推送累加 → 客户端本地排序」，
+#    全程无 SortTotal 响应、无 SortBy 请求。dt13/dt19 是被订阅的行情字段编号，
+#    不是排序键。详见 HANDOFF_STOCKLIST_PUSH.md「排序榜单协议逆向」章节。
+#
+# 3. 竞价金额/竞价涨幅**是服务器侧排序**（纠正「客户端本地算」的旧认知）：
+#    客户端只发 SortBy=68758/68762，服务器排好序返回；客户端显示值本地重算，
+#    但排序动作发生在服务器，不需要拉全市场开盘价。
+#
+# "verified"= 抓包命中过该 SortBy 值的请求（本次三份抓包全部 verified=True）。
 SORT_BY_VALUES = {
-    "涨幅":    {"sort_by": 199112,  "verified": True},   # 抓包命中 4 次（默认值）
-    "涨速":    {"sort_by": 48,      "verified": True},   # 抓包命中 2 次（4分钟涨幅）
-    "主力净流入": {"sort_by": 592890,  "verified": True},   # 抓包命中 2 次
-    "成交量":  {"sort_by": 13,      "verified": False},  # 字段表确认，未抓到请求
-    "成交额":  {"sort_by": 19,      "verified": False},  # 字段表确认（dt19=总金额）
-    "换手率":  {"sort_by": 1968584, "verified": False},  # 字段表确认，未抓到请求
-    "量比":    {"sort_by": 1771976, "verified": False},  # 字段表确认，未抓到请求
-    "价格":    {"sort_by": 10,      "verified": False},  # 字段表确认
+    "涨幅":    {"sort_by": 199112,  "verified": True},   # 返回 dt200
+    "涨速":    {"sort_by": 48,      "verified": True},   # 返回 dt48（4分钟涨幅）
+    "换手率":  {"sort_by": 1968584, "verified": True},   # 返回 dt200
+    "量比":    {"sort_by": 1771976, "verified": True},   # 返回 dt200
+    "主力净流入": {"sort_by": 592890,  "verified": True},   # 返回 dt250
+    "竞价金额": {"sort_by": 68758,   "verified": True},   # 返回 dt150
+    "竞价涨幅": {"sort_by": 68762,   "verified": True},   # 返回 dt154
+    # 注：成交量/成交额不在此表——它们走增量订阅本地排序（见上方说明）。
 }
 # SortDir：D=降序（抓包 36 次全是 D）。升序值（A/U）未经抓包/文档证实，为推测。
 
@@ -1132,7 +1148,7 @@ SORT_BY_VALUES = {
 def build_stock_list_query(
     markets: list[int] | tuple[int, ...] = (17, 22, 151),
     sort_begin: int = 0,
-    sort_count: int = 29,
+    sort_count: int = 59,
     datatype: list[int] | None = None,
     sort_by: int = 199112,
     sort_dir: str = "D",
@@ -1141,38 +1157,40 @@ def build_stock_list_query(
 ) -> bytes:
     """构造股票列表查询请求（空 CodeList + 排序查询，8901端口）。
 
-    同花顺在用户打开「沪深A股」列表界面时发此请求（抓包帧3898确认）。
-    本请求是「排序代码表查询」，服务器按 ``sort_by`` 指定的字段排序后返回前
-    ``sort_count`` 条。``sort_by`` 就是 DataType 字段编号本身（抓包铁证：每个
-    排序请求的 SortBy 恒等于其 DataType 单值），见 :data:`SORT_BY_VALUES`。
+    同花顺在用户打开「沪深A股」列表界面、切换排序列时发此请求。
+    服务器按 ``sort_by`` 指定的字段排序后返回一段代码（由 ``sort_begin`` 定位）。
 
-    请求文本（抓包帧3898真值，sort_by/sort_dir 已参数化）：
+    请求文本（抓包真值，sort_by/sort_dir/sort_begin/sort_count 已参数化）：
       CodeList=17();22();151();   ← 空括号 = 该市场全部（17=沪 22=深A 151=北交所）
-      DataType=199112,            ← 返回字段（排序查询里通常 = sort_by）
+      DataType=199112,            ← 返回字段
       SortType=Sort
-      SortBy=199112               ← 排序字段（= DataType 编号，见 SORT_BY_VALUES）
+      SortBy=199112               ← 排序键（见 SORT_BY_VALUES，与 DataType 是独立编号空间）
       SortDir=D                   ← D=降序（抓包 36 次全是 D）
       SortAppend=YC
-      SortBegin=0                 ← 抓包确认：恒为 0（不是真翻页游标）
-      SortCount=29                ← 本次要的条数（hexin 逐步放大直到拿到全量）
+      SortBegin=0                 ← 翻页游标：首次=0，下拉翻页时递增到已加载位置
+      SortCount=59                ← 每页条数（hexin 恒用 59）
       FuncPeriod=0
       DateTime=0(0-0)
       LackTime=0,0,0,0,0,0,0,0
       pageid=1334
 
-    ⚠ 翻页模型（抓包帧3898→4967确认）：hexin 不是用 SortBegin 递增翻页，
-    而是固定 SortBegin=0，把 SortCount 从 29 逐步放大（29→261→2538→2645），
-    直到服务器返回的 SortDataCount == SortTotal（一次性拿全量）。
+    ★ 翻页模型（2026-07-23 三份抓包确认，纠正旧文档错误）：
+      hexin 用 **SortBegin 游标翻页**——首次请求 SortBegin=0 拿第 1~59 名，
+      下拉后递增 SortBegin（实测序列 0→1361→2715→3773→5151，总 5210 条），
+      SortCount 恒为 59。旧文档说"SortBegin 恒 0、SortCount 递增放大"是错的。
+      下拉中途 CodeList 会带「锚点代码」(如 17(600173,600219,...))，但空括号
+      + SortBegin 递增同样有效（抓包里也存在），故本函数始终发空括号。
 
     Args:
         markets: 市场码列表。17=沪 22=深A 151=北交所（默认）。
             抓包确认深 A 市场码是 22（不是 33；33 是深市另一类，hexin 单独拉）。
-        sort_begin: 抓包恒为 0（保留参数仅为兼容）。
-        sort_count: 本次要的条数。hexin 从 29 开始逐步放大。
+        sort_begin: 翻页游标。首次为 0；下拉翻页时递增到已加载位置（见上方翻页模型）。
+        sort_count: 每页条数，hexin 恒用 59。
         datatype: DataType 列表，默认 [199112]（抓包真值，不带 55）。
-        sort_by: 排序字段编号，默认 199112（涨幅）。取值见 :data:`SORT_BY_VALUES`：
-            涨幅=199112、涨速=48、主力净流入=592890（均已抓包实测）；
-            成交量=13、成交额=19、换手率=1968584、量比=1771976（字段表确认，待活网验证）。
+        sort_by: 排序键编号，默认 199112（涨幅）。取值见 :data:`SORT_BY_VALUES`
+            （均为活网验证）：涨幅=199112、涨速=48、换手率=1968584、量比=1771976、
+            主力净流入=592890、竞价金额=68758、竞价涨幅=68762。
+            ⚠ 成交量/成交额不在此列——它们走增量订阅本地排序，没有 SortBy。
         sort_dir: 排序方向，``"D"``=降序（默认，抓包确认）；升序值推测为 ``"A"``（未实测）。
         pageid: 固定 1334。
         seq: 序列标签。
@@ -1209,14 +1227,14 @@ def build_stock_list_query(
 def parse_stock_list_response(body: bytes) -> dict:
     """解析股票列表响应（文本头 + hd3.1 16-bit 变体帧），返回分页元数据 + 代码列表。
 
-    响应结构（抓包帧3900确认）：
-        SortTotal=2645          ← 全市场代码总数
+    响应结构（抓包确认）：
+        SortTotal=5210          ← 全市场代码总数
         SortTop=1900544
-        SortBegin=0             ← 恒为 0
-        SortCount=29            ← 本次请求的条数（= 请求里的 SortCount）
+        SortBegin=0             ← 翻页游标（本次请求的起始位置；首次 0，翻页递增）
+        SortCount=59            ← 本次请求的条数（= 请求里的 SortCount，hexin 恒 59）
         SortCalcProgress=1
         SortDataFirst=0
-        SortDataCount=29        ← 数据区实际条数（min(SortCount, SortTotal)）
+        SortDataCount=59        ← 数据区实际条数（min(SortCount, SortTotal-SortBegin)）
         OrderList=
         hd3.1\\0 + 16-bit 变体头 + 字段表 + BitRLE流
 
