@@ -8,7 +8,8 @@
 
 - HTTP 三步鉴权（RSA 公钥 → unified_login → mainverify）
 - head128 + passport64 构造（PC 版 ACCOUNT_TYPE 前缀）
-- PC 远航版 login 帧构造（8901 端口）
+- PC 远航版 login 帧构造（8901 端口）+ **login 后自动 init 握手**激活行情通道
+- **M_hqdns 动态域名解析**：从 passport 解析服务器域名 → DNS 查询拿最新 IP（不硬编码）
 - 多 IP 冗余连接 + 失败诊断
 - **设备指纹全自动生成**：`generate_imei()` + `generate_mac64()`（算法已逆向，无需抓包）
 - **二维码扫码登录**：终端显示二维码，手机同花顺扫码即登录（无需账号密码）
@@ -19,6 +20,8 @@
   600056 等股票的 现价/昨收/开盘/涨幅/竞价金额
 - **全市场股票列表**（`stock_list`）：重放 hexin 启动序列，~6 秒拿全市场 7400+ 代码
   全部代码（约7500+条），hd3.1 BitRLE 解码，自动翻页
+- **热门股排序查询**（`stock_list_hot`）：DataType=199112 排序查询（同花顺打开 A 股
+  列表时发的请求），服务器返回按 SortBy 排序的前 N 条代码
 - **自定义板块/自选股管理**（`blocks`）：分组 CRUD + 成分股增删 + 自选股 +
   动态板块查询。走标准 HTTPS（cookie 鉴权），移植自 thspy，实测列出 95 个分组。
 - **短线精灵（异动）**（`dxjl_*`）：9601 端口 qurealorder 历史查询，hq1.0 响应解析。
@@ -26,7 +29,8 @@
 - **心跳保活**（自动）：connect() 后后台线程每 3 秒（8901）/30 秒（9601）发心跳，
   维持长连接。实测静置 10 秒后连接仍可用。
 - **短线精灵实时推送**（`subscribe_realtime` + `receive_pushes`）：9601 subrealorder
-  订阅 + pushrealorder 推送接收。实测盘中 20 秒收到 507 条异动推送。
+  订阅 + pushrealorder 推送接收。盘中 ~500-800 帧/分钟，异动代码/金额/涨幅/方向
+  全部解码（异动字节锚定 + THS float，30 种异动全覆盖，历史对照 100% 精确）。
 
 ## 三种登录方式
 
@@ -395,15 +399,29 @@ thspypc/
 ## 已知限制
 
 - hd3.1 变体（unk=0x36/0x42/0x4a 等非 BitRLE 编码）暂不支持，`parse_hd3_response`
-  自动跳过。推送帧（封单额/首次涨停时间/主力净额）未集成。
-- 短线精灵**实时推送**（pushrealorder）：已实现（9601 subrealorder 订阅 + 推送接收），
-  能提取异动股票代码。但 pushrealorder 记录区的数值字段（金额/价格/量）解码待逆向，
-  当前保留 `raw_bytes`。
+  自动跳过。
+- hq1.0 字段表 TLV 格式未破解（字段表签名跨帧固定但 TLV 切分方式未对齐）。
+  当前推送帧的数值解码通过**异动字节锚定 + THS float 扫描**绕过，30 种异动
+  全覆盖（金额/涨幅 100% 精确）。解出 TLV 能实现通用 schema 驱动解析，但
+  实际收益有限（需 Ghidra 逆向 hexin.exe）。
+- upstockname A 股名称的块状编码未解（纯文本段已解），默认走同花顺本地缓存
+  填充名称（需安装同花顺 PC 客户端）。
+- 全市场快照 `market_snapshot()`（hfd1.0）只覆盖沪市，深市不支持；
+  用 `market_snapshot_with_quotes()`（stock_list + list_quotes 混合方案）覆盖全市场。
 - 终端 ASCII 二维码可能因字体宽高比扫不了，用 `qr_login.png` 图片扫更可靠。
 - passport 的 signdate/signvalid 用本地时间，和服务器时区可能差 1 小时（不影响登录）。
-- 连续多次登录同一账号可能遇到 VerifyCode=-1（特定服务器实例的临时状态，
-  非账号级限流——实测同账号连不同 IP 第2次 -1 但第3次又 0）。`connect()` 遇到
-  -1 会自动换下一个 host 重试。hexin 客户端连 7 个 IP 并发所以不受影响。
+- VerifyCode=-1 是**同账号同 IP 短时间重复 login 的会话冲突**（非账号限流）。
+  hexin 客户端每 ~20s 重新登录一波、每波并发连 7 个不同 IP，同一 IP 重复登录
+  间隔 ≥20s，因此不触发。thspypc 的 `connect()` 串行遍历 IP，遇到 -1 自动换下一个
+  host。**测试时注意**：确保同花顺客户端已退出（同账号不能两个客户端同时在线），
+  不要短时间（<20s）内反复 connect。
+
+## 服务器 IP 动态获取
+
+thspypc 不硬编码服务器 IP——HTTP 鉴权返回的 passport 里有 `M_hqdns` 字段
+（域名列表），`resolve_market_hosts()` 解析这些域名拿到当前可用的 8901 IP
+（DNS 轮询，每次可能不同）。hexin 客户端也是这么做的。硬编码的 `MARKET_HOSTS`
+仅作 DNS 解析失败时的回退。
 
 ## License
 
