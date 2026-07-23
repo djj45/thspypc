@@ -106,7 +106,7 @@ class THSClient:
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
-        # 测速缓存 + IP 轮换（避免反复 connect 集中撞同一批快 IP 触发账号级 -1）
+        # 测速缓存 + IP 轮换（减少反复 connect 的 login 次数，降低单点登录会话冲突）
         self._probe_cache: tuple[float, list[str]] | None = None  # (ts, 按延迟排序的IP全表)
         self._PROBE_CACHE_TTL = 300.0        # 测速缓存有效期（秒），5 分钟
         self._login_rr_offset = 0            # login 轮换偏移（每次 connect 后推进）
@@ -119,14 +119,14 @@ class THSClient:
           - "all_hosts_failed"   所有 8901 IP 都连不上（网络/防火墙）
           - "login_rejected"     连上了但 VerifyCode != 0（passport 被拒）
 
-        VerifyCode=-1 不是账号级限流（实测同账号连不同 IP，第2次 -1 但第3次
-        又成功）。hexin 客户端连 7 个 IP 并发所以不受影响。本方法遇到 -1 会
-        自动换下一个 host 重试（不冷却等待）。
+        VerifyCode=-1 有两种：A. login 帧内容错误（check 字节/sk/sv，已修复）；
+        B. level2 单点登录会话冲突（同账号反复 connect 抢会话触发，**非账号封禁**——
+        停止反复 connect 即恢复，同花顺客户端始终能登）。本方法遇到 -1 会换 host
+        重试，连续 5 个 -1 判定会话冲突提前放弃（error="session_conflict"）。
 
-        **连接治理（防 -1）**：若距上次成功 connect < 20s（同 IP 会话冲突窗口）
-        且当前连接仍活着，本方法**直接复用现有连接**返回成功，不重新 login——
-        这是 hexin 客户端的策略（连接还活着就别重连，见 HANDOFF §7）。连接已
-        断时正常走登录流程。
+        **连接治理（防 -1）**：若距上次成功 connect < 20s 且当前连接仍活着，本方法
+        **直接复用现有连接**返回成功，不重新 login——这是 hexin 客户端的策略
+        （连接还活着就别重连）。连接已断时正常走登录流程。
         """
         # ---- 连接治理：活着且未过冷却期 → 复用，避免重复 login 触发 -1 ----
         if (self._last_connect_ts
@@ -413,8 +413,9 @@ class THSClient:
         sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0)
         if sorted_ips:
             # 从测速排序的全表里轮换取 7 个（不固定前 7 个）。
-            # 每次连接后推进 _login_rr_offset，让反复连接时分散到不同 IP 子集，
-            # 避免集中撞同一批快 IP 触发账号级 VerifyCode=-1 封禁。
+            # 每次连接后推进 _login_rr_offset，让反复连接时分散到不同 IP 子集。
+            # 注：-1 是 level2 单点登录会话冲突（按账号不按 IP），轮换主要价值是
+            # 减少对同一 IP 的重复 login，根本对策仍是长连接不反复 connect。
             n_concurrent = min(7, len(sorted_ips))
             offset = self._login_rr_offset % max(1, len(sorted_ips))
             # 环形取 n_concurrent 个（offset 起，绕回）
@@ -428,9 +429,8 @@ class THSClient:
             batch = hosts[:n_concurrent]
 
         winner = self._concurrent_login(batch, login_body)
-        # 推进轮换偏移：下次 connect 用不同的 IP 子集，避免反复 connect 集中撞
-        # 同一批 IP 触发账号级 VerifyCode=-1 封禁。推进 n_concurrent 让下次
-        # 完全换一批（不与本次重叠）。
+        # 推进轮换偏移：下次 connect 用不同的 IP 子集。注：-1 会话冲突按账号判断
+        # 不按 IP，轮换主要减少同 IP 重复 login；根本对策是长连接不反复 connect。
         self._login_rr_offset = (self._login_rr_offset + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
         if winner:
             host, sock, result = winner
@@ -447,7 +447,7 @@ class THSClient:
             )
 
         # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）。
-        # 加连续 -1 计数：账号若被全局封禁（所有 IP 秒回 -1），试更多 IP 无意义，
+        # 加连续 -1 计数：单点登录会话冲突时所有 IP 秒回 -1，试更多 IP 无意义，
         # 串行 fallback：测速排序后的剩余可达 IP（跳过本次 batch），再补原始列表里
         # 测速超时但可能可用的 IP。加连续 -1 计数，避免傻试拖到几十秒。
         fallback_hosts = [ip for ip in (sorted_ips or hosts) if ip not in set(batch)]
@@ -489,17 +489,20 @@ class THSClient:
                         consecutive_minus1 += 1
                         logger.warning("%s:%d VerifyCode=-1（连续 %d 次）",
                                        host, MARKET_PORT, consecutive_minus1)
-                        # 连续多个 -1 = 账号全局封禁，提前放弃
+                        # 连续多个 -1 = 单点登录会话冲突（level2 账号同一时刻只能一个
+                        # 活跃会话；反复 login 抢会话触发服务器保护）。非账号封禁——
+                        # 停止反复 connect 即恢复，同花顺客户端始终能登。
                         if consecutive_minus1 >= MAX_CONSECUTIVE_MINUS1:
-                            logger.warning("连续 %d 个 IP 返回 -1，判定账号全局封禁，"
-                                           "停止重试（等待一段时间后重试）",
+                            logger.warning("连续 %d 个 IP 返回 -1，判定为单点登录会话冲突，"
+                                           "停止重试（停止反复 connect 即恢复）",
                                            consecutive_minus1)
                             return LoginResult(
                                 success=False,
                                 verify_code="-1",
-                                error="global_rate_limited",
+                                error="session_conflict",
                                 detail=f"连续 {consecutive_minus1} 个 IP VerifyCode=-1，"
-                                       "账号疑似被全局封禁，等待几分钟后重试",
+                                       "疑似 level2 单点登录会话冲突（同账号反复 login 抢会话）。"
+                                       "停止反复 connect 即恢复，无需等待",
                             )
                         continue
                     logger.warning("%s:%d 登录被拒 (VerifyCode=%s)", host, MARKET_PORT, verify_code)
@@ -579,7 +582,7 @@ class THSClient:
         最快 122.9.115.201=28ms，最慢 74ms，超时的剔除。
 
         纯 TCP 握手测速——**不发 login**，连上立即关闭，不触发 VerifyCode=-1
-        （-1 是 login 帧内容/账号封禁触发的，TCP 连接不触发）。
+        （-1 是 login 帧内容错误或单点登录会话冲突触发的，TCP 连接不触发）。
 
         **测速缓存**：5 分钟内（``_PROBE_CACHE_TTL``）复用上次测速结果，避免反复
         connect 时重复测速。缓存命中时秒回。缓存只存按延迟排序的全表，调用方用

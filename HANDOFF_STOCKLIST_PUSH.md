@@ -451,7 +451,7 @@ names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ..
 | **测速选 IP**（`_probe_fastest_hosts`） | 并发 TCP 握手测 70 个 IP 延迟（复刻同花顺「测试 IP」），选最快 7 个 login。connect 从 2~46s（盲选）降到稳定 ~2s |
 | **init 握手优化** | init 响应只是 1 帧 49KB 配置（非代码表），读 1 帧 + 0.2s peek 即可。从 8s 降到 0.3s |
 | **并发登录提前退出** | `_concurrent_login` 用 `all_done` 计数器，所有 IP 都完成即退出（不必等满 timeout） |
-| **连续 -1 提前放弃** | 串行 fallback 连续 5 个 -1 判定全局封禁，停止重试（避免傻试 60 个 IP 拖几十秒） |
+| **连续 -1 提前放弃** | 串行 fallback 连续 5 个 -1 判定会话冲突，停止重试（避免傻试 60 个 IP 拖几十秒） |
 
 **测速选 IP 机制**（抓包复刻同花顺，2026-07-23）：
 - `tests/capture_ip_test.py` 抓同花顺「获取/测试 IP」功能，确认机制：
@@ -460,21 +460,21 @@ names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ..
 - thspypc 的 `_probe_fastest_hosts` 做同样的事：纯 TCP 握手不发 login，不触发 -1，70 个 IP 并发测完 ~1s
 
 **⚠ VerifyCode=-1 的两种类型（2026-07-23 最终澄清）**：
-- **A. login 帧内容**（已修复）：check 字节硬编码（0 字节 FIN）/ sk/sv 缺失（-6）。
+- **A. login 帧内容错误**（已修复）：check 字节硬编码（0 字节 FIN）/ sk/sv 缺失（-6）。
   正常使用不再触发。
-- **B. 账号级临时封禁**（无法绕过）：同账号短时间反复 connect，尤其集中撞同一批 IP，
-  触发服务器保护——所有 IP 秒回 -1，持续几分钟~十几分钟。**这是服务器行为，代码无法
-  绕过，只能等释放**。实测：反复 connect 同一批快 IP 几次即触发。
-- 应对 B 的措施：① connect 冷却复用（同进程内不重复 login）；② **测速缓存 + IP 轮换**
-  （`_probe_cache` 5 分钟复用测速结果；`_login_rr_offset` 每次推进，login 从快 IP 池
-  轮换取 7 个，分散到不同子集，避免集中撞同一批）；③ 连续 5 个 -1 提前返回
-  `error="global_rate_limited"` 提示等待，不傻试 60 个 IP。
+- **B. level2 单点登录会话冲突**（非账号封禁）：level2 账号同一时刻只允许一个活跃
+  会话。thspypc 反复 connect 时新 login 踢旧会话，服务器检测到同账号短时间多次 login
+  抢会话，返回 -1 阻止。**不是封禁**——同花顺客户端始终能登录（占会话就保持长连接
+  不抢），停止反复 connect 后 thspypc 也能恢复，无需等待。实测：反复 connect 几次即触发。
+- 应对 B 的措施：① connect 冷却复用（同进程内不重复 login）；② 测速缓存 + IP 轮换
+  （减少 login 次数；注：-1 按账号判断不按 IP，轮换非治本）；③ 连续 5 个 -1 提前返回
+  `error="session_conflict"` 提示，不傻试 60 个 IP。
 - **根本对策**：connect 一次保持长连接反复查，不要反复 connect。
 
 **仍需用户注意**：
 - 确保同花顺客户端已退出（同账号不能两个客户端同时在线）
-- 短时间反复 connect 会触发 B 类型 -1，等几分钟释放；测速（`_probe_fastest_hosts`）
-  纯 TCP 握手不发 login，可以放心跑
+- 反复 connect 触发 B 类型 -1 时，停止反复 connect 即恢复（无需等待）；测速
+  （`_probe_fastest_hosts`）纯 TCP 握手不发 login，可以放心跑
 
 **相关文件**：
 - `src/thspypc/client.py` — `_probe_fastest_hosts`（含缓存）/ `_do_tcp_login_raw`（IP 轮换）/ `_market_snapshot_on_main_sock` / `is_connected` / `ensure_connected` / `connect`（冷却）/ `_send_init_handshake`（优化）/ `_concurrent_login`（提前退出）
