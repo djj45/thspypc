@@ -120,9 +120,9 @@ class THSClient:
           - "login_rejected"     连上了但 VerifyCode != 0（passport 被拒）
 
         VerifyCode=-1 有两种：A. login 帧内容错误（check 字节/sk/sv，已修复）；
-        B. level2 单点登录会话冲突（同账号反复 connect 抢会话触发，**非账号封禁**——
-        停止反复 connect 即恢复，同花顺客户端始终能登）。本方法遇到 -1 会换 host
-        重试，连续 5 个 -1 判定会话冲突提前放弃（error="session_conflict"）。
+        B. 同 IP 短时间重复 login 的会话冲突（level2 单点登录；**非账号封禁**——
+        IP 充分分散时不触发，同花顺客户端始终能登）。本方法用 IP 轮换规避，
+        连续 5 个 -1 判定会话冲突提前放弃（error="session_conflict"）。
 
         **连接治理（防 -1）**：若距上次成功 connect < 20s 且当前连接仍活着，本方法
         **直接复用现有连接**返回成功，不重新 login——这是 hexin 客户端的策略
@@ -489,20 +489,20 @@ class THSClient:
                         consecutive_minus1 += 1
                         logger.warning("%s:%d VerifyCode=-1（连续 %d 次）",
                                        host, MARKET_PORT, consecutive_minus1)
-                        # 连续多个 -1 = 单点登录会话冲突（level2 账号同一时刻只能一个
-                        # 活跃会话；反复 login 抢会话触发服务器保护）。非账号封禁——
-                        # 停止反复 connect 即恢复，同花顺客户端始终能登。
+                        # 连续多个 -1 = 同 IP 短时间重复 login 的会话冲突（level2 单点
+                        # 登录，对相同 IP 重复 login 触发）。非账号封禁——IP 分散时不触发，
+                        # 同花顺客户端始终能登，改用不同 IP 即恢复。
                         if consecutive_minus1 >= MAX_CONSECUTIVE_MINUS1:
-                            logger.warning("连续 %d 个 IP 返回 -1，判定为单点登录会话冲突，"
-                                           "停止重试（停止反复 connect 即恢复）",
+                            logger.warning("连续 %d 个 IP 返回 -1，判定为同 IP 重复 login 会话冲突，"
+                                           "停止重试（改用不同 IP 即恢复）",
                                            consecutive_minus1)
                             return LoginResult(
                                 success=False,
                                 verify_code="-1",
                                 error="session_conflict",
                                 detail=f"连续 {consecutive_minus1} 个 IP VerifyCode=-1，"
-                                       "疑似 level2 单点登录会话冲突（同账号反复 login 抢会话）。"
-                                       "停止反复 connect 即恢复，无需等待",
+                                       "疑似同 IP 短时间重复 login 的会话冲突（level2 单点登录）。"
+                                       "改用不同 IP 或等片刻即恢复，非账号封禁",
                             )
                         continue
                     logger.warning("%s:%d 登录被拒 (VerifyCode=%s)", host, MARKET_PORT, verify_code)

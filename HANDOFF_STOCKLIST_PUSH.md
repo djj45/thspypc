@@ -462,18 +462,20 @@ names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ..
 **⚠ VerifyCode=-1 的两种类型（2026-07-23 最终澄清）**：
 - **A. login 帧内容错误**（已修复）：check 字节硬编码（0 字节 FIN）/ sk/sv 缺失（-6）。
   正常使用不再触发。
-- **B. level2 单点登录会话冲突**（非账号封禁）：level2 账号同一时刻只允许一个活跃
-  会话。thspypc 反复 connect 时新 login 踢旧会话，服务器检测到同账号短时间多次 login
-  抢会话，返回 -1 阻止。**不是封禁**——同花顺客户端始终能登录（占会话就保持长连接
-  不抢），停止反复 connect 后 thspypc 也能恢复，无需等待。实测：反复 connect 几次即触发。
-- 应对 B 的措施：① connect 冷却复用（同进程内不重复 login）；② 测速缓存 + IP 轮换
-  （减少 login 次数；注：-1 按账号判断不按 IP，轮换非治本）；③ 连续 5 个 -1 提前返回
-  `error="session_conflict"` 提示，不傻试 60 个 IP。
-- **根本对策**：connect 一次保持长连接反复查，不要反复 connect。
+- **B. 同 IP 短时间重复 login 的会话冲突**（非账号封禁）：level2 账号同一时刻只允许
+  一个活跃会话。**对相同 IP 短时间重复 login** 触发服务器 -1 保护。**不是账号封禁**——
+  同花顺客户端用同账号始终能登录。实测（`test_repeated_connect.py`）：
+  - 反复 connect 5 次、**IP 充分分散**（轮换）→ 全部成功（interval=0 也行）
+  - 反复 connect、**集中撞同一批 IP**（旧版盲选/测速结果复用）→ 几次后 -1
+- 应对 B 的措施：① connect 冷却复用（同进程内不重复 login）；② **测速缓存 + IP 轮换**
+  （`_probe_cache` 5 分钟复用测速结果；`_login_rr_offset` 每次推进，login 从快 IP 池
+  轮换取 7 个，让每次打不同 IP——实测有效规避 -1）；③ 连续 5 个 -1 提前返回
+  `error="session_conflict"`，不傻试 60 个 IP。
+- 仍建议长连接复用，但反复 connect 在 IP 分散时也安全。
 
 **仍需用户注意**：
 - 确保同花顺客户端已退出（同账号不能两个客户端同时在线）
-- 反复 connect 触发 B 类型 -1 时，停止反复 connect 即恢复（无需等待）；测速
+- 若遇到 -1（集中撞同 IP 导致），改用不同 IP 或等片刻即恢复（非账号封禁）；测速
   （`_probe_fastest_hosts`）纯 TCP 握手不发 login，可以放心跑
 
 **相关文件**：
