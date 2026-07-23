@@ -3,10 +3,13 @@
 """
 探针：尝试不同市场码发深市全市场快照请求，看是否返回深市股票。
 
-假设：
-  - 市场 32 = 深市（与 hexin cache stockname_32 对应）
-  - hfd1.0 可能要求深市发独立请求
-  - 可能市场 144-151 不对/不支持
+⚠ **一次性探针，结论已存档（HANDOFF §11e：深市 hfd1.0 不支持）。**
+本脚本循环 connect/disconnect 5 次，**会触发 VerifyCode=-1**（同账号同 IP
+短时间重复 login 的会话冲突，见 HANDOFF §7）。如需重跑，务必先确保同花顺
+客户端已退出，并接受每次运行后需等 ≥20s 冷却。新代码请勿照搬此 connect
+循环模式——参考 :meth:`THSClient.market_snapshot`（主连接单次发）。
+
+历史结论：市场 32/33 单独请求返回 26B 错误，深市 A 股 hfd1.0 不支持。
 """
 from __future__ import annotations
 

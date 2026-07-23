@@ -155,7 +155,8 @@ def main():
         print(f"✗ 登录失败: {result.error}")
         sys.exit(1)
     print(f"✓ {result.server}  (Ctrl+C 退出)\n", flush=True)
-    time.sleep(2)  # 等 init 握手完成
+    # init 握手已在 connect() 内同步完成（_send_init_handshake 返回即就绪），
+    # 无需额外等待。
 
     try:
         while True:

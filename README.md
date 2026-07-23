@@ -228,18 +228,29 @@ sz = [s["code"] for s in stocks if s["market"] == 33]   # 深市，直接喂 lis
 底层缓存函数（无需登录即可独立使用）：`save_stock_codes` / `load_stock_codes` /
 `is_stock_cache_expired` / `market_from_code` / `default_stock_cache_path`。
 
-### Passport64 生成（已复刻 hexin，无需抓包）
+### Passport64 生成 + login 帧校验（已复刻 hexin，无需抓包）
 
-`build_passport64` 自动从服务端返回的 `passport_bytes` 里**过滤掉客户端路由/配置字段**
-（`M_hq`/`M_hqdns`/`M_wg`/`download`/`signlength` 等 10 个），只保留身份/权限字段
-（含 sk/sv/bind 会话密钥）。这与 hexin.exe 缓存的 Passport64 处理方式一致——实测过滤后
-b64 长度与 hexin 缓存逐字符相同（2304 字符），且具备行情查询权限。
+`build_passport64` 自动从服务端返回的 `passport_bytes`（53 字段）里**过滤掉 10 个路由
+字段**（M_hq/M_hqdns/M_wg/M_zx/UpdateSvr/download/Foss_url/DownloadSelfStock/
+UploadSelfStock/signlength），保留含 sk/sv 的 **43 个身份/会话字段**（2304 字符）。
 
-> 之前发现"HTTP 鉴权生成的 passport 无行情权限"，根因就是没过滤这些配置字段。
-> 带配置字段的 passport 能登录（VerifyCode=0）但行情网关校验不通过；过滤后即恢复。
+`build_login_body_pc` 的帧头校验字节**动态计算**（非固定值）：
+`check = (固定文本长度 + 1) & 0xFF`，其中固定文本 = `Ask=login\n...Passport64=`。
 
-`THSClient.connect()`（账号密码 HTTP 鉴权）已内置此过滤，直接可用，无需抓包。
+> **login 失败的两个独立根因**（2026-07-23 完整逆向 + 三变体实测）：
+> - **0 字节 FIN**：校验字节错（曾硬编码 0xaa）。修为动态计算后解决。
+> - **PromptText=-6**：sk/sv 被误过滤。抓包显示 hexin 不发 sk/sv 明文，但它的 head128
+>   把 sk/sv 编码进了 signature；thspypc 的 head128（移植自 thspy Mac 版）没这能力，
+>   故**必须保留 sk/sv 明文字段**。回退过滤到 10 字段后解决。
+> - 两者都修后 VerifyCode=0，cli_ticker 活网验证通过。
+
+`THSClient.connect()`（账号密码 HTTP 鉴权）已内置，直接可用，无需抓包。
 `connect_with_passport64()` 仍保留，用于直接传入外部 Passport64（如抓包调试）。
+
+诊断工具：
+- `tests/capture_login_compare.py`（抓 hexin 8901 login 帧 4 维度对比）
+- `tests/compare_login_frame_bytes.py`（逐字节对比，定位校验字节差异）
+- `tests/test_passport_variants.py`（三变体实测字段集，定位 sk/sv 缺失）
 
 ### 解码链（纯 Python，无 unicorn 依赖）
 
@@ -410,18 +421,46 @@ thspypc/
   用 `market_snapshot_with_quotes()`（stock_list + list_quotes 混合方案）覆盖全市场。
 - 终端 ASCII 二维码可能因字体宽高比扫不了，用 `qr_login.png` 图片扫更可靠。
 - passport 的 signdate/signvalid 用本地时间，和服务器时区可能差 1 小时（不影响登录）。
-- VerifyCode=-1 是**同账号同 IP 短时间重复 login 的会话冲突**（非账号限流）。
-  hexin 客户端每 ~20s 重新登录一波、每波并发连 7 个不同 IP，同一 IP 重复登录
-  间隔 ≥20s，因此不触发。thspypc 的 `connect()` 串行遍历 IP，遇到 -1 自动换下一个
-  host。**测试时注意**：确保同花顺客户端已退出（同账号不能两个客户端同时在线），
-  不要短时间（<20s）内反复 connect。
+- VerifyCode=-1 的**两个根因都已修复**（2026-07-23）：① login 帧校验字节动态计算
+  （曾硬编码 0xaa 导致 0 字节 FIN）；② sk/sv 必须保留（曾误过滤导致 PromptText=-6）。
+  **不是账号限流、不是连接频率**——同账号反复登录退出 hexin 客户端毫无问题
+  （抓包 21+14 次 login 全 VerifyCode=0）。详见「Passport64 生成」章节。
 
-## 服务器 IP 动态获取
+- 仍需注意：确保同花顺客户端已退出（同账号不能两个客户端同时在线）。
+
+## 连接治理（长连接复用）
+
+`THSClient` 复刻 hexin 客户端的长连接模式，一条连接反复查询（hexin 抓包零 FIN）：
+
+- `connect()` 成功后建议**保持长连接反复查询**，不要频繁 `disconnect()`/`connect()`。
+  连接还活着时重复调用 `connect()` 会自动复用（冷却期内不重新 login，
+  `error="reused_existing_connection"`）。
+- `is_connected` 属性：探测 8901 主连接是否仍活着（MSG_PEEK 非阻塞，不消费数据）。
+- `ensure_connected()` 方法：查询前的健康检查，连接断了返回 False（不自动重连，
+  把重连决策留给调用方）。
+- `enable_heartbeat=True`（默认）：后台心跳维持长连接（8901 每 3s、9601 每 30s）。
+
+## 服务器 IP 动态获取 + 测速选最优
 
 thspypc 不硬编码服务器 IP——HTTP 鉴权返回的 passport 里有 `M_hqdns` 字段
 （域名列表），`resolve_market_hosts()` 解析这些域名拿到当前可用的 8901 IP
-（DNS 轮询，每次可能不同）。hexin 客户端也是这么做的。硬编码的 `MARKET_HOSTS`
-仅作 DNS 解析失败时的回退。
+（DNS 轮询，每次可能不同）。hexin 客户端也是这么做的（抓包确认：它并发 DNS 查询
+`shlv2.123ths.com`/`szlv2.123ths.com` 等域名拿 IP，按运营商分组）。硬编码的
+`MARKET_HOSTS` 仅作 DNS 解析失败时的回退。
+
+拿到 ~70 个 IP 后，`connect()` 会**并发 TCP 握手测延迟**（`_probe_fastest_hosts`），
+选最快的 7 个 login——复刻同花顺「测试 IP」功能的机制（抓包确认：同花顺并发 TCP
+连多个 IP 测 SYN→SYN-ACK 往返时间，最快 122.9.115.201=28ms）。纯 TCP 握手不发 login，
+不触发 VerifyCode=-1。测速整体 ~1s（70 个 IP 并发），login 稳定 ~2s。
+
+## init 握手激活行情通道
+
+login 成功后 `connect()` 自动发 init 请求（`_send_init_handshake`）激活行情查询通道——
+不发 init 直接 `list_quotes` 会超时（抓包确认 hexin 每条连接 LOGIN→INIT→行情查询）。
+
+init 响应是**服务器配置帧**（~49KB，含 S-OS/S-Version 等元数据），不是全量代码表
+（代码表是 `stock_list()` 重放序列才触发）。实测稳定返回 1 帧，读 1 帧即激活通道，
+`list_quotes` 立即可用。
 
 ## License
 

@@ -17,13 +17,22 @@
 **背景**：同花顺客户端打开 A 股列表"瞬间"拿全市场行情，靠的是**空括号全市场订阅**
 （`CodeList=16();17();...`，frame 1046）。单请求 ~0.13s 返回 326KB 全市场数据。
 
-**已实现的三个 API**：
+**已实现的三个 API**（2026-07-23 限流修复后）：
 
-| API | 覆盖 | 速度 | 行情精度 |
-|-----|------|------|---------|
-| `market_snapshot()` | 沪市 ~1200 条 | ~1s | 实验性 |
-| `market_snapshot_with_quotes()` | **沪深全市场 ~7400 条** | ~10-30s | **准确** |
-| `stock_list_cached()` | 沪深全部 ~7400 条 | ~瞬时(缓存) | 无行情 |
+| API | 覆盖 | 速度 | 行情精度 | hfd1.0 依赖 |
+|-----|------|------|---------|:-----------:|
+| `market_snapshot()` | 沪市 ~1200 条 | ~1s | 实验性 | ✅ 主连接单次发 |
+| `market_snapshot_with_quotes()` | **沪深全市场 ~7400 条** | ~10-30s | **准确** | ❌ 已移除 |
+| `stock_list_cached()` | 沪深全部 ~7400 条 | ~瞬时(缓存) | 无行情 | ❌ |
+
+> **2026-07-23 限流修复**：`market_snapshot_with_quotes` 去掉了 hfd1.0 调用——
+> 旧实现 `_try_market_snapshot_on_host` 循环 connect/disconnect 最多 5 次 × 每次
+> 并发 7 IP = 短时间 35 次 login 打同一批 IP，**必然触发 VerifyCode=-1**
+> （限流根因，见 §7）。且 hfd1.0 名称覆盖（1209 锚点）不如 hexin 本地缓存
+> （~8000 条），故移除。code+name 现完全由 `stock_list_cached(with_names=True)`
+> 提供。`market_snapshot()` 改为在主连接 `self._sock` 上单次发（新方法
+> `_market_snapshot_on_main_sock`），host 不支持时返回空，不再重连。
+> 详见 §7a。
 
 #### 11a. 名称锚点扩采（✅ 1409 个锚点）
 
@@ -418,6 +427,46 @@ names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ..
 - `src/thspypc/protocol.py:resolve_market_hosts` — M_hqdns 动态域名解析
 - `src/thspypc/protocol.py:_parse_stock_list_hd10_variant` — 199112 hd1.0 解析
 - `tests/probe_stock_list_hot.py` — A/B 测试探针
+
+### 7a. 连接治理 + 性能优化（✅ 2026-07-23）
+
+> ⚠ **纠正**：本节原标题"VerifyCode=-1 限流根治"是**错误归因**。后续抓包 + 三变体实测
+> 证明 -1 的真正根因是 login 帧内容（check 字节硬编码 + sk/sv 误过滤，见 §2），
+> 与连接频率无关（同账号反复登录退出 hexin 毫无问题）。本节的代码改进（连接治理、
+> market_snapshot 改造）仍有价值（避免无谓重连、防选慢 IP），但**不是防 -1 的手段**。
+
+**代码改进**（虽然不是 -1 解法，但都是好实践）：
+
+| 改进 | 实现 | 价值 |
+|------|------|------|
+| market_snapshot 不再反复 connect | `_try_market_snapshot_on_host` 删除 → `_market_snapshot_on_main_sock`（主连接单次发） | 避免无谓重连 |
+| market_snapshot_with_quotes 去 hfd1.0 | code+name 走 `stock_list_cached` | 简化 + 名称更全 |
+| `connect()` 冷却复用 | 连接活着 + <20s 直接复用（`error=reused_existing_connection`） | 避免重复 login |
+| `is_connected` 属性 + `ensure_connected()` | MSG_PEEK 探测连接活性 | 健康检查 |
+
+**真正的性能优化**（本次会话后期完成）：
+
+| 优化 | 效果 |
+|------|------|
+| **测速选 IP**（`_probe_fastest_hosts`） | 并发 TCP 握手测 70 个 IP 延迟（复刻同花顺「测试 IP」），选最快 7 个 login。connect 从 2~46s（盲选）降到稳定 ~2s |
+| **init 握手优化** | init 响应只是 1 帧 49KB 配置（非代码表），读 1 帧 + 0.2s peek 即可。从 8s 降到 0.3s |
+| **并发登录提前退出** | `_concurrent_login` 用 `all_done` 计数器，所有 IP 都完成即退出（不必等满 timeout） |
+| **连续 -1 提前放弃** | 串行 fallback 连续 5 个 -1 判定全局封禁，停止重试（避免傻试 60 个 IP 拖几十秒） |
+
+**测速选 IP 机制**（抓包复刻同花顺，2026-07-23）：
+- `tests/capture_ip_test.py` 抓同花顺「获取/测试 IP」功能，确认机制：
+  ① DNS 解析 `*.123ths.com` 域名拿 IP（thspypc 的 `resolve_market_hosts` 同此）
+  ② 并发 TCP 握手测延迟（SYN→SYN-ACK），选最快的（最快 122.9.115.201=28ms）
+- thspypc 的 `_probe_fastest_hosts` 做同样的事：纯 TCP 握手不发 login，不触发 -1，70 个 IP 并发测完 ~1s
+
+**仍需用户注意**：
+- 确保同花顺客户端已退出（同账号不能两个客户端同时在线）
+- 短时间反复 connect（如调试）可能触发账号级临时 -1（所有 IP 秒回 -1），等几分钟释放
+
+**相关文件**：
+- `src/thspypc/client.py` — `_probe_fastest_hosts` / `_market_snapshot_on_main_sock` / `is_connected` / `ensure_connected` / `connect`（冷却）/ `_send_init_handshake`（优化）/ `_concurrent_login`（提前退出）
+- `src/thspypc/protocol.py` — `MARKET_HOSTS` 注释纠正 / `_PASSPORT_DROP_FIELDS`（见 §2）
+- `tests/cli_ticker.py` — 去掉冗余 `time.sleep(2)`
 
 ---
 

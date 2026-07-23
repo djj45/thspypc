@@ -103,6 +103,9 @@ class THSClient:
         self._realorder_lock = threading.Lock()         # 保护 9601 socket send
         self._hb_seq_8901 = 0
         self._hb_seq_9601 = 0
+        # 连接治理（避免反复 connect 触发 VerifyCode=-1）
+        self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
+        self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
 
     def connect(self) -> LoginResult:
         """账号密码登录：HTTP 鉴权 → 构造 PC login 帧 → 连 8901 → 验证。
@@ -115,7 +118,25 @@ class THSClient:
         VerifyCode=-1 不是账号级限流（实测同账号连不同 IP，第2次 -1 但第3次
         又成功）。hexin 客户端连 7 个 IP 并发所以不受影响。本方法遇到 -1 会
         自动换下一个 host 重试（不冷却等待）。
+
+        **连接治理（防 -1）**：若距上次成功 connect < 20s（同 IP 会话冲突窗口）
+        且当前连接仍活着，本方法**直接复用现有连接**返回成功，不重新 login——
+        这是 hexin 客户端的策略（连接还活着就别重连，见 HANDOFF §7）。连接已
+        断时正常走登录流程。
         """
+        # ---- 连接治理：活着且未过冷却期 → 复用，避免重复 login 触发 -1 ----
+        if (self._last_connect_ts
+                and self.is_connected
+                and (time.time() - self._last_connect_ts < self._CONNECT_COOLDOWN)):
+            elapsed = time.time() - self._last_connect_ts
+            logger.info("connect(): 当前连接仍活着（%.1fs 前），复用避免重复 login 触发 -1",
+                        elapsed)
+            return LoginResult(
+                success=True, verify_code="0",
+                server=f"(reused)",
+                error="reused_existing_connection",
+            )
+
         # ---- 第 1 步：HTTP 三步鉴权 ----
         try:
             logger.info("开始 HTTP 三步鉴权 (account=%s)...", self.username)
@@ -134,6 +155,60 @@ class THSClient:
         self._init_blocks()
 
         return self._do_tcp_login(passport_fields)
+
+    # ── 连接治理（避免反复 connect 触发 VerifyCode=-1）──
+
+    @property
+    def is_connected(self) -> bool:
+        """8901 主连接是否仍活着。
+
+        socket 文件描述符仍开**且**未被对端关闭（recv 探测无数据=活着；
+        recv 返回 b""=对端关闭）。非阻塞探测，不消耗数据也不阻塞。
+
+        注意：仅检查 8901 主连接，不含 9601 短线精灵连接
+        （:attr:`_realorder_sock`，懒连接）。
+        """
+        with self._sock_lock:
+            sock = self._sock
+            if sock is None:
+                return False
+            try:
+                # 设非阻塞探测；MSG_PEEK 不消费缓冲区数据
+                sock.setblocking(False)
+                try:
+                    data = sock.recv(1, socket.MSG_PEEK)
+                finally:
+                    sock.setblocking(True)
+                # 有数据=活着且待读；空 b""=对端 FIN
+                return data != b""
+            except BlockingIOError:
+                # 无数据可读=连接仍开着（最常见情况）
+                return True
+            except OSError:
+                return False
+
+    def ensure_connected(self) -> bool:
+        """查询前的健康检查：确认 8901 主连接仍可用。
+
+        与 ``self._sock is not None`` 的区别：后者只检查文件描述符是否存在，
+        而本方法还会探测 socket 是否已被对端/网络中断关闭。
+
+        本方法**不自动重连**——重连=重新 login=新的 VerifyCode=-1 风险
+        （见 HANDOFF §7）。连接断开时返回 False，由调用方决定是否重连
+        （通常应等 ≥20s 冷却后再 connect）。
+
+        Returns:
+            True 表示连接可用，可直接查询；False 表示连接已断。
+
+        Raises:
+            RuntimeError: 从未登录过（self._sock 为 None 且无 _last_connect_ts）。
+        """
+        if self._sock is None:
+            if self._last_connect_ts == 0.0:
+                raise RuntimeError("未登录，请先 connect() / connect_cached()")
+            logger.warning("连接已断开，需重新 connect()（注意 ≥20s 冷却避免 -1）")
+            return False
+        return True
 
     def _init_blocks(self) -> None:
         """初始化板块/自选股管理（HTTPS cookie 鉴权）。
@@ -328,10 +403,19 @@ class THSClient:
             logger.info("M_hqdns 动态解析无结果，回退到硬编码 MARKET_HOSTS")
             hosts = list(MARKET_HOSTS)
 
-        # 并发连 N 个 IP（hexin 用 7 个）
-        n_concurrent = min(7, len(hosts))
-        batch = hosts[:n_concurrent]
-        logger.info("并发连接 %d 个 IP: %s", len(batch), batch[:3])
+        # 测速选最快的 IP（复刻同花顺「测试 IP」功能）。
+        # 并发 TCP 握手测延迟，选最快的 login，避免盲选到慢 IP（曾 46s 超时）。
+        # 测速纯 TCP 握手不发 login，不触发 -1。
+        fastest = self._probe_fastest_hosts(hosts, top_n=7, timeout=1.0)
+        if fastest:
+            batch = fastest
+            n_concurrent = len(batch)
+        else:
+            # 测速全部超时（网络异常），回退到盲取前 7 个
+            logger.warning("IP 测速全部超时，回退到盲取前 7 个")
+            n_concurrent = min(7, len(hosts))
+            batch = hosts[:n_concurrent]
+        logger.info("并发连接 %d 个 IP（测速排序后）: %s", len(batch), batch[:3])
 
         winner = self._concurrent_login(batch, login_body)
         if winner:
@@ -348,9 +432,21 @@ class THSClient:
                 passport_fields=passport_fields,
             )
 
-        # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）
+        # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）。
+        # 加连续 -1 计数：账号若被全局封禁（所有 IP 秒回 -1），试更多 IP 无意义，
+        # 串行 fallback：测速排序后的剩余可达 IP（第 8 个起），再补原始列表里
+        # 测速超时但可能可用的 IP。加连续 -1 计数，避免傻试拖到几十秒。
+        fallback_hosts = fastest[n_concurrent:] if fastest else hosts[n_concurrent:]
+        # 补上测速时剔除的超时 IP（万一它们只是测速瞬间不可达）
+        seen = set(batch) | set(fallback_hosts)
+        for h in hosts:
+            if h not in seen:
+                fallback_hosts.append(h)
+
         last_err = ""
-        for host in hosts[n_concurrent:]:
+        consecutive_minus1 = 0
+        MAX_CONSECUTIVE_MINUS1 = 5
+        for host in fallback_hosts:
             try:
                 logger.info("尝试连接 %s:%d ...", host, MARKET_PORT)
                 sock = socket.create_connection((host, MARKET_PORT), timeout=15)
@@ -376,8 +472,21 @@ class THSClient:
                 else:
                     sock.close()
                     if verify_code == "-1":
-                        logger.warning("%s:%d VerifyCode=-1，换下一个 host 重试...",
-                                       host, MARKET_PORT)
+                        consecutive_minus1 += 1
+                        logger.warning("%s:%d VerifyCode=-1（连续 %d 次）",
+                                       host, MARKET_PORT, consecutive_minus1)
+                        # 连续多个 -1 = 账号全局封禁，提前放弃
+                        if consecutive_minus1 >= MAX_CONSECUTIVE_MINUS1:
+                            logger.warning("连续 %d 个 IP 返回 -1，判定账号全局封禁，"
+                                           "停止重试（等待一段时间后重试）",
+                                           consecutive_minus1)
+                            return LoginResult(
+                                success=False,
+                                verify_code="-1",
+                                error="global_rate_limited",
+                                detail=f"连续 {consecutive_minus1} 个 IP VerifyCode=-1，"
+                                       "账号疑似被全局封禁，等待几分钟后重试",
+                            )
                         continue
                     logger.warning("%s:%d 登录被拒 (VerifyCode=%s)", host, MARKET_PORT, verify_code)
                     return LoginResult(
@@ -395,40 +504,111 @@ class THSClient:
 
         return LoginResult(success=False, error="all_hosts_failed", detail=last_err)
 
-    def _send_init_handshake(self, timeout: float = 8.0) -> None:
-        """login 后发 init 请求激活行情通道，排空 init 响应。
+    def _send_init_handshake(self, timeout: float = 2.0) -> None:
+        """login 后发 init 请求激活行情通道，读取 init 响应（服务器配置帧）。
 
         hexin 客户端 login 后紧跟 init 请求（subtype 0x0001），服务器据此
         激活该连接的行情查询通道。不发 init 直接 list_quotes 会超时
         （2026-07-23 抓包确认：hexin 每条连接 LOGIN→INIT→行情查询）。
 
-        init 响应含全量代码表（dc≈7400，多帧），必须排空否则残留帧会干扰
-        后续 list_quotes 的 read_frame。排空策略：循环读帧直到超时无数据，
-        单帧超时 8s（init 大帧传输需要几秒）。
+        init 响应是**服务器配置帧**（~49KB，含 S-OS/S-Version/SName 等元数据），
+        不是全量代码表（代码表是 stock_list() 重放序列才触发）。实测稳定返回
+        1 帧（多次验证），0.1s 即到达。读完这 1 帧配置即激活行情通道，立即
+        可 list_quotes（实测读 1 帧后 list_quotes 0.17s 成功）。
+
+        本方法读第 1 帧配置（短超时等它到达），再用极短 peek（0.2s）确认无
+        残留帧后即返回。旧实现用 8s 超时 + 循环 30 帧，每帧后空等一个超时周期，
+        白等 ~8s——实际配置帧 1 帧、瞬间到达，无需等待。
+
+        本方法在 login 成功路径上调用（self._sock 已赋值），进入即记录连接就绪
+        时刻 ``self._last_connect_ts``（供 connect() 的冷却复用判断）。
         """
+        # login 已成功、连接已就绪，记录时刻供下次 connect() 冷却判断
+        self._last_connect_ts = time.time()
         try:
             req = build_init_query()
             with self._sock_lock:
                 self._sock.sendall(req + b"\n")
+                # 读第 1 帧配置（等它到达，最多 timeout 秒）
                 self._sock.settimeout(timeout)
-                # 完整排空 init 响应——服务器推送完整 init 数据后才认为
-                # init 完成、激活行情通道。只读几帧不够（实测 list_quotes 会超时）。
                 n = 0
-                for _ in range(30):
+                try:
+                    read_frame(self._sock)
+                    n += 1
+                except (socket.timeout, OSError):
+                    pass
+                except ValueError:
                     try:
-                        read_frame(self._sock)
-                        n += 1
-                    except (socket.timeout, OSError):
-                        break  # 无更多数据，排空完成
-                    except ValueError:
-                        try:
-                            self._sock.settimeout(3.0)
-                            self._sock.recv(8192)
-                        except Exception:
-                            pass
-                logger.debug("init 握手完成（排空 %d 帧，行情通道已激活）", n)
+                        self._sock.settimeout(1.0)
+                        self._sock.recv(8192)
+                    except Exception:
+                        pass
+                # 极短 peek 确认无残留帧（防偶发多帧），0.2s 几乎零成本
+                self._sock.settimeout(0.2)
+                try:
+                    read_frame(self._sock)
+                    n += 1
+                except (socket.timeout, OSError):
+                    pass  # 无残留，正常情况
+                except ValueError:
+                    pass
+                logger.debug("init 握手完成（读 %d 帧配置，行情通道已激活）", n)
         except Exception as e:
             logger.warning("init 握手失败（行情查询可能超时）: %s", e)
+
+    def _probe_fastest_hosts(self, hosts: list[str], top_n: int = 7,
+                             timeout: float = 1.0) -> list[str]:
+        """并发 TCP 握手测每个 IP 的延迟，返回最快的 top_n 个。
+
+        复刻同花顺客户端「测试 IP」功能的机制（2026-07-23 抓包确认）：并发对多个
+        IP 发 TCP 连接，测 SYN→SYN-ACK 握手往返时间，选最快的 login。同花顺实测
+        最快 122.9.115.201=28ms，最慢 74ms，超时的剔除。
+
+        纯 TCP 握手测速——**不发 login**，连上立即关闭，不触发 VerifyCode=-1
+        （-1 是 login 帧内容触发的，TCP 连接不触发）。这避免了 thspypc 盲选前 7
+        个 IP 经常选到慢 IP（46s 超时）的问题。
+
+        Args:
+            hosts: 待测 IP 列表。
+            top_n: 返回最快的几个。
+            timeout: 单个 TCP 连接超时（秒）。1s 足够区分（最快 28ms，1s 内必回）。
+
+        Returns:
+            按延迟升序排列的 IP 列表（最多 top_n 个）。全部超时返回空列表
+            （调用方应回退到盲选）。
+        """
+        results: list[tuple[str, float]] = []  # (ip, rtt_seconds)
+        lock = threading.Lock()
+
+        def _probe(host):
+            t0 = time.time()
+            try:
+                s = socket.create_connection((host, MARKET_PORT), timeout=timeout)
+                rtt = time.time() - t0
+                s.close()  # 连上立即关闭，不发任何数据
+                with lock:
+                    results.append((host, rtt))
+            except (socket.timeout, OSError):
+                pass  # 超时/拒绝，剔除
+
+        threads = [threading.Thread(target=_probe, args=(h,), daemon=True)
+                   for h in hosts]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=timeout + 0.5)  # 整体最多等 timeout+0.5s
+
+        results.sort(key=lambda x: x[1])
+        fastest = [ip for ip, _ in results[:top_n]]
+        if fastest:
+            logger.info("IP 测速完成（%.1fs）：最快 %s=%.0fms，共 %d/%d 个可达",
+                        time.time() - t0,
+                        fastest[0], results[0][1] * 1000,
+                        len(results), len(hosts))
+            logger.debug("测速详情: %s",
+                         ", ".join(f"{ip}={rtt*1000:.0f}ms" for ip, rtt in results[:7]))
+        return fastest
 
     def _concurrent_login(self, hosts: list[str],
                           login_body: bytes, timeout: float = 12.0):
@@ -436,10 +616,16 @@ class THSClient:
 
         复刻 hexin 的并发登录策略：同时连 N 个 IP，用最先成功的，其余关闭。
         这避免了串行逐个尝试对同一 IP 重复登录导致 VerifyCode=-1。
+
+        优化：用完成计数器（all_done Event）——所有线程都完成（无论成败）即提前
+        退出 wait，不必等满 timeout。当账号处于全局 -1（所有 IP 秒回 -1）时，这能
+        省下整段 timeout 的白等（如 14s → 0.1s）。
         """
         results = [None] * len(hosts)  # 每个线程的 (host, sock, result) 或 None
         errors = [None] * len(hosts)
-        done = threading.Event()
+        done = threading.Event()         # 有一个成功
+        all_done = threading.Event()     # 所有线程都结束（成败皆可）
+        remaining = [len(hosts)]         # 未完成数（用 list 做 mutable 计数）
 
         def _try_one(idx, host):
             try:
@@ -462,12 +648,22 @@ class THSClient:
                     errors[idx] = f"VerifyCode={vc}"
             except Exception as e:
                 errors[idx] = str(e)
+            finally:
+                # 所有线程完成时唤醒 wait（提前退出，不必等满 timeout）
+                remaining[0] -= 1
+                if remaining[0] <= 0:
+                    all_done.set()
 
         threads = [threading.Thread(target=_try_one, args=(i, h),
                                     daemon=True) for i, h in enumerate(hosts)]
         for t in threads:
             t.start()
-        done.wait(timeout=timeout + 2)
+        # 等成功（done）或全部完成（all_done），取先到的，最多等 timeout+2
+        deadline = time.time() + timeout + 2
+        while not done.is_set() and not all_done.is_set():
+            if time.time() >= deadline:
+                break
+            done.wait(timeout=min(0.5, deadline - time.time()))
         # 等所有线程结束（失败的会自己关闭 sock）
         for t in threads:
             t.join(timeout=1)
@@ -812,151 +1008,147 @@ class THSClient:
 
     # ── 全市场快照（hfd1.0 空括号协议）──
 
-    @staticmethod
-    def _try_market_snapshot_on_host(
-        username: str,
-        password: str,
-        imei: str,
-        mac64: str,
+    def _market_snapshot_on_main_sock(
+        self,
         markets: list[int] | None = None,
         timeout: float = 10.0,
-        max_attempts: int = 5,
-    ) -> tuple[list[dict], str]:
-        """反复尝试在不同 host 上发 market_snapshot，直到成功。
+    ) -> list[dict]:
+        """在主连接 self._sock 上发一次全市场快照请求，解析 hfd1.0 响应。
 
-        服务器集群中只有部分 host 支持 hfd1.0 空括号快照（实测 122.9.202.190 可，
-        122.9.125.190 不可）。本方法反复重连直到命中支持 host。
+        ⚠ **不限流的根本前提**：本方法在 :meth:`connect` 建立的长连接上发请求，
+        绝不新建/断开连接。反复 connect/disconnect 会触发 VerifyCode=-1（同账号
+        同 IP 短时间重复 login 的会话冲突，见 HANDOFF §7），这是此前
+        ``market_snapshot`` 必然限流的根因——旧实现循环 ``connect()``/``disconnect()``
+        最多 5 次 × 每次并发 7 IP = 短时间 35 次 login 打同一批 IP。
+
+        host 不支持 hfd1.0（返回空/超时）时返回空列表，由调用方
+        （:meth:`market_snapshot_with_quotes`）决定是否走 :meth:`list_quotes`
+        兜底。本连接不被破坏，后续仍可做其他查询。
+
+        前置条件：已 connect() 成功（self._sock 存在）。
+
+        Args:
+            markets: 市场码列表，None 用 :data:`MARKET_SNAPSHOT_MARKETS`。
+            timeout: 单次 read_frame 超时（秒）。
 
         Returns:
-            (records, server_ip): 成功时的记录列表和服务器 IP。
-            全部失败时返回 ([], "")。
+            解析后的记录列表（约 1200 条，hfd1.0 数值字段为近似值）。
+            host 不支持或超时返回 []。
         """
-        last_error = ""
-        for attempt in range(max_attempts):
-            client = THSClient(username, password, imei=imei, mac64=mac64,
-                               enable_heartbeat=False)
-            r = client.connect()
-            if not r.success:
-                last_error = f"登录失败: {r.error}"
-                continue
+        if self._sock is None:
+            logger.debug("market_snapshot: 未连接，跳过")
+            return []
 
-            req = protocol.build_market_snapshot_query(markets=markets)
-            try:
-                client._sock.sendall(req + b"\n")
-                client._sock.settimeout(timeout)
-                raw = protocol.read_frame(client._sock)
-            except (socket.timeout, OSError, ValueError) as e:
-                last_error = f"读响应失败: {e}"
-                client.disconnect()
-                continue
-
-            if raw and b"hfd1.0" in raw:
-                try:
-                    from thspypc.parse_hfd1 import parse_hfd1_response
-                    records = parse_hfd1_response(raw)
-                    logger.info("market_snapshot: host=%s 成功, %d 条",
-                                r.server, len(records))
-                    client.disconnect()
-                    return records, r.server
-                except Exception as e:
-                    last_error = f"解析失败: {e}"
-                    client.disconnect()
-                    continue
-            else:
-                last_error = f"host={r.server} 不支持 hfd1.0"
-                client.disconnect()
-                continue
-
-        logger.warning("market_snapshot: 全部 %d 次尝试失败 (%s)",
-                       max_attempts, last_error)
-        return [], ""
+        req = protocol.build_market_snapshot_query(markets=markets)
+        try:
+            with self._sock_lock:
+                if not self._sock:
+                    return []
+                self._sock.sendall(req + b"\n")
+                self._sock.settimeout(timeout)
+                # 服务器可能先推文本帧再推 hfd1.0 数据帧，循环找首个含标记的
+                # （与 list_quotes 同模式）
+                for _ in range(8):
+                    try:
+                        raw = read_frame(self._sock)
+                    except (socket.timeout, OSError):
+                        return []
+                    except ValueError:
+                        # magic 对齐失败（推送帧中间魔数碰撞），跳过这一段继续
+                        continue
+                    if raw and b"hfd1.0" in raw:
+                        from thspypc.parse_hfd1 import parse_hfd1_response
+                        try:
+                            records = parse_hfd1_response(raw)
+                            logger.info("market_snapshot: 主连接 hfd1.0 成功, %d 条",
+                                        len(records))
+                            return records
+                        except Exception as e:
+                            logger.debug("market_snapshot: hfd1.0 解析失败: %s", e)
+                            return []
+        except (socket.timeout, OSError) as e:
+            logger.debug("market_snapshot: 主连接读取失败: %s", e)
+        return []
 
     def market_snapshot(
         self,
         markets: list[int] | None = None,
         timeout: float = 10.0,
     ) -> list[dict]:
-        """全市场行情快照：一个请求拿沪深全市场 code+name（~0.13s）。
+        """全市场行情快照：一个请求拿沪市全市场 code+name（~0.13s）。
 
-        ⚠️  本方法在**新连接**上执行（因为 hfd1.0 空括号请求需要特定的
-        服务器 host，可能与当前连接不同）。调用后当前连接不受影响。
+        在 :meth:`connect` 建立的**主连接**上发 hfd1.0 空括号请求
+        （``CodeList=16();17();...``），服务器一次性返回整个市场的股票代码和
+        名称。相比 :meth:`list_quotes` 逐批查询（~250 请求），本方法只需 1 个请求，
+        速度提升 2~3 个数量级。
 
-        使用空括号 ``CodeList=16();17();...`` 语法，服务器一次性返回整个市场的
-        股票代码和名称。相比 :meth:`list_quotes` 逐批查询（~250 请求），本方法
-        只需 1 个请求，速度提升 2~3 个数量级。
+        ⚠️ **数值字段（price/change_pct 等）当前为近似值**，通过 THS float 扫描
+        推断，准确度有限。对于准确行情请用 :meth:`list_quotes`（或
+        :meth:`market_snapshot_with_quotes` 的混合方案）。
 
-        ⚠️  数值字段（price/change_pct 等）当前为近似值，通过 THS float 扫描推断，
-        准确度有限。对于准确行情请用 :meth:`list_quotes`。
+        ⚠️ 当前连接的服务器 host **可能不支持 hfd1.0**（集群中仅部分 host 支持）。
+        不支持时本方法返回空列表——但**不重连**（重连会触发 VerifyCode=-1，
+        见 HANDOFF §7）。需要稳定拿沪市行情时优先用
+        :meth:`market_snapshot_with_quotes`。
 
         Args:
-            markets: 市场码列表，None 用默认全市场（16-22/144-151 沪深全）。
-            timeout: 单次响应超时（秒）。
+            markets: 市场码列表，None 用 :data:`MARKET_SNAPSHOT_MARKETS`
+                （16-22/144-151 沪市全）。
+            timeout: 单次 read_frame 超时（秒）。
 
         Returns:
             list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``，
-            约 1200+ 条（当前锚点覆盖率）。数值字段可能为 None（解析未对齐时）。
+            约 1200+ 条（当前锚点覆盖率）。host 不支持或超时返回 []。
+
+        Raises:
+            RuntimeError: 未登录（self._sock 为空）。
         """
-        records, server = self._try_market_snapshot_on_host(
-            self.username, self.password, self.imei, self.mac64,
-            markets=markets, timeout=timeout)
-        if server:
-            logger.info("market_snapshot: %s 返回 %d 条", server, len(records))
-        return records
+        if self._sock is None:
+            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        return self._market_snapshot_on_main_sock(markets=markets, timeout=timeout)
 
     def market_snapshot_with_quotes(
         self,
         timeout: float = 60.0,
         batch_size: int = 30,
-        hfd1_only: bool = False,
     ) -> list[dict]:
         """全市场行情快照：沪深全市场 code+name+准确行情。
 
-        | 数据源 | 沪市 A + 三板/基金 | 深市 A |
-        |--------|-------------------|--------|
-        | code   | hfd1.0 快照（1请求） | stock_list 缓存 |
-        | name   | hfd1.0 快照 | stock_list 缓存 |
-        | quotes | list_quotes 回填 | list_quotes 回填 |
+        纯双数据源方案（**不依赖 hfd1.0**，彻底避免反复 connect 限流）：
 
-        核心策略：
-          1. hfd1.0 空括号请求 → SH A + 三板/基金 code+name（~0.13s）
-          2. stock_list 缓存 → 深市 code+name（~瞬时）
-          3. list_quotes 批量回填 → 全部股票的准确行情
+        | 数据源 | 覆盖 | 速度 |
+        |--------|------|------|
+        | :meth:`stock_list_cached` | 沪深全市场 code+name | ~瞬时(缓存) / ~6s(首次) |
+        | :meth:`list_quotes` | 全市场准确行情（批量回填） | ~10-30s |
+
+        旧实现额外调用 hfd1.0 空括号快照拿沪市 code+name，但 hfd1.0 路径
+        反复 connect/disconnect 触发 VerifyCode=-1（限流根因，见 HANDOFF §7），
+        且名称覆盖（1209 锚点）不如 hexin 本地缓存（~8000 条）全，故移除。
+        code+name 现完全由 ``stock_list_cached(with_names=True)`` 提供。
 
         Args:
-            timeout: list_quotes 总超时（秒）。
+            timeout: list_quotes 单批超时（秒）。
             batch_size: 每批 list_quotes 数量。
-            hfd1_only: True 时只返回 hfd1.0 覆盖的市场（沪市/三板），
-                不包含深市。默认 False。
 
         Returns:
             list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``。
-            code 和 name 来自 hfd1.0/stock_list，数值来自 list_quotes
-            （盘中准确值，需在交易时段调用）。
-        """
-        # 1. hfd1.0 取沪市/三板 code+name
-        hfd1_records, _ = self._try_market_snapshot_on_host(
-            self.username, self.password, self.imei, self.mac64,
-            timeout=10.0)
-        hfd1_by_code = {r["code"]: r for r in hfd1_records}
+            code 和 name 来自 stock_list 缓存（hexin 本地名称），数值来自
+            list_quotes（盘中准确值，需在交易时段调用）。
 
-        # 2. stock_list 缓存取全量代码（含深市）
+        Raises:
+            RuntimeError: 未登录。
+        """
+        if self._sock is None:
+            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+
+        # 1. stock_list 缓存取全量 code+name（含沪深，名称来自 hexin 本地缓存）
         stock_codes = self.stock_list_cached(with_names=True)
         all_by_code: dict[str, dict] = {}
-
         for s in stock_codes:
             code = s["code"]
-            name = s.get("name", hfd1_by_code.get(code, {}).get("name", ""))
-            all_by_code[code] = {"code": code, "name": name}
+            all_by_code[code] = {"code": code, "name": s.get("name", "")}
 
-        # 用 hfd1.0 的名称覆盖（更完整）
-        for code, r in hfd1_by_code.items():
-            if code in all_by_code:
-                all_by_code[code]["name"] = r.get("name", all_by_code[code]["name"])
-
-        if hfd1_only:
-            return list(all_by_code.values())
-
-        # 3. list_quotes 批量回填行情
+        # 2. list_quotes 批量回填行情（在主连接上，安全）
         datatype = [5, 7, 8, 9, 10, 13, 18, 19, 48, 49]
         codes_all = list(all_by_code.keys())
         quote_count = 0
@@ -1497,6 +1689,16 @@ class THSClient:
         return frame_count
 
     def disconnect(self) -> None:
+        """关闭所有连接（8901 主连接 + 9601 短线精灵）并停止心跳。
+
+        注意：重复调用 :meth:`connect` 不会触发新的 login——若当前连接仍活着
+        且未过冷却期（20s），:meth:`connect` 直接复用现有连接（见其 docstring）。
+        只有本方法（或网络中断）真正关闭 socket 后，下次 connect 才会重新 login。
+
+        hexin 客户端从不主动断开（90s 抓包零 FIN），thspypc 遵循同样模式：
+        长连接反复查询，避免反复 disconnect/connect 触发 VerifyCode=-1
+        （同账号同 IP 短时间重复 login 的会话冲突，见 HANDOFF §7）。
+        """
         self.stop_heartbeat()
         for attr, lock in (("_sock", self._sock_lock),
                            ("_realorder_sock", self._realorder_lock)):

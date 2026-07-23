@@ -79,13 +79,48 @@
 
 ⚠️ **非交易日可用**：实测 8901 协议层不约束代码表查询（周日可登录、可发请求）。
 
-### 2. Passport64 生成复刻
+### 2. Passport64 生成 + login 帧校验字节（✅ 2026-07-23 完整逆向，登录打通）
 
-**问题**：HTTP 鉴权生成的 passport 能登录（VerifyCode=0）但**无行情查询权限**
+login 失败有两个独立根因，都已修复（2026-07-23 三变体实测 + cli_ticker 活网验证 VerifyCode=0）：
 
-**根因**：服务端返回的 passport_bytes 含 53 个字段，其中 10 个是客户端路由/配置字段（`M_hq`/`M_hqdns`/`M_wg`/`download`/`signlength` 等）。hexin 缓存的 passport 会**过滤掉这 10 个字段**（剩 43 个）。带配置字段的 passport 能登录但行情网关校验不通过。
+**根因 1：sk/sv 必须保留（PromptText=-6 的真凶）**
 
-**修复**：`build_passport64` 自动过滤 `_PASSPORT_DROP_FIELDS`（10 个字段），过滤后 b64 长度与 hexin 缓存逐字符一致（2304 字符），行情权限恢复。**无需抓包，账号密码直接可用**。
+抓包发现 hexin **发送**的 Passport64 只有 20 字段（1124/1130 字符），不含 sk/sv/userflag/
+level2 的明文。曾误判为"thspypc 也该过滤这些"，但三变体实测推翻：
+- 20 字段（过滤 sk/sv）→ **VerifyCode=-1, PromptText=-6**（会话密钥缺失）
+- 43 字段（含 sk/sv）→ **VerifyCode=0** ✅
+- 53 字段（全不过滤）→ **VerifyCode=0** ✅
+
+原因：hexin 不发 sk/sv **明文**，但它的 head128 用自有算法把 sk/sv 编码进了 signature。
+thspypc 的 head128 移植自 thspy Mac 版（`_sig_to_nibbles`），没有编码 sk/sv，因此**必须
+保留 sk/sv 明文字段**作为补偿。README 表 3"必须保留 sk/sv"的结论一直是对的。
+
+**结论**：`_PASSPORT_DROP_FIELDS` 只过滤 10 个路由字段（M_hq/M_hqdns/M_wg/M_zx/UpdateSvr/
+download/Foss_url/DownloadSelfStock/UploadSelfStock/signlength），保留含 sk/sv 的 43 字段
+（2304 字符）。
+
+**根因 2：login 帧校验字节是动态的（0 字节 FIN 的真凶）**
+
+`build_login_body_pc` 的帧头 `\t A \t \x00 zh_CN.GBK <校验字节> \t` 里，校验字节**不是
+固定 0xaa**，而是动态计算（抓包 14 帧逆向确认）：
+```
+校验字节 = (固定文本长度 + 1) & 0xFF
+固定文本 = "Ask=login\n...Passport64="（不含 Passport64 值）
+```
+thspypc 不带 UserName → 固定文本 169B → 校验字节 0xaa；hexin 带 UserName → 209B → 0xd2。
+校验字节错误 → 服务器 0 字节 FIN 直接断连（连错误码都不给）。
+
+**完整诊断过程**（供后续排查参考）：
+1. `tests/capture_login_compare.py` —— 抓 hexin 8901 login 帧，4 维度对比（IP/login字段/
+   VerifyCode/thspypc 对照）。发现同账号反复登录退出 hexin 毫无问题（21+14 帧 VerifyCode
+   全 0），证明 -1 不是账号限流/连接频率。
+2. `tests/compare_login_frame_bytes.py` —— 逐字节对比 login 帧，定位到 offset 13 校验字节
+   差异（hexin=0xd2 thspypc=0xaa），逆向出动态计算公式。
+3. `tests/test_passport_variants.py` —— 三变体（20/43/53 字段）实测，确认 sk/sv 必须保留。
+4. 修复后 cli_ticker 活网验证 VerifyCode=0，行情显示正常。
+
+⚠️ **§7a 的"连接频率导致 -1"分析是错的**——-1/-6 纯粹是 login 帧内容问题（校验字节 +
+sk/sv），与连接频率无关。连接治理（冷却复用/长连接）仍是好实践，但不是防 -1 的手段。
 
 ### 3. 自定义板块管理（移植自 thspy）
 
@@ -276,9 +311,10 @@ unk=0x36/0x42/0x4a 等非 BitRLE 编码的 hd3.1 帧暂不支持（`parse_hd3_re
 ### 9601 心跳帧
 - 5 字节 body: `09 <3字节序号 big-endian> 07`，hexlen=00000004
 
-### Passport64 字段过滤
-- 过滤 10 个字段：`M_hq`/`M_hqdns`/`M_wg`/`M_zx`/`UpdateSvr`/`download`/`Foss_url`/`DownloadSelfStock`/`UploadSelfStock`/`signlength`
-- 过滤后才有行情查询权限
+### Passport64 字段过滤（✅ 2026-07-23 最终结论，见 §2）
+- 只过滤 **10 个路由字段**（M_hq/M_hqdns/M_wg/M_zx/UpdateSvr/download/Foss_url/DownloadSelfStock/UploadSelfStock/signlength）
+- **保留含 sk/sv 的 43 字段**（2304 字符）。sk/sv 必须保留——thspypc 的 head128 没编码 sk/sv，需明文补
+- login 帧校验字节动态计算（非固定 0xaa），见 build_login_body_pc
 
 ### MARKET_HOSTS（实测 2026-07-17）
 - `122.9.202.190` / `122.9.125.190`：登录+行情均可（推荐）

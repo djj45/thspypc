@@ -74,19 +74,18 @@ def test_live():
         print("✗ 未配置 .env")
         return False
 
-    print("活网测试 (market_snapshot 自动重试 host)...")
+    print("活网测试 (market_snapshot 在主连接上发，不再循环重连)...")
+    client = THSClient(user, pwd)
+    r = client.connect()
+    if not r.success:
+        print(f"✗ 登录失败: {r.error}")
+        return False
+    print(f"  已连接 {r.server}")
+
     t0 = time.time()
-    records = THSClient._try_market_snapshot_on_host(
-        user, pwd,
-        imei=os.environ.get("THS_IMEI", ""),
-        mac64=None,
-        timeout=10.0,
-        max_attempts=5,
-    )
+    recs = client.market_snapshot(timeout=10.0)
     elapsed = time.time() - t0
 
-    recs, server = records
-    print(f"  服务器: {server or '(无)'}")
     print(f"  耗时: {elapsed*1000:.1f}ms")
     print(f"  记录数: {len(recs)}")
 
@@ -98,7 +97,10 @@ def test_live():
         print(f"  沪A(6xx): {codes_600}, 深A(000): {codes_000}, 创业板(3xx): {codes_300}")
         for r in recs[:5]:
             print(f"    {r['code']:>8s} {r['name']:12s}  price={r.get('price', 'N/A')}")
+    else:
+        print("  （当前 host 不支持 hfd1.0；用 market_snapshot_with_quotes 走 list_quotes 兜底）")
 
+    client.disconnect()
     return bool(recs)
 
 

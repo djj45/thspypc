@@ -38,23 +38,26 @@ AUTH_PORT = 80
 # 行情查询需要连到真正处理 CodeList 的服务器（标 ★ 的是实测能返回
 # hd1.0/hd3.1 数据的 IP）。把这些排在前面提高 list_quotes 命中率。
 #
-# ⚠ 2026-07-23 重大发现：旧的 IP（122.9.202.190 等）已退化为纯登录网关，
-# login 成功但 list_quotes/stock_list_hot(199112) 全部超时。hexin 客户端
-# 实际连的是新集群（122.9.115.201 等），行情查询正常。把新集群 IP 排在
-# 最前面。（hexin 抓包确认 login + 199112 在同一条连接上，无需额外握手。）
+# ⚠ 这是 DNS 解析失败时的回退 IP 列表。正常运行走 :func:`resolve_market_hosts`
+# 从 passport 的 M_hqdns 动态解析（拿到当前最新 IP）。
+#
+# 历史误判澄清（2026-07-23 最终结论）：此前认为旧 IP（122.9.202.190 等）"退化为
+# 纯登录网关、行情查询超时"，**已被推翻**。真正根因是 login 后缺 init 握手帧——
+# connect() 直接发行情查询导致超时。补上 init 握手后（见 client._send_init_handshake），
+# 旧 IP 同样能正常返回 list_quotes/stock_list_hot 行情。新旧 IP 都是行情网关，
+# 不存在"退化"一说。注释中的"新/旧集群"分组已无实际意义，保留 IP 仅为扩充回退池。
 MARKET_PORT = 8901
 MARKET_HOSTS = [
-    # 2026-07-23 新集群（hexin 抓包实测，login+行情查询+199112 均可用）
-    "122.9.115.201",   # ★ 2026-07-23 实测：login+199112(SortTotal=264)+dc=7606 全量代码表
-    "8.134.101.39",    # ★ 2026-07-23 实测
-    "8.134.146.31",    # ★ 2026-07-23 实测
-    "47.101.161.13",   # 2026-07-23 hexin 连过
-    "139.159.135.214", # 2026-07-23 hexin 连过
-    "122.9.204.225",   # 2026-07-23 实测：dc=7606 全量代码表
-    # 旧集群（2026-07-17，已退化为纯登录网关，行情查询超时）
-    "122.9.202.190",   # 2026-07-17 旧：登录可用，2026-07-23 实测行情查询超时
-    "122.9.125.190",   # 旧
-    "116.63.108.136",  # 旧：登录可用，行情查询 timeout
+    # 2026-07-23 实测可用（hexin 抓包 / thspypc init 握手后验证）
+    "122.9.115.201",
+    "8.134.101.39",
+    "8.134.146.31",
+    "47.101.161.13",
+    "139.159.135.214",
+    "122.9.204.225",
+    "122.9.202.190",   # init 握手后实测可用（此前误判为"退化"，实为缺 init）
+    "122.9.125.190",
+    "116.63.108.136",
     "8.134.98.163",
     "121.37.31.87",
     "8.138.46.177",
@@ -445,11 +448,18 @@ def build_head128_pure(signature: str) -> tuple[bytes, bytes]:
     return (ACCOUNT_TYPE + decoded[:123]), decoded[123:128]
 
 
-# 服务端 passport_bytes 里这些字段是「客户端路由/配置」信息（行情服务器地址等），
-# 不参与行情网关的 passport 校验。hexin.exe 缓存的 Passport64 会把它们去掉，
-# 只保留身份/权限字段。实测：带这些字段的 passport 能登录（VerifyCode=0）但
-# 行情查询返回空（无权限）；去掉后即恢复行情权限（2026-07-17 实测确认）。
-# 过滤后 b64 长度与 hexin 缓存完全一致（2304 字符），字段集也一致。
+# 服务端 passport_bytes 含 53 个字段，其中 10 个是客户端路由/配置字段
+# （行情/网关/下载服务器地址等）。hexin 缓存的 Passport64 会过滤掉这 10 个路由字段
+# （剩 43 个身份/权限字段，含 sk/sv 会话密钥）。过滤后 b64 长度 2304 字符，VerifyCode=0。
+#
+# ⚠ sk/sv/userflag/level2/bind 等**必须保留**（2026-07-23 三变体实测确认）。
+# 抓包显示 hexin 发送的 Passport64 不含这些明文字段（只有 20 字段），但 hexin 的
+# head128 用其自有算法把 sk/sv 编码进了 signature。thspypc 的 head128 移植自 thspy
+# Mac 版（_sig_to_nibbles），没有编码 sk/sv，因此**必须保留 sk/sv 明文字段**作为补偿。
+# 过滤掉 sk/sv 会导致 VerifyCode=-1, PromptText=-6（会话密钥缺失）。
+#
+# 早期曾误判为"hexin 不发 sk/sv 所以 thspypc 也该过滤"，实测该变体返回 -6。
+# 同时"check 字节硬编码 0xaa"也是错的（见 build_login_body_pc 的动态计算）。
 _PASSPORT_DROP_FIELDS = frozenset({
     "M_hq", "M_hqdns", "M_wg", "M_zx",          # 行情/短线/网关服务器地址
     "UpdateSvr", "download",                      # 升级/下载服务器
@@ -463,15 +473,13 @@ def build_passport64(auth_info: dict, mac_b64: str = "") -> str:
     """
     构造 Passport64：head128(128B) + prefix_5b(5B) + 服务端 passport 字段 + base64。
 
-    重要：PC 版不截断 passport 字段（保留 userflag 之后的 bind/sk/sv 等）。
-    thspy 截断到 userflag= 的做法在 PC 版会导致 VerifyCode=-1（sk/sv 是会话密钥，
-    服务器要校验）。实测保留全部身份字段才能登录成功。
+    服务端 passport_bytes 含 53 个字段，其中 10 个是客户端路由/配置字段
+    （M_hq/M_hqdns/download 等），过滤掉（剩 43 字段，b64 长度 2304 字符）。
 
-    但服务端返回的 passport_bytes 里含一批客户端路由/配置字段（M_hq/M_hqdns/
-    download 等），hexin.exe 缓存的 Passport64 会把它们去掉（见 _PASSPORT_DROP_FIELDS）。
-    实测：带这些字段的 passport 能登录但**无行情查询权限**；去掉后行情正常
-    （2026-07-17 实测，去掉后 b64 长度与 hexin 缓存逐字符一致，行情查询解出
-    600056 等股票现价）。
+    ⚠ sk/sv/userflag/level2/bind 等身份/会话字段**必须保留**（2026-07-23 三变体
+    实测确认）。过滤掉 sk/sv 会导致 VerifyCode=-1, PromptText=-6（会话密钥缺失）。
+    抓包显示 hexin 发送的 Passport64 不含这些明文字段，但 hexin 的 head128 把 sk/sv
+    编码进了 signature；thspypc 的 head128（移植自 thspy Mac 版）没有，故需明文保留。
     """
     signature = auth_info.get("signature", "")
     passport_bytes = auth_info.get("passport_bytes", b"")
@@ -511,10 +519,18 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     （身份信息都封装在 Passport64 里），比 thspy 的 Mac 版 login 帧更简洁。
 
     hexin 有时带 UserName=thsuser/Password=thsuser（匿名占位），有时不带——
-    两种都能登录。thspypc 不带（更简洁），实测与 hexin 不带时逐字段一致。
+    抓包确认 21 个 login 帧中帧1-2/8-10/15-17 带，其余不带，且全部 VerifyCode=0。
+    thspypc 不带（更简洁），抓包对比确认字段集一致。
 
-    关键：行情查询能否工作取决于连的 IP（动态解析 M_hqdns），而非 login 帧
-    字段。旧 IP 集群退化为纯登录网关；新集群（M_hqdns 域名解析）行情正常。
+    关键：login 成功需要两个条件（2026-07-23 实测定位）：
+    ① Passport64 **必须保留 sk/sv 等会话字段**（见 :func:`build_passport64`），
+       过滤掉会 PromptText=-6；② **帧头校验字节必须动态计算**（见下文），
+       错了则 0 字节 FIN 直接断连。两者都满足才能 VerifyCode=0。
+
+    ⚠ **帧头校验字节是动态的**（2026-07-23 抓包确认），不是固定 0xaa。校验字节 =
+    login 文本中 ``Ask=login`` 到 ``Passport64=`` 这段固定文本（不含 Passport64 值）
+    的字节长度 + 1。抓包验证：固定文本 209B→0xd2，203B→0xcc（14 帧全部吻合）。
+    服务器据此校验帧完整性，校验字节错误则 0 字节 FIN 直接关闭连接。
     """
     parts = [
         ("Ask", "login"),
@@ -524,13 +540,15 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
         ("C-SupportPushVer", "1.0"),
         ("C-SupReqDataVer", "hq6.0"),
         ("C-SupPushDataVer", "hq6.0"),
-        ("Passport64", passport64),
     ]
-    fields = "\n".join(f"{k}={v}" for k, v in parts)
+    # 固定文本部分（Ask=login 到 Passport64=，不含 passport64 值）
+    fixed_text = "\n".join(f"{k}={v}" for k, v in parts) + "\nPassport64="
+    fixed_bytes = fixed_text.encode("gbk")
+    # 校验字节 = 固定文本字节长度 + 1（抓包逆向确认，见 docstring）
+    check_byte = (len(fixed_bytes) + 1) & 0xFF
     # 帧头前缀：\t A \t \x00 zh_CN.GBK <校验字节> \t
-    # (PROTOCOL.md §2.2)
-    # 校验字节 0xaa：hexin 不带 UserName 时的值（抓包确认）。
-    return b"\x09\x41\x09\x00" + b"zh_CN.GBK\xAA\x09" + fields.encode("gbk")
+    prefix = b"\x09\x41\x09\x00" + b"zh_CN.GBK" + bytes([check_byte]) + b"\x09"
+    return prefix + fixed_bytes + passport64.encode("ascii")
 
 
 def parse_login_response(body: bytes) -> dict:
