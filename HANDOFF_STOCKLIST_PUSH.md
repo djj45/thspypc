@@ -373,47 +373,45 @@ stocks = client.stock_list(with_names=True)  # 7458 条含名称，~6s
 names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ...}
 ```
 
-### 7. stock_list_hot() / 199112 超时根因（✅ 2026-07-23 已解决）
+### 7. list_quotes / stock_list_hot 超时根因（✅ 2026-07-23 已解决）
 
-DataType=199112 排序查询。根因是 **login 帧差异 + 服务器 IP 集群迁移**，
-已彻底解决。
+行情查询（list_quotes / stock_list_hot/199112）超时无响应。经多轮抓包 + A/B
+测试，**真正根因是 login 后缺少 init 握手帧**。
 
-**根因链**：
+**调查历程（三轮，逐步逼近真凶）**：
 
-1. **旧 IP 集群退化为纯登录网关**：thspypc 的 `MARKET_HOSTS`（122.9.202.190
-   等，2026-07-17 实测）login 成功但**行情查询全部超时**——这些 IP 不再处理
-   CodeList/199112 查询。
+1. ~~第一轮：归因 login 帧缺 UserName/Password + 校验字节 0xc9~~（后被推翻）
+2. ~~第二轮：归因 IP 集群迁移（旧 IP 退化为纯登录网关）~~（后被推翻）
+3. **第三轮（最终结论）**：2026-07-23 多次抓包对比 hexin 客户端的连接序列，
+   发现 hexin 每条 8901 连接的顺序是 `LOGIN → INIT → 行情查询`。thspypc 的
+   `connect()` 跳过了 INIT，直接发行情查询 → 服务器不激活该连接的行情通道 → 超时。
 
-2. **hexin 连新集群**：2026-07-23 抓包确认 hexin 连的 IP（122.9.115.201 等）
-   与 thspypc MARKET_HOSTS **零重叠**。新集群 login + 199112 在同一条连接上，
-   午休时间也能返回 `SortTotal=2314` + hd1.0 数据。
+**最终修复**（2026-07-23）：
+- `client.py:_send_init_handshake()` — login 成功后自动发 init 请求 + 排空响应，
+  激活行情通道。在 `_do_tcp_login_raw` 的 VerifyCode=0 分支调用。
+- `protocol.py:resolve_market_hosts()` — 从 passport `M_hqdns` 动态解析域名拿
+  最新 IP（不再依赖硬编码 MARKET_HOSTS 快照）。`build_login_body_pc` 维持
+  0xaa 无 UserName（抓包确认 hexin 多数时候也不带）。
 
-3. **login 帧差异**：hexin login 带 `UserName=thsuser`/`Password=thsuser`
-   （匿名占位，真实身份在 Passport64）。thspypc 旧 login 帧缺这两行。新集群
-   服务器检查这两个字段——无 UserName 的 login 被拒（VerifyCode=-1）。
+**验证**（2026-07-23 13:00，同花顺客户端已退出、干净连接）：
+- ✅ 连 122.9.202.190（之前认为"退化"的旧 IP），init 握手后
+  `list_quotes` 成功：600000 现价 9.03 涨幅 0.22%、600004 涨幅 0.51%
+- → 证明旧 IP 没退化，之前超时纯粹因为没发 init
 
-4. **校验字节**：login 帧前缀 `\x09\x41\x09\x00 zh_CN.GBK <1B校验> \x09` 的
-   校验字节是 body 内容的函数。加 UserName/Password 后 body 变了，旧值 0xaa
-   失效。**暴力扫描 256 个值定位：0xc9**（带 UserName/Password 时 VerifyCode=0）。
-   算法本身未逆向（sum/xor 等不匹配），0xc9 为实测值。
+**关于 VerifyCode=-1 的澄清**：
+- 不是账号限流，而是**同账号并发会话冲突**——thspypc 和 hexin 客户端同时
+  用同账号登录会导致 -1。hexin 客户端只登录一次保持长连接所以不受影响。
+- 测试时必须确保同花顺客户端已退出，且不要短时间内反复 connect/disconnect。
 
-**修复**（2026-07-23，已写入代码）：
-- `build_login_body_pc` 加 `UserName=thsuser`/`Password=thsuser` + 校验字节改 0xc9
-- `MARKET_HOSTS` 新集群 IP（122.9.115.201 等）排在最前
-
-**验证结果**：
-- ✅ 登录新集群 122.9.115.201 VerifyCode=0
-- ✅ `list_quotes` 恢复正常（600000 现价 9.03 涨幅 0.22%）
-- ✅ `stock_list_hot`/199112 服务器返回 `SortTotal=2314` `SortDataCount=20` + hd1.0 数据
-  （⚠ `parse_stock_list_response` 对 hd1.0 格式返回 0 条，待适配——连接层面已通）
-
-**剩余问题**：199112 响应是 hd1.0 格式（非 hd3.1），`parse_stock_list_response`
-当前只解析 hd3.1 16-bit 变体，需增加 hd1.0 分支（同 `parse_hd1_response` 的逻辑）。
+**199112/stock_list_hot 的 hd1.0 解析**：
+- `_parse_stock_list_hd10_variant` 已实现（199112 小批量响应走 hd1.0 明文变体）
+- `stock_list_hot` 已修复（加 `\n` + 多帧读循环 + 市场码改 33）
 
 **相关文件**：
-- `src/thspypc/protocol.py:build_login_body_pc` — login 帧（UserName + 0xc9）
-- `src/thspypc/protocol.py:MARKET_HOSTS` — 新集群 IP 排在最前
-- `tests/probe_stock_list_hot.py` — A/B 测试探针（含 --host 强制连指定 IP、暴力扫描逻辑）
+- `src/thspypc/client.py:_send_init_handshake` — init 握手（login 后自动调用）
+- `src/thspypc/protocol.py:resolve_market_hosts` — M_hqdns 动态域名解析
+- `src/thspypc/protocol.py:_parse_stock_list_hd10_variant` — 199112 hd1.0 解析
+- `tests/probe_stock_list_hot.py` — A/B 测试探针
 
 ---
 
@@ -557,9 +555,8 @@ uv run python tests/analyze_push_fields.py --input data/matched.csv --max-diff 1
 
 ### ✅ 4. stock_list_hot()（已解决 2026-07-23，见 §7）
 
-根因：旧 IP 集群退化 + login 帧缺 UserName/Password + 校验字节。
-已修复（新集群 IP + UserName + 0xc9），连接层面打通。
-剩余：199112 响应 hd1.0 格式的解析器适配（parse_stock_list_response 待加 hd1.0 分支）。
+根因：connect() 缺 init 握手 + 199112 的 hd1.0 解析缺失。
+已修复（init 握手 + M_hqdns 动态 IP + hd1.0 解析 + stock_list_hot 读帧 bug）。
 
 ### 5. hq1.0 字段表 TLV 格式（中优先级，见 §10）
 

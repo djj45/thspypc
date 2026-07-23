@@ -344,6 +344,9 @@ class THSClient:
                 if verify_code == "0":
                     self._sock = sock
                     self._start_heartbeat()
+                    # login 后发 init 激活行情查询（hexin login 后紧跟 init 请求，
+                    # 不发则服务器不激活该连接的行情通道，list_quotes 超时）
+                    self._send_init_handshake()
                     logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
                     return LoginResult(
                         success=True,
@@ -377,6 +380,38 @@ class THSClient:
                 continue
 
         return LoginResult(success=False, error="all_hosts_failed", detail=last_err)
+
+    def _send_init_handshake(self, timeout: float = 8.0) -> None:
+        """login 后发 init 请求激活行情通道，排空响应（不解析，丢掉即可）。
+
+        hexin 客户端 login 后紧跟 init 请求（subtype 0x0001），服务器据此
+        激活该连接的行情查询通道。不发 init 直接 list_quotes 会超时
+        （2026-07-23 抓包确认：hexin 每条连接 LOGIN→INIT→行情查询）。
+
+        init 响应含全量代码表（dc≈7400），但这里只激活连接、排空响应，
+        不解析（解析在 stock_list() 里做）。失败不影响登录状态（init 非必需
+        用于登录本身，只影响后续行情查询）。
+        """
+        try:
+            req = build_init_query()
+            with self._sock_lock:
+                self._sock.sendall(req + b"\n")
+                self._sock.settimeout(timeout)
+                # 排空 init 响应（可能多帧，含全量代码表大帧）
+                for _ in range(20):
+                    try:
+                        read_frame(self._sock)
+                    except (socket.timeout, OSError):
+                        break
+                    except ValueError:
+                        try:
+                            self._sock.settimeout(1.0)
+                            self._sock.recv(8192)
+                        except Exception:
+                            pass
+            logger.debug("init 握手完成（行情通道已激活）")
+        except Exception as e:
+            logger.warning("init 握手失败（行情查询可能超时）: %s", e)
 
     def list_quotes(
         self,
