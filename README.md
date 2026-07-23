@@ -183,10 +183,46 @@ with THSClient("账号", "密码") as client:
 重放模板固化在 `src/thspypc/data/stock_list_replay.bin`（提取自 cold_start.pcap）。
 
 ⚠️ **限制**：
-- 响应**不含股票名称**（dt55 字段全 0）—— 名称走 upstockname 请求，尚未实现；
-  `stocks` 里每项 `name` 恒为 `""`，需要名称请用 `list_quotes(codes)` 另查
+- 默认 `with_names=False` 时 `name` 恒为 `""`；`stock_list(with_names=True)` 会自动
+  从同花顺本地缓存填充名称（需安装同花顺 PC 客户端）
 - 覆盖全市场（沪 600/601/603/688 + 深 + 北交所 870-875/920 + 新三板 830-839 + 基金 430/400）
 - 非交易日也可用（实测周日正常拉取代码表）
+
+### 带本地缓存的代码表（`stock_list_cached`）
+
+`stock_list()` 每次都要重放启动序列拉取（~6 秒）。如果一天内要多次用全量代码表，
+用缓存版：当天首次走网络拉取并写盘，之后直接读缓存（~瞬时），跨自然日自动失效。
+
+```python
+with THSClient("账号", "密码") as client:
+    client.connect()
+
+    # 当天首次：走网络拉取（~6s）+ 写盘 ~/.ths_stock_codes.json
+    stocks = client.stock_list_cached()
+    # 当天再次：直接读缓存（<0.1s，不发网络请求）
+    stocks = client.stock_list_cached()
+
+    # 强制刷新（忽略缓存重新拉取）
+    stocks = client.stock_list_cached(refresh=True)
+```
+
+返回的每项含派生的 `market` 字段（沪=17/深=33），可直接按市场分流喂给 `list_quotes`：
+
+```python
+# market 字段按代码前缀派生（17=沪市A股, 33=深市A股, None=北交所/基金等）
+from thspypc import market_from_code
+sh = [s["code"] for s in stocks if s["market"] == 17]   # 沪市，直接喂 list_quotes(market=17)
+sz = [s["code"] for s in stocks if s["market"] == 33]   # 深市，直接喂 list_quotes(market=33)
+```
+
+**缓存细节**：
+- 路径 `~/.ths_stock_codes.json`（见 `default_stock_cache_path`），JSON 格式
+- 失效口径：**按自然日**——写入的日期与查询日不同即失效（隔夜自动刷新）
+- 仅在拉取到有效结果（非空）时写盘，避免失败拉取被缓存一整天
+- 缓存与账号无关（全市场代码表共享一个文件），换账号无需清缓存
+
+底层缓存函数（无需登录即可独立使用）：`save_stock_codes` / `load_stock_codes` /
+`is_stock_cache_expired` / `market_from_code` / `default_stock_cache_path`。
 
 ### Passport64 生成（已复刻 hexin，无需抓包）
 

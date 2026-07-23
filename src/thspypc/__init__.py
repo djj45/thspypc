@@ -15,6 +15,13 @@ thspypc — 同花顺 Windows PC 远航版行情协议纯 Python 实现。
         print("登录成功" if result.success else f"失败: {result.error}")
 """
 from .client import THSClient, LoginResult
+from .client import (
+    market_from_code,
+    default_stock_cache_path,
+    save_stock_codes,
+    load_stock_codes,
+    is_stock_cache_expired,
+)
 from .protocol import (
     # 常量
     MARKET_HOSTS, MARKET_PORT, C_VERSION_PC, LIST_QUOTE_DATATYPE_DEFAULT,
@@ -26,6 +33,9 @@ from .protocol import (
     generate_imei, generate_mac64,
     # 行情查询（个股列表）
     build_list_quote_query, parse_hd1_response, parse_hd3_response, decode_ths_float,
+    # 全市场快照（空括号单请求，hfd1.0 格式）
+    build_market_snapshot_query, MARKET_SNAPSHOT_MARKETS, MARKET_SNAPSHOT_DATATYPE,
+
     # 股票列表（全市场代码表）
     build_stock_list_query, parse_stock_list_response, STOCK_LIST_DATATYPE,
     build_init_query, parse_init_response,
@@ -42,10 +52,13 @@ from .qr_login import (
     QrLoginResult, qr_login_flow,
     save_credentials, load_credentials, is_credentials_expired, default_cache_path,
 )
+from .parse_hfd1 import parse_hfd1_response
 
 __version__ = "0.1.0"
 __all__ = [
     "THSClient", "LoginResult",
+    "market_from_code", "default_stock_cache_path",
+    "save_stock_codes", "load_stock_codes", "is_stock_cache_expired",
     "MARKET_HOSTS", "MARKET_PORT", "C_VERSION_PC", "LIST_QUOTE_DATATYPE_DEFAULT",
     "REALORDER_HOST", "REALORDER_PORT", "DXJL_DATATYPE", "ANOMALY_MAP_DXJL",
     "encode_frame", "read_frame",
@@ -53,6 +66,8 @@ __all__ = [
     "build_login_body_pc", "parse_login_response", "parse_passport_fields",
     "generate_imei", "generate_mac64",
     "build_list_quote_query", "parse_hd1_response", "parse_hd3_response", "decode_ths_float",
+    "build_market_snapshot_query", "MARKET_SNAPSHOT_MARKETS", "MARKET_SNAPSHOT_DATATYPE",
+    "parse_hfd1_response",
     "build_stock_list_query", "parse_stock_list_response", "STOCK_LIST_DATATYPE",
     "build_init_query", "parse_init_response",
     "build_qurealorder_query", "parse_qurealorder_response", "read_frame_realorder",

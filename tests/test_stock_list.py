@@ -141,13 +141,18 @@ def test_live():
     print(f"\n调用 stock_list()（重放请求序列，~30s）...")
     import time
     t0 = time.time()
-    stocks = client.stock_list(timeout=30)
+    with_names = "--with-names" in sys.argv
+    stocks = client.stock_list(timeout=30, with_names=with_names)
     elapsed = time.time() - t0
     print(f"✓ 获取 {len(stocks)} 条代码（{elapsed:.1f}s）")
 
     if stocks:
         print(f"  前 8: {[s['code'] for s in stocks[:8]]}")
         print(f"  后 5: {[s['code'] for s in stocks[-5:]]}")
+        if with_names:
+            named = [s for s in stocks if s.get("name")]
+            if named:
+                print(f"  名称示例: {[(s['code'], s['name']) for s in named[:5]]}")
         pre = Counter(s["code"][:3] for s in stocks if len(s["code"]) >= 3)
         print(f"  前缀分布(top10): {dict(pre.most_common(10))}")
         if len(stocks) >= 7000:

@@ -556,6 +556,72 @@ def build_list_quote_query(
     return encode_frame(body)
 
 
+# 全市场快照请求的默认市场码集（stock_list.pcap frame 1046 真值）
+# 16/17/18/19/20/22 = 沪深 A 股主板/创业板/科创板/B 股
+# 144/145/146/147/150/151 = 深圳系列市场（含北交所）
+MARKET_SNAPSHOT_MARKETS = [16, 17, 18, 19, 20, 22, 144, 145, 146, 147, 150, 151]
+# 快照请求默认字段：[5]=代码 [55]=名称（抓包 frame 1046 真值）
+# 注：快照请求的 DataType 语法是 [N] 方括号包裹（区别于 list_quote 的普通逗号分隔）
+MARKET_SNAPSHOT_DATATYPE = [5, 55]
+
+
+def build_market_snapshot_query(
+    markets: list[int] | tuple[int, ...] | None = None,
+    datatype: list[int] | None = None,
+    pageid: int = 5716,
+    seq: int = 0x0001,
+) -> bytes:
+    """构造全市场行情快照请求（空括号语法，一个请求拿整个市场）。
+
+    这是 hexin 打开 A 股列表时发的请求（stock_list.pcap frame 1046 真值）。
+    与 :func:`build_list_quote_query` 的关键区别：
+
+    - **空括号** ``CodeList=16();17();...``——不塞具体代码，表示"给我这些市场的
+      全部股票"。服务器据此一次性返回整个市场的快照（实测 ~0.13s 拿沪深全量）。
+    - **DataType 方括号语法** ``DataType=[5],[55]``——每个字段编号用方括号包裹，
+      逗号分隔（区别于 list_quote 的普通 ``7,49,13``）。
+    - 文本字段顺序、DateTime 格式略有不同（``DateTime=0`` 不带括号，无 LackTime 行）。
+
+    二进制头布局与 build_list_quote_query 相同（cmd=0x09 + 22B 头），仅文本不同。
+
+    Args:
+        markets: 市场码列表，None 用 :data:`MARKET_SNAPSHOT_MARKETS`
+            （16-22/144-151，覆盖沪深 A 股全市场）。
+        datatype: DataType 字段编号列表，None 用 :data:`MARKET_SNAPSHOT_DATATYPE`
+            （[5]=代码, [55]=名称）。
+        pageid: 页面 id（frame 1046 真值=5716）。
+        seq: 序列标签（hdr[5:7]），frame 1046 真值=0x0001。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+    """
+    if markets is None:
+        markets = MARKET_SNAPSHOT_MARKETS
+    if datatype is None:
+        datatype = MARKET_SNAPSHOT_DATATYPE
+    # 空括号全市场语法：16();17();...
+    codelist = "".join(f"{m}();" for m in markets)
+    # DataType 方括号语法：[5],[55]
+    dt_str = ",".join(f"[{d}]" for d in datatype)
+    # 文本（frame 1046 真值：DataType 在前，CodeList 在后，行分隔 \r\n，末尾 \r）
+    text = (
+        f"DataType={dt_str}\r\n"
+        f"CodeList={codelist}\r\n"
+        f"DateTime=0\r\n"
+        f"pageid={pageid}\r"
+    ).encode("gbk")
+
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x09\x00"
+    hdr[11:13] = b"\x00\x01"
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
 # 股票列表请求的默认市场组合（抓包帧3898确认：hexin 用 17/22/151 拉沪+深A+北交所）
 # ⚠ 深市 A 股主板的市场码是 22（不是 33）—— 抓包确认。
 #   33 是深市的另一个分类（创业板/基金等），hexin 用单独一条并发连接拉 33。
@@ -1228,6 +1294,218 @@ def _transpose_bitplane_0x1763410(src: bytes, hs: int, dc: int) -> bytes:
 
 
 # =============================================================================
+# upstockname —— 8901 端口全量/增量股票名称同步
+#
+# method=upstockname 请求（\\x09 分隔的纯文本帧）：
+#   instid=65536\\nmethod=upstockname\\nmarket=<CHANNEL>\\nStockNameVer=;;\\n...
+# 服务器返回含若干 [name_<MARKET>] 段的响应。
+#
+# 段编码分两类（2026-07-22 抓包样本 stream35/37/38/40/41 全量验证）：
+#   1. 纯文本 GBK（行分隔 \\r\\n 或 \\n）：name_96_*（外汇）、name_88_*、
+#      name_128_*、name_216_*、name_48_48、name_64_*（期货/北交所，数万条）、
+#      name_UNS*、name_UHI*（外盘）—— 占绝大多数市场，直接 decode('gbk')
+#   2. 块状变长 LZ 编码：name_16_16（沪深 A 股）、name_168_16（混合）
+#      —— 17 字节单元 [ctrl][16B]，ctrl=0x00 时 16B 全 literal，
+#      ctrl≠0x00 时含 1 字节 LZ match（如 0xc1→展开 4 字节"A000"）。
+#      match 字节的 offset/len 编码尚未完全破解（见 HANDOFF §6/§四）。
+#
+# 每行格式：CODE=NAME|ALIAS@FLAG  （CODE 前可有 @ 前缀，见 UNS 段）
+# =============================================================================
+
+# 已知使用块状变长 LZ 编码的段（沪/深 A 股名称）。其余段为纯文本。
+_BLOCK_ENCODED_SEGMENTS = {"16_16", "168_16"}
+
+
+def build_upstockname_request(
+    market: str = "URS",
+    stock_name_ver: str = ";;",
+    pageid: int = 5716,
+    instid: int = 65536,
+) -> bytes:
+    """构造 upstockname 请求帧（\\x09 分隔的纯文本帧）。
+
+    请求格式与 hexin 客户端字节级一致（2026-07-19/22 抓包确认）::
+
+        \\x09instid=65536\\nmethod=upstockname\\nmarket=<CHANNEL>\\n
+        StockNameVer=;;\\nprototype=kvproto\\npageid=5716\\n
+
+    Args:
+        market: 市场通道码，如 ``URS``（沪A）、``UNX``（深A）、``UCX``（北交所）、
+            ``UNS``（纳斯达克）、``UHI``（港交所）。决定服务器下发哪些 [name_] 段。
+        stock_name_ver: 本地名称版本号。``;;`` 表示无缓存，请求全量；
+            传服务器上次下发的 ``ConfigVer`` 则只拿增量。
+        pageid: 抓包实测 5716（hexin 客户端用），冷启动全量链路用 392。
+        instid: 登录后的实例 ID，默认 65536。
+
+    Returns:
+        请求帧体 bytes（不含 FD FD FD FD 帧头，由发送层封装）。
+
+    Note:
+        实测服务器按账号追踪名称版本状态——即使发 ``StockNameVer=;;``，
+        thspypc 账号通常也只能拿到增量（~12 条）。全量下发需 hexin 客户端
+        冷启动触发（清空 stockname 缓存后启动）。详见 HANDOFF §6。
+    """
+    body = (
+        f"instid={instid}\n"
+        f"method=upstockname\n"
+        f"market={market}\n"
+        f"StockNameVer={stock_name_ver}\n"
+        f"prototype=kvproto\n"
+        f"pageid={pageid}\n"
+    )
+    return b"\x09" + body.encode("gbk")
+
+
+def _iter_name_segments(body: bytes):
+    """从 upstockname 响应体中迭代出 (段名, 数据起止)。
+
+    段名形如 ``name_16_16``（去掉方括号）。数据区从段头后的分隔符之后
+    开始，到下一个 ``[name_`` 段头前结束。
+
+    Args:
+        body: upstockname 响应帧体（含若干 ``[name_..]`` 段）。
+
+    Yields:
+        (seg_name:str, data_start:int, data_end:int) 三元组。
+    """
+    # 段名形如 ``name_16_16``，但部分段名内含 \0 字节（如 ``[name_168_16\x00]``），
+    # 解析时剔除 \0。
+    matches = list(re.finditer(rb"\[name_([^\]]+)\]", body))
+    for i, m in enumerate(matches):
+        seg_name = m.group(1).replace(b"\x00", b"").decode("ascii", errors="replace")
+        # 段头后跳过分隔符（\r\n / \n / \0 的任意组合）
+        ds = m.end()
+        while ds < len(body) and body[ds] in (0x0d, 0x0a, 0x00):
+            ds += 1
+        de = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        yield seg_name, ds, de
+
+
+def _name_code_is_valid(code: str) -> bool:
+    """校验代码字段是否是合理的股票/品种代码。
+
+    正常代码（如 ``600000``、``AUDUSD``、``HKEXT100``、``NDX``）全部由可打印
+    ASCII 字符组成，无控制字符，长度 ≤ 16。块状编码段产生的乱码"行"键会
+    含大量控制字符（\\x00-\\x1f）和超长字符串，借此剔除。
+    """
+    if not code or len(code) > 16:
+        return False
+    # 含控制字符或非可打印 ASCII（GBK 中文代码极罕见，这里从严）
+    for ch in code:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7f:
+            return False
+        if 0x80 <= o <= 0x9f:  # GBK 扩展区控制字符
+            return False
+    return True
+
+
+def _parse_name_text(seg_data: bytes) -> dict[str, str]:
+    """解析纯文本名称段（GBK，行分隔 \\r\\n/\\n）。
+
+    每行 ``CODE=NAME|ALIAS@FLAG``，CODE 前可有 ``@`` 前缀。
+    仅保留非空的 NAME（取 ``|`` 和 ``@`` 之前的部分）。
+    代码和名称都校验，剔除块状编码段误入时产生的乱码行。
+    """
+    names: dict[str, str] = {}
+    try:
+        text = seg_data.decode("gbk", errors="replace")
+    except (UnicodeDecodeError, ValueError):
+        return names
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("[") or line.startswith("ConfigVer"):
+            continue
+        if "=" not in line:
+            continue
+        code, _, rest = line.partition("=")
+        code = code.strip().lstrip("@")
+        if not _name_code_is_valid(code):
+            continue
+        name = rest.split("|")[0].split("@")[0].strip()
+        # 过滤乱码名称（块状编码段误入时会出现替换字符/控制字符）
+        if name and "\ufffd" not in name and not any(ord(c) < 0x20 for c in name):
+            names[code] = name
+    return names
+
+
+def _is_block_encoded(seg_data: bytes) -> bool:
+    """启发式判断段是否用了块状变长 LZ 编码。
+
+    纯文本段的 GBK 解码有效行率高（>85%）；块状段因 ctrl/match 字节
+    插入，GBK 解码会产生大量乱码行（有效行率 <60%）。
+    """
+    try:
+        text = seg_data.decode("gbk", errors="replace")
+    except (UnicodeDecodeError, ValueError):
+        return True
+    valid = bad = 0
+    for line in text.splitlines():
+        line = line.strip().lstrip("@")
+        if "=" not in line or line.startswith(("ConfigVer", "[")):
+            continue
+        code, _, rest = line.partition("=")
+        if code.strip() and rest.strip():
+            if "\ufffd" in rest[:8]:
+                bad += 1
+            else:
+                valid += 1
+    total = valid + bad
+    if total < 3:
+        return False
+    return valid / total < 0.60
+
+
+def decode_name_frame(body: bytes) -> dict:
+    """解析 upstockname 响应帧，提取各市场段的股票名称。
+
+    遍历所有 ``[name_<MARKET>]`` 段，对纯文本段直接解出 ``CODE→NAME`` 映射；
+    对块状变长 LZ 编码段（沪/深 A 股 name_16_16 等）当前跳过并记录到
+    ``skipped`` —— 这类段的 match 字节 offset/len 编码尚未逆向完成
+    （见模块 docstring 与 HANDOFF §6）。
+
+    Args:
+        body: upstockname 响应帧体。
+
+    Returns:
+        dict::
+
+            {
+              "names": {code: name, ...},   # 所有可解段合并（后段覆盖前段）
+              "by_segment": {seg_name: {code: name, ...}, ...},
+              "skipped": [seg_name, ...],    # 块状编码、未解的段
+              "segments": [(seg_name, data_len, kind), ...],  # kind: "text"/"block"
+            }
+    """
+    result = {
+        "names": {},
+        "by_segment": {},
+        "skipped": [],
+        "segments": [],
+    }
+    for seg_name, ds, de in _iter_name_segments(body):
+        seg_data = body[ds:de]
+        # 先按段名快速判断，再用启发式兜底
+        base = seg_name.split("_")[0] if "_" in seg_name else seg_name
+        is_block = (seg_name in _BLOCK_ENCODED_SEGMENTS
+                    or base in ("16", "168")
+                    or _is_block_encoded(seg_data))
+        if is_block:
+            result["skipped"].append(seg_name)
+            result["segments"].append((seg_name, len(seg_data), "block"))
+            logger.debug("decode_name_frame: 跳过块状编码段 [%s] (%dB)",
+                         seg_name, len(seg_data))
+            continue
+        seg_names = _parse_name_text(seg_data)
+        result["by_segment"][seg_name] = seg_names
+        result["names"].update(seg_names)
+        result["segments"].append((seg_name, len(seg_data), "text"))
+        logger.debug("decode_name_frame: 解析纯文本段 [%s] → %d 条名称",
+                     seg_name, len(seg_names))
+    return result
+
+
+# =============================================================================
 # 短线精灵（DXJL）—— 9601 端口 qurealorder 历史翻页
 # （移植自 thspy，PC 远航版复用同一 9601 协议）
 # =============================================================================
@@ -1439,6 +1717,26 @@ ANOMALY_MAP_DXJL = {
     # 远价位垫单/压单（有金额）
     (0xa4, b"\xff\x32\x32\x00"): "远价位垫单",
     (0xa5, b"\x00\xe6\x00\x00"): "远价位压单",
+}
+
+# 仅按异动字节的回退映射（推送帧常无方向标记 ff323200/00e60000）。
+# d6/d7 等由异动字节唯一确定；bc/bd/be/bf 需方向标记区分，回退取主动类。
+ANOMALY_BYTE_MAP = {
+    0xd6: "大笔买入", 0xd7: "大笔卖出",
+    0xd1: "区间放量涨", 0xd2: "区间放量跌",
+    0xd8: "涨停封板", 0xda: "跌停封板",
+    0xd9: "打开涨停板", 0xdb: "打开跌停板",
+    0xdc: "急速拉升", 0xdd: "猛烈打压",
+    0xe0: "逼近涨停", 0xe1: "逼近跌停",
+    0xe2: "涨停大减", 0xe3: "跌停大减",
+    0xe4: "强势封涨停", 0xee: "强势封跌停",
+    0x66: "特大挂买", 0x67: "特大挂卖",
+    0xa2: "拖拉机挂买", 0xa3: "拖拉机挂卖",
+    0xa4: "远价位垫单", 0xa5: "远价位压单",
+    0x6c: "撤特大买", 0x6d: "撤涨停买",
+    0x6e: "撤特大卖", 0x6f: "撤跌停卖",
+    0xbc: "特大主动买", 0xbd: "特大被动买",
+    0xbe: "特大主动卖", 0xbf: "特大被动卖",
 }
 
 
@@ -1725,56 +2023,220 @@ def build_subrealorder_query(instance: int, market: int,
 _PUSH_CODE_RE_A = re.compile(rb"\x21([036]\d{5})")
 _PUSH_CODE_RE_B = re.compile(rb"\x2d.{1,2}([036]\d{5})", re.DOTALL)
 
+# 涨幅字段的 THS LE32 模式：低 3 字节为 abs(涨幅%)×100 的整数，高字节 0xa0(正)/0xa8(负)
+_PUSH_CHG_RE = re.compile(rb"([\x00-\xff]{3})[\xa0\xa8]")
+
+
+def _extract_push_payload(raw: bytes) -> bytes:
+    """[已废弃] 从 push 记录的 raw_bytes 提取纯数据区（跳过 Format B/A 壳），
+    并包含格式 B 声明长度之后的 extra 字节。
+
+    2026-07-22：parse_pushrealorder_response 已重写为异动字节锚定 + THS float
+    精确解码，不再调用本函数。保留供历史参考。
+
+    原 docstring（Format B/A 壳解析）:
+      Format B: 0x2d + len(1B) + [market_prefix(1B)?] + code(6B) + payload [+ extra ...]
+      Format A: 0x21 + code(6B) + payload
+    """
+    if not raw:
+        return b""
+    if raw[0] == 0x2d and len(raw) >= 3:          # Format B
+        dlen = raw[1]
+        data = raw[2:2 + dlen]                     # 声明长度的数据
+        extra = raw[2 + dlen:]                     # 声明长度之后的额外字节
+        # 检查是否有市场前缀（代码以 '0'-'9' 即 0x30-0x39 开头）
+        if len(data) >= 7 and data[0] not in range(0x30, 0x3A):
+            return data[7:] + extra                # 前缀(1) + 代码(6) = 7 字节
+        elif len(data) >= 6:
+            return data[6:] + extra                # 代码(6)
+        return data + extra
+    elif raw[0] == 0x21 and len(raw) >= 7:         # Format A
+        return raw[7:]                             # 标记(1) + 代码(6)
+    return raw
+
+
+def _decode_push_single(raw: bytes) -> dict:
+    """[已废弃] 解码单条推送记录的数值字段（金额、涨幅）。
+
+    2026-07-22：parse_pushrealorder_response 已重写（异动字节锚定 + THS float
+    精确解码，金额/涨幅 100% 准确），不再调用本函数。保留供历史参考。
+
+    编码发现（2026-07-21，245 条对照样本验证）：
+    - 涨幅：THS 定点 LE32，高字节 0xa0(正)/0xa8(负)，exp=2（÷100），
+           低 3 字节 = abs(涨幅%)×100。检测率 93%。
+    - 金额：THS 定点 LE32，位于 payload 内。检测率受偏移变化影响。
+
+    策略：
+    1. 先去壳（跳过 Format B/A 头部），得到纯 payload
+    2. 在 payload 中扫描 0xa0/0xa8 结尾的 4 字节窗口 → 涨幅
+    3. 在 payload 中扫描所有 THS LE32，过滤取最大非涨幅正数 → 金额候选
+    """
+    result = {"金额": 0.0, "涨幅": 0.0, "金额_来源": "none"}
+    payload = _extract_push_payload(raw)
+    if len(payload) < 4:
+        return result
+
+    # ── 涨幅：扫描 3 数据字节 + 0xa0/0xa8 标记 ──
+    best_chg = None
+    best_chg_abs = 0.0
+    for i in range(len(payload) - 3):
+        if payload[i + 3] in (0xa0, 0xa8):
+            le32 = int.from_bytes(payload[i:i + 4], "little")
+            val = decode_ths_float(le32)
+            # 涨幅应该在合理范围内（±100），过滤掉异常大的 THS 解码值
+            if abs(val) <= 200 and abs(val) > best_chg_abs:
+                best_chg = val
+                best_chg_abs = abs(val)
+    if best_chg is not None:
+        result["涨幅"] = best_chg
+
+    # ── 金额：THS LE32 + plain LE32 ──
+    AMT_MIN = 10000
+    AMT_MAX = 500000000
+    best_amt = 0.0
+
+    # 优先在涨幅标记前 30 字节搜索
+    search_range = range(len(payload) - 3)
+    if best_chg is not None:
+        for i in range(len(payload) - 3):
+            if payload[i + 3] in (0xa0, 0xa8):
+                le32_chk = int.from_bytes(payload[i:i + 4], "little")
+                val_chk = decode_ths_float(le32_chk)
+                if abs(val_chk - best_chg) < 0.01:
+                    chg_end = i + 4
+                    search_start = max(0, chg_end - 30)
+                    search_range = range(search_start, chg_end - 3)
+                    break
+
+    for i in search_range:
+        le32 = int.from_bytes(payload[i:i + 4], "little")
+        # THS 定点
+        val = decode_ths_float(le32)
+        if AMT_MIN < val < AMT_MAX and val > best_amt:
+            best_amt = val
+        # plain unsigned LE32（部分记录金额是纯整数）
+        if AMT_MIN < le32 < AMT_MAX and float(le32) > best_amt:
+            best_amt = float(le32)
+
+    if best_amt > 0:
+        result["金额"] = best_amt
+        result["金额_来源"] = "ths_le32"
+
+    return result
+
 
 def parse_pushrealorder_response(body: bytes) -> list[dict]:
     """解析 9601 pushrealorder 推送帧，返回异动记录列表。
 
-    推送帧结构（文档 §7）：
-      文本头: ``\\tmethod=pushrealorder\\ninstid=...\\nmarket=...\\n...\\n\\x00``
-      hq1.0 容器头 + 记录区
+    推送帧结构（2026-07-22 确认，见 HANDOFF §8）::
 
-    记录区每条以 tag 字节开头：
-      ``0x21('!')`` + 6字节ASCII代码 / ``0x2d('-')`` + 变长 / ``0xa0``/``0xa8`` 数值
+        文本头: \\tmethod=pushrealorder\\ninstid=...\\nmarket=...\\n...\\n\\x00
+        hq1.0 容器头 (88B) + 记录区
 
-    本解析器提取股票代码 + 市场标记 + 原始记录字节。数值字段（金额/价格/量）
-    的精确解码待逆向（文档 §7.5 标注），保留 raw_bytes 供后续分析。
+    记录区::
+
+        [marker 0x11/0x21] [代码 6B ASCII] [01 25 09 01 50 ...]
+          └─ 每条异动子记录（同一代码可有多条）:
+             [异动字节 d6/d7/66...] [0c 08 40 头] [方向标记 ff323200/00e60000]
+             [变长中间字段] [金额 THS float 4B] [涨幅 THS float 4B]
+
+    数值字段解码（2026-07-22 历史对照 100% 验证）：
+      - 涨幅 = THS float（LE32，高字节 a0=正/a8=负），扫描异动字节后首个 a0/a8 标记
+      - 金额 = THS float（LE32），紧跟涨幅前 4 字节
+      - 异动类型 = (异动字节, 方向标记) 组合查 ANOMALY_MAP_DXJL
+
+    Args:
+        body: pushrealorder 响应帧 body（含文本头 + hq1.0 容器）。
 
     Returns:
-        list[dict]，每项 ``{代码, 市场, raw_bytes}``。非 pushrealorder 帧返回空。
+        list[dict]，每项 ``{代码, 市场, 异动类型, 异动编码, 金额, 涨幅, raw_bytes}``。
+        非 pushrealorder 帧返回空。
     """
+    if b"pushrealorder" not in body:
+        return []
+
     # 文本头里的 market 字段
     market = ""
     m = re.search(rb"market=(\d+)", body[:200])
     if m:
         market = m.group(1).decode("ascii", errors="replace")
 
-    # 定位记录区：找 hq1.0 魔数，记录区在其后的字段表之后。
-    # 简化：在整个 body 里扫描代码标记（pushrealorder 帧的记录区特征）。
-    # 用两种正则提取代码（格式A: !+代码，格式B: -+长度+代码）。
     records = []
-    seen_codes = set()
-    # 合并两种 pattern 的匹配结果，按位置排序
-    matches = []
+    # 异动字节集合（ANOMALY_MAP_DXJL 的所有 key 低字节）
+    anomaly_bytes = set(k[0] for k in ANOMALY_MAP_DXJL)
+    # 方向标记
+    dir_buy = b"\xff\x32\x32\x00"   # 买/涨方向
+    dir_sell = b"\x00\xe6\x00\x00"  # 卖/跌方向
+
+    # 扫描所有代码标记（格式A: 0x21+代码，格式B: 0x2d+变长+代码）
+    code_matches = []
     for pat in (_PUSH_CODE_RE_A, _PUSH_CODE_RE_B):
-        matches.extend(pat.finditer(body))
-    matches.sort(key=lambda m: m.start())
-    for m in matches:
-        code = m.group(1).decode("ascii", errors="replace")
-        if code in seen_codes:
-            continue
-        seen_codes.add(code)
-        # 截取这条记录的原始字节（从代码标记到下一个代码标记，最多 48 字节）
-        start = m.start()
-        nxt_start = None
-        for nm in matches:
-            if nm.start() > m.end():
-                nxt_start = nm.start()
-                break
-        end = nxt_start if nxt_start else min(start + 48, len(body))
-        raw = body[start:end]
-        records.append({
-            "代码": code,
-            "市场": market,
-            "raw_bytes": raw.hex(),
-        })
+        code_matches.extend(pat.finditer(body))
+    code_matches.sort(key=lambda cm: cm.start())
+
+    for i, cm in enumerate(code_matches):
+        code = cm.group(1).decode("ascii", errors="replace")
+        # 记录区范围：本代码到下一代码（或帧尾）
+        rec_start = cm.start()
+        rec_end = code_matches[i + 1].start() if i + 1 < len(code_matches) else len(body)
+        rec = body[rec_start:rec_end]
+
+        # 在此代码的记录区扫描异动记录。
+        # 有效异动记录 = 异动字节 + 后跟 0c 08 40 头（字段 64 方向标记的前缀）。
+        # 这避免把数据区碰巧等于异动字节的字节误判为异动。
+        j = 0
+        while j < len(rec) - 7:
+            ab = rec[j]
+            if ab not in anomaly_bytes:
+                j += 1
+                continue
+            # 要求异动字节后紧跟 0c 08 40 头（容忍 0c 08 的其他变体）
+            if rec[j + 1:j + 4] != b"\x0c\x08\x40":
+                j += 1
+                continue
+
+            # 0c 08 40 头之后是方向标记 + 变长字段 + 金额 + 涨幅
+            # 方向标记（ff323200 或 00e60000，在头后 16 字节内）
+            direction = b""
+            search_region = rec[j + 4:j + 20]
+            for marker in (dir_buy, dir_sell):
+                mp = search_region.find(marker)
+                if mp >= 0:
+                    direction = marker
+                    break
+
+            # 异动类型：优先用 (异动字节, 方向标记) 精确匹配，
+            # 方向标记缺失时回退到仅异动字节（ANOMALY_BYTE_MAP）。
+            if direction:
+                anomaly_type = ANOMALY_MAP_DXJL.get(
+                    (ab, direction), ANOMALY_BYTE_MAP.get(ab, f"未知0x{ab:02x}"))
+            else:
+                anomaly_type = ANOMALY_BYTE_MAP.get(ab, f"未知0x{ab:02x}")
+
+            # 扫描涨幅：异动字节后首个 a0/a8 结尾的 THS float（值在 ±50 内）
+            change_pct = 0.0
+            amount = 0.0
+            for pos in range(j + 4, min(j + 25, len(rec) - 3)):
+                if rec[pos + 3] in (0xa0, 0xa8):
+                    val = decode_ths_float(struct.unpack("<I", rec[pos:pos + 4])[0])
+                    if -50 < val < 50:
+                        change_pct = round(val, 2)
+                        # 金额 = 涨幅前 4 字节（THS float）
+                        if pos >= 4:
+                            amt_val = decode_ths_float(
+                                struct.unpack("<I", rec[pos - 4:pos])[0])
+                            if 10000 < amt_val < 1_000_000_000:
+                                amount = round(amt_val, 2)
+                        break
+
+            records.append({
+                "代码": code,
+                "市场": market,
+                "异动类型": anomaly_type,
+                "异动编码": ab,
+                "金额": amount,
+                "涨幅": change_pct,
+                "raw_bytes": rec[j:j + 20].hex(),
+            })
+            j += 4  # 跳过已处理的异动记录头
     return records

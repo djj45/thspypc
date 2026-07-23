@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import datetime
+import json
 import logging
 import os
 import socket
@@ -30,6 +32,8 @@ from .protocol import (
     build_qurealorder_query,
     build_stock_list_query,
     build_subreal_query,
+    build_upstockname_request,
+    decode_name_frame,
     encode_frame,
     full_http_auth,
     generate_imei,
@@ -440,9 +444,79 @@ class THSClient:
         logger.warning("list_quotes: 8 帧内未找到 hd 数据帧")
         return []
 
+    def stock_list_hot(
+        self,
+        count: int = 29,
+        timeout: float = 10.0,
+        with_names: bool | str = False,
+    ) -> list[dict]:
+        """获取当前活跃的热门股票代码列表（轻量 API，~1s）。
+
+        使用 DataType=199112 排序查询（同花顺打开 A 股列表时发的请求），
+        服务器返回按 SortBy 排序的前 N 条记录。由于无翻页，只拿一批。
+
+        ⚠ 此路径**不能拿全量**（约 29 条，且可能重复）。
+        拿全量代码表请用 ``stock_list()``。
+
+        Args:
+            count: 返回条数，默认 29（对齐 hexin 客户端第一页）。
+            timeout: 超时时间（秒）。
+            with_names: 是否填充中文名称（同 stock_list 的 with_names 参数）。
+
+        Returns:
+            list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``。
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        if self._sock is None:
+            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+
+        req = build_stock_list_query(
+            markets=(17, 22, 151),
+            sort_count=count,
+            datatype=[199112],
+        )
+
+        with self._sock_lock:
+            sock = self._sock
+            sock.sendall(req)
+            sock.settimeout(timeout)
+            try:
+                resp = read_frame(sock)
+            except (socket.timeout, OSError) as e:
+                logger.error("stock_list_hot: 读取响应失败: %s", e)
+                return []
+
+        if not resp:
+            logger.warning("stock_list_hot: 无响应")
+            return []
+
+        meta = parse_stock_list_response(resp)
+        stocks = meta.get("stocks", [])
+        logger.info("stock_list_hot: 获取 %d 条（共 %d 条）",
+                    len(stocks), meta.get("sort_total", 0))
+
+        # 可选名称填充
+        if with_names and stocks:
+            stockname_dir = with_names if isinstance(with_names, str) else None
+            name_map = THSClient.load_hexin_names(stockname_dir)
+            if name_map:
+                filled = 0
+                for s in stocks:
+                    nm = name_map.get(s["code"], "")
+                    if nm:
+                        s["name"] = nm
+                        filled += 1
+                logger.info("stock_list_hot: 从 hexin 缓存填充 %d/%d 条名称",
+                            filled, len(stocks))
+
+        return stocks
+
     def stock_list(
         self,
         timeout: float = 30.0,
+        with_names: bool | str = False,
     ) -> list[dict]:
         """获取全市场股票代码列表（沪深+北交所+新三板+基金，~7400 条）。
 
@@ -455,15 +529,17 @@ class THSClient:
         推送 dc≈7422 的全量 hd3.1 帧。本方法用 ``data/stock_list_replay.bin``
         里固化的 4 个请求段（提取自 cold_start.pcap stream 44 帧1619/1965/2308/2481）。
 
-        ⚠ 响应**不含股票名称**（dt55 字段全 0）。名称走单独的 upstockname 请求，
-        尚未实现。返回的 stocks 里 name 恒为 ""。
-
         Args:
             timeout: 收尾读取的总时长（秒）。重放后服务器陆续推送，需等全量帧到达。
+            with_names: 是否填充中文名称。
+                - False: 不填名称（默认，快）
+                - True: 自动从同花顺本地缓存加载名称（需安装同花顺 PC 客户端）
+                - str: 指定 stockname 目录路径
 
         Returns:
-            list[dict]，每项 ``{"code": "600000", "name": ""}``。
+            list[dict]，每项 ``{"code": "600000", "name": "浦发银行"}``。
             约 7400 条，按 dt5 代码字段顺序（通常代码升序）。
+            with_names=False 时 name 恒为 ""。
 
         Raises:
             RuntimeError: 未登录。
@@ -538,7 +614,417 @@ class THSClient:
         else:
             logger.warning("stock_list: 重放后未收到全量代码表帧 "
                            "（可能服务器实例未响应，重连换 IP 重试）")
+
+        # 可选：从 hexin 本地缓存填充中文名称
+        if with_names:
+            stockname_dir = with_names if isinstance(with_names, str) else None
+            name_map = THSClient.load_hexin_names(stockname_dir)
+            if name_map:
+                filled = 0
+                for s in best_stocks:
+                    nm = name_map.get(s["code"], "")
+                    if nm:
+                        s["name"] = nm
+                        filled += 1
+                logger.info("stock_list: 从 hexin 缓存填充 %d/%d 条名称",
+                            filled, len(best_stocks))
+
         return best_stocks
+
+    def stock_list_cached(
+        self,
+        *,
+        cache_path: str | None = None,
+        refresh: bool = False,
+        with_names: bool = True,
+        timeout: float = 30.0,
+    ) -> list[dict]:
+        """获取全市场股票代码表（带本地缓存，有效期一天=自然日）。
+
+        :meth:`stock_list` 的缓存版：当天首次调用走网络拉取（~6s）并写盘，
+        之后当天再调用直接读缓存（~瞬时），不再发网络请求。跨自然日自动失效。
+
+        缓存文件 ``~/.ths_stock_codes.json``（见 :func:`default_stock_cache_path`），
+        含全量代码 + 名称 + 派生市场码（沪=17/深=33），可直接喂给
+        :meth:`list_quotes`。
+
+        Args:
+            cache_path: 缓存文件路径，None 用默认路径。
+            refresh: True 时强制刷新（忽略缓存，重新走网络拉取并覆盖写盘）。
+            with_names: 网络拉取时是否填充名称。默认 True（缓存场景几乎都要名称，
+                且只写盘一次）。缓存命中时此参数无效（名称已存盘）。
+            timeout: 网络拉取的总超时（秒），传给 :meth:`stock_list`。
+
+        Returns:
+            list[dict]，每项 ``{"code", "name", "market"}``，约 7400 条。
+            market 为派生值：17=沪市 A 股、33=深市 A 股、None=北交所/新三板/基金
+            （list_quotes 当前不支持的市场，仍保留 code+name 供其他用途）。
+
+        Raises:
+            RuntimeError: 未登录（缓存未命中需走网络时）。
+        """
+        path = cache_path or default_stock_cache_path()
+        if not refresh:
+            loaded = load_stock_codes(path)
+            if loaded is not None:
+                stocks, saved_date = loaded
+                logger.info("stock_list_cached: 命中缓存 (%s, %d 条)",
+                            saved_date, len(stocks))
+                return stocks
+        # 缓存不存在/过期/强制刷新 → 走网络
+        logger.info("stock_list_cached: 缓存未命中，走 stock_list() 拉取...")
+        stocks = self.stock_list(timeout=timeout, with_names=with_names)
+        # 覆盖 market 字段为派生值（stock_list 返回的 market 恒为 0）
+        for s in stocks:
+            s["market"] = market_from_code(s["code"])
+        # 仅在拿到有效结果时写盘，避免失败的拉取被缓存一整天
+        if stocks:
+            save_stock_codes(stocks, path)
+        else:
+            logger.warning("stock_list_cached: 拉取为空，不写缓存（可重试）")
+        return stocks
+
+    # ── 全市场快照（hfd1.0 空括号协议）──
+
+    @staticmethod
+    def _try_market_snapshot_on_host(
+        username: str,
+        password: str,
+        imei: str,
+        mac64: str,
+        markets: list[int] | None = None,
+        timeout: float = 10.0,
+        max_attempts: int = 5,
+    ) -> tuple[list[dict], str]:
+        """反复尝试在不同 host 上发 market_snapshot，直到成功。
+
+        服务器集群中只有部分 host 支持 hfd1.0 空括号快照（实测 122.9.202.190 可，
+        122.9.125.190 不可）。本方法反复重连直到命中支持 host。
+
+        Returns:
+            (records, server_ip): 成功时的记录列表和服务器 IP。
+            全部失败时返回 ([], "")。
+        """
+        last_error = ""
+        for attempt in range(max_attempts):
+            client = THSClient(username, password, imei=imei, mac64=mac64,
+                               enable_heartbeat=False)
+            r = client.connect()
+            if not r.success:
+                last_error = f"登录失败: {r.error}"
+                continue
+
+            req = protocol.build_market_snapshot_query(markets=markets)
+            try:
+                client._sock.sendall(req + b"\n")
+                client._sock.settimeout(timeout)
+                raw = protocol.read_frame(client._sock)
+            except (socket.timeout, OSError, ValueError) as e:
+                last_error = f"读响应失败: {e}"
+                client.disconnect()
+                continue
+
+            if raw and b"hfd1.0" in raw:
+                try:
+                    from thspypc.parse_hfd1 import parse_hfd1_response
+                    records = parse_hfd1_response(raw)
+                    logger.info("market_snapshot: host=%s 成功, %d 条",
+                                r.server, len(records))
+                    client.disconnect()
+                    return records, r.server
+                except Exception as e:
+                    last_error = f"解析失败: {e}"
+                    client.disconnect()
+                    continue
+            else:
+                last_error = f"host={r.server} 不支持 hfd1.0"
+                client.disconnect()
+                continue
+
+        logger.warning("market_snapshot: 全部 %d 次尝试失败 (%s)",
+                       max_attempts, last_error)
+        return [], ""
+
+    def market_snapshot(
+        self,
+        markets: list[int] | None = None,
+        timeout: float = 10.0,
+    ) -> list[dict]:
+        """全市场行情快照：一个请求拿沪深全市场 code+name（~0.13s）。
+
+        ⚠️  本方法在**新连接**上执行（因为 hfd1.0 空括号请求需要特定的
+        服务器 host，可能与当前连接不同）。调用后当前连接不受影响。
+
+        使用空括号 ``CodeList=16();17();...`` 语法，服务器一次性返回整个市场的
+        股票代码和名称。相比 :meth:`list_quotes` 逐批查询（~250 请求），本方法
+        只需 1 个请求，速度提升 2~3 个数量级。
+
+        ⚠️  数值字段（price/change_pct 等）当前为近似值，通过 THS float 扫描推断，
+        准确度有限。对于准确行情请用 :meth:`list_quotes`。
+
+        Args:
+            markets: 市场码列表，None 用默认全市场（16-22/144-151 沪深全）。
+            timeout: 单次响应超时（秒）。
+
+        Returns:
+            list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``，
+            约 1200+ 条（当前锚点覆盖率）。数值字段可能为 None（解析未对齐时）。
+        """
+        records, server = self._try_market_snapshot_on_host(
+            self.username, self.password, self.imei, self.mac64,
+            markets=markets, timeout=timeout)
+        if server:
+            logger.info("market_snapshot: %s 返回 %d 条", server, len(records))
+        return records
+
+    def market_snapshot_with_quotes(
+        self,
+        timeout: float = 60.0,
+        batch_size: int = 30,
+        hfd1_only: bool = False,
+    ) -> list[dict]:
+        """全市场行情快照：沪深全市场 code+name+准确行情。
+
+        | 数据源 | 沪市 A + 三板/基金 | 深市 A |
+        |--------|-------------------|--------|
+        | code   | hfd1.0 快照（1请求） | stock_list 缓存 |
+        | name   | hfd1.0 快照 | stock_list 缓存 |
+        | quotes | list_quotes 回填 | list_quotes 回填 |
+
+        核心策略：
+          1. hfd1.0 空括号请求 → SH A + 三板/基金 code+name（~0.13s）
+          2. stock_list 缓存 → 深市 code+name（~瞬时）
+          3. list_quotes 批量回填 → 全部股票的准确行情
+
+        Args:
+            timeout: list_quotes 总超时（秒）。
+            batch_size: 每批 list_quotes 数量。
+            hfd1_only: True 时只返回 hfd1.0 覆盖的市场（沪市/三板），
+                不包含深市。默认 False。
+
+        Returns:
+            list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``。
+            code 和 name 来自 hfd1.0/stock_list，数值来自 list_quotes
+            （盘中准确值，需在交易时段调用）。
+        """
+        # 1. hfd1.0 取沪市/三板 code+name
+        hfd1_records, _ = self._try_market_snapshot_on_host(
+            self.username, self.password, self.imei, self.mac64,
+            timeout=10.0)
+        hfd1_by_code = {r["code"]: r for r in hfd1_records}
+
+        # 2. stock_list 缓存取全量代码（含深市）
+        stock_codes = self.stock_list_cached(with_names=True)
+        all_by_code: dict[str, dict] = {}
+
+        for s in stock_codes:
+            code = s["code"]
+            name = s.get("name", hfd1_by_code.get(code, {}).get("name", ""))
+            all_by_code[code] = {"code": code, "name": name}
+
+        # 用 hfd1.0 的名称覆盖（更完整）
+        for code, r in hfd1_by_code.items():
+            if code in all_by_code:
+                all_by_code[code]["name"] = r.get("name", all_by_code[code]["name"])
+
+        if hfd1_only:
+            return list(all_by_code.values())
+
+        # 3. list_quotes 批量回填行情
+        datatype = [5, 7, 8, 9, 10, 13, 18, 19, 48, 49]
+        codes_all = list(all_by_code.keys())
+        quote_count = 0
+
+        for i in range(0, len(codes_all), batch_size):
+            batch = codes_all[i:i + batch_size]
+            try:
+                mkt = market_from_code(batch[0]) if batch else 17
+                recs = self.list_quotes(batch, market=mkt,
+                                        datatype=datatype,
+                                        timeout=min(timeout, 15))
+                for r in recs:
+                    code = r.get("code", "")
+                    if code and code in all_by_code:
+                        all_by_code[code].update({
+                            "price": r.get("price"),
+                            "change_pct": r.get("change_pct"),
+                            "high": r.get("high"),
+                            "low": r.get("low"),
+                            "open": r.get("open"),
+                            "amount": r.get("amount"),
+                            "volume": r.get("volume"),
+                            "prev_close": r.get("prev_close"),
+                        })
+                        quote_count += 1
+            except Exception as e:
+                logger.debug("market_snapshot batch %s 失败: %s", batch[:3], e)
+
+        result = list(all_by_code.values())
+        logger.info("market_snapshot_with_quotes: %d 条, 回填 %d 条行情",
+                    len(result), quote_count)
+        return result
+
+    # ── 股票名称（网络 upstockname 协议）──
+
+    def fetch_stock_names(
+        self,
+        market: str = "URS",
+        stock_name_ver: str = ";;",
+        timeout: float = 10.0,
+    ) -> dict:
+        """通过 upstockname 协议从服务器获取股票名称（探索性能力）。
+
+        ⚠ **默认名称源是** :meth:`load_hexin_names`（同花顺本地缓存，瞬时、稳定、
+        覆盖沪深北 A 股）。本方法仅作探索性补充——且对主用途（A 股名称）无增益：
+        thspypc 拿到的增量帧恰好是未解的 ``name_16_16`` 块状段。
+
+        发送 ``method=upstockname`` 请求，解析响应中的 ``[name_<MARKET>]`` 段。
+        纯文本段（外汇/期货/北交所/外盘等）直接解出；块状自定义编码段
+        （沪深 A 股 ``name_16_16``）当前跳过（编码未逆向，简单模型已穷举证伪，见
+        :func:`thspypc.protocol.decode_name_frame` 与 HANDOFF §6a/§6b）。
+
+        服务器按账号追踪名称版本，thspypc 账号通常只能拿到**增量**（~12 条），
+        全量需 hexin 客户端冷启动触发。本方法适合补充 :meth:`load_hexin_names`
+        覆盖不到的市场（外盘/期货）。
+
+        Args:
+            market: 市场通道码（``URS``/``UNX``/``UCX``/``UNS``/``UHI`` …）。
+            stock_name_ver: 本地版本号，``;;`` 请求全量（实际仍可能只回增量）。
+            timeout: 读响应总时长（秒）。
+
+        Returns:
+            :func:`decode_name_frame` 的结果 dict::
+
+                {
+                  "names": {code: name, ...},
+                  "by_segment": {...},
+                  "skipped": [...],   # 块状编码、未解的段名
+                  "segments": [(seg_name, data_len, kind), ...],
+                }
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        if self._sock is None:
+            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+
+        req = build_upstockname_request(market, stock_name_ver)
+        names_result: dict = {
+            "names": {}, "by_segment": {}, "skipped": [], "segments": [],
+        }
+        with self._sock_lock:
+            sock = self._sock
+            if not sock:
+                return names_result
+            sock.sendall(req)
+            sock.settimeout(2.0)
+            t0 = time.time()
+            # 名称帧通常 1~2 帧就到；读到含 [name_ 的帧后继续读 2s 收尾
+            got_name = False
+            while True:
+                if got_name and (time.time() - t0 > 4):
+                    break
+                if not got_name and (time.time() - t0 > timeout):
+                    break
+                try:
+                    resp = read_frame(sock)
+                    if not resp:
+                        continue
+                except (socket.timeout, OSError):
+                    continue
+                except ValueError:
+                    try:
+                        sock.settimeout(1.0)
+                        sock.recv(8192)
+                        sock.settimeout(2.0)
+                    except Exception:
+                        pass
+                    continue
+                # 名称帧特征：含 [name_ 或 MarketCode 或 upnametype
+                if b"[name_" in resp or b"upnametype" in resp or b"MarketCode" in resp:
+                    got_name = True
+                    r = decode_name_frame(resp)
+                    names_result["names"].update(r["names"])
+                    names_result["by_segment"].update(r["by_segment"])
+                    names_result["skipped"].extend(r["skipped"])
+                    names_result["segments"].extend(r["segments"])
+
+        logger.info("fetch_stock_names(market=%s): 解出 %d 条名称，跳过 %d 个块状段",
+                    market, len(names_result["names"]), len(names_result["skipped"]))
+        return names_result
+
+    # ── 股票名称加载 ──
+
+    @staticmethod
+    def load_hexin_names(
+        stockname_dir: str | None = None,
+    ) -> dict[str, str]:
+        """从同花顺本地缓存加载股票代码→名称映射（**默认名称源**）。
+
+        这是获取 A 股名称的推荐方式——瞬时、稳定、零网络依赖，覆盖沪深北交易所。
+        相比网络协议 :meth:`fetch_stock_names`（块状段未解、只能拿增量），本方法
+        是主用途的首选。
+
+        读取 ``<hexin_dir>/stockname/stockname_*_0.txt`` 文件，
+        解析 ``CODE=NAME|ALIAS@FLAG`` 格式。仅保留 6 位数字代码。
+
+        Args:
+            stockname_dir: stockname 目录路径。为 None 时自动探测常见安装位置：
+                ``C:/同花顺软件/同花顺/stockname/``。
+
+        Returns:
+            dict[str, str]，键为 6 位数字代码（如 "600000"），值为中文名称（如 "浦发银行"）。
+            约 8000+ 条（覆盖沪深北交易所）。
+        """
+        if stockname_dir is None:
+            # 自动探测常见安装路径
+            candidates = [
+                r"C:\同花顺软件\同花顺\stockname",
+                r"D:\同花顺软件\同花顺\stockname",
+                os.path.expandvars(r"%LOCALAPPDATA%\同花顺\stockname"),
+                os.path.expandvars(r"%APPDATA%\同花顺\stockname"),
+            ]
+            for c in candidates:
+                if os.path.isdir(c):
+                    stockname_dir = c
+                    break
+        if not stockname_dir or not os.path.isdir(stockname_dir):
+            logger.warning("load_hexin_names: stockname 目录不存在，返回空映射。"
+                           "请安装同花顺 PC 客户端或手动指定 --stockname-dir")
+            return {}
+
+        names: dict[str, str] = {}
+        for fname in sorted(os.listdir(stockname_dir)):
+            # 只读 _0.txt 基础文件（_1.txt 是增量，.base 是备份）
+            if not (fname.endswith("_0.txt") and fname.startswith("stockname_")):
+                continue
+            fpath = os.path.join(stockname_dir, fname)
+            try:
+                with open(fpath, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            try:
+                text = raw.decode("gbk", errors="replace")
+            except UnicodeDecodeError:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("[") or line.startswith("ConfigVer"):
+                    continue
+                if "=" not in line:
+                    continue
+                code, _, rest = line.partition("=")
+                # 只取 6 位纯数字代码（A 股/北交所/新三板）
+                if not (code.isdigit() and len(code) == 6):
+                    continue
+                name = rest.split("|")[0].split("@")[0].strip()
+                if name:
+                    names[code] = name
+
+        logger.info("load_hexin_names: 从 %s 加载 %d 条名称",
+                    stockname_dir, len(names))
+        return names
 
     # ── 自定义板块/自选股管理（门面方法，委托给 BlockManager）──
 
@@ -903,3 +1389,136 @@ class THSClient:
 
     def __exit__(self, *exc):
         self.disconnect()
+
+
+# ── 全市场股票代码表本地缓存（有效期一天=自然日）──────────────────────────────
+# 仿 qr_login 的缓存模式：JSON 存 home 目录，saved_date 按自然日判断失效。
+# stock_list() 拉取 ~7400 条代码一次后写盘，当天重复查询直接读缓存。
+
+def default_stock_cache_path() -> str:
+    """股票代码表缓存的默认路径（用户 home 目录，跨平台）。"""
+    return os.path.join(os.path.expanduser("~"), ".ths_stock_codes.json")
+
+
+def market_from_code(code: str) -> int | None:
+    """按股票代码前缀派生 ``list_quotes`` 的市场码。
+
+    ``stock_list()`` 返回的 market 字段恒为 0（dt5 首字节在解码中丢失，
+    见 ``protocol._dt5_market``），无法直接用。本函数按 A 股代码前缀规则
+    派生 ``list_quotes`` 能认的市场码（17=沪 33=深，见
+    ``build_list_quote_query`` docstring）。
+
+    Args:
+        code: 6 位数字股票代码（如 "600000"、"000001"、"300750"）。
+
+    Returns:
+        17（沪市 A 股/科创板）、33（深市 A 股/创业板），或 None（北交所/
+        新三板/基金等 list_quotes 当前不支持的市场）。
+    """
+    if len(code) < 3:
+        return None
+    p = code[:3]
+    # 沪市 A 股（600/601/603/605）+ 科创板（688）
+    if p in ("600", "601", "603", "605") or p == "688":
+        return 17
+    # 深市 A 股（000/001/002/003）+ 创业板（300/301）
+    if p in ("000", "001", "002", "003", "300", "301"):
+        return 33
+    # 北交所（8xxxxx/920xxx）、新三板（830-839）、基金（430/400）等：list_quotes 不支持
+    return None
+
+
+def save_stock_codes(stocks: list[dict], path: str | None = None) -> str:
+    """把全量股票代码表写盘缓存（覆盖写）。
+
+    每条记录保留 ``code/name/market``，并写入 ``saved_date``（自然日，用于失效判断）
+    和 ``saved_at``（Unix 时间戳，调试用）。
+
+    Args:
+        stocks: ``stock_list()`` 的返回值，每项含 ``code``（其余字段如 name/market
+            有则保留，market 会用 :func:`market_from_code` 重新派生覆盖）。
+        path: 缓存路径，None 用 :func:`default_stock_cache_path`。
+
+    Returns:
+        实际写入的文件路径。
+    """
+    path = path or default_stock_cache_path()
+    # 规范化：确保每条有 name/market 字段，market 用派生值覆盖
+    records = []
+    for s in stocks:
+        code = s.get("code", "")
+        if not code:
+            continue
+        records.append({
+            "code": code,
+            "name": s.get("name", ""),
+            "market": market_from_code(code),
+        })
+    data = {
+        "saved_date": datetime.date.today().isoformat(),
+        "saved_at": int(time.time()),
+        "count": len(records),
+        "stocks": records,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info("股票代码表已缓存: %s (%d 条)", path, len(records))
+    except OSError as e:
+        logger.warning("股票代码表写盘失败（不影响本次返回）: %s", e)
+    return path
+
+
+def load_stock_codes(
+    path: str | None = None,
+) -> tuple[list[dict], str] | None:
+    """读取缓存的股票代码表（已过期或损坏时返回 None）。
+
+    Args:
+        path: 缓存路径，None 用 :func:`default_stock_cache_path`。
+
+    Returns:
+        ``(stocks, saved_date)``：stocks 为 ``[{code, name, market}, ...]``，
+        saved_date 为缓存写入的自然日（如 "2026-07-22"）。
+        文件不存在、已过期（跨自然日）或格式错误时返回 None。
+    """
+    path = path or default_stock_cache_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        saved_date = data["saved_date"]
+        stocks = data["stocks"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.warning("股票代码表缓存读取失败（将忽略）: %s", e)
+        return None
+    # 按自然日判断：saved_date 与今天不同即过期
+    today = datetime.date.today().isoformat()
+    if saved_date != today:
+        logger.info("股票代码表缓存已过期 (saved_date=%s, today=%s)",
+                    saved_date, today)
+        return None
+    return stocks, saved_date
+
+
+def is_stock_cache_expired(path: str | None = None,
+                           now: datetime.date | None = None) -> bool:
+    """判断股票代码表缓存是否已过期（按自然日）。
+
+    与 :func:`load_stock_codes` 的内置判断一致：缓存写入的自然日与查询日不同
+    即视为过期。文件不存在或损坏也返回 True。
+
+    Args:
+        path: 缓存路径，None 用默认路径。
+        now: 指定查询日（调试用），None 用 datetime.date.today()。
+
+    Returns:
+        True 表示缓存已过期/不存在/损坏（需重新拉取）。
+    """
+    loaded = load_stock_codes(path)
+    if loaded is None:
+        return True
+    _, saved_date = loaded
+    today = (now or datetime.date.today()).isoformat()
+    return saved_date != today

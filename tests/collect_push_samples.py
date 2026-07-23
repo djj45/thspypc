@@ -58,6 +58,7 @@ def load_dotenv():
 
 
 def match_pushes_with_history(pushes: list[dict], history: list[dict],
+                              full_frames: list[dict] | None = None,
                               time_window_s: float = TIME_WINDOW_S) -> list[dict]:
     """按代码 + 时间窗口匹配推送记录与历史异动。
 
@@ -68,6 +69,9 @@ def match_pushes_with_history(pushes: list[dict], history: list[dict],
     Args:
         pushes: 每项含 {ts(秒级本地时间), code, market, raw_bytes}。
         history: 每项含 {时间(微秒戳), 代码, 异动类型, 异动编码, 金额, 涨跌幅, ...}。
+        full_frames: 完整推送帧列表（每项含 {ts, len, hex}）。若提供，则匹配时
+            附带 push_frame_hex（包含 hq1.0 字段表头 + 完整记录区，离线逆向用）。
+            关联方式：取时间戳最接近 push_ts 的帧。
         time_window_s: 时间窗口（秒）。
 
     Returns:
@@ -110,6 +114,15 @@ def match_pushes_with_history(pushes: list[dict], history: list[dict],
         if key in seen:
             continue
         seen.add(key)
+        # 关联完整帧（离线逆向数值字段用，包含字段表头 + 完整记录区）
+        push_frame_hex = ""
+        if full_frames:
+            best_frame = min(
+                full_frames, key=lambda fr: abs(fr["ts"] - p_ts),
+                default=None,
+            )
+            if best_frame is not None:
+                push_frame_hex = best_frame.get("hex", "")
         matched_rows.append({
             "code": code,
             "hist_type": best.get("异动类型", ""),
@@ -121,6 +134,7 @@ def match_pushes_with_history(pushes: list[dict], history: list[dict],
             "push_ts": round(p_ts, 3),
             "time_diff_s": round(best_diff, 3) if best_diff is not None else "",
             "push_raw_bytes": p.get("raw_bytes", ""),
+            "push_frame_hex": push_frame_hex,
         })
     return matched_rows
 
@@ -214,7 +228,7 @@ def main():
     _save(history, "history.jsonl")
 
     # === 匹配 ===
-    matched_rows = match_pushes_with_history(pushes, history)
+    matched_rows = match_pushes_with_history(pushes, history, full_frames)
     matched_path = os.path.join(DATA_DIR, "matched.csv")
     with open(matched_path, "w", encoding="utf-8", newline="") as f:
         if matched_rows:
