@@ -398,10 +398,16 @@ names = THSClient.load_hexin_names()         # → {"600000": "浦发银行", ..
   `list_quotes` 成功：600000 现价 9.03 涨幅 0.22%、600004 涨幅 0.51%
 - → 证明旧 IP 没退化，之前超时纯粹因为没发 init
 
-**关于 VerifyCode=-1 的澄清**：
-- 不是账号限流，而是**同账号并发会话冲突**——thspypc 和 hexin 客户端同时
-  用同账号登录会导致 -1。hexin 客户端只登录一次保持长连接所以不受影响。
-- 测试时必须确保同花顺客户端已退出，且不要短时间内反复 connect/disconnect。
+**关于 VerifyCode=-1 的澄清**（2026-07-23 抓包分析 hexin 登录模式）：
+- 不是账号限流，而是**同账号同 IP 短时间重复 login 的会话冲突**。
+- hexin 客户端的登录策略（抓包确认）：每 ~20s 重新登录一波，每波**并发连
+  7 个不同 IP**，28 次 login 分布在 18 个 IP 上。同一 IP 重复登录间隔 ≥20s。
+  因此 hexin 从不对同一 IP 短时间狂发 login，不触发冲突。
+- thspypc 的 `connect()` 串行遍历 IP 列表，对每个 IP 发 login——如果测试时
+  反复 connect/disconnect（如调试），几十秒内对同一批 IP 发几十次 login，
+  服务器返回 VerifyCode=-1（会话冲突保护）。
+- **测试要点**：① 确保同花顺客户端已退出（同账号不能两个客户端同时在线）；
+  ② 不要短时间（<20s）内反复 connect；③ 失败后等 30s 再重试。
 
 **199112/stock_list_hot 的 hd1.0 解析**：
 - `_parse_stock_list_hd10_variant` 已实现（199112 小批量响应走 hd1.0 明文变体）
