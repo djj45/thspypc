@@ -22,25 +22,36 @@ from .protocol import (
     REALORDER_HOST,
     REALORDER_PORT,
     STOCK_LIST_DATATYPE,
-    SUBREAL_CHANNELS,
     build_heartbeat_8901,
     build_heartbeat_9601,
     build_init_query,
+    build_kline_query,
     build_list_quote_query,
     build_login_body_pc,
     build_passport64,
     build_qurealorder_query,
     build_stock_list_query,
-    build_subreal_query,
     build_upstockname_request,
+    build_history_timeline_query,
+    build_snapshot_subscribe,
+    build_manual_login_body,
+    build_timeline_query,
     decode_name_frame,
     encode_frame,
     full_http_auth,
     generate_imei,
     generate_mac64,
+    KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN,
+    KLINE_PERIOD_60MIN, KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
     parse_hd1_response,
     parse_hd3_response,
+    parse_kline_hd3_response,
+    parse_history_timeline_response,
     parse_init_response,
+    parse_snapshot_push,
+    is_snapshot_push,
+    SNAPSHOT_PAGEID,
+    SNAPSHOT_PAGEID_SUB,
     parse_login_response,
     parse_passport_fields,
     parse_qurealorder_response,
@@ -95,6 +106,8 @@ class THSClient:
         self._http_cookies: dict | None = None
         # 短线精灵（9601 TCP，懒连接）
         self._realorder_sock: socket.socket | None = None
+        self._connected_ip: str = ""     # 当前 8901 连接的 IP（诊断用）
+        self._bad_kline_ips: set[str] = set()  # K线查询失败过的 IP（重连时跳过）
         self._instance = 700000          # 请求序列号
         # 心跳（后台线程，connect 成功后自动启动）
         self._heartbeat_thread: threading.Thread | None = None
@@ -103,6 +116,13 @@ class THSClient:
         self._realorder_lock = threading.Lock()         # 保护 9601 socket send
         self._hb_seq_8901 = 0
         self._hb_seq_9601 = 0
+        # 实时分时推送（8901 pageid=4214 订阅后的逐 tick 快照）
+        self._snapshot_thread: threading.Thread | None = None
+        self._snapshot_stop = threading.Event()
+        self._snapshot_codes: set[str] = set()    # 已订阅的代码
+        self._snapshot_cb = None                  # 用户回调 fn(code, market, price, volume)
+        self._latest_price: dict[str, float] = {} # code → 最新现价（供 poll 取用）
+        self._push_sock = None                    # __manual 推送连接（独立于主连接）
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
@@ -419,17 +439,18 @@ class THSClient:
         # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
         sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0)
         if sorted_ips:
-            # 从测速排序的全表里轮换取 N 个（不固定前几个）。
-            # 每次连接后推进 _login_rr_offset，让反复连接时分散到不同 IP 子集。
-            # 并发数取 7（复刻 hexin）：level2 单点登录下并发 login 只有 1 个能赢，
-            # 其余 6 个被服务器标 -1（"烧掉"），但 7 个并发提供足够容错（实测 5 个
-            # 在跨实例轮换失效时容错不足）。轮换偏移 + 测速结果持久化到磁盘，跨进程共享。
-            n_concurrent = min(7, len(sorted_ips))
-            offset = self._login_rr_offset % max(1, len(sorted_ips))
+            # ★ K线坏 IP 黑名单过滤：部分 IP（如 116.63.x.x）不支持大 K线查询，
+            # 只返回部分数据或 timeout（实测 §14j）。重连时跳过这些 IP，优先选
+            # 未失败过的。若全部在黑名单（罕见），退而用全表（不让黑名单卡死）。
+            good_ips = [ip for ip in sorted_ips if ip not in self._bad_kline_ips]
+            pool = good_ips if good_ips else sorted_ips
+            n_concurrent = min(7, len(pool))
+            offset = self._login_rr_offset % max(1, len(pool))
             # 环形取 n_concurrent 个（offset 起，绕回）
-            batch = (sorted_ips[offset:] + sorted_ips[:offset])[:n_concurrent]
-            logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）: %s",
-                        len(batch), offset, batch[:3])
+            batch = (pool[offset:] + pool[:offset])[:n_concurrent]
+            skip_note = f"（跳过 {len(self._bad_kline_ips)} 个坏IP）" if self._bad_kline_ips else ""
+            logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）%s: %s",
+                        len(batch), offset, skip_note, batch[:3])
         else:
             # 测速全部超时（网络异常），回退到盲取前 7 个
             logger.warning("IP 测速全部超时，回退到盲取前 7 个")
@@ -444,6 +465,7 @@ class THSClient:
         if winner:
             host, sock, result = winner
             self._sock = sock
+            self._connected_ip = host
             self._start_heartbeat()
             self._send_init_handshake()
             logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
@@ -482,6 +504,7 @@ class THSClient:
 
                 if verify_code == "0":
                     self._sock = sock
+                    self._connected_ip = host
                     self._start_heartbeat()
                     self._send_init_handshake()
                     logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
@@ -555,30 +578,41 @@ class THSClient:
             req = build_init_query()
             with self._sock_lock:
                 self._sock.sendall(req + b"\n")
-                # 读第 1 帧配置（等它到达，最多 timeout 秒）
+                # 读配置帧并彻底排空缓冲区：先 timeout 秒等第 1 帧（配置帧），
+                # 再用 0.3s 短超时循环读，直到无数据（排空残留帧/半帧）。
+                # 残留半帧会让首个 K线请求的 read_frame 从错位位置扫 magic → 解析失败
+                # 或误判连接关闭。循环排空能避免首请求偶发 ConnectionError（§14j）。
                 self._sock.settimeout(timeout)
                 n = 0
+                # 第 1 帧：配置帧（~49KB），等它到达
                 try:
                     read_frame(self._sock)
                     n += 1
                 except (socket.timeout, OSError):
                     pass
                 except ValueError:
+                    # magic 对齐失败（偶发），丢一段继续
                     try:
-                        self._sock.settimeout(1.0)
+                        self._sock.settimeout(0.5)
                         self._sock.recv(8192)
                     except Exception:
                         pass
-                # 极短 peek 确认无残留帧（防偶发多帧），0.2s 几乎零成本
-                self._sock.settimeout(0.2)
-                try:
-                    read_frame(self._sock)
-                    n += 1
-                except (socket.timeout, OSError):
-                    pass  # 无残留，正常情况
-                except ValueError:
-                    pass
-                logger.debug("init 握手完成（读 %d 帧配置，行情通道已激活）", n)
+                # 循环排空后续帧（配置帧后可能跟推送帧/ACK），每帧 0.3s 超时
+                # 最多读 8 帧（防异常情况死循环），正常 1-2 帧即超时退出
+                self._sock.settimeout(0.3)
+                for _ in range(8):
+                    try:
+                        read_frame(self._sock)
+                        n += 1
+                    except (socket.timeout, OSError):
+                        break  # 无更多数据，排空完成
+                    except ValueError:
+                        # 半帧/magic 错位，丢一段继续排空
+                        try:
+                            self._sock.recv(8192)
+                        except Exception:
+                            break
+                logger.debug("init 握手完成（读 %d 帧，行情通道已激活，缓冲区已排空）", n)
         except Exception as e:
             logger.warning("init 握手失败（行情查询可能超时）: %s", e)
 
@@ -793,27 +827,447 @@ class THSClient:
         logger.warning("list_quotes: 8 帧内未找到 hd 数据帧")
         return []
 
+    # K线周期名 → 周期码（kline/timeline 方法共用）
+    _KLINE_PERIOD_CODES = {
+        "5min": KLINE_PERIOD_5MIN, "15min": KLINE_PERIOD_15MIN,
+        "30min": KLINE_PERIOD_30MIN, "60min": KLINE_PERIOD_60MIN,
+        "day": KLINE_PERIOD_DAY, "week": KLINE_PERIOD_WEEK,
+        "month": KLINE_PERIOD_MONTH,
+    }
+
+    def kline(
+        self,
+        code: str,
+        period: str = "day",
+        count: int = 2146,
+        fuquan: str = "Q",
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 3,
+    ) -> list[dict]:
+        """查 K线（复用登录后的 8901 长连接，复刻 hexin 单连接连发模式）。
+
+        发送 ``build_kline_query`` 构造的 K线请求，解析 ``parse_kline_hd3_response``
+        返回的 hd3.1 变体响应（flag=0x0042/0x0046），返回 OHLCV 记录列表。
+
+        **连接复用**（关键）：抓包确认 hexin 在**同一条 TCP 长连接**上连发日/周/
+        月/5分K 请求（不轮换 IP）。本方法复用 ``self._sock``，首次调用触发 connect()，
+        后续调用复用同一条连接——这避免了每次重连新建短连接时的会话不稳定
+        （周/月K route=0x014e 在新连接上易被 RST，长连接复用则稳定）。
+
+        **重试**：连接断开或读超时时自动 ensure_connected + 重试（最多 ``retries`` 次）。
+        每次重试用 IP 轮换取新连接（测速缓存 + 轮换偏移），命中稳定 IP 即成功。
+
+        Args:
+            code: 股票代码（纯数字，如 "000089"）
+            period: 周期名（"5min"/"15min"/"30min"/"60min"/"day"/"week"/"month"）
+            count: 取的根数（服务器按实际数据返回，可能少于 count）
+            fuquan: 复权（"Q"=前复权 "H"=后复权 ""=不复权）
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）
+            timeout: 单次 read_frame 超时（秒）
+            retries: 连接失败时的重试次数（每次重连轮换 IP）
+
+        Returns:
+            记录列表，每条 ``{code, time, open, high, low, close, volume,
+            amount, bar_index?, dt<N>...}``，按时间正序。日内K（5分等）的
+            ``time`` 为 None、原 dt1 值存 ``bar_index``。
+
+        Raises:
+            ValueError: period 不在支持列表内。
+            RuntimeError: 重试 ``retries`` 次后仍失败。
+        """
+        if period not in self._KLINE_PERIOD_CODES:
+            raise ValueError(f"period 不支持: {period}，可选: {list(self._KLINE_PERIOD_CODES)}")
+        period_code = self._KLINE_PERIOD_CODES[period]
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+
+        last_err = ""
+        for attempt in range(retries + 1):
+            # ensure_connected 对从未登录会 raise；这里统一用 is_connected 判断，
+            # 连接不在则 connect()（首次登录 + 断线重连都走这里，IP 轮换取新连接）
+            if not self.is_connected:
+                logger.info("kline: 连接不可用，connect（attempt %d/%d，IP 轮换）",
+                            attempt + 1, retries)
+                lr = self.connect()
+                if not lr.success:
+                    last_err = f"connect 失败: {lr.error}"
+                    continue
+            try:
+                recs = self._kline_query_once(code, market, period_code, count,
+                                              fuquan, timeout)
+                # ★ 数据完整性校验：部分坏 IP（116.63.x / 119.3.x 等）"成功"返回但
+                # 只给最近部分数据（day 121/336、week 26、month 7，§14j）。这种截断
+                # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）视为坏 IP。
+                # 新股天然根数少，但新股 day/week/month 都少，不会触发（阈值是相对 count）。
+                if recs and count > 20 and len(recs) < count * 0.5:
+                    logger.warning("kline %s %s 数据不全：%d/%d 根（IP=%s，疑似坏 IP 只返回部分数据）",
+                                   code, period, len(recs), count, self._connected_ip or "?")
+                    if attempt < retries:
+                        if self._connected_ip:
+                            self._bad_kline_ips.add(self._connected_ip)
+                            logger.info("将 %s 加入 K线坏 IP 黑名单（共 %d 个），换 IP 重试",
+                                        self._connected_ip, len(self._bad_kline_ips))
+                        self._drop_connection()
+                        last_err = f"数据不全 {len(recs)}/{count}"
+                        continue
+                return recs
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("kline %s %s 失败（attempt %d, IP=%s）: %s",
+                               code, period, attempt + 1, self._connected_ip or "?", last_err)
+                # ★ 记录坏 IP：部分 IP（116.63.x 等）不支持大 K线查询，重连时跳过。
+                # 日志确认：成功 IP 都是 8.x/122.9.x，失败 IP 都是 116.63.x（§14j）。
+                if self._connected_ip:
+                    self._bad_kline_ips.add(self._connected_ip)
+                    logger.info("将 %s 加入 K线坏 IP 黑名单（共 %d 个），下次 connect 跳过",
+                                self._connected_ip, len(self._bad_kline_ips))
+                # 连接已坏，强制下次重连
+                self._drop_connection()
+        raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
+
+    def _kline_query_once(self, code: str, market: int, period: int, count: int,
+                          fuquan: str, timeout: float) -> list[dict]:
+        """在当前 8901 连接上发一次 K线请求并解析响应（单次，不重试）。"""
+        if self._sock is None:
+            raise RuntimeError("未登录")
+        frame = build_kline_query(code, market=market, period=period,
+                                  fuquan=fuquan, count=count)
+        self._sock.settimeout(timeout)
+        with self._sock_lock:
+            if not self._sock:
+                raise ConnectionError("连接已关闭")
+            self._sock.sendall(frame + b"\n")
+        # 循环读帧，跳过文本/ACK 帧，累积所有 hd3.1 K线数据帧（响应可能分多帧）。
+        # 旧实现只取首个 hd3.1 帧，当服务器把大盘 K线分帧返回时会截断（实测 day
+        # 偶发只拿 121/336 根）。改为累积合并：读到首个数据帧后继续读，把同批
+        # hd3.1 帧的记录全部合并，直到读到非 hd3.1 帧（如下个请求的 ACK）或超时。
+        all_recs: list[dict] = []
+        got_data = False
+        for _ in range(16):
+            try:
+                resp = read_frame(self._sock)
+            except socket.timeout:
+                if got_data:
+                    break  # 已拿到数据，后续无更多帧，正常结束
+                raise  # 没拿到任何数据，向上抛 timeout 触发重试
+            except ValueError:
+                # read_frame magic 对齐失败（半帧/推送帧错位），丢一段继续找下个帧边界
+                logger.debug("kline: read_frame magic 错位，丢弃一段重试")
+                try:
+                    self._sock.recv(8192)
+                except OSError:
+                    raise ConnectionError("连接已关闭")
+                if got_data:
+                    # 已有数据，排空后停止（避免残留污染下次请求）
+                    break
+                continue
+                # read_frame magic 对齐失败（半帧/推送帧错位），丢一段继续找下个帧边界
+                logger.debug("kline: read_frame magic 错位，丢弃一段重试")
+                try:
+                    self._sock.recv(8192)
+                except OSError:
+                    raise ConnectionError("连接已关闭")
+                continue
+            if b"hd3.1\x00" in resp:
+                recs = parse_kline_hd3_response(resp)
+                if recs:
+                    all_recs.extend(recs)
+                    got_data = True
+                    # 已拿到首帧数据，缩短超时快速确认有无后续帧（避免等满 timeout）
+                    self._sock.settimeout(2.0)
+                    continue  # 继续读，可能还有后续帧
+                logger.debug("kline: 收到 hd3.1 但解析为空，继续读")
+                continue
+            if got_data:
+                # 已拿到数据，这帧是下个请求的 ACK/文本帧，停止累积
+                break
+            logger.debug("kline: 跳过非数据帧 %dB", len(resp))
+        if all_recs:
+            return all_recs
+        logger.warning("kline: 未找到 hd3.1 K线数据帧")
+        return []
+
+    def timeline(
+        self,
+        code: str,
+        market: int = 0,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """查当日分时图（逐点行情：现价/均价/量额，复刻 hexin 分时白线）。
+
+        L2 账号走 **pageid=4214 推送通道**（``__manual`` 连接），用 35 个 level2
+        字段查询 ``DateTime=8192``。2026-07-24 抓包确认 hexin 盘后也走此路径
+        拿当日完整 240 根分时。
+
+        ⚠️ 自动建立 ``__manual`` 推送连接（同 :meth:`snapshot_subscribe`）。
+        普通账号走 pageid=9354 请求-响应（本方法不支持，用 :func:`build_timeline_query`
+        在主连接上手动发）。
+
+        Args:
+            code: 股票代码（纯数字，如 ``"000938"``）。
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
+            timeout: 单次 read_frame 超时（秒）。
+
+        Returns:
+            记录列表，每条 ``{time, dt10(现价), dt13(量), dt19(额), dt14(均价), ...}``，
+            按时间正序。非交易日/盘前当天无分时数据时返回空列表。
+
+        Raises:
+            RuntimeError: 未登录或 ``__manual`` 连接建立失败。
+        """
+        if self._auth is None:
+            # 未登录则自动 connect（拿 Passport64 用于 __manual 登录）
+            lr = self.connect()
+            if not lr.success:
+                raise RuntimeError(f"connect 失败: {lr.error}")
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        # 确保 __manual 推送连接存在
+        if self._push_sock is None:
+            # ★ 关闭主连接（实测：两条同 IP 同 Passport64 连接并存会导致
+            # __manual 的 4214 订阅 CodeListSize=0。关掉主连接只留 __manual
+            # 一条连接后 CodeListSize=1。kline/list_quotes 在推送期间不可用。）
+            self._drop_connection()
+            sock = self._open_manual_push_connection()
+            if sock is None:
+                raise RuntimeError("__manual 推送连接建立失败")
+            self._push_sock = sock
+        return self._timeline_query_once(code, market, timeout)
+
+    def _timeline_query_once(self, code: str, market: int, timeout: float) -> list[dict]:
+        """在 __manual 推送连接上发 L2 当日分时请求并解析响应。
+
+        必须先发 4214 订阅注册帧（注册到推送通道），服务器回 CodeListSize=1 后，
+        才能发分时数据查询（DateTime=8192）。抓包确认 hexin 也是这个顺序。
+        """
+        from thspypc.protocol import build_timeline_l2_query
+        import re as _re
+        sock = self._push_sock
+        if sock is None:
+            raise RuntimeError("__manual 推送连接不可用")
+
+        # 步骤1: 先发 4214 订阅注册帧（如果该 code 还没订阅过）
+        if code not in self._snapshot_codes:
+            sub_frame = build_snapshot_subscribe(code, market=market, seq=0)
+            sock.settimeout(5.0)
+            try:
+                sock.sendall(sub_frame + b"\n")
+            except OSError as e:
+                self._push_sock = None
+                raise ConnectionError(f"订阅帧发送失败: {e}")
+            # 读注册响应，等 CodeListSize≥1
+            registered = False
+            for _ in range(5):
+                try:
+                    resp = read_frame(sock)
+                except (socket.timeout, OSError, ValueError):
+                    break
+                m = _re.search(rb"CodeListSize=(\d+)", resp)
+                if m and int(m.group(1)) >= 1:
+                    registered = True
+                    self._snapshot_codes.add(code)
+                    break
+            if not registered:
+                logger.warning("timeline: %s 4214 注册失败（CodeListSize=0）", code)
+                # 继续尝试发查询（有些服务器注册和查询可合并响应）
+
+        # 步骤2: 发 L2 分时数据查询（pageid=4214, DateTime=8192）
+        extra = "32(399002,);" if market == 33 else "16(1A0002,);"
+        frame = build_timeline_l2_query(code, market=market, extra_codelist=extra)
+        sock.settimeout(timeout)
+        try:
+            sock.sendall(frame + b"\n")
+        except OSError as e:
+            self._push_sock = None
+            raise ConnectionError(f"查询帧发送失败: {e}")
+        # 分时响应与 K线同为 hd3.1 变体，复用累积读帧逻辑
+        all_recs: list[dict] = []
+        got_data = False
+        for _ in range(20):
+            try:
+                resp = read_frame(sock)
+            except socket.timeout:
+                if got_data:
+                    break
+                raise
+            except (OSError, ValueError) as e:
+                if got_data:
+                    break
+                raise ConnectionError(f"读取失败: {e}")
+            if b"hd3.1\x00" in resp or b"hd1.0\x00" in resp:
+                recs = parse_kline_hd3_response(resp)
+                if recs:
+                    all_recs.extend(recs)
+                    got_data = True
+                    sock.settimeout(2.0)
+                    continue
+                continue
+            if got_data:
+                break
+        if all_recs:
+            return all_recs
+        logger.warning("timeline: 未找到分时数据帧")
+        return []
+
+    def history_timeline(
+        self,
+        code: str,
+        date,
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 3,
+    ) -> list[dict]:
+        """查**历史分时（回忆）**：某交易日的逐点分时行情（现价/量额/level2 大单）。
+
+        复刻 hexin 在分时图上按 ←/→ 切换历史日期时发的请求（pageid=4417，嵌套子帧，
+        DateTime=8192(bar_start-bar_start+355)）。bar_start 由 ``date`` 经
+        :func:`protocol.date_to_timeline_bar` 自动换算（编码已破解，4 锚点验证）。
+
+        **与当日分时的区别**：历史分时用独立的 pageid=4417 协议，DataType 含 level2
+        大单字段（201-230），对应 hexin 分时图的「大单金额」第二条曲线。
+
+        ⚠ **响应解码当前仅支持定长帧**（指数 1A0002 类，dc=0x040000f2 hs=88 fc=22）。
+        个股 level2 变长帧（如紫光 000938，记录 93/94 字节交替）的逐点解码待后续
+        优化——但请求能正确发出并拿到响应，服务器返回的原始帧可用于离线分析。
+
+        Args:
+            code: 股票代码（如 ``"000938"``；指数用 ``"1A0002"``）。
+            date: 目标交易日（``date``/``datetime``/``"YYYY-MM-DD"`` 字符串）。
+                必须是历史交易日（非当天，当天用 :meth:`timeline`）。
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33；
+                指数 1A0002 等需手动传 16）。
+            timeout: 单次 read_frame 超时（秒）。
+            retries: 连接失败时的重试次数（每次重连轮换 IP）。
+
+        Returns:
+            记录列表，每条 ``{bar_index, dt10, dt13, dt19, dt22, dt23, ...}``。
+            dt10=现价、dt13=成交量、dt19=成交额、dt201-230=level2 大单金额。
+            定长帧（指数）可正确解出；变长 level2 帧（个股）当前可能返回空或部分。
+
+        Raises:
+            RuntimeError: 重试 ``retries`` 次后仍失败。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        last_err = ""
+        for attempt in range(retries + 1):
+            if not self.is_connected:
+                logger.info("history_timeline: 连接不可用，connect（attempt %d/%d）",
+                            attempt + 1, retries)
+                lr = self.connect()
+                if not lr.success:
+                    last_err = f"connect 失败: {lr.error}"
+                    continue
+            try:
+                return self._history_timeline_once(code, date, market, timeout)
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
+                               code, date, attempt + 1, last_err)
+                self._drop_connection()
+        raise RuntimeError(f"history_timeline {code} {date} 重试 {retries} 次仍失败: {last_err}")
+
+    def _history_timeline_once(self, code: str, date, market: int,
+                               timeout: float) -> list[dict]:
+        """在当前 8901 连接上发一次历史分时请求并解析响应（单次，不重试）。"""
+        if self._sock is None:
+            raise RuntimeError("未登录")
+        frame = build_history_timeline_query(code, date=date, market=market)
+        self._sock.settimeout(timeout)
+        with self._sock_lock:
+            if not self._sock:
+                raise ConnectionError("连接已关闭")
+            self._sock.sendall(frame + b"\n")
+        # 循环读帧，跳过文本/ACK 帧，取首个 hd1.0 历史分时数据帧
+        for _ in range(8):
+            try:
+                resp = read_frame(self._sock)
+            except ValueError:
+                logger.debug("history_timeline: read_frame magic 错位，丢弃一段重试")
+                try:
+                    self._sock.recv(8192)
+                except OSError:
+                    raise ConnectionError("连接已关闭")
+                continue
+            if b"hd1.0" in resp:
+                recs = parse_history_timeline_response(resp)
+                if recs:
+                    return recs
+                logger.debug("history_timeline: 收到 hd1.0 但解析为空（可能 level2 变长帧），继续读")
+                continue
+            if b"hd3.1\x00" in resp:
+                # 部分响应走 hd3.1 变体，复用 kline 解码尝试
+                recs = parse_kline_hd3_response(resp)
+                if recs:
+                    return recs
+                continue
+            logger.debug("history_timeline: 跳过非数据帧 %dB", len(resp))
+        logger.warning("history_timeline: 8 帧内未找到历史分时数据帧")
+        return []
+
+    @staticmethod
+    def _market_for_code(code: str) -> int:
+        """股票代码 → 市场码（6xx=沪17，其余=深33；指数 1A0/399 需调用方手动传 16/32）。"""
+        if code.startswith("6"):
+            return 17
+        if code.startswith(("1A", "1B")):   # 沪市指数
+            return 16
+        if code.startswith("39"):            # 深市指数
+            return 32
+        return 33
+
+    def _drop_connection(self) -> None:
+        """标记当前 8901 连接为坏（强制下次 ensure_connected 触发重连）。"""
+        with self._sock_lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+        self.stop_heartbeat()
+
     def stock_list_hot(
         self,
         count: int = 29,
         timeout: float = 10.0,
         with_names: bool | str = False,
+        sort_by: int = 199112,
+        sort_dir: str = "D",
+        max_pages: int = 120,
     ) -> list[dict]:
-        """获取当前活跃的热门股票代码列表（轻量 API，~1s）。
+        """获取排序榜单（自动翻页，可拿完整榜单）。
 
-        使用 DataType=199112 排序查询（同花顺打开 A 股列表时发的请求），
-        服务器返回按 SortBy 排序的前 N 条记录。由于无翻页，只拿一批。
+        发送排序代码表查询（同花顺打开 A 股列表、切换排序列时发的请求），
+        服务器按 ``sort_by`` 指定的字段排序后返回。本方法自动用 SortBegin 游标
+        翻页，直到拿满 ``count`` 条或取完整个榜单。
 
-        ⚠ 此路径**不能拿全量**（约 29 条，且可能重复）。
-        拿全量代码表请用 ``stock_list()``。
+        ``sort_by`` 是排序键编号（见 :data:`protocol.SORT_BY_VALUES`，均为活网验证）：
+        涨幅=199112、涨速=48、换手率=1968584、量比=1771976、主力净流入=592890、
+        竞价金额=68758、竞价涨幅=68762。默认按涨幅降序（涨幅榜）。
+        换成跌幅榜传 ``sort_by=199112, sort_dir="A"``（升序值 A 为推测，未实测）。
+
+        ⚠ 成交量/成交额**不能**通过本方法拿——它们不走 SortBy 路径，而是客户端
+        订阅行情推送（dt13/dt19）后本地排序。详见 HANDOFF_STOCKLIST_PUSH.md。
+
+        翻页机制（2026-07-23 抓包确认）：SortBegin 是游标（首次 0，翻页递增到
+        已加载位置），每页 59 条（SortCount 恒 59）。``count`` 是想要的总条数，
+        本方法内部循环请求直到拿满。
 
         Args:
-            count: 返回条数，默认 29（对齐 hexin 客户端第一页）。
-            timeout: 超时时间（秒）。
+            count: 想要的总条数，默认 29（对齐 hexin 第一页，向后兼容）。
+                想要完整榜单（约 5200 条）传一个大数如 5300 即可。
+            timeout: 单次请求的超时时间（秒）。
             with_names: 是否填充中文名称（同 stock_list 的 with_names 参数）。
+            sort_by: 排序键编号，默认 199112（涨幅）。见
+                :data:`protocol.SORT_BY_VALUES`。
+            sort_dir: 排序方向，``"D"``=降序（默认）、``"A"``=升序（推测，未实测）。
+            max_pages: 翻页安全阀（默认 120，≈5300/59），防止死循环。
 
         Returns:
             list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``。
+            按 code 去重（页边界可能重叠）。
 
         Raises:
             RuntimeError: 未登录。
@@ -821,40 +1275,76 @@ class THSClient:
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
 
-        req = build_stock_list_query(
-            markets=(17, 22, 33),
-            sort_count=count,
-            datatype=[199112],
-        )
+        # markets 对齐 hexin 抓包真值（stock_list.pcap）：17=沪 22=深A 151=北交所。
+        # 注意 33 是深市另一类（非深A 主板/创业板），抓包确认排序查询用的是 22 不是 33。
+        PAGE = 59  # hexin 每页恒 59 条（抓包确认）
+        stocks: list[dict] = []
+        seen_codes: set[str] = set()
+        sort_total = 0
+        sort_begin = 0
+        target = count  # 想要的总条数
 
         with self._sock_lock:
             sock = self._sock
-            sock.sendall(req + b"\n")
-            sock.settimeout(timeout)
-            # 循环读帧，跳过 MarketTime 等文本帧，取首个含 SortTotal 的数据帧
-            # （同 list_quotes 的多帧模式：服务器可能先推 MarketTime 再推数据）
-            resp = None
-            for _ in range(8):
-                try:
-                    frame = read_frame(sock)
-                except (socket.timeout, OSError) as e:
-                    logger.error("stock_list_hot: 读取响应失败: %s", e)
-                    return []
-                if not frame:
-                    continue
-                if b"SortTotal" in frame:
-                    resp = frame
+            for page in range(max_pages):
+                req = build_stock_list_query(
+                    markets=(17, 22, 151),
+                    sort_begin=sort_begin,
+                    sort_count=PAGE,
+                    datatype=[sort_by],
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                )
+                sock.sendall(req + b"\n")
+                sock.settimeout(timeout)
+                # 循环读帧，跳过 MarketTime 等文本帧，取首个含 SortTotal 的数据帧
+                # （同 list_quotes 的多帧模式：服务器可能先推 MarketTime 再推数据）
+                resp = None
+                for _ in range(8):
+                    try:
+                        frame = read_frame(sock)
+                    except (socket.timeout, OSError) as e:
+                        logger.error("stock_list_hot: 读取响应失败: %s", e)
+                        return stocks
+                    if not frame:
+                        continue
+                    if b"SortTotal" in frame:
+                        resp = frame
+                        break
+                    # 跳过非数据帧（MarketTime / CodeListSize 等）
+
+                if not resp:
+                    logger.warning("stock_list_hot: 第 %d 页无数据帧响应", page + 1)
                     break
-                # 跳过非数据帧（MarketTime / CodeListSize 等）
 
-        if not resp:
-            logger.warning("stock_list_hot: 无数据帧响应")
-            return []
+                meta = parse_stock_list_response(resp)
+                if not sort_total:
+                    sort_total = meta.get("sort_total", 0)
+                page_stocks = meta.get("stocks", [])
+                # 按 code 去重合并（页边界可能重叠）
+                new_in_page = 0
+                for s in page_stocks:
+                    c = s.get("code", "")
+                    if c and c not in seen_codes:
+                        seen_codes.add(c)
+                        stocks.append(s)
+                        new_in_page += 1
 
-        meta = parse_stock_list_response(resp)
-        stocks = meta.get("stocks", [])
-        logger.info("stock_list_hot: 获取 %d 条（共 %d 条）",
-                    len(stocks), meta.get("sort_total", 0))
+                data_count = meta.get("sort_data_count", len(page_stocks))
+                logger.debug("stock_list_hot: 第 %d 页 SortBegin=%d 拿 %d 条"
+                             "（新增 %d），累计 %d/%d",
+                             page + 1, sort_begin, data_count, new_in_page,
+                             len(stocks), sort_total)
+
+                # 终止条件：已拿够 / 已取完整个榜单 / 本页无数据
+                if len(stocks) >= target or len(stocks) >= sort_total \
+                        or data_count == 0:
+                    break
+                # 推进游标：用累计已收条数作为下一页起点（对齐抓包 Begin≈已加载位置）
+                sort_begin = len(stocks)
+
+        logger.info("stock_list_hot: 共 %d 页，获取 %d 条（共 %d 条，目标 %d）",
+                    page + 1, len(stocks), sort_total, target)
 
         # 可选名称填充
         if with_names and stocks:
@@ -1500,6 +1990,218 @@ class THSClient:
             self._heartbeat_thread.join(timeout=5)
         self._heartbeat_thread = None
 
+    # ── 实时分时推送（pageid=5716 多股订阅触发，2026-07-24 抓包破解）──
+
+    def snapshot_subscribe(
+        self,
+        code: str,
+        market: int | None = None,
+        callback=None,
+    ) -> bool:
+        """订阅个股实时逐 tick 快照推送（现价随每笔成交跳动）。
+
+        用 **``__manual`` 身份开一条独立的 8901 推送连接**，发 pageid=4214 订阅帧
+        （嵌套双子帧），服务端持续推送 71B 快照帧（约每 3 秒，盘中全程不断）。
+
+        ★ ``__manual`` 登录是推送通道的必要身份（2026-07-24 三份抓包 + 实测确认）：
+        hexin 收推送的那条连接就是 ``__manual`` 登录的。普通登录发 4214 订阅 →
+        ``CodeListSize=0``（注册失败）；``__manual`` 登录 → ``CodeListSize=1``
+        （注册成功）。两种 login 的响应字段完全一致，但只有 ``__manual`` 能注册
+        4214 推送通道——这是会话级权限差异。
+
+        ⚠️ 需要 **level2 账号**：普通账号打开分时走 pageid=9354（请求-响应，无推送）。
+        ⚠️ 需在**盘中**（9:30-15:00）才有逐笔成交推送；收盘后注册成功但无推送数据。
+
+        推送连接独立于主连接（``self._sock``），不影响 kline/list_quotes 等
+        请求-响应方法。推送数据由后台线程读取并解析，两种消费方式：
+          - ``callback``：每收到一帧调用 ``callback(code, market, price, volume)``
+          - 无 callback 时存入 ``self._latest_price[code]``，用 ``latest_price()`` 取
+
+        Args:
+            code: 股票代码（纯数字，如 ``"000938"``）。
+            market: 市场码（17=沪 33=深）。None 时按代码推导（6开头=沪17，其余=深33）。
+            callback: 可选回调 ``fn(code:str, market:str, price:float, volume:int)``。
+
+        Returns:
+            True=订阅请求已发送（CodeListSize≥1）；False=注册失败或未登录。
+        """
+        if self._auth is None:
+            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        if market is None:
+            market = 17 if code.startswith("6") else 33
+
+        # ★ 用 __manual 身份开独立推送连接（首次订阅时建立，后续复用）
+        if self._push_sock is None:
+            sock = self._open_manual_push_connection()
+            if sock is None:
+                logger.error("snapshot_subscribe: __manual 推送连接建立失败")
+                return False
+            self._push_sock = sock
+            logger.info("snapshot_subscribe: __manual 推送连接已建立")
+
+        # 发 pageid=4214 嵌套订阅帧
+        self._instance += 1
+        frame = build_snapshot_subscribe(code, market=market,
+                                          seq=self._instance & 0xFFFF)
+        try:
+            self._push_sock.sendall(frame + b"\n")
+        except OSError as e:
+            logger.error("snapshot_subscribe: 发送失败 %s，重连", e)
+            self._push_sock = None
+            return False
+
+        # 读注册响应（CodeListSize=1 才算成功）
+        import socket as _socket
+        self._push_sock.settimeout(5.0)
+        registered = False
+        try:
+            for _ in range(5):
+                body = read_frame(self._push_sock)
+                if b"CodeListSize=" in body:
+                    import re
+                    m = re.search(rb"CodeListSize=(\d+)", body)
+                    size = int(m.group(1)) if m else 0
+                    if size >= 1:
+                        registered = True
+                    logger.info("snapshot_subscribe: CodeListSize=%d（%s）",
+                                size, "注册成功" if registered else "注册失败")
+                    break
+        except (_socket.timeout, OSError, ValueError):
+            pass
+
+        if not registered:
+            logger.warning("snapshot_subscribe: %s 注册失败（CodeListSize=0，"
+                           "检查账号是否有 L2 权限）", code)
+            return False
+
+        self._snapshot_codes.add(code)
+        if callback is not None:
+            self._snapshot_cb = callback
+        # 启动推送读取线程
+        if self._snapshot_thread is None or not self._snapshot_thread.is_alive():
+            self._snapshot_stop.clear()
+            self._snapshot_thread = threading.Thread(
+                target=self._snapshot_loop, name="ths-snapshot", daemon=True)
+            self._snapshot_thread.start()
+            logger.debug("分时推送读取线程已启动")
+        logger.info("snapshot_subscribe: 已订阅 %s（market=%d）", code, market)
+        return True
+
+    def _open_manual_push_connection(self):
+        """用 __manual 身份开一条独立 8901 连接（推送通道专用）。
+
+        复用主连接的 Passport64/Mac64/IP，但 login 帧用 UserName=__manual。
+        登录后发 init（MarketCode=32 深市，复刻 hexin __manual 连接）激活
+        行情通道——之前认为"__manual 连接发 init 会被拒断连"是因为用了
+        MarketCode=16;144（沪市），改用 32 后 hexin 抓包确认可正常接受。
+
+        ★ 主连接保持不断（kline/list_quotes 仍可用）。__manual 连接独立于
+        主连接，服务器允许同一 Passport64 开多条连接（hexin 也是多连接并存）。
+        """
+        import socket as _socket
+        passport64 = build_passport64(self._auth)
+        host = self._connected_ip or "127.0.0.1"
+        logger.info("__manual 推送连接: 连接 %s:%d ...", host, MARKET_PORT)
+        try:
+            sock = _socket.create_connection((host, MARKET_PORT), timeout=15)
+        except OSError as e:
+            logger.error("__manual 连接失败 %s: %s", host, e)
+            return None
+        login_body = build_manual_login_body(passport64, self.mac64)
+        try:
+            sock.sendall(encode_frame(login_body) + b"\n")
+            sock.settimeout(8.0)
+            resp = read_frame(sock)
+            vc = ""
+            for line in resp.decode("gbk", "replace").replace("\r\n", "\n").split("\n"):
+                if line.startswith("VerifyCode="):
+                    vc = line.split("=", 1)[1]
+            if vc != "0":
+                logger.error("__manual 登录失败 VerifyCode=%s", vc)
+                sock.close()
+                return None
+        except (OSError, ValueError) as e:
+            logger.error("__manual 登录异常: %s", e)
+            sock.close()
+            return None
+        # ★ 发 init(MarketCode=32) 激活 __manual 连接的行情通道（关键！）
+        # 之前 HANDOFF §2 说"__manual 连接发 init 会被拒断连"——那是因为用了
+        # MarketCode=16;144（沪市）。改用 32（深市）后实测正常（2026-07-24）：
+        # init 响应 23742B 完整配置帧，不断连，且 init 后 4214 订阅才拿到
+        # CodeListSize=1（不发 init → CodeListSize=0）。
+        try:
+            init_frame = build_init_query(market_code="32;")
+            sock.sendall(init_frame + b"\n")
+            # 排空 init 响应：配置帧可能分多个 TCP 段到达，用较长超时确保读完
+            n_frames = 0
+            n_bytes = 0
+            for _ in range(30):
+                sock.settimeout(3.0)
+                try:
+                    b = read_frame(sock)
+                    n_frames += 1
+                    n_bytes += len(b)
+                except (socket.timeout, OSError, ValueError):
+                    break
+            logger.info("__manual init 完成（MarketCode=32，%d帧/%dB）", n_frames, n_bytes)
+            if n_bytes < 5000:
+                logger.warning("__manual init 响应过小（%dB），可能未完整激活行情通道", n_bytes)
+        except OSError as e:
+            logger.warning("__manual init 异常: %s", e)
+            # init 失败可能是坏 IP，但仍返回 sock 让调用方尝试
+        return sock
+
+    def latest_price(self, code: str) -> float | None:
+        """取某代码的最新现价（snapshot_subscribe 后由推送线程更新）。"""
+        return self._latest_price.get(code)
+
+    def stop_snapshot(self) -> None:
+        """停止分时推送读取线程，关闭 __manual 推送连接（disconnect 时自动调用）。"""
+        self._snapshot_stop.set()
+        if self._snapshot_thread and self._snapshot_thread.is_alive():
+            self._snapshot_thread.join(timeout=3)
+        self._snapshot_thread = None
+        if self._push_sock is not None:
+            try:
+                self._push_sock.close()
+            except OSError:
+                pass
+            self._push_sock = None
+
+    def _snapshot_loop(self) -> None:
+        """后台读取 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
+
+        读取 ``self._push_sock``（独立 __manual 连接，不影响主连接的查询/心跳）。
+        用短超时轮询 read_frame，遇到非快照帧（心跳响应、注册响应等）直接丢弃。
+        """
+        import socket as _socket
+        while not self._snapshot_stop.is_set():
+            sock = self._push_sock
+            if sock is None:
+                if self._snapshot_stop.wait(1.0):
+                    break
+                continue
+            try:
+                sock.settimeout(1.0)
+                body = read_frame(sock)
+            except (_socket.timeout, OSError):
+                continue
+            except ValueError:
+                # read_frame 偶尔在半帧处解析失败，跳过
+                continue
+            if not is_snapshot_push(body):
+                continue
+            rec = parse_snapshot_push(body)
+            if rec is None:
+                continue
+            self._latest_price[rec["code"]] = rec["price"]
+            if self._snapshot_cb is not None:
+                try:
+                    self._snapshot_cb(rec["code"], rec["market"],
+                                      rec["price"], rec["volume"])
+                except Exception as e:
+                    logger.warning("snapshot 回调异常: %s", e)
+
     def _heartbeat_loop(self) -> None:
         """心跳循环：8901 每 3 秒、9601 每 30 秒（10 个 3 秒周期）。
 
@@ -1743,6 +2445,7 @@ class THSClient:
         （同账号同 IP 短时间重复 login 的会话冲突，见 HANDOFF §7）。
         """
         self.stop_heartbeat()
+        self.stop_snapshot()
         for attr, lock in (("_sock", self._sock_lock),
                            ("_realorder_sock", self._realorder_lock)):
             with lock:

@@ -29,10 +29,22 @@ from .protocol import (
     # 协议函数
     encode_frame, read_frame,
     full_http_auth, build_passport64,
-    build_login_body_pc, parse_login_response, parse_passport_fields,
+    build_login_body_pc, build_manual_login_body, parse_login_response, parse_passport_fields,
     generate_imei, generate_mac64,
     # 行情查询（个股列表）
     build_list_quote_query, parse_hd1_response, parse_hd3_response, decode_ths_float,
+    # K线（hd3.1 变体，flag=0x0042/0x0046）
+    parse_kline_hd3_response, build_kline_query, KLINE_DATATYPE,
+    KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
+    KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN, KLINE_PERIOD_60MIN,
+    # 分时图（当日逐点 + 历史回忆）
+    build_timeline_query, TIMELINE_DATATYPE,
+    build_history_timeline_query, parse_history_timeline_response,
+    HISTORY_TIMELINE_DATATYPE, HISTORY_TIMELINE_PAGEID,
+    date_to_timeline_bar, timeline_bar_to_date,
+    # 实时分时推送（pageid=4214 逐 tick 快照，现价随成交跳动）
+    build_snapshot_subscribe, parse_snapshot_push, is_snapshot_push,
+    SNAPSHOT_PAGEID, SNAPSHOT_DATATYPE,
     # 全市场快照（空括号单请求，hfd1.0 格式）
     build_market_snapshot_query, MARKET_SNAPSHOT_MARKETS, MARKET_SNAPSHOT_DATATYPE,
 
@@ -63,9 +75,18 @@ __all__ = [
     "REALORDER_HOST", "REALORDER_PORT", "DXJL_DATATYPE", "ANOMALY_MAP_DXJL",
     "encode_frame", "read_frame",
     "full_http_auth", "build_passport64",
-    "build_login_body_pc", "parse_login_response", "parse_passport_fields",
+    "build_login_body_pc", "build_manual_login_body", "parse_login_response", "parse_passport_fields",
     "generate_imei", "generate_mac64",
     "build_list_quote_query", "parse_hd1_response", "parse_hd3_response", "decode_ths_float",
+    "parse_kline_hd3_response", "build_kline_query", "KLINE_DATATYPE",
+    "KLINE_PERIOD_DAY", "KLINE_PERIOD_WEEK", "KLINE_PERIOD_MONTH",
+    "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN", "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",
+    "build_timeline_query", "TIMELINE_DATATYPE",
+    "build_snapshot_subscribe", "parse_snapshot_push", "is_snapshot_push",
+    "SNAPSHOT_PAGEID", "SNAPSHOT_DATATYPE",
+    "build_history_timeline_query", "parse_history_timeline_response",
+    "HISTORY_TIMELINE_DATATYPE", "HISTORY_TIMELINE_PAGEID",
+    "date_to_timeline_bar", "timeline_bar_to_date",
     "build_market_snapshot_query", "MARKET_SNAPSHOT_MARKETS", "MARKET_SNAPSHOT_DATATYPE",
     "parse_hfd1_response",
     "build_stock_list_query", "parse_stock_list_response", "STOCK_LIST_DATATYPE",

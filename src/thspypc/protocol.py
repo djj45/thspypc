@@ -551,6 +551,47 @@ def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     return prefix + fixed_bytes + passport64.encode("ascii")
 
 
+def build_manual_login_body(passport64: str, mac_b64: str) -> bytes:
+    """构造 ``UserName=__manual`` 登录帧 body（8901 推送通道专用身份）。
+
+    ★ **分时逐 tick 推送（pageid=4214）必须用此身份登录**（2026-07-24 三份抓包
+    + 实测确认）：hexin 收到 71B 推送的那条连接就是 ``__manual`` 登录的。用普通
+    登录（无 UserName）发 4214 订阅 → 服务器回 ``CodeListSize=0``（注册失败）；
+    改用 ``__manual`` 登录 → ``CodeListSize=1``（注册成功）。两种 login 的响应
+    字段完全一致（同 S-Version/S-PushVer/VerifyCode=0），但 ``__manual`` 身份
+    能注册 4214 推送通道、普通身份不能——这是会话级权限差异，不在 login 响应
+    字段里体现。
+
+    与 :func:`build_login_body_pc` 的区别（抓包字节级确认）：
+      - 多 ``UserName=__manual`` / ``Password=__manual`` 两行
+      - UserName/Password 行末是 ``\\r\\n`` **加一个额外 ``\\n``**（``\\r\\n\\n``），
+        其余行用 ``\\n``
+      - check 字节计算方式相同（固定文本字节数 + 1）
+
+    Args:
+        passport64: 与普通登录相同的 Passport64 票据。
+        mac_b64: Mac64 设备标识。
+
+    Returns:
+        login 帧 body（含 ``\\x09`` 前缀，不含 FD FD FD FD 头）。
+    """
+    fixed = (
+        f"Ask=login\n"
+        f"C-Version={C_VERSION_PC}\n"
+        f"UserName=__manual\r\n\n"      # ★ \r\n + 额外 \n
+        f"Password=__manual\r\n\n"      # ★ \r\n + 额外 \n
+        f"VerifyType=1\n"
+        f"Mac64={mac_b64}\n"
+        f"C-SupportPushVer=1.0\n"
+        f"C-SupReqDataVer=hq6.0\n"
+        f"C-SupPushDataVer=hq6.0\n"
+        f"Passport64="
+    ).encode("gbk")
+    check = (len(fixed) + 1) & 0xFF
+    prefix = b"\x09\x41\x09\x00" + b"zh_CN.GBK" + bytes([check]) + b"\x09"
+    return prefix + fixed + passport64.encode("ascii")
+
+
 def parse_login_response(body: bytes) -> dict:
     """解析 login 响应。成功标志：VerifyCode=0。"""
     text_start = body.find(b"Reply=")
@@ -650,7 +691,869 @@ def build_list_quote_query(
     return encode_frame(body)
 
 
-# 全市场快照请求的默认市场码集（stock_list.pcap frame 1046 真值）
+# K线周期码（PC 版 DateTime 第一参数，与 Mac 版 PERIOD_MAP 一致，文档 §14b）。
+# 1分=0x3001、5分=0x3005、15分=0x300F、30分=0x301E、60分=0x303C、120分=0x3078、
+# 日=0x4000、周=0x5001、月=0x6001、季=0x6003、年=0x7001。
+KLINE_PERIOD_DAY = 0x4000
+KLINE_PERIOD_WEEK = 0x5001
+KLINE_PERIOD_MONTH = 0x6001
+KLINE_PERIOD_5MIN = 0x3005
+KLINE_PERIOD_15MIN = 0x300F
+KLINE_PERIOD_30MIN = 0x301E
+KLINE_PERIOD_60MIN = 0x303C
+
+# K线标准 OHLCV 字段集（文档 §14a，与 Mac 版 datatype 一致）。
+# 时间(1)/开(7)/高(8)/低(9)/收(11)/量(13)/额(19)；响应里时间字段自带。
+KLINE_DATATYPE = [7, 8, 9, 11, 13, 19]
+
+
+def build_kline_query(
+    code: str,
+    market: int = 33,
+    period: int = KLINE_PERIOD_DAY,
+    fuquan: str = "Q",
+    count: int = 2146,
+    pageid: int = 9355,
+    seq: int = 0x0025,
+) -> bytes:
+    """构造 8901 端口 K线请求帧（PC 版 CodeList 文本格式）。
+
+    请求格式（2026-07-24 抓包 hexin 9.60.20 逐字节确认，文档 §14a）::
+
+        \\x09 + 23字节二进制头(子帧0x0009) + GBK 文本:
+          ReqFuquan=<复权>\\r\\n            Q=前复权 H=后复权 空=不复权
+          CodeList=<市场>(<代码>,);\\r\\n
+          DataType=7,8,9,11,13,19,\\r\\n
+          DateTime=<周期码>(<历史偏移>-0)\\r\\n   周期码见 KLINE_PERIOD_*，偏移负数=从最新往回取
+          LackTime=0,0,0,0,0,0,0,0\\r\\n
+          pageid=9355\\r                   9355=K线图（分时图是 9354）
+
+    二进制头关键字节随周期变化（抓包 16 个请求归纳，route=[11:13] LE16）：
+
+        ===========  ===========  =====  =====
+        周期          route        [17]   [18]
+        ===========  ===========  =====  =====
+        5分(0x3005)   0x0001       0x05   0x30
+        日(0x4000)    0x0001       0x00   0x40
+        周(0x5001)    0x014e       0x01   0x50
+        月(0x6001)    0x014e       0x01   0x60
+        ===========  ===========  =====  =====
+
+    日K/分K 用 route=0x0001；周K/月K 首次请求用 route=0x014e（翻页二次请求
+    回到 0x0001）。[18] = 周期码高字节（period>>8）。周/月 route=0x014e 是
+    必需的——用 0x0001 服务器只回 26B ACK 不下发数据。
+
+    Args:
+        code: 股票代码（纯数字，如 "000089"）
+        market: 市场码（33=深 17=沪）
+        period: 周期码（KLINE_PERIOD_DAY/WEEK/MONTH/...，见模块常量）
+        fuquan: 复权（"Q"=前复权 "H"=后复权 ""=不复权）
+        count: 取的根数（转成负的历史偏移，从最新往回取）
+        pageid: 页面 id（K线图=9355）
+        seq: 序列标签（hdr[5:7]）
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+    """
+    dt_str = ",".join(str(d) for d in KLINE_DATATYPE) + ","
+    text = (
+        f"ReqFuquan={fuquan}\r\nCodeList={market}({code},);\r\n"
+        f"DataType={dt_str}\r\nDateTime={period}({-count}-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x09\x00"   # 子帧类型 0x0009
+    # route[11:13] 随周期：周/月=0x014e（必需），日/分=0x0001
+    route = 0x014E if period >= 0x5000 else 0x0001
+    struct.pack_into("<H", hdr, 11, route)
+    hdr[17] = 0x01 if period >= 0x5000 else (0x05 if period < 0x4000 else 0x00)
+    hdr[18] = (period >> 8) & 0xFF      # 周期码高字节
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+# 分时图（当日逐点）周期码与字段集（文档 §14，2026-07-24 抓包 pageid=9354）。
+# 分时走与 K线不同的子帧：子帧类型 0x0002（K线是 0x0009），路由 0x000a。
+TIMELINE_PERIOD = 0x2000   # DateTime 第一参数（=8192）
+TIMELINE_PAGEID = 9354     # 分时图页面 id（K线图是 9355）
+# 分时 DataType（抓包 DataType=10,13,14,15,19,22,23,54,6,45）：
+# dt10=现价 dt13=量 dt14=均量价? dt15=? dt19=额 dt22/23=买卖盘 dt54=? dt6=昨收 dt45=?
+TIMELINE_DATATYPE = [10, 13, 14, 15, 19, 22, 23, 54, 6, 45]
+
+
+def build_timeline_query(
+    code: str,
+    market: int = 33,
+    datatype: list[int] | None = None,
+    pageid: int = TIMELINE_PAGEID,
+    seq: int = 0x0025,
+) -> bytes:
+    """构造 8901 端口分时图请求帧（PC 版，当日逐点行情）。
+
+    请求格式（2026-07-24 抓包 pageid=9354 逐字节确认）::
+
+        \\x09 + 23字节二进制头(子帧0x0002 路由0x000a) + GBK 文本:
+          CodeList=<市场>(<代码>,);\\r\\n
+          DataType=10,13,14,15,19,22,23,54,6,45,\\r\\n
+          DateTime=8192(0-0)\\r\\n         8192=0x2000 分时周期码
+          LackTime=0,0,0,0,0,0,0,0\\r\\n
+          pageid=9354\\r                  9354=分时图（K线图是 9355）
+
+    与 K线请求（build_kline_query）的区别：
+      - 子帧类型 0x0002（K线是 0x0009）
+      - 路由 0x000a（K线随周期 0x0001/0x014e）
+      - 无 ReqFuquan（分时是当日实时，不复权）
+      - DataType 是分时专用字段集（现价/量额/买卖盘/昨收）
+
+    Args:
+        code: 股票代码（纯数字）
+        market: 市场码（33=深 17=沪）
+        datatype: 字段集（默认 TIMELINE_DATATYPE）
+        pageid: 页面 id（分时图=9354）
+        seq: 序列标签
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+    """
+    if datatype is None:
+        datatype = TIMELINE_DATATYPE
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    text = (
+        f"CodeList={market}({code},);\r\nDataType={dt_str}\r\n"
+        f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x02\x00"   # 子帧类型 0x0002（分时专用，K线是 0x0009）
+    struct.pack_into("<H", hdr, 11, 0x000A)  # 路由 0x000a
+    struct.pack_into("<H", hdr, 19, len(text) + 1)
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+# L2 当日分时 DataType（35 个字段，2026-07-24 抓包 realtime_push_150041 真值）。
+# hexin L2 账号打开分时图走 pageid=4214（推送通道），用这套 level2 字段集；
+# 普通账号走 pageid=9354（上面 TIMELINE_DATATYPE，10 个基础字段）。
+# dt10=现价 dt13=量 dt19=额 dt14=均价 dt272/271/15/38=level2 扩展 dt6=昨收
+TIMELINE_L2_DATATYPE = [
+    272, 229, 14, 207, 271, 228, 13, 227, 19, 40,
+    226, 54, 18, 204, 39, 225, 10, 203, 210, 38,
+    224, 23, 202, 209, 223, 230, 15, 22, 201, 208,
+    6, 1110, 407, 1111, 380,
+]
+
+
+def build_timeline_l2_query(
+    code: str,
+    market: int = 33,
+    extra_codelist: str = "",
+    datatype: list[int] | None = None,
+    seq: int = 0x005b,
+) -> bytes:
+    """构造 **L2 当日分时**请求（pageid=4214 推送通道，level2 字段集）。
+
+    L2 账号的 hexin 打开分时图走此请求（2026-07-24 抓包 150041 确认），
+    与普通账号的 :func:`build_timeline_query`（pageid=9354）不同::
+
+        \\x09 + 23字节二进制头(子帧0x0009 路由0x0201) + GBK 文本:
+          CodeList=<extra>;<市场>(<代码>,);\\r\\n   (hexin 附带指数 399002)
+          DataType=<35个level2字段>,\\r\\n
+          DateTime=8192(0-0)\\r\\n
+          LackTime=0,3,0,0,20031231,2,0,0\\r\\n    (注意 LackTime 非全0)
+
+    ⚠ 必须在 ``__manual`` 登录的连接上发送（4214 通道需要 __manual 身份）。
+
+    Args:
+        code: 股票代码（如 ``"000938"``）。
+        market: 市场码（33=深 17=沪）。
+        extra_codelist: 附加代码（hexin 附带指数，如 ``"32(399002,);"``）。
+        datatype: 字段集（默认 TIMELINE_L2_DATATYPE，35 个 level2 字段）。
+        seq: 序列号（hexin 用 0x105b，高字节 0x10）。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic），可直接 sendall。
+    """
+    if datatype is None:
+        datatype = TIMELINE_L2_DATATYPE
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    main_cl = f"{market}({code},);"
+    codelist = (extra_codelist + main_cl) if extra_codelist else main_cl
+    text = (
+        f"CodeList={codelist}\r\nDataType={dt_str}\r\n"
+        f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
+        f"LackTime=0,3,0,0,20031231,2,0,0\r\npageid={SNAPSHOT_PAGEID}\r\n"
+    ).encode("gbk")
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, (seq & 0xFF) | 0x1000)  # seq 高字节 0x10（hexin 真值）
+    hdr[7:11] = b"\x12\x00\x09\x00"     # 子帧 0x0009
+    hdr[11] = 0x02; hdr[12] = 0x01       # 路由 0x0201（L2 分时，直接写字节）
+    hdr[18] = 0x20                        # hexin 真值（L2 分时特有标记）
+    struct.pack_into("<I", hdr, 19, len(text))
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+# 历史分时（历史回忆）参数（2026-07-24 两次抓包确认，文档 §14h）。
+# 历史分时与当日分时是两套不同协议：不同 pageid、不同子帧、不同 DataType。
+HISTORY_TIMELINE_PAGEID = 4417        # 历史分时 pageid（当日是 9354/4214）
+# 历史分时 DataType（26 个 level2 字段，抓包 1A0002/000938 真值）：
+# dt10=现价 dt13=量 dt19=额 dt22/23=买卖盘 dt201-230=level2 大单金额(双线) dt6=昨收
+# 对应 hexin 分时图「股价线 + 大单金额线(level2)」两条曲线。
+HISTORY_TIMELINE_DATATYPE = [
+    229, 207, 228, 13, 227, 19, 226, 54, 204, 225,
+    10, 203, 210, 224, 23, 202, 209, 223, 230, 22,
+    201, 208, 6, 1110, 407, 1111,
+]
+# 组内差：arg2 - arg1 恒 = 355（一个交易日的分时点数，含集合竞价 padding）。
+HISTORY_TIMELINE_BAR_SPAN = 355
+
+# ── DateTime bar 序号的日期编码（2026-07-24 四锚点破解，文档 §14h）──
+#
+# 历史分时请求 ``DateTime=8192(bar_start-bar_end)`` 里的大数是该交易日
+# **首条分时 bar 的全局序号**，编码规则（4 个日期锚点逐字节验证一致）::
+#
+#     bar_start = (目标日期 - EPOCH).days × 2048 + INTRADAY_BAR_OFFSET
+#              = (目标日期.toordinal() - 675063) × 2048 + 606
+#
+# 即「自 1849-04-05 起的日历日数 × 2048 + 日内偏移 606」。日历日（含周末），
+# 非交易日。1849-04-05 是同花顺内部基准日（ordinal=675063），物理含义未知但
+# 数值稳定——4 锚点（2026-05-13/14、06-30、07-23）反推 epoch 全为该日。
+#
+# 日内偏移：历史交易日恒 606；当日盘前请求是 960（预测值，开盘前用）。
+# 取历史日期时统一用 606。
+#
+# 验证锚点（arg1 只依赖日期，与股票无关）：
+#   2026-05-13 → 132477534   2026-06-30 → 132575838
+#   2026-05-14 → 132479582   2026-07-23 → 132622942
+TIMELINE_BAR_EPOCH_ORDINAL = 675063   # date(1849, 4, 5).toordinal()
+TIMELINE_BAR_DAYS_SCALE = 2048        # 每日历日对应 2048 个 bar 单位
+TIMELINE_INTRADAY_BAR = 606           # 历史交易日日内 bar 偏移（盘前=960）
+
+
+def date_to_timeline_bar(d: datetime) -> int:
+    """交易日日期 → 历史分时 DateTime 的 bar_start（首条 bar 全局序号）。
+
+    Args:
+        d: 目标交易日（``datetime`` 或 ``date``）。
+
+    Returns:
+        bar_start 整数，用于 ``DateTime=8192(bar_start-bar_start+355)``。
+
+    见模块常量区的编码公式说明（4 锚点验证）。
+    """
+    ordinal = d.toordinal() if hasattr(d, "toordinal") and not isinstance(d, int) \
+        else _date_to_ordinal(d)
+    return (ordinal - TIMELINE_BAR_EPOCH_ORDINAL) * TIMELINE_BAR_DAYS_SCALE \
+        + TIMELINE_INTRADAY_BAR
+
+
+def timeline_bar_to_date(bar_start: int) -> "datetime":
+    """bar_start（首条 bar 序号）→ 交易日日期（逆变换，供诊断/校验）。"""
+    days = (bar_start - TIMELINE_INTRADAY_BAR) // TIMELINE_BAR_DAYS_SCALE
+    ordinal = days + TIMELINE_BAR_EPOCH_ORDINAL
+    return datetime.fromordinal(ordinal)
+
+
+def _date_to_ordinal(d) -> int:
+    """兼容 date/datetime/('YYYY-MM-DD' 字符串) → ordinal。"""
+    if isinstance(d, str):
+        from datetime import date as _date
+        parts = d.replace("-", "").replace("/", "")
+        d = _date(int(parts[:4]), int(parts[4:6]), int(parts[6:8]))
+    return d.toordinal()
+
+
+def build_history_timeline_query(
+    code: str,
+    bar_start: int | None = None,
+    market: int = 33,
+    datatype: list[int] | None = None,
+    pageid: int = HISTORY_TIMELINE_PAGEID,
+    seq: int = 0x0025,
+    inner_seq: int = 0x0000,
+    dt_prev_off: int = -61,
+    date=None,
+) -> bytes:
+    """构造 8901 端口**历史分时（回忆）**请求帧（嵌套子帧结构）。
+
+    请求格式（2026-07-24 抓包 pageid=4417 逐字节确认，文档 §14h）::
+
+        外层帧: cmd=0x09, 子帧 0x0009, 路由 0x017c, [18]=0x20
+                文本: CodeList=<m>(<code>,);\\r\\n
+                      DataType=<26个level2字段>,\\r\\n
+                      DateTime=8192(<bar_start>-<bar_start+355>)\\r\\n   ★bar序号区间
+                      DTPrevOff=-61\\r\\n
+                      LackTime=0,3,0,0,0,0,0,0\\r\\n
+                      pageid=4417\\r
+        内层子帧(紧跟): 00 16 00 00 + inner_seq + 12 00 02 00(子帧0x0002)
+                        + 7c 02(路由0x027c) + 文本: CodeList=<m>(<code>,);\\r\\npageid=4417\\r
+
+    与当日分时（build_timeline_query）的区别：
+      - **pageid 4417**（当日是 9354）
+      - **子帧 0x0009** + 路由 0x017c（当日是单层 0x0002 + 0x000a）
+      - **嵌套结构**（外层 0x0009 + 内层 0x0002 壳）
+      - **DataType 26 个 level2 字段**（含 201-230 大单金额，当日无）
+      - DateTime 带具体 bar 序号区间（当日是 0-0）
+      - 多 ``DTPrevOff=-61``（含义待确认，抓包恒为 -61）
+
+    ★ **bar_start（日期定位参数）**：``DateTime=8192(bar_start-bar_start+355)`` 里
+    的两个大数是该交易日**首条分时 bar 的全局序号**，编码已破解（4 锚点验证，
+    见 :func:`date_to_timeline_bar`）::
+
+        bar_start = (目标日期 - 1849-04-05).days × 2048 + 606
+
+    传 ``date`` 参数即可自动换算（推荐），无需手算 bar_start。
+
+    Args:
+        code: 股票代码（如 ``"000938"``；指数用 ``"1A0002"``）。
+        bar_start: 该交易日首条 bar 的全局序号。与 ``date`` 二选一（``date`` 优先）。
+        date: 目标交易日（``date``/``datetime``/``"YYYY-MM-DD"`` 字符串）。
+            优先于 ``bar_start``，自动用 :func:`date_to_timeline_bar` 换算。
+        market: 市场码（17=沪 33=深；指数 1A0002 用 16）。
+        datatype: 字段集，None 用 :data:`HISTORY_TIMELINE_DATATYPE`。
+        pageid: 4417（历史分时）。
+        seq: 外层帧序列标签。
+        inner_seq: 内层子帧序列标签。
+        dt_prev_off: DTPrevOff 值（抓包恒 -61，含义待确认）。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic），可直接 sendall。
+    """
+    if date is not None:
+        bar_start = date_to_timeline_bar(date)
+    if bar_start is None:
+        raise ValueError("必须传 bar_start 或 date 之一")
+    if datatype is None:
+        datatype = HISTORY_TIMELINE_DATATYPE
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    bar_end = bar_start + HISTORY_TIMELINE_BAR_SPAN
+
+    # 外层文本（DataType/DateTime/DTPrevOff/LackTime 行，末尾 \r\n）
+    outer_text = (
+        f"CodeList={market}({code},);\r\nDataType={dt_str}\r\n"
+        f"DateTime={TIMELINE_PERIOD}({bar_start}-{bar_end})\r\n"
+        f"DTPrevOff={dt_prev_off}\r\n"
+        f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+
+    # 内层子帧文本（壳，仅 CodeList + pageid，末尾 \r\n）
+    inner_text = (
+        f"CodeList={market}({code},);\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+
+    # 内层子帧头（22B，抓包逐字节确认）：00 16 00 00 + inner_seq + 12 00 02 00
+    #   + 7c 02(路由0x027c) + 00×5 + 00 + 文本长度(LE16, =字节数) + 00 00
+    inner_hdr = bytearray(22)
+    inner_hdr[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", inner_hdr, 4, inner_seq & 0xFFFF)
+    inner_hdr[6:10] = b"\x12\x00\x02\x00"   # 子帧 0x0002
+    inner_hdr[10:12] = b"\x7c\x02"           # 路由 0x027c
+    struct.pack_into("<H", inner_hdr, 18, len(inner_text))
+    inner_frame = bytes(inner_hdr) + inner_text
+
+    # 外层帧头（23B）：cmd 0x09 + 00 16 00 00 + seq + 12 00 09 00(子帧0x0009)
+    #   + 7c 01(路由0x017c) + 00×5 + 20(★[18]=0x20，历史分时特有) + 文本长度 + 00 00
+    outer_hdr = bytearray(23)
+    outer_hdr[0] = 0x09
+    outer_hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", outer_hdr, 5, seq & 0xFFFF)
+    outer_hdr[7:11] = b"\x12\x00\x09\x00"   # 子帧 0x0009
+    outer_hdr[11:13] = b"\x7c\x01"           # 路由 0x017c
+    outer_hdr[18] = 0x20                      # 抓包真值（当日分时/盘口此位=0x00）
+    struct.pack_into("<H", outer_hdr, 19, len(outer_text))
+    body = bytes(outer_hdr) + outer_text + inner_frame
+    return encode_frame(body)
+
+
+def parse_history_timeline_response(body: bytes) -> list[dict]:
+    """解析历史分时响应（hd1.0 嵌套壳变体 dc=0x040000f2），返回逐点行情。
+
+    响应结构（2026-07-24 抓包确认，文档 §14h）::
+
+        hd1.0\\0
+        + dc(LE32)            ← 0x040000f2：高16位0x0004=嵌套壳标记，低16位=记录数(242)
+        + flag(LE16=0x007e)
+        + hs(LE16=88)         ← 单条记录字节长度（= 字段表 width 累加）
+        + fc(LE16=22)         ← 字段数
+        + 字段表(fc×4B)       ← dt1/10/13/19/22/23/201-230，width 全=4
+        + ~110B 壳头           ← 含 ff*8 padding + dt5 代码标记
+        + 记录区: dc_low 条，每条 hs 字节，行主序明文
+
+    dt1（时间字段）= 该 bar 的**全局序号**（首条 = 请求里的 bar_start，每条 +1）。
+    非交易日时间戳——是 hexin 内部连续 bar 编号，无法直接还原成 HH:MM。
+    其它字段（dt10 现价/dt13 量/dt19 额/dt201-230 大单）用 decode_ths_float。
+
+    Args:
+        body: 完整 TCP 帧体（含 hd1.0 标记）。
+
+    Returns:
+        记录列表，每条 ``{bar_index, dt10, dt13, dt19, dt22, dt23, ...}``。
+        dt10=现价、dt13=成交量、dt19=成交额、dt201-230=level2 大单金额。
+        未找到历史分时帧（dc 高16位≠0x0004 或字段表不含 dt10）时返回空列表。
+    """
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return []
+    base = pos + 6  # 跳过 hd1.0\0
+    if base + 10 > len(body):
+        return []
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    # 历史分时帧：dc = 0x0400xxxx（高16位=0x0400 嵌套壳标记，低16位=记录数）
+    if (dc >> 16) != 0x0400:
+        return []
+    nrec = dc & 0xFFFF           # 低 16 位 = 记录数（242）
+    flag = struct.unpack("<H", body[base+4:base+6])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if nrec == 0 or hs == 0 or fc == 0 or fc > 40:
+        return []
+    ftoff = base + 10
+    ft = body[ftoff:ftoff + fc*4]
+    if len(ft) < fc*4:
+        return []
+    fields = [(ft[i*4], ft[i*4+1], ft[i*4+2], ft[i*4+3]) for i in range(fc)]
+    # 字段表必须含 dt10（现价），否则不是历史分时帧
+    if not any(f[0] == 10 for f in fields):
+        return []
+
+    # 记录区前有壳头（~110B padding + 代码标记），定位首条记录：
+    # dt1 是第一个字段，首条 dt1 值 = 请求的 bar_start（1.3 亿级大数）。
+    # 扫描字段表后，找首个「dt1 落在 bar 序号区间 且 +hs 处 = dt1+1」的位置
+    # （壳头有干扰值，用 dt1+1 校验排除噪声）。
+    recoff = ftoff + fc*4
+    rec0_off = -1
+    scan_end = min(recoff + hs * 3, len(body) - hs)
+    for off in range(recoff, scan_end):
+        v = struct.unpack("<I", body[off:off+4])[0]
+        if 100_000_000 < v < 200_000_000:
+            # 校验：+hs 处（下一条记录的 dt1）应是 v+1
+            v_next = struct.unpack("<I", body[off+hs:off+hs+4])[0]
+            if v_next == v + 1:
+                rec0_off = off
+                break
+    if rec0_off < 0:
+        return []
+
+    recs: list[dict] = []
+    for ri in range(nrec):
+        o = rec0_off + ri * hs
+        if o + hs > len(body):
+            break
+        rec: dict = {}
+        fo = o
+        for dt, fmt, fl, w in fields:
+            chunk = body[fo:fo+w]
+            fo += w
+            if w == 4:
+                raw = struct.unpack("<I", chunk)[0]
+                if dt == 1:
+                    # dt1 是 bar 全局序号（整数），不用 float 解码
+                    rec["bar_index"] = raw
+                else:
+                    rec[f"dt{dt}"] = decode_ths_float(raw)
+        recs.append(rec)
+    return recs
+
+
+# =============================================================================
+# 个股五档盘口（封单额）—— 8901 端口
+#
+# 2026-07-23 用 002353 杰瑞股份（涨停，封单额 11.37 亿）对照抓包破解确认：
+#   - 盘口请求的 DataType 是 [13,18,24,25,26,27,28,29,...,150,151,...,154,155,...]
+#     （**不是** [19,223-262]，后者是资金流数据：大/中/小单净额，dt227≈dt19）
+#   - 买盘字段对（价/量）：dt24/25=买一 dt26/27=买二 dt28/29=买三
+#                         dt150/151=买四 dt154/155=买五
+#   - ★ 封单额 = dt24(买一价) × dt25(买一量,单位:股)
+#     例：002353 → 135.11 × 8416876 = 1,137,204,116 元 ≈ 11.37 亿（与界面一致）
+#   - 涨停封死时卖盘字段（dt34/35 等）为 0（无卖盘挂单），符合预期
+# =============================================================================
+
+# 五档盘口请求的 DataType（2026-07-23 抓包 002353/688799 真值，26 字段）。
+# 含完整五档买卖盘 + 量。
+DEPTH_QUOTE_DATATYPE = [
+    13, 18,                          # 成交量, 涨幅
+    24, 25, 26, 27, 28, 29,          # 买一/二/三 价+量
+    30, 31, 32, 33, 34, 35,          # 卖一/二/三 价+量
+    122, 123, 124, 125,              # (扩展档位)
+    150, 151, 152, 153,              # 买四 价+量 + 卖四 价+量
+    154, 155, 156, 157,              # 买五 价+量 + 卖五 价+量
+]
+
+# 买盘五档字段对（价 dt, 量 dt）——2026-07-23 抓包确认
+# 002353 涨停股对照：买一 135.11/84169手 → 封单额=dt24×dt25=11.37亿
+BUY_LEVEL_FIELDS = [
+    ("买一", 24, 25), ("买二", 26, 27), ("买三", 28, 29),
+    ("买四", 150, 151), ("买五", 154, 155),
+]
+
+# 卖盘五档字段对（价 dt, 量 dt）——2026-07-23 抓包 688799 对照确认
+# 卖一 47.30/52手 卖二 47.31/45手 卖三 47.36/10手 卖四 47.37/10手 卖五 47.38/40手
+SELL_LEVEL_FIELDS = [
+    ("卖一", 30, 31), ("卖二", 32, 33), ("卖三", 34, 35),
+    ("卖四", 152, 153), ("卖五", 156, 157),
+]
+
+
+def build_depth_quote_query(
+    code: str,
+    market: int = 33,
+    datatype: list[int] | None = None,
+    pageid: int = 1333,
+    seq: int = 0x0000,
+    inner_seq: int = 0x0163,
+) -> bytes:
+    """构造个股五档盘口请求帧（fdfdfdfd magic + 8字节hex长度 + body）。
+
+    这是 hexin 在「个股详情页/分时图」打开时发的盘口请求（2026-07-23
+    抓包确认）。响应含五档买卖盘，**封单额 = dt24(买一价) × dt25(买一量,股)**。
+
+    请求是**嵌套子帧**结构（与 :func:`build_list_quote_query` 的单层不同，
+    抓包帧体逐字节对照确认）::
+
+        外层帧: cmd=0x09, 子帧类型 0x0002, 路由 0x001c
+                文本: CodeList=<m>(<code>,);\\r\\npageid=<pid>\\r
+        内层子帧(紧跟外层文本): 00 16 00 00 + inner_seq(LE16)
+                + 12 00 09 00(子帧0x0009) + 00 01(路由) + 00×5 + 00
+                + 文本长度(LE16) + 00 00
+                + CodeList=<m>(<code>,);\\r\\nDataType=...\\r\\n
+                  DateTime=0(0-0)\\r\\nLackTime=...\\r\\npageid=<pid>\\r
+
+    内层子帧就是标准的 list_quote 子帧（0x0009），外层 0x0002 壳多带一个
+    CodeList+pageid 前缀。服务器据此返回该股的 hd1.0 盘口帧。
+
+    Args:
+        code: 股票代码（6 位数字，如 ``"002353"``）。
+        market: 市场码。深市=33（002353 实测），沪市=17。注意深 A 在盘口请求
+            里用 33（与 stock_list 的 22 不同——盘口请求走 33 通道）。
+        datatype: DataType 字段列表，None 用 :data:`DEPTH_QUOTE_DATATYPE`。
+        pageid: 页面 id（抓包实测 1333）。
+        seq: 外层帧序列标签。
+        inner_seq: 内层子帧序列标签。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+
+    Note:
+        盘后（非交易时段）同花顺仍能显示盘口快照，故可盘后抓包验证。
+    """
+    if datatype is None:
+        datatype = DEPTH_QUOTE_DATATYPE
+    codes_str = code + ","
+    market_str = f"{market}({codes_str})"
+    dt_str = ",".join(str(d) for d in datatype) + ","
+
+    # 外层文本（行尾 \r\n；长度字段 = 文本字节数，无 +1）
+    outer_text = (
+        f"CodeList={market_str};\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    # 内层子帧文本（标准 list_quote 文本，行尾 \r）
+    inner_text = (
+        f"CodeList={market_str};\r\nDataType={dt_str}\r\n"
+        f"DateTime=0(0-0)\r\nLackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+
+    # 内层子帧头（22B，抓包逐字节确认）：
+    #   00 16 00 00 + inner_seq(LE16) + 12 00 09 00(子帧0x0009) + 00 01(路由)
+    #   + 00×6 + 文本长度(LE16, =字节数+1) + 00 00
+    inner_hdr = bytearray(22)
+    inner_hdr[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", inner_hdr, 4, inner_seq & 0xFFFF)
+    inner_hdr[6:10] = b"\x12\x00\x09\x00"
+    inner_hdr[10:12] = b"\x00\x01"
+    # [12:18] = 0
+    struct.pack_into("<H", inner_hdr, 18, len(inner_text) + 1)
+    # [20:22] = 00 00
+    inner_frame = bytes(inner_hdr) + inner_text
+
+    # 外层帧头（23B）：cmd 0x09 + 00 16 00 00 + seq + 12 00 02 00(子帧0x0002)
+    #   + 1c 00(路由) + 00×5 + 00 + 文本长度(LE16, =字节数) + 00 00
+    outer_hdr = bytearray(23)
+    outer_hdr[0] = 0x09
+    outer_hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", outer_hdr, 5, seq & 0xFFFF)
+    outer_hdr[7:11] = b"\x12\x00\x02\x00"   # 子帧类型 0x0002（盘口壳）
+    outer_hdr[11:13] = b"\x1c\x00"           # 路由 0x001c（抓包真值）
+    # [13:18]=0, [18]=0
+    struct.pack_into("<H", outer_hdr, 19, len(outer_text))   # 外层长度无 +1
+    body = bytes(outer_hdr) + outer_text + inner_frame
+    return encode_frame(body)
+
+
+def parse_depth_quote_response(body: bytes) -> dict:
+    """解析个股五档盘口响应，返回五档买卖盘 + 封单额（涨停/跌停自动判断）。
+
+    响应是 hd1.0 单股帧（dc=1），字段表含 dt24（买一价）。本函数定位该帧、
+    按字段表切分记录，并据买卖一档状态计算封单额。
+
+    封单额判断逻辑（2026-07-23 抓包对照确认）：
+      - **涨停**：卖一量(dt31)=0（无卖盘挂单），封单额 = dt24(买一价) × dt25(买一量)
+        例：002353 → 135.11 × 8416876 = 11.37 亿
+      - **跌停**：买一量(dt25)=0（无买盘挂单），封单额 = dt30(卖一价) × dt31(卖一量)
+      - **正常**：买卖一档都有量，无封单，seal_amount=0
+
+    Args:
+        body: 完整 TCP 帧体（含 hd1.0 标记，通常是 read_frame 读出的单帧）。
+
+    Returns:
+        dict::
+
+            {
+              "code": "002353",
+              "buy":  [{"level":"买一","price":..,"qty":..,"amount":..}, ...],
+              "sell": [{"level":"卖一","price":..,"qty":..,"amount":..}, ...],
+              "seal_amount": 1137204116.0,   # 封单额（元），正常股为 0
+              "seal_type": "涨停",            # "涨停"/"跌停"/None
+              "fields": {"dt13":..., "dt24":..., ...},
+            }
+
+        未找到盘口帧（字段表不含 dt24）时返回空 dict。
+    """
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return {}
+    base = pos + 6
+    if base + 10 > len(body):
+        return {}
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if not (0 < dc < 100 and 0 < hs < 500 and 0 < fc < 50):
+        return {}
+    ftoff = base + 10
+    ft = body[ftoff:ftoff + fc*4]
+    if len(ft) < fc*4:
+        return {}
+    fields = [(ft[i*4], ft[i*4+1], ft[i*4+3]) for i in range(fc)]  # (dt,fmt,width)
+    if not any(d == 24 for d, _, _ in fields):
+        return {}  # 非盘口帧
+    recoff = ftoff + fc*4
+    rec: dict = {}
+    for dt, fmt, width in fields:
+        chunk = body[recoff:recoff+width]
+        recoff += width
+        if len(chunk) < width:
+            break
+        if dt == 5 and fmt == 0x20:
+            rec["code"] = chunk[1:1+6].split(b"\x00")[0].decode("ascii", errors="replace")
+        elif width == 4:
+            rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+
+    # 组装五档买卖盘
+    def build_levels(level_fields):
+        out = []
+        for level, pk, qk in level_fields:
+            p = rec.get(f"dt{pk}")
+            q = rec.get(f"dt{qk}")
+            if p is not None and q is not None:
+                out.append({"level": level, "price": p, "qty": q,
+                            "amount": p * q if p else 0.0})
+        return out
+    buy = build_levels(BUY_LEVEL_FIELDS)
+    sell = build_levels(SELL_LEVEL_FIELDS)
+
+    # 封单额判断：涨停(卖一空) / 跌停(买一空) / 无封单
+    b1_qty = rec.get("dt25", 0)   # 买一量
+    s1_qty = rec.get("dt31", 0)   # 卖一量
+    seal = 0.0
+    seal_type = None
+    if s1_qty == 0 and b1_qty > 0 and "dt24" in rec:
+        # 涨停：封单 = 买一价 × 买一量
+        seal = rec["dt24"] * rec["dt25"]
+        seal_type = "涨停"
+    elif b1_qty == 0 and s1_qty > 0 and "dt30" in rec:
+        # 跌停：封单 = 卖一价 × 卖一量
+        seal = rec["dt30"] * rec["dt31"]
+        seal_type = "跌停"
+    # else: 正常股，买卖一档都有量，无封单
+
+    return {
+        "code": rec.get("code", ""),
+        "buy": buy,
+        "sell": sell,
+        "seal_amount": seal,
+        "seal_type": seal_type,
+        "fields": {k: v for k, v in rec.items() if k.startswith("dt")},
+    }
+
+
+# =============================================================================
+# 个股基本资料（行情统计 + 股本财务）—— 8901 端口
+#
+# 2026-07-23 多票对照界面值破解（002487/001317/600056）。请求是嵌套子帧
+# （外层 cmd=0x09 子帧0x0002 路由0x001c + 内层 0x0009），响应是 hd1.0 变体帧
+# （dc=0x01000001 嵌套壳标记，hs=159 fc=27）。
+#
+# 字段表含单值(fmt0x70)和双值(fmt0x61/0x62/0x66/0x68, 8字节=日期+数值)两类。
+#
+# ★ 已确认字段（三票界面对照，PE 公式精确验证 差异=0.00）：
+#   dt7=开盘 dt8=最高 dt9=最低 dt10=现价 dt13=成交量(股) dt14=外盘(股)
+#   dt19=成交额 dt66=涨幅% dt69=涨停价(昨收×1.1) dt70=跌停价(昨收×0.9)
+#   dt74=盘后量(股) dt75=盘后笔数
+#   dt146(fmt61)=总股本    dt151(fmt61)=流通股本
+#   dt151(fmt62)=TTM净利润(近4季之和,动态PE分母) dt107(fmt62)=上年年报净利润(静态PE分母)
+#   dt124(fmt61)=实际流通股(实换手分母,含义待细化)
+#   dt33(fmt68)=注册制上市日（001317=2024-08-29 已确认）
+#
+# PE 公式验证（600056 中国医药，差异 0.00）：
+#   动态PE = 总市值(dt146×现价) ÷ TTM净利(dt151_fmt62) = 141.21亿/4.83亿 = 29.24 ✓
+#   静态PE = 总市值(dt146×现价) ÷ 年报净利(dt107_fmt62) = 141.21亿/4.73亿 = 29.84 ✓
+#
+# ⚠ 待查字段：dt70(fmt66)=(19700101, 7.02) 非PE非EPS；dt45；dt90/dt92；dt130
+#
+# 本地计算（服务器不给）：换手=成交量÷流通股本 流通值=流通股本×现价
+#                          总市值=总股本×现价 动/静态PE 量比/委比需历史或盘口数据
+# =============================================================================
+
+# 基本资料请求的 DataType（2026-07-23 抓包 002487 真值，26 字段）
+QUOTE_INFO_DATATYPE = [
+    7, 8, 9, 10, 13, 14, 19, 69, 70, 74, 75, 85, 90, 92, 130,
+    6, 45, 66,
+    380, 402, 407, 663, 665, 1606, 2081, 262763,
+]
+
+
+def parse_quote_info_response(body: bytes) -> dict:
+    """解析个股基本资料响应（嵌套壳帧 dc=0x01000001），返回行情统计+股本财务。
+
+    这是盘口页"基本资料"区域的响应（2026-07-23 抓包确认）。含开/高/低/收、
+    涨跌停价、内外盘、盘后数据、股本、净利润等。响应是 hd1.0 变体帧
+   （dc=0x01000001 嵌套壳标记，字段表含 dt74 等基本资料字段）。
+
+    双值字段（fmt=0x61/0x62/0x66/0x68，width=8）= (日期, 数值)，日期如
+    20260331=季报日、19700101=哨兵（无数据）。单值字段（fmt=0x70，width=4）
+    用 decode_ths_float。
+
+    Args:
+        body: 完整 TCP 帧体（含 hd1.0 标记）。
+
+    Returns:
+        dict::
+
+            {
+              "code": "002487",
+              "fields": {  # 单值字段
+                "dt7": 37.12, "dt10": 39.55, "dt69": 40.83, "dt146": ...,
+                ...
+              },
+              "dual": {   # 双值字段 (日期, 值)
+                "dt146_61": (20260707, 740085850),  # 总股本
+                "dt151_61": (20260707, 630920270),  # 流通股本
+                ...
+              },
+              "derived": {  # 本地计算的派生字段
+                "inner": 14832495,      # 内盘(股) = dt13 - dt14
+                "turnover": 4.87,       # 换手% = 成交量/流通股本
+                "circ_mv": 24950000000, # 流通值 = 流通股本×现价
+                "total_mv": ...,        # 总市值 = 总股本×现价
+              },
+            }
+
+        未找到基本资料帧（字段表不含 dt74）时返回空 dict。
+    """
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return {}
+    base = pos + 6
+    if base + 10 > len(body):
+        return {}
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    # 基本资料帧: dc=0x01000001(嵌套壳) 或标准 dc=1，字段表含 dt74
+    if not (0 < hs < 500 and 0 < fc < 50):
+        return {}
+    ftoff = base + 10
+    ft = body[ftoff:ftoff + fc*4]
+    if len(ft) < fc*4:
+        return {}
+    fields = [(ft[i*4], ft[i*4+1], ft[i*4+3]) for i in range(fc)]  # (dt,fmt,width)
+    if not any(d == 74 for d, _, _ in fields):
+        return {}  # 非基本资料帧
+
+    # 嵌套壳帧的记录区前有一段壳头（全0 + 0004 0021 前缀），需定位代码标记
+    recoff = ftoff + fc*4
+    # 找记录起点：dt5 字段格式 [市场码1B][6B ASCII代码]，扫到 6 位 ASCII 数字
+    rec_start = -1
+    for off in range(recoff, min(recoff + hs, len(body) - 7)):
+        code_b = body[off+1:off+7]
+        if len(code_b) == 6 and all(48 <= b <= 57 for b in code_b):
+            rec_start = off
+            break
+    if rec_start < 0:
+        return {}
+
+    rec: dict = {}
+    dual: dict = {}
+    o = rec_start
+    for dt, fmt, width in fields:
+        chunk = body[o:o+width]
+        o += width
+        if len(chunk) < width:
+            break
+        if dt == 5 and fmt == 0x20:
+            rec["code"] = chunk[1:1+6].split(b"\x00")[0].decode("ascii", errors="replace")
+        elif width == 4:
+            rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+        elif width == 8:
+            v1 = decode_ths_float(struct.unpack("<I", chunk[:4])[0])
+            v2 = decode_ths_float(struct.unpack("<I", chunk[4:8])[0])
+            dual[f"dt{dt}_{fmt:02x}"] = (v1, v2)
+
+    # 派生字段（本地计算）
+    derived: dict = {}
+    dt13 = rec.get("dt13", 0)   # 成交量(股)
+    dt14 = rec.get("dt14", 0)   # 外盘(股)
+    if dt13:
+        derived["inner"] = dt13 - dt14  # 内盘 = 总量 - 外盘
+    # 流通股本 dt151(fmt61) 第二值
+    liutong = _dual_second(dual, 151, 0x61)
+    if liutong and rec.get("dt10"):
+        derived["circ_share"] = liutong
+        derived["circ_mv"] = liutong * rec["dt10"]   # 流通值
+        if dt13:
+            derived["turnover"] = (dt13/100) / (liutong/100) * 100  # 换手%
+    # 总股本 dt146(fmt61) 第二值
+    zong = _dual_second(dual, 146, 0x61)
+    if zong and rec.get("dt10"):
+        derived["total_share"] = zong
+        derived["total_mv"] = zong * rec["dt10"]     # 总市值
+    # 实际流通股 dt124(fmt61) -> 实换手
+    shiji = _dual_second(dual, 124, 0x61)
+    if shiji and dt13:
+        derived["real_turnover"] = (dt13/100) / (shiji/100) * 100
+
+    # 动/静态市盈率（600056 验证 差异=0.00）
+    # 动态PE = 总市值 ÷ TTM净利润(dt151_fmt62)
+    # 静态PE = 总市值 ÷ 上年年报净利润(dt107_fmt62)
+    total_mv = derived.get("total_mv")
+    if total_mv:
+        ttm = _dual_second(dual, 151, 0x62)   # TTM净利润(近4季)
+        if ttm and ttm > 0:   # 亏损时 PE 无意义，不计算
+            derived["pe_ttm"] = total_mv / ttm
+        ann = _dual_second(dual, 107, 0x62)   # 上年年报净利润
+        if ann and ann > 0:
+            derived["pe_annual"] = total_mv / ann
+
+    return {"code": rec.get("code", ""), "fields": rec, "dual": dual,
+            "derived": derived}
+
+
+def _dual_second(dual: dict, dt: int, fmt: int) -> float | None:
+    """从 dual 字典取指定 dt/fmt 的第二值（数值部分，第一值通常是日期）。"""
+    v = dual.get(f"dt{dt}_{fmt:02x}")
+    return v[1] if v else None
+
+
+
 # 16/17/18/19/20/22 = 沪深 A 股主板/创业板/科创板/B 股
 # 144/145/146/147/150/151 = 深圳系列市场（含北交所）
 MARKET_SNAPSHOT_MARKETS = [16, 17, 18, 19, 20, 22, 144, 145, 146, 147, 150, 151]
@@ -724,45 +1627,85 @@ STOCK_LIST_MARKETS = [(17, "沪"), (22, "深"), (151, "北交所")]
 # DataType=199112 = 返回代码表（抓包帧3898确认：DataType=199112, 末尾只有一个逗号，不带 55）
 STOCK_LIST_DATATYPE = [199112]
 
+# SortBy 字段编号 → 含义。
+#
+# ★ 2026-07-23 三份抓包（list_quote_fields_20260723_232604/233238/233805.pcap）
+#   彻底澄清排序协议，纠正了旧文档的多处错误：
+#
+# 1. SortBy **不是** DataType 字段编号本身（旧文档错误结论）。两者是独立编号空间：
+#    SortBy=199112(涨幅) 的响应返回的是 dt200；SortBy=592890(主力净流入) 返回 dt250；
+#    SortBy=68762(竞价涨幅) 返回 dt154。不要把 SortBy 当 DataType 用。
+#
+# 2. 成交量/成交额**不走 SortBy 路径**（旧文档误标 sort_by=13/19）。
+#    它们走「CodeList+AddCode 增量订阅（子帧 0x0002）→ 行情推送累加 → 客户端本地排序」，
+#    全程无 SortTotal 响应、无 SortBy 请求。dt13/dt19 是被订阅的行情字段编号，
+#    不是排序键。详见 HANDOFF_STOCKLIST_PUSH.md「排序榜单协议逆向」章节。
+#
+# 3. 竞价金额/竞价涨幅**是服务器侧排序**（纠正「客户端本地算」的旧认知）：
+#    客户端只发 SortBy=68758/68762，服务器排好序返回；客户端显示值本地重算，
+#    但排序动作发生在服务器，不需要拉全市场开盘价。
+#
+# "verified"= 抓包命中过该 SortBy 值的请求（本次三份抓包全部 verified=True）。
+SORT_BY_VALUES = {
+    "涨幅":    {"sort_by": 199112,  "verified": True},   # 返回 dt200
+    "涨速":    {"sort_by": 48,      "verified": True},   # 返回 dt48（4分钟涨幅）
+    "换手率":  {"sort_by": 1968584, "verified": True},   # 返回 dt200
+    "量比":    {"sort_by": 1771976, "verified": True},   # 返回 dt200
+    "主力净流入": {"sort_by": 592890,  "verified": True},   # 返回 dt250
+    "竞价金额": {"sort_by": 68758,   "verified": True},   # 返回 dt150
+    "竞价涨幅": {"sort_by": 68762,   "verified": True},   # 返回 dt154
+    # 注：成交量/成交额不在此表——它们走增量订阅本地排序（见上方说明）。
+}
+# SortDir：D=降序（抓包 36 次全是 D）。升序值（A/U）未经抓包/文档证实，为推测。
+
 
 def build_stock_list_query(
     markets: list[int] | tuple[int, ...] = (17, 22, 151),
     sort_begin: int = 0,
-    sort_count: int = 29,
+    sort_count: int = 59,
     datatype: list[int] | None = None,
+    sort_by: int = 199112,
+    sort_dir: str = "D",
     pageid: int = 1334,
     seq: int = 0x0025,
 ) -> bytes:
-    """构造股票列表查询请求（空 CodeList + DataType=199112，8901端口）。
+    """构造股票列表查询请求（空 CodeList + 排序查询，8901端口）。
 
-    同花顺在用户打开「沪深A股」列表界面时发此请求（抓包帧3898确认）。
-    注意：这不是启动时拉全量代码表的请求 —— 启动时走 init/qustocklink。
-    本请求是「排序代码表查询」，服务器按 SortBy 排序后返回前 SortCount 条。
+    同花顺在用户打开「沪深A股」列表界面、切换排序列时发此请求。
+    服务器按 ``sort_by`` 指定的字段排序后返回一段代码（由 ``sort_begin`` 定位）。
 
-    请求文本（抓包帧3898真值）：
+    请求文本（抓包真值，sort_by/sort_dir/sort_begin/sort_count 已参数化）：
       CodeList=17();22();151();   ← 空括号 = 该市场全部（17=沪 22=深A 151=北交所）
-      DataType=199112,            ← 199112 返回代码表（不带 ,55）
+      DataType=199112,            ← 返回字段
       SortType=Sort
-      SortBy=199112
-      SortDir=D                   ← 降序
+      SortBy=199112               ← 排序键（见 SORT_BY_VALUES，与 DataType 是独立编号空间）
+      SortDir=D                   ← D=降序（抓包 36 次全是 D）
       SortAppend=YC
-      SortBegin=0                 ← 抓包确认：恒为 0（不是真翻页游标）
-      SortCount=29                ← 本次要的条数（hexin 逐步放大直到拿到全量）
+      SortBegin=0                 ← 翻页游标：首次=0，下拉翻页时递增到已加载位置
+      SortCount=59                ← 每页条数（hexin 恒用 59）
       FuncPeriod=0
       DateTime=0(0-0)
       LackTime=0,0,0,0,0,0,0,0
       pageid=1334
 
-    ⚠ 翻页模型（抓包帧3898→4967确认）：hexin 不是用 SortBegin 递增翻页，
-    而是固定 SortBegin=0，把 SortCount 从 29 逐步放大（29→261→2538→2645），
-    直到服务器返回的 SortDataCount == SortTotal（一次性拿全量）。
+    ★ 翻页模型（2026-07-23 三份抓包确认，纠正旧文档错误）：
+      hexin 用 **SortBegin 游标翻页**——首次请求 SortBegin=0 拿第 1~59 名，
+      下拉后递增 SortBegin（实测序列 0→1361→2715→3773→5151，总 5210 条），
+      SortCount 恒为 59。旧文档说"SortBegin 恒 0、SortCount 递增放大"是错的。
+      下拉中途 CodeList 会带「锚点代码」(如 17(600173,600219,...))，但空括号
+      + SortBegin 递增同样有效（抓包里也存在），故本函数始终发空括号。
 
     Args:
         markets: 市场码列表。17=沪 22=深A 151=北交所（默认）。
             抓包确认深 A 市场码是 22（不是 33；33 是深市另一类，hexin 单独拉）。
-        sort_begin: 抓包恒为 0（保留参数仅为兼容）。
-        sort_count: 本次要的条数。hexin 从 29 开始逐步放大。
+        sort_begin: 翻页游标。首次为 0；下拉翻页时递增到已加载位置（见上方翻页模型）。
+        sort_count: 每页条数，hexin 恒用 59。
         datatype: DataType 列表，默认 [199112]（抓包真值，不带 55）。
+        sort_by: 排序键编号，默认 199112（涨幅）。取值见 :data:`SORT_BY_VALUES`
+            （均为活网验证）：涨幅=199112、涨速=48、换手率=1968584、量比=1771976、
+            主力净流入=592890、竞价金额=68758、竞价涨幅=68762。
+            ⚠ 成交量/成交额不在此列——它们走增量订阅本地排序，没有 SortBy。
+        sort_dir: 排序方向，``"D"``=降序（默认，抓包确认）；升序值推测为 ``"A"``（未实测）。
         pageid: 固定 1334。
         seq: 序列标签。
 
@@ -776,7 +1719,7 @@ def build_stock_list_query(
     dt_str = ",".join(str(d) for d in datatype) + ","
     text = (
         f"CodeList={codelist}\r\nDataType={dt_str}\r\n"
-        f"SortType=Sort\r\nSortBy=199112\r\nSortDir=D\r\nSortAppend=YC\r\n"
+        f"SortType=Sort\r\nSortBy={sort_by}\r\nSortDir={sort_dir}\r\nSortAppend=YC\r\n"
         f"SortBegin={sort_begin}\r\nSortCount={sort_count}\r\n"
         f"FuncPeriod=0\r\nDateTime=0(0-0)\r\n"
         f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
@@ -798,14 +1741,14 @@ def build_stock_list_query(
 def parse_stock_list_response(body: bytes) -> dict:
     """解析股票列表响应（文本头 + hd3.1 16-bit 变体帧），返回分页元数据 + 代码列表。
 
-    响应结构（抓包帧3900确认）：
-        SortTotal=2645          ← 全市场代码总数
+    响应结构（抓包确认）：
+        SortTotal=5210          ← 全市场代码总数
         SortTop=1900544
-        SortBegin=0             ← 恒为 0
-        SortCount=29            ← 本次请求的条数（= 请求里的 SortCount）
+        SortBegin=0             ← 翻页游标（本次请求的起始位置；首次 0，翻页递增）
+        SortCount=59            ← 本次请求的条数（= 请求里的 SortCount，hexin 恒 59）
         SortCalcProgress=1
         SortDataFirst=0
-        SortDataCount=29        ← 数据区实际条数（min(SortCount, SortTotal)）
+        SortDataCount=59        ← 数据区实际条数（min(SortCount, SortTotal-SortBegin)）
         OrderList=
         hd3.1\\0 + 16-bit 变体头 + 字段表 + BitRLE流
 
@@ -1286,6 +2229,277 @@ def parse_hd3_response(body: bytes) -> list[dict]:
     bitplane = _decode_bitrle_0x13746d0(bitrle, expect)
     recs = _transpose_bitplane_0x1763410(bitplane, hs, dc)
     return _parse_hd_records(recs, fields, hs, dc)
+
+
+# K线 dt 字段编号 → 标准含义（与请求 DataType 对齐，同 Mac 版 thspy）
+KLINE_DT_OPEN = 7
+KLINE_DT_HIGH = 8
+KLINE_DT_LOW = 9
+KLINE_DT_CLOSE = 11
+KLINE_DT_VOL = 13
+KLINE_DT_AMT = 19
+
+
+def parse_kline_hd3_response(body: bytes) -> list[dict]:
+    """解析 K线响应的 hd3.1 变体（flag=0x0042/0x0046，PC 版 8901 端口 K线图）。
+
+    解码核心与标准 hd3.1 完全相同（``_decode_bitrle_0x13746d0`` BitRLE 解码 +
+    ``_transpose_bitplane_0x1763410`` 位平面转置，两者均经 Unicorn 逐字节验证），
+    区别仅在帧头布局：dc 是 LE32、字段表后有 26 字节壳头（含 ASCII 代码）。
+
+    头格式（抓包 kline_20260724_000441_resp_stream1.bin 三帧验证）::
+
+        hd3.1\\0
+        + dc(LE32)              ← 记录数（K线根数）
+        + flag(LE16=0x0042/0x0046)  ← 变体标记（0x0046=OHLC K线；0x0042=分笔/tick 类）
+        + hs(LE16)              ← 单条记录字节长度（= 字段表 width 累加）
+        + fc(LE16)              ← 字段数
+        + 字段表(fc×4B)         ← (dt, fmt, flags, width)，数值字段 fmt=0x70/0x64
+        + 26字节壳头            ← [0:2]市场码 + [4]0x21 + [5:11]6B ASCII 代码 + ...
+        + BitRLE头(BE32=dc*hs)  ← 大端，与标准 hd3.1 一致
+        + BitRLE位流
+
+    时间字段（dt1）格式随周期而变：分/日K 是 Unix 时间戳，周/月K 是 YYYYMMDD
+    紧凑整数。本函数用 ``dt1 < 100_000_000`` 判定为 YYYYMMDD（恒 < 10^8），
+    否则当 Unix 时间戳，两者都还原成 ``datetime`` 存入 ``time`` 字段。
+
+    Args:
+        body: 完整 TCP 帧体（含 ``hd3.1\\0`` 标记）。
+
+    Returns:
+        记录列表，每条 ``{code, time, open, high, low, close, volume, amount,
+        dt<N>...}``，按时间正序（最早在前）。
+        缺失字段不出现；无法定位 hd3.1 标记或 BitRLE 头不匹配返回 ``[]``。
+    """
+    pos = body.find(b"hd3.1\x00")
+    if pos < 0:
+        return []
+    base = pos + 6
+    if len(body) < base + 10:
+        return []
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    flag = struct.unpack("<H", body[base+4:base+6])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if dc == 0 or hs == 0 or fc == 0 or fc > 50:
+        return []
+    if flag not in (0x0042, 0x0046):
+        logger.debug("kline hd3.1 非 K线变体(flag=0x%x), 跳过", flag)
+        return []
+    fields = _parse_hd_field_table(body, base + 10, fc)
+    # K线变体壳头固定 26 字节（市场码 + 0x21 + 6B ASCII 代码 + padding）
+    shell_off = base + 10 + fc * 4
+    if len(body) < shell_off + 26:
+        return []
+    shell = body[shell_off: shell_off + 26]
+    code = shell[5:11].decode("ascii", errors="replace") if shell[4] == 0x21 else ""
+    bitrle_off = shell_off + 26
+    if len(body) < bitrle_off + 4:
+        return []
+    expect = dc * hs
+    bitrle_head = struct.unpack(">I", body[bitrle_off:bitrle_off+4])[0]
+    if bitrle_head != expect:
+        logger.debug("kline hd3.1 BitRLE 头不匹配: got=0x%x expect=0x%x(dc*hs=%d, flag=0x%x)",
+                     bitrle_head, expect, expect, flag)
+        return []
+    bitplane = _decode_bitrle_0x13746d0(body[bitrle_off:], expect)
+    if len(bitplane) < expect:
+        logger.debug("kline hd3.1 BitRLE 解码不足: got=%d expect=%d", len(bitplane), expect)
+        return []
+    recs = _transpose_bitplane_0x1763410(bitplane, hs, dc)
+    # 字段表 dt → 行内偏移（width 累加）
+    dt_offset: dict[int, tuple[int, int]] = {}  # dt -> (offset, width)
+    off = 0
+    for dt, fmt, width in fields:
+        dt_offset[dt] = (off, width)
+        off += width
+    # 先按首根 dt1 判定整帧的时间格式（同一帧所有行用同一种编码）。
+    # 分/日/周/月K 用 Unix 时间戳或 YYYYMMDD；日内 K（5分等）的 dt1 是绝对 bar
+    # 序号（连续递增，增量=周期分钟数），不是时间戳——用首根值能否解出合理
+    # 日期来区分（bar 序号当 Unix 解会落到 1970 年代，明显不合理）。
+    time_is_bar_index = False
+    if 1 in dt_offset and dc > 0:
+        o0, _ = dt_offset[1]
+        first_row = recs[0:hs]
+        tv0 = struct.unpack("<I", first_row[o0:o0+4])[0] if len(first_row[o0:o0+4]) == 4 else 0
+        time_is_bar_index = _kline_dt1_is_bar_index(tv0)
+    records: list[dict] = []
+    for i in range(dc):
+        row = recs[i*hs: (i+1)*hs]
+        if len(row) < hs:
+            break
+        rec: dict = {"code": code}
+        # 时间（dt1）
+        if 1 in dt_offset:
+            o, w = dt_offset[1]
+            tv = struct.unpack("<I", row[o:o+4])[0] if len(row[o:o+4]) == 4 else 0
+            if time_is_bar_index:
+                # 日内 K：dt1 是绝对 bar 序号，无法直接还原成时刻，保留原值
+                rec["time"] = None
+                rec["bar_index"] = tv
+            else:
+                rec["time"] = _kline_decode_time(tv)
+        # OHLCV 标准字段
+        for name, dt in (("open", KLINE_DT_OPEN), ("high", KLINE_DT_HIGH),
+                         ("low", KLINE_DT_LOW), ("close", KLINE_DT_CLOSE),
+                         ("volume", KLINE_DT_VOL), ("amount", KLINE_DT_AMT)):
+            if dt in dt_offset:
+                o, w = dt_offset[dt]
+                chunk = row[o:o+w]
+                if len(chunk) >= 4:
+                    rec[name] = decode_ths_float(struct.unpack("<I", chunk[:4])[0])
+        # 其余 dt 原样保留（fmt=0x70/0x64 当 THS float，否则 raw），供调试/扩展
+        for dt, (o, w) in dt_offset.items():
+            if dt in (1, KLINE_DT_OPEN, KLINE_DT_HIGH, KLINE_DT_LOW,
+                      KLINE_DT_CLOSE, KLINE_DT_VOL, KLINE_DT_AMT):
+                continue
+            chunk = row[o:o+w]
+            if w == 4 and len(chunk) == 4:
+                fields_ref = dict((d, f) for d, f, _ in fields)
+                if fields_ref.get(dt) in (0x70, 0x64):
+                    rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+                else:
+                    rec[f"dt{dt}_raw"] = chunk
+        records.append(rec)
+    return records
+
+
+def parse_timeline_l2_response(body: bytes) -> list[dict]:
+    """解析 L2 当日分时响应（hd3.1 变体 flag=0x00b4，pageid=4214 推送通道）。
+
+    与 K线响应（:func:`parse_kline_hd3_response`）的差异（2026-07-24 抓包确认）::
+
+        - flag=0x00b4（K线是 0x0042/0x0046）
+        - 壳头 44 字节（K线是 26B），含两只票的代码壳（指数 + 个股）
+        - dc=482 是两只票合计（各 241 根），不是单票根数
+        - BitRLE + 位平面转置与 K线完全相同
+
+    壳头结构（44B）::
+
+        [0:5]   市场码 + 标记(0x20)     ← 指数（如 399002）
+        [5:12]  6B ASCII 代码 + padding
+        [12:22] padding
+        [22:23] 标记 0x21               ← 个股（如 000938）
+        [23:30] 6B ASCII 代码 + padding
+        [30:44] padding/f1 标记
+
+    解码后按 hs 切分行，前 dc//2 行是第一只票，后 dc//2 行是第二只票。
+    本函数返回**个股**分时记录（跳过指数）。
+
+    Args:
+        body: 完整 TCP 帧体（含 ``hd3.1\\0`` 标记）。
+
+    Returns:
+        个股分时记录列表，每条 ``{code, time, dt10, dt13, dt19, ...}``。
+        非分时帧返回空。
+    """
+    pos = body.find(b"hd3.1\x00")
+    if pos < 0:
+        return []
+    base = pos + 6
+    if len(body) < base + 10:
+        return []
+    dc = struct.unpack("<I", body[base:base+4])[0]
+    flag = struct.unpack("<H", body[base+4:base+6])[0]
+    hs = struct.unpack("<H", body[base+6:base+8])[0]
+    fc = struct.unpack("<H", body[base+8:base+10])[0]
+    if dc == 0 or hs == 0 or fc == 0 or fc > 50:
+        return []
+    if flag != 0x00b4:
+        return []
+    fields = _parse_hd_field_table(body, base + 10, fc)
+    # 壳头 44B（双票代码壳）
+    shell_off = base + 10 + fc * 4
+    if len(body) < shell_off + 44:
+        return []
+    shell = body[shell_off:shell_off + 44]
+    # 提取两只票代码
+    idx_code = shell[5:11].split(b"\x00")[0].decode("ascii", errors="replace")
+    stock_code = ""
+    for off in range(22, 30):
+        if shell[off] == 0x21:
+            stock_code = shell[off+1:off+7].split(b"\x00")[0].decode("ascii", errors="replace")
+            break
+    bitrle_off = shell_off + 44
+    if len(body) < bitrle_off + 4:
+        return []
+    expect = dc * hs
+    bitrle_head = struct.unpack(">I", body[bitrle_off:bitrle_off+4])[0]
+    if bitrle_head != expect:
+        logger.debug("timeline_l2 BitRLE头不匹配: got=0x%x expect=0x%x", bitrle_head, expect)
+        return []
+    bitplane = _decode_bitrle_0x13746d0(body[bitrle_off:], expect)
+    if len(bitplane) < expect:
+        return []
+    recs_raw = _transpose_bitplane_0x1763410(bitplane, hs, dc)
+    # 字段表 dt → 行内偏移
+    dt_offset: dict[int, tuple[int, int]] = {}
+    off = 0
+    for dt, fmt, width in fields:
+        dt_offset[dt] = (off, width)
+        off += width
+    # dc 行分两半：前 dc//2 是第一只票（指数），后 dc//2 是个股
+    half = dc // 2
+    records: list[dict] = []
+    for i in range(half, dc):  # 只取个股（后半）
+        row = recs_raw[i*hs: (i+1)*hs]
+        if len(row) < hs:
+            break
+        rec: dict = {"code": stock_code}
+        for dt, (o, w) in dt_offset.items():
+            chunk = row[o:o+w]
+            if dt == 1 and w == 4 and len(chunk) == 4:
+                tv = struct.unpack("<I", chunk)[0]
+                # 分时 dt1 是 bar 序号（连续递增），不是时间戳
+                rec["bar_index"] = tv
+            elif w == 4 and len(chunk) == 4:
+                fmt_val = dict((d, f) for d, f, _ in fields).get(dt)
+                if fmt_val in (0x70, 0x64):
+                    rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
+                else:
+                    rec[f"dt{dt}"] = struct.unpack("<I", chunk)[0]
+        records.append(rec)
+    return records
+    """K线时间字段还原：``<100_000_000`` 视为 YYYYMMDD 紧凑整数，否则当 Unix 时间戳。
+
+    抓包确认：5分K/日K 用 Unix 时间戳（如 1784789709 = 2026-07-23 14:55:09），
+    周/月K 用 YYYYMMDD（如 19980831 = 1998-08-31，000089 上市月）。
+    分界取 10^8：YYYYMMDD 恒 < 10^8（最大 99991231），Unix 时间戳恒 ≥ 10^8（1973+）。
+    """
+    import datetime
+    if tv < 100_000_000:
+        # YYYYMMDD 紧凑整数
+        y, md = divmod(tv, 10000)
+        m, d = divmod(md, 100)
+        try:
+            return datetime.datetime(y, m or 1, d or 1)
+        except ValueError:
+            return datetime.datetime.min
+    try:
+        return datetime.datetime.fromtimestamp(tv)
+    except (OSError, ValueError, OverflowError):
+        return datetime.datetime.min
+
+
+def _kline_dt1_is_bar_index(tv: int) -> bool:
+    """判断 dt1 首根值是否是日内 K 的「绝对 bar 序号」而非时间戳。
+
+    抓包确认两类时间编码（见文档 §14d）：
+      - 日/周/月K：Unix 时间戳（如 1784789709）或 YYYYMMDD（如 19980831，< 10^8）
+      - 日内 K（5分等）：dt1 是连续 bar 序号（如 132491944，增量=周期分钟数），
+        当 Unix 时间戳解会落到 1970 年代（中国股市 1990+ 才有），据此区分。
+
+    判定：值 ≥ 10^8 且当 Unix 时间戳解出的年份 < 1990（早于沪深交易所成立），
+    视为 bar 序号。
+    """
+    import datetime
+    if tv < 100_000_000:
+        return False  # YYYYMMDD
+    try:
+        dt = datetime.datetime.fromtimestamp(tv)
+    except (OSError, ValueError, OverflowError):
+        return True
+    return dt.year < 1990
 
 
 def _decode_bitrle_0x13746d0(src: bytes, expect: int) -> bytes:
@@ -2114,31 +3328,43 @@ _SUBREAL_CLASS_PREFIX = {
 }
 
 
-def build_subreal_query(instance: int, channel: str = "URS", action: int = 1,
-                        codelist: str = "", class_prefix: str | None = None) -> bytes:
+def build_subreal_query(instance: int, channel: str = "URS", action=1,
+                        codelist: str = "", class_prefix: str | None = None,
+                        pageid: int = 1341) -> bytes:
     """构造 subreal 实时订阅请求（8901 端口，method=subreal）。
 
     ⚠️ 这是 8901 上的 subreal 格式（订阅异动通道 URS/UNX 等）。
-    实测 8901 subreal 后服务器**不推送**。实时推送要用 9601 的 subrealorder
-    （见 build_subrealorder_query）。本函数保留供参考/兼容。
+    单独发 subreal（pageid=1341/5716 异动通道）后服务器**不推送**个股行情。
+    但作为**分时快照订阅（pageid=4214）的前置序列**，subreal×5 必须先发——
+    2026-07-24 收盘包 ABCBA 五次切换确认：每次切票都先发 subreal×5
+    （URS/UCT/UNX/UCX/UME，pageid=4214，action=change），再发分时快照请求，
+    服务器才会持续推送 71B 逐 tick 帧。
 
     Args:
-        instance: 请求序列号。
+        instance: 请求序列号（hexin 用 0x7FFFFFFF=2147483647）。
         channel: 异动通道，URS/UCT/UNX/UCX/UME（见 SUBREAL_CHANNELS）。
-        action: 1=全新订阅 2=取消 3=增代码 4=删代码。
-        codelist: 订阅代码，空=全市场。
+        action: ``1``=全新订阅 ``2``=取消 ``3``=增代码 ``4``=删代码，
+            或字符串 ``"change"``/``"add"``/``"del"``（分时前置用 "change"）。
+        codelist: 订阅代码，空=全市场（注意 hexin 发空格 ``" "`` 不是空串）。
         class_prefix: 订阅类别前缀，默认按 channel 自动推导。
+        pageid: 页面 id。异动通道=1341/5716；**分时前置序列=4214**。
 
     Returns:
         请求帧 body（含 \\x09 前缀，不含 FD FD FD FD 头）。
+
+    Note:
+        抓包确认分时前置 subreal 用 ``instid=2147483647 action=change
+        codelist=" "（一个空格）pageid=4214``，与异动通道 subreal 略有差异。
     """
     if class_prefix is None:
         class_prefix = _SUBREAL_CLASS_PREFIX.get(channel, channel + "I")
+    # hexin 分时前置用空格" "而非空串（codelist= 后有个空格）
+    cl = codelist if codelist != "" else " "
     text = (
         f"instid={instance}\n"
         f"method=subreal\nmarket={channel}\nperiod=0\n"
         f"action={action}\nclass={class_prefix}\n"
-        f"codelist={codelist}\npageid=1341"
+        f"codelist={cl}\npageid={pageid}\n"
     )
     return b"\x09" + text.encode("gbk")
 
@@ -2396,3 +3622,188 @@ def parse_pushrealorder_response(body: bytes) -> list[dict]:
             })
             j += 4  # 跳过已处理的异动记录头
     return records
+
+
+# =============================================================================
+# 个股实时分时推送 —— pageid=4214 订阅 + 71B 逐 tick 快照解析
+# （8901 端口，盘中逐笔现价/量。2026-07-24 抓包破解，文档 §17）
+# =============================================================================
+#
+# ★ 71B 逐 tick 推送是 level2 专属功能（2026-07-24 两账号对比确认）：
+#   - L2 账号打开分时图 → 发 pageid=4214 + 路由 0x0002 → 持续 71B 推送
+#   - 普通账号打开分时图 → 发 pageid=9354 + 路由 0x000a → 仅请求-响应（无推送）
+#   两账号请求的**字节结构完全相同**，唯一差异是 byte11 路由（0x02 vs 0x0a）+
+#   pageid（4214 vs 9354）。普通账号的 subreal 异动订阅也全部 errorcode=-1。
+#
+# ★ 激活帧真值（realtime_push_20260724_131453.pcap，L2 冷启动包，逐字节确认）：
+#   login t=0.12s → 用户 t=30.16s 点开分时 → 发 4214 订阅帧 →
+#   t=30.42s 即收到首个 71B 推送（延迟 0.26s）。全程 0 个 subreal+4214 前置帧，
+#   推翻了"subreal×5 前置"和"连接老化 60-90s"两个旧假设——订阅后直接推送。
+#
+# 订阅请求格式（子帧 0x0002，路由 0x0002，L2 分时通道）：
+#   \\x09 + 22字节二进制头 + GBK 文本:
+#     CodeList=<市场>(<代码>,);\\r\\npageid=4214\\r\\n
+#   头部关键位：byte7-10=12 00 02 00（子帧0x0002），byte11-12=02 00（路由0x0002）
+#
+# 71B 快照帧字段表（603118 多样本字节级对照确认）：
+#   off0     0x09          cmd
+#   off5     变化          序号/计数（低字节）
+#   off12    变化          时间戳高位（秒计数）
+#   off25    市场标志      0x11=沪 0x21=深
+#   off29-34 ASCII代码     "603118" / "000938"
+#   off39    变化          序号/计数（低字节，第二处）
+#   off58-59 LE16 ÷1000    ★现价（分时白线数据源）
+#   off62-63 LE16          单笔成交量（手）
+#   off70   0x7d           帧尾标记
+# （71B 与 72B 从 off14 起结构不同，72B 多 1 字节、字段布局有变，
+#   现价仍在 LE16÷1000 合理价位区间内，解析器对两种长度都尝试。）
+
+SNAPSHOT_PAGEID = 4214        # 分时图订阅 pageid（L2 专属，触发 71B 逐 tick 推送）
+SNAPSHOT_PAGEID_SUB = 5716    # 自选股列表行情 pageid（多股，不触发分时推送，仅列表刷新）
+# 触发推送的子帧类型：12 00 02 00（子帧 0x0002）。
+# 早先误用 0x0009（查询子帧）+ 路由 02 01，实测"有响应无推送"。
+# 2026-07-24 L2 冷启动包逐字节确认：激活帧是子帧 0x0002 + 路由 0x0002。
+SNAPSHOT_SUBTYPE = b"\x12\x00\x02\x00"
+# 实时分时快照的 DataType（抓包真值：现价/量/额/买卖盘/昨收等）。
+# dt10=现价 dt24/30=买卖盘? dt69/70=量额 dt127=扩展
+SNAPSHOT_DATATYPE = [10, 24, 30, 69, 70, 127]
+
+
+def build_snapshot_subscribe(
+    code: str,
+    market: int = 17,
+    pageid: int = SNAPSHOT_PAGEID,
+    seq: int = 0x0086,
+    datatype: list[int] | None = None,
+    inner_seq: int = 0x0071,
+) -> bytes:
+    """构造个股实时分时订阅请求（8901 端口，pageid=4214，触发持续推送）。
+
+    订阅后服务端在该 TCP 连接上持续推送 71B 逐 tick 快照帧
+    （现价/量随每笔成交跳动，约每 3 秒一帧，盘中全程不断）。
+    用 ``parse_snapshot_push`` 解析推送帧。
+
+    ⚠ **需要 level2 账号**（2026-07-24 两账号对比确认）：L2 账号走 pageid=4214 +
+    路由 0x0002 触发持续推送；普通账号打开分时发的是 pageid=9354 + 路由 0x000a
+    （请求-响应，无推送）。
+
+    ★ 激活帧是**嵌套双子帧**（L2 冷启动包 realtime_push_131453.pcap t=30.155s
+    逐字节确认，实测只发外层会零推送，必须带内层查询帧）::
+
+        外层子帧 0x0002 (路由0x0002):  CodeList=<m>(<code>,);\\r\\npageid=4214\\r\\n
+          └ 内层子帧 0x0009 (路由0x0001):  CodeList=<m>(<code>,);\\r\\n
+                DataType=10,24,30,69,70,127,\\r\\nDateTime=0(0-0)\\r\\n
+                LackTime=0,...\\r\\npageid=4214\\r\\n
+
+        外层 = 订阅注册（告诉服务器"把这只票加入 4214 推送列表"）
+        内层 = 首次数据查询（拉当前快照，同时激活推送流）
+        两个子帧打在同一个 TCP 包里（外层文本后紧跟内层子帧头）。
+
+    早先实现只发外层单子帧 → 零推送。补上内层 0x0009 查询帧后才是完整激活序列。
+
+    Args:
+        code: 股票代码（纯数字，如 ``"603118"``）。
+        market: 市场码（17=沪 33=深）。
+        pageid: 订阅页面 id（L2 分时=4214）。
+        seq: 外层序列号（byte5-6）。
+        datatype: 内层查询的 DataType（默认 SNAPSHOT_DATATYPE）。
+        inner_seq: 内层子帧序列号。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic + hex 长度），可直接 sendall。
+
+    Raises:
+        ValueError: code 非法。
+    """
+    if not code or not code.isdigit():
+        raise ValueError(f"code 必须为纯数字: {code!r}")
+    if datatype is None:
+        datatype = SNAPSHOT_DATATYPE
+
+    # 外层：订阅注册（子帧 0x0002 + 路由 0x0002，精简文本）
+    outer_text = f"CodeList={market}({code},);\r\npageid={pageid}\r\n".encode("gbk")
+
+    # 内层：首次数据查询（子帧 0x0009 + 路由 0x0001，标准查询文本）
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    inner_text = (
+        f"CodeList={market}({code},);\r\nDataType={dt_str}\r\n"
+        f"DateTime=0(0-0)\r\nLackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    # 内层子帧头（22B）：00 16 00 00 + inner_seq + 12 00 09 00 + 00 01 + 00×6 + len(LE32)
+    inner_hdr = bytearray(22)
+    inner_hdr[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", inner_hdr, 4, inner_seq & 0xFFFF)
+    inner_hdr[6:10] = b"\x12\x00\x09\x00"   # 子帧 0x0009
+    inner_hdr[10:12] = b"\x00\x01"           # 路由 0x0001
+    struct.pack_into("<I", inner_hdr, 18, len(inner_text))
+    inner_frame = bytes(inner_hdr) + inner_text
+
+    # 外层帧头（23B）：cmd 0x09 + 00 16 00 00 + seq + 12 00 02 00 + 02 00 + len(LE32)
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, seq & 0xFFFF)
+    hdr[7:11] = b"\x12\x00\x02\x00"   # 子帧 0x0002（L2 分时订阅通道）
+    hdr[11] = 0x02; hdr[12] = 0x00     # 路由 0x0002
+    struct.pack_into("<I", hdr, 19, len(outer_text))   # 外层文本长度 LE32
+    body = bytes(hdr) + outer_text + inner_frame
+    return encode_frame(body)
+
+
+def parse_snapshot_push(body: bytes) -> dict | None:
+    """解析 71B 逐 tick 快照推送帧，返回现价等字段。
+
+    这是 pageid=4214 订阅后服务端持续推送的帧（分时白线数据源）。
+    现价字段 off58-59 LE16 ÷1000 已用 603118/000938 多样本验证。
+
+    ⚠️ 仅解析 71B 子帧（off14=0x80 标志）。72B 子帧（off14=0x82）结构不同
+    （现价不在 off58，off14 起布局有变），需另行逆向，本函数对其返回 None。
+
+    Args:
+        body: 推送帧 body（去掉 fdfdfdfd magic + 8位hex长度后的部分）。
+
+    Returns:
+        dict 含 ``code``/``market``/``price``/``volume`` 等；非 71B 快照帧返回 None::
+
+            {
+                "code": "603118",
+                "market": "SH",        # off28 推导：0x11→SH 0x21→SZ
+                "price": 16.22,        # off58-59 LE16÷1000
+                "volume": 300,         # off62-63 LE16（单笔量，手）
+                "tick_seq": 0x80,      # off39 序号
+                "raw_len": 71,
+            }
+    """
+    # 71B 子帧：off0=0x09, off14=0x80（72B 变体是 0x82）, off29-34=ASCII代码
+    if len(body) != 71 or body[0] != 0x09 or body[14] != 0x80:
+        return None
+    code_bytes = body[29:35]
+    if not all(0x30 <= b <= 0x39 for b in code_bytes):
+        return None
+    code = code_bytes.decode("ascii")
+    # 市场：off28（0x11=沪/SH，0x21=深/SZ）
+    mk_flag = body[28]
+    market = "SH" if mk_flag == 0x11 else ("SZ" if mk_flag == 0x21 else f"?{mk_flag:#x}")
+    # 现价：off58-59 LE16 ÷1000
+    price_raw = struct.unpack("<H", body[58:60])[0]
+    price = price_raw / 1000.0
+    # 单笔量：off62-63 LE16
+    volume = struct.unpack("<H", body[62:64])[0]
+    # 序号：off39
+    tick_seq = body[39]
+    return {
+        "code": code,
+        "market": market,
+        "price": price,
+        "volume": volume,
+        "tick_seq": tick_seq,
+        "raw_len": len(body),
+    }
+
+
+def is_snapshot_push(body: bytes) -> bool:
+    """快速判断 body 是否为 71B 逐 tick 快照推送帧。"""
+    return (len(body) == 71
+            and body[0] == 0x09
+            and body[14] == 0x80
+            and all(0x30 <= b <= 0x39 for b in body[29:35]))
