@@ -128,6 +128,8 @@ class THSClient:
         # 市会导致 init 只回 210B、4214 注册 CodeListSize=0。详见
         # resolve_l2_hosts_grouped() 与 HANDOFF_PUSH_INVESTIGATION §沪深分服突破。
         self._push_socks: dict = {}               # {"sh": sock, "sz": sock}
+        self._push_lock = threading.Lock()        # 保护 _push_socks 并发（预热线程 vs 主线程）
+        self._preheat_threads: dict[str, threading.Thread] = {}  # 预热线程（主流程可 join 等待）
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
@@ -1034,15 +1036,25 @@ class THSClient:
         from thspypc.protocol import pick_l2_market
         key = pick_l2_market(market)
         if key not in self._push_socks:
-            # ★ 关闭主连接（实测：两条同 IP 同 Passport64 连接并存会导致
-            # __manual 的 4214 订阅 CodeListSize=0。关掉主连接只留 __manual
-            # 一条连接后 CodeListSize=1。kline/list_quotes 在推送期间不可用。）
-            self._drop_connection()
-            sock = self._open_manual_push_connection(market, skip_init=skip_init,
-                                                      use_main_ip=use_main_ip)
-            if sock is None:
-                raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
-            self._push_socks[key] = sock
+            # ★ 如果该市正在后台预热，先 join 等它完成（避免主流程重复建连接）
+            with self._push_lock:
+                preheat_t = self._preheat_threads.get(key)
+            if preheat_t is not None and preheat_t.is_alive():
+                logger.info("timeline[%s]: 等待预热[%s]连接完成...", code, key)
+                preheat_t.join(timeout=20)
+            # 预热完成后再次检查（预热可能已填入 _push_socks）
+            if key not in self._push_socks:
+                # ★ 关闭主连接（实测：两条同 IP 同 Passport64 连接并存会导致
+                # __manual 的 4214 订阅 CodeListSize=0。关掉主连接只留 __manual
+                # 一条连接后 CodeListSize=1。kline/list_quotes 在推送期间不可用。）
+                self._drop_connection()
+                sock = self._open_manual_push_connection(market, skip_init=skip_init,
+                                                          use_main_ip=use_main_ip)
+                if sock is None:
+                    raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
+                self._push_socks[key] = sock
+            # ★ 后台预热另一市连接（复刻 hexin 启动即双连，避免首次切市等 init）
+            self._preheat_other_market(key)
         return self._timeline_query_once(code, market, timeout)
 
     def _timeline_query_once(self, code: str, market: int, timeout: float) -> list[dict]:
@@ -2062,6 +2074,8 @@ class THSClient:
                 return False
             self._push_socks[key] = sock
             logger.info("snapshot_subscribe: __manual[%s] 推送连接已建立", key)
+            # ★ 后台预热另一市连接
+            self._preheat_other_market(key)
 
         # 发 pageid=4214 嵌套订阅帧
         self._instance += 1
@@ -2110,6 +2124,40 @@ class THSClient:
             logger.debug("分时推送读取线程已启动")
         logger.info("snapshot_subscribe: 已订阅 %s（market=%d）", code, market)
         return True
+
+    def _preheat_other_market(self, current_key: str) -> None:
+        """后台异步预热另一市的 __manual 连接（复刻 hexin 启动即双连行为）。
+
+        hexin 启动时同时连 sz+sh 两条 L2 服务器，所以切任何票都秒加载。thspypc
+        原来是惰性的——遇到某市票才建该市连接，首次切另一市要等 init（4-5s）。
+        本方法在首次建好某市连接后，后台异步建另一市，用户无感。
+
+        预热线程存入 _preheat_threads，主流程用到该市时可 join 等待（避免重复建）。
+        """
+        other = "sh" if current_key == "sz" else "sz"
+        with self._push_lock:
+            if other in self._push_socks or other in self._preheat_threads:
+                return  # 已有连接或正在预热
+        other_market = 17 if other == "sh" else 33
+
+        def _do_preheat():
+            try:
+                sock = self._open_manual_push_connection(other_market)
+                if sock is not None:
+                    with self._push_lock:
+                        if other not in self._push_socks:  # 防竞争（主线程可能已建）
+                            self._push_socks[other] = sock
+                            logger.info("预热[%s] 连接已就绪（后台）", other)
+                        else:
+                            sock.close()  # 主线程抢先建了，关掉重复的
+            except Exception as e:
+                logger.debug("预热[%s] 失败（不影响主流程）: %s", other, e)
+
+        t = threading.Thread(target=_do_preheat, name=f"ths-preheat-{other}",
+                             daemon=True)
+        with self._push_lock:
+            self._preheat_threads[other] = t
+        t.start()
 
     def _open_manual_push_connection(self, market: int, skip_init: bool = False,
                                       use_main_ip: bool = False):
@@ -2170,19 +2218,30 @@ class THSClient:
             logger.info("__manual[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
                         key, len(hosts), hosts[:3], init_market_code,
                         "（skip_init）" if skip_init else "")
+            stale = False
             for host in hosts:
-                sock = self._try_open_manual_sock(host, passport64, key,
-                                                   init_market_code, skip_init)
-                if sock is not None:
-                    return sock
+                result = self._try_open_manual_sock(host, passport64, key,
+                                                     init_market_code, skip_init)
+                if result is not None and result != "stale_passport":
+                    return result
+                if result == "stale_passport":
+                    # 票据失效，剩余 IP 必然也失败，立即跳出重新鉴权
+                    stale = True
+                    logger.info("__manual[%s] 票据失效（%s），跳过剩余 IP 直接重新鉴权",
+                                key, host)
+                    break
                 logger.info("__manual[%s] IP %s 不可用，换下一个", key, host)
-            # ★ 全失败：__manual 登录对 Passport64 新鲜度敏感——同一票据被多次
-            # 使用后服务器会拒（PromptText="通行证有被修改的痕迹"）。主连接已建立
-            # 不受影响，但新 __manual 登录会被拒。重新 full_http_auth 拿新鲜票据
-            # 再试一轮即可解决（间歇性 VerifyCode=-1 的根因）。
-            if allow_refresh:
-                logger.warning("__manual[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
-                               key)
+            # ★ 票据失效或全失败：__manual 登录对 Passport64 新鲜度敏感——同一票据
+            # 被多次使用后服务器会拒（PromptText="通行证有被修改的痕迹"）。主连接
+            # 已建立不受影响，但新 __manual 登录会被拒。检测到 stale 或全失败时，
+            # 重新 full_http_auth 拿新鲜票据再试一轮。
+            if stale or allow_refresh:
+                if stale:
+                    logger.warning("__manual[%s] 票据失效，重新 HTTP 鉴权拿新鲜 Passport64...",
+                                   key)
+                else:
+                    logger.warning("__manual[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
+                                   key)
                 try:
                     self._auth = full_http_auth(self.username, self.password, self.imei)
                     fresh = build_passport64(self._auth)
@@ -2226,6 +2285,10 @@ class THSClient:
                 logger.error("__manual[%s] %s 登录失败 VerifyCode=%s PromptText=%s",
                              key, host, vc, prompt or "(无)")
                 sock.close()
+                # 票据失效（"通行证被修改痕迹"等）→ 返回特殊标记，让调用方
+                # 立即重新鉴权，不再浪费剩余 IP（旧逻辑要试完全部 9 个才重试）
+                if "通行证" in prompt or "身份" in prompt:
+                    return "stale_passport"
                 return None
             logger.info("__manual[%s] %s 登录成功", key, host)
         except (OSError, ValueError) as e:
@@ -2289,6 +2352,7 @@ class THSClient:
             except OSError:
                 pass
         self._push_socks.clear()
+        self._preheat_threads.clear()
 
     def _snapshot_loop(self) -> None:
         """后台读取沪深两条 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
