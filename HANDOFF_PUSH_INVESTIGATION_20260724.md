@@ -396,3 +396,92 @@ DNS 解析两组域名，IP 完全不交集：
 - `captures_live/timeline_20260724_190949.pcap` — hexin L2 分时抓包（对照来源）
 - `captures_live/hexin_timeline_resp_000938.bin` — hexin 真实响应（hd3.1，241条，解析参照）
 - `captures_live/_stream1_raw.txt` — hexin stream1 原始 hex（请求序列）
+
+---
+
+## ★★★ 性能优化 + Passport64 时效（2026-07-24 深夜续）
+
+> 端到端验证通过后，针对"比同花顺慢"做了三轮优化，并定位了间歇性登录失败的根因。
+
+### 性能优化三轮（6 只股票连续切换，平均 0.27s）
+
+| 轮次 | 优化点 | 解决的问题 | 效果 |
+|------|--------|-----------|------|
+| ① 查询直接 return | `_timeline_query_once` 拿到数据后立即返回 | 旧实现 `settimeout(2.0)+continue` 白等下一帧 timeout | 复用查询 2.13s→**0.13s** |
+| ② init 短 timeout | 配置帧排空用 0.5s timeout 替代固定 3s 循环 | init 末尾白等 3s | 首次 5.23s→1.05s |
+| ③ 后台预热另一市 | 首次建好某市后，后台异步建另一市；主流程 join 等待 | 首次切跨市要等 init（4-5s） | 跨市 9.13s→**0.44s** |
+
+最终：所有查询 0.1-0.7s，平均 0.27s，与 hexin 秒加载体感一致。
+
+### 后台预热机制（复刻 hexin 启动即双连）
+
+hexin 启动时同时连 sz+sh 两条 L2 服务器，切任何票都秒加载。thspypc 原是惰性的——
+遇到某市票才建该市连接。`_preheat_other_market()` 在首次建好某市连接后，后台线程
+异步建另一市：
+
+```
+timeline(000938深) → 建 sz 连接 → 触发 _preheat_other_market("sz")
+                                   └─ 后台线程建 sh 连接（init 4-5s，用户无感）
+timeline(000063/000001深) → 复用 sz（0.13s），期间 sh 预热进行中
+timeline(603118沪) → key=sh 不在池 → join 等预热线程 → 直接用预热的 sh 连接（0.44s）
+```
+
+关键：主流程发现 key 不在 `_push_socks` 时，**先 join 等预热线程**（`_preheat_threads`），
+再决定是否自己建——避免预热线程和主流程重复建连接竞争（早期版本建了两次 sh 连接）。
+
+### Passport64 时效（间歇性 VerifyCode=-1 根因）
+
+**现象**：同一账号短时间内多次运行，`__manual` 登录突然全 IP 失败，PromptText：
+```
+认证失败：我们发现您的登录通行证有被修改的痕迹，我们无法确认您的身份。
+```
+但单跑一次（重新 `full_http_auth`）又成功。
+
+**根因**：`__manual` 登录对 Passport64 新鲜度敏感。主连接 login 已"消费"了该票据
+（服务器侧记录会话），`__manual` 再用同一票据登录被判"通行证被修改"。这不是限流/封禁
+（同花顺客户端能正常打开），是**同一 Passport64 被重复用于新登录**触发服务器保护。
+
+**不是过期的证据**：`signdate=2026072311` / `signvalid=2026072911`（有效期一周），
+但短时间内重复 `__manual` 登录仍被拒。主连接已建立的不受影响（会话已激活），只有
+**新的 `__manual` 登录**会被拒。
+
+**解决**：`_open_manual_push_connection` 的 `_try_round()` 检测到 "通行证/身份" 类
+PromptText（返回 `"stale_passport"` 标记）→ **立即跳出剩余 IP 循环**，重新
+`full_http_auth` 拿新鲜 Passport64 再试一轮：
+
+```
+__manual[sz] 139.9.198.250 登录失败...通行证被修改
+票据失效（139.9.198.250），跳过剩余 IP 直接重新鉴权   ← 只试 1 个，不试 9 个
+重新 HTTP 鉴权拿新鲜 Passport64...
+重试一轮 → 139.9.198.250 登录成功                   ← 新票据首 IP 即成
+```
+
+早期版本（试完全部 9 个 IP 才重试）耗时 16s，优化后 **1s** 即恢复。
+
+### 完整的 timeline 连接生命周期
+
+```
+connect()                    # HTTP 鉴权 → 主连接 login（普通登录）
+  ↓
+timeline(code)
+  ├─ key = pick_l2_market(market)        # 深→sz / 沪→sh
+  ├─ if key not in _push_socks:
+  │    ├─ 若该市正在预热 → join 等预热线程
+  │    ├─ _drop_connection()             # 关主连接（双连接并存会 CodeListSize=0）
+  │    ├─ _open_manual_push_connection()  # __manual 登录 + init(配套MarketCode)
+  │    │    └─ 票据失效 → 自动重新鉴权重试
+  │    ├─ _push_socks[key] = sock
+  │    └─ _preheat_other_market(key)     # 后台预热另一市
+  └─ _timeline_query_once()
+       ├─ 4214 订阅（首次该 code）→ CodeListSize=1
+       └─ L2 分时查询 → hd3.1 响应 → parse_timeline_l2_response → 241 根
+```
+
+### 关键文件（本轮新增/改动）
+
+- `src/thspypc/client.py`:
+  - `_preheat_other_market()` — 后台预热 + `_preheat_threads` join 等待（新增）
+  - `_try_round()` — 票据失效快速恢复（`stale_passport` 标记 + 重新鉴权）
+  - `_timeline_query_once` — 拿到数据直接 return（去掉白等 timeout）
+  - init 排空短 timeout（3s→0.5s）
+- `tests/test_timeline_switch.py` — 6 只股票连续切换验证（沪深跨市 + 计时）

@@ -31,6 +31,13 @@
 - **短线精灵实时推送**（`subscribe_realtime` + `receive_pushes`）：9601 subrealorder
   订阅 + pushrealorder 推送接收。盘中 ~500-800 帧/分钟，异动代码/金额/涨幅/方向
   全部解码（异动字节锚定 + THS float，30 种异动全覆盖，历史对照 100% 精确）。
+- **K线查询**（`kline`）：日/周/月/5分/15分/30分/60分K线，hd3.1 flag=0x0042/0x0046
+  响应解析，连接复用（一次 connect 查多只多周期）。
+- **沪深 L2 分时查询**（`timeline`）：当日逐点分时（现价/量/额/均价，241 根），
+  level2 账号走 pageid=4214 推送通道，hd3.1 flag=0x00b4 响应解析。
+  ★ **沪深分服**：shlv2（沪）/szlv2（深）是两套独立 L2 服务器（IP 0 重叠），
+  按股票市场选对应 IP + 配套 init MarketCode（沪 16;144 / 深 32）。
+  ★ **后台预热**：首次建好某市连接后异步预热另一市，跨市切换 0.44s（复刻 hexin 秒加载）。
 
 ## 三种登录方式
 
@@ -431,6 +438,12 @@ thspypc/
     提前返回 `error="session_conflict"`。
   - 仍建议长连接复用（connect 一次反复查），但反复 connect 在 IP 分散时也安全。
   - 确保同花顺客户端已退出（同账号不能两个客户端同时在线）。
+- **`__manual` 登录的 Passport64 时效**（分时/推送通道专用）：主连接 login 已"消费"
+  Passport64（服务器记录会话），`__manual` 再用同一票据登录会被拒——PromptText
+  "我们发现您的登录通行证有被修改的痕迹"。**这不是过期**（signvalid 有效期一周），
+  是同一票据被重复用于新登录触发的保护。主连接已建立的不受影响，只有新的
+  `__manual` 登录会被拒。`_open_manual_push_connection` 检测到此类 PromptText 会
+  **立即重新 `full_http_auth`** 拿新鲜 Passport64 重试（16s→1s），用户无感。
 
 ## 连接治理（长连接复用 + 防 -1）
 
