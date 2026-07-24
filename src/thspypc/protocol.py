@@ -125,6 +125,68 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
                     len(domains), len(ips), ips[:5])
     return ips
 
+
+def resolve_l2_hosts(passport_bytes: bytes) -> list[str]:
+    """从 passport 的 M_hqdns 解析 **L2 行情服务器** IP（只取 lv2 域名）。
+
+    M_hqdns 里混有多种服务器域名，只有 ``shlv2``/``szlv2``（域名含 ``lv2``）
+    才是 Level2 行情服务器，解析出的 IP 才支持 pageid=4214 推送注册 +
+    init(MarketCode=32) 完整配置帧（23KB+）。非 L2 域名（``fu4``/``hkus``/
+    ``ifindhq`` 等）的 IP init 只回 210B、4214 注册 CodeListSize=0。
+
+    实测对比（2026-07-24）::
+
+        shlv2.123ths.com → 8.134.98.163 等（L2，支持推送）
+        szlv2.123ths.com → 8.134.112.142 等（L2，支持推送）
+        fu4.123ths.com   → 8.138.46.177 等（非L2，不支持推送）
+
+    Args:
+        passport_bytes: HTTP 鉴权返回的 passport_bytes（含 M_hqdns 字段）。
+
+    Returns:
+        L2 服务器的 IP 列表（去重保序）。无 L2 域名时返回空列表。
+    """
+    import socket as _socket
+    text = passport_bytes.decode("latin-1", errors="replace")
+    m = re.search(r'M_hqdns="([^"]*)"', text)
+    if not m:
+        for field in text.split("|"):
+            if field.startswith("M_hqdns="):
+                m_hqdns = field.split("=", 1)[1]
+                break
+        else:
+            return []
+    else:
+        m_hqdns = m.group(1)
+
+    # 只收域名含 "lv2" 的条目（shlv2/szlv2）
+    l2_domains = []
+    for entry in m_hqdns.split(","):
+        dm = re.match(r'([\w.]+):(\d+):', entry.strip())
+        if dm and dm.group(2) == str(MARKET_PORT) and "lv2" in dm.group(1).lower():
+            l2_domains.append(dm.group(1))
+
+    if not l2_domains:
+        logger.warning("M_hqdns 中无 lv2 域名（账号可能无 L2 权限）")
+        return []
+
+    ips: list[str] = []
+    seen: set[str] = set()
+    for domain in l2_domains:
+        try:
+            _, _, addrs = _socket.gethostbyname_ex(domain)
+            for ip in addrs:
+                if ip not in seen:
+                    seen.add(ip)
+                    ips.append(ip)
+        except OSError:
+            continue
+
+    if ips:
+        logger.info("L2 服务器（%s）解析 → %d 个 IP: %s",
+                    ",".join(l2_domains), len(ips), ips[:5])
+    return ips
+
 # --- 客户端身份参数（PC 远航版，从 login_lv2.pcapng 的 passport 实测）---
 # 首次测试用 Mac 参数被 8901 拒（VerifyCode=-1, PromptText=-6:），服务器返回
 # thshq-hwyeast-globalthsindex-gateway，判定 passport 身份（Mac）与 PC 网关不符。

@@ -2099,8 +2099,20 @@ class THSClient:
         主连接，服务器允许同一 Passport64 开多条连接（hexin 也是多连接并存）。
         """
         import socket as _socket
+        from thspypc.protocol import resolve_l2_hosts
         passport64 = build_passport64(self._auth)
-        host = self._connected_ip or "127.0.0.1"
+        # ★ 优先用 L2 服务器 IP（shlv2/szlv2 域名解析），非 L2 的 IP
+        # 不支持 4214 推送注册（init 只回 210B、CodeListSize=0）。
+        l2_ips = resolve_l2_hosts(self._auth.get("passport_bytes", b""))
+        # 当前主连接 IP 如果在 L2 列表里就用它，否则取 L2 列表第一个
+        if self._connected_ip in l2_ips:
+            host = self._connected_ip
+        elif l2_ips:
+            host = l2_ips[0]
+            logger.info("__manual: 主连接 IP %s 非 L2，改用 L2 IP %s",
+                        self._connected_ip, host)
+        else:
+            host = self._connected_ip or "127.0.0.1"
         logger.info("__manual 推送连接: 连接 %s:%d ...", host, MARKET_PORT)
         try:
             sock = _socket.create_connection((host, MARKET_PORT), timeout=15)
