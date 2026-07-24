@@ -1122,13 +1122,11 @@ class THSClient:
                     recs = parse_kline_hd3_response(resp)
                 if recs:
                     all_recs.extend(recs)
-                    got_data = True
-                    sock.settimeout(2.0)
                     logger.info("timeline[%s]: 解出 %d 条分时记录", code, len(recs))
-                    continue
+                    # ★ 拿到数据直接返回，不再继续读（旧实现 settimeout(2.0)+continue
+                    #   会白等 2 秒 timeout 读下一帧，是"复用查询仍 2 秒"的元凶）
+                    return all_recs
                 continue
-            if got_data:
-                break
         if all_recs:
             return all_recs
         logger.warning("timeline[%s]: 未找到分时数据帧（共读 %d 帧）", code, i + 1)
@@ -2149,42 +2147,56 @@ class THSClient:
         """
         import socket as _socket
         from thspypc.protocol import resolve_l2_hosts_grouped, pick_l2_market
+
+        def _try_round(passport64, allow_refresh):
+            """用给定 passport64 尝试所有候选 IP；全失败时可选重新鉴权重试一轮。"""
+            if use_main_ip:
+                if not self._connected_ip:
+                    logger.error("__manual: use_main_ip 但无主连接 IP")
+                    return None
+                hosts = [self._connected_ip]
+                logger.info("__manual[%s] use_main_ip=True → 强制连主连接 IP %s",
+                            key, self._connected_ip)
+            else:
+                grouped = resolve_l2_hosts_grouped(self._auth.get("passport_bytes", b""))
+                hosts = list(grouped.get(key, []))
+                if self._connected_ip and self._connected_ip in hosts:
+                    hosts.remove(self._connected_ip)
+                    hosts.insert(0, self._connected_ip)
+                if not hosts:
+                    logger.error("__manual: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
+                    return None
+
+            logger.info("__manual[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
+                        key, len(hosts), hosts[:3], init_market_code,
+                        "（skip_init）" if skip_init else "")
+            for host in hosts:
+                sock = self._try_open_manual_sock(host, passport64, key,
+                                                   init_market_code, skip_init)
+                if sock is not None:
+                    return sock
+                logger.info("__manual[%s] IP %s 不可用，换下一个", key, host)
+            # ★ 全失败：__manual 登录对 Passport64 新鲜度敏感——同一票据被多次
+            # 使用后服务器会拒（PromptText="通行证有被修改的痕迹"）。主连接已建立
+            # 不受影响，但新 __manual 登录会被拒。重新 full_http_auth 拿新鲜票据
+            # 再试一轮即可解决（间歇性 VerifyCode=-1 的根因）。
+            if allow_refresh:
+                logger.warning("__manual[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
+                               key)
+                try:
+                    self._auth = full_http_auth(self.username, self.password, self.imei)
+                    fresh = build_passport64(self._auth)
+                    logger.info("__manual[%s] 已拿到新鲜 Passport64，重试一轮", key)
+                    return _try_round(fresh, allow_refresh=False)
+                except Exception as e:
+                    logger.error("__manual[%s] 重新鉴权失败: %s", key, e)
+            logger.error("__manual[%s] 全部候选 IP 都失败", key)
+            return None
+
         passport64 = build_passport64(self._auth)
         key = pick_l2_market(market)
         init_market_code = "16;144;" if key == "sh" else "32;"
-
-        if use_main_ip:
-            # 调试模式：强制用主连接 IP（复刻 _replay_exact 成功路径）
-            if not self._connected_ip:
-                logger.error("__manual: use_main_ip 但无主连接 IP")
-                return None
-            candidates = [self._connected_ip]
-            logger.info("__manual[%s] use_main_ip=True → 强制连主连接 IP %s",
-                        key, self._connected_ip)
-        else:
-            # 按沪深分组解析 L2 服务器 IP（shlv2 / szlv2）
-            grouped = resolve_l2_hosts_grouped(self._auth.get("passport_bytes", b""))
-            candidates = list(grouped.get(key, []))
-            # 优先用当前主连接 IP（若它在该组里，省一次 DNS 命中）
-            if self._connected_ip and self._connected_ip in candidates:
-                candidates.remove(self._connected_ip)
-                candidates.insert(0, self._connected_ip)
-            if not candidates:
-                logger.error("__manual: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
-                return None
-
-        logger.info("__manual[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
-                    key, len(candidates), candidates[:3], init_market_code,
-                    "（skip_init）" if skip_init else "")
-
-        for host in candidates:
-            sock = self._try_open_manual_sock(host, passport64, key,
-                                               init_market_code, skip_init)
-            if sock is not None:
-                return sock
-            logger.info("__manual[%s] IP %s 不可用，换下一个", key, host)
-        logger.error("__manual[%s] 全部 %d 个候选 IP 都失败", key, len(candidates))
-        return None
+        return _try_round(passport64, allow_refresh=True)
 
     def _try_open_manual_sock(self, host, passport64, key, init_market_code, skip_init=False):
         """对单个 IP 执行 __manual 连接 → 登录 → init，成功返回 socket。
@@ -2230,8 +2242,18 @@ class THSClient:
             sock.sendall(init_frame + b"\n")
             n_frames = 0
             n_bytes = 0
-            for _ in range(30):
-                sock.settimeout(3.0)
+            # 先用较长 timeout 等第一帧（配置帧 23-49KB，可能分多段到达），
+            # 拿到大帧后用短 timeout 快速排空残留，避免白等。
+            sock.settimeout(5.0)
+            try:
+                b = read_frame(sock)
+                n_frames += 1
+                n_bytes += len(b)
+            except (socket.timeout, OSError, ValueError):
+                pass
+            # 排空后续帧（配置帧后可能跟 ACK/推送帧），短 timeout 快速结束
+            for _ in range(10):
+                sock.settimeout(0.5)
                 try:
                     b = read_frame(sock)
                     n_frames += 1
