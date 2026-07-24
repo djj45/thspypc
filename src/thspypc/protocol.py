@@ -187,6 +187,108 @@ def resolve_l2_hosts(passport_bytes: bytes) -> list[str]:
                     ",".join(l2_domains), len(ips), ips[:5])
     return ips
 
+
+def pick_l2_market(market: int) -> str:
+    """把行情市场码归约为沪深分组键。
+
+    thspypc 内部 market 用两套数值（见 client.snapshot_subscribe 注释）：
+
+        - snapshot 订阅帧：17=沪市主板，33=深市
+        - init MarketCode：16=沪，144=沪市科创板，32=深
+
+    归约为连接池键 ``"sh"`` / ``"sz"``，用于路由到对应的 L2 服务器
+    （shlv2 / szlv2）。
+
+    Args:
+        market: 上述任一套数值。
+
+    Returns:
+        ``"sh"``（沪市：含 16/17/144）或 ``"sz"``（深市：32/33）。
+
+    Raises:
+        ValueError: market 非法。
+    """
+    if market in (16, 17, 144):
+        return "sh"
+    if market in (32, 33):
+        return "sz"
+    raise ValueError(f"market 非法（仅支持 16/17/144=沪, 32/33=深）: {market}")
+
+
+def resolve_l2_hosts_grouped(passport_bytes: bytes) -> dict[str, list[str]]:
+    """从 passport 的 M_hqdns 解析 L2 行情服务器 IP，按沪深分组返回。
+
+    ★ 2026-07-24 实测铁证（diag_l2_hosts.py）：沪深 L2 行情是**两套完全独立
+    的服务器**，IP 集合 0 重叠::
+
+        shlv2.123ths.com:8901:16;144  → 沪市 5 个 IP（8.134.98.163 等）
+        szlv2.123ths.com:8901:32      → 深市 9 个 IP（8.134.86.216 等）
+
+    M_hqdns 域名后缀的市场码直接对应：``shlv2`` 服务沪市（16/144），
+    ``szlv2`` 服务深市（32）。把两者合并成一个列表（旧
+    :func:`resolve_l2_hosts` 的做法）会随机连错市，导致 init 只回 210B 小帧、
+    4214 注册 CodeListSize=0——这是 HANDOFF 里"支持 push 的 IP 比例约 30%"
+    的真因。
+
+    Args:
+        passport_bytes: HTTP 鉴权返回的原始 passport_bytes。
+
+    Returns:
+        ``{"sh": [沪市 L2 IP...], "sz": [深市 L2 IP...]}``。
+        某组无 lv2 域名时该 key 对应空列表。
+    """
+    import socket as _socket
+    text = passport_bytes.decode("latin-1", errors="replace")
+    m = re.search(r'M_hqdns="([^"]*)"', text)
+    if not m:
+        m_hqdns = ""
+        for field in text.split("|"):
+            if field.startswith("M_hqdns="):
+                m_hqdns = field.split("=", 1)[1]
+                break
+    else:
+        m_hqdns = m.group(1)
+
+    # 域名 → 分组键
+    def _group(domain: str) -> str | None:
+        d = domain.lower()
+        if d.startswith("shlv2"):
+            return "sh"
+        if d.startswith("szlv2"):
+            return "sz"
+        return None
+
+    grouped: dict[str, list[str]] = {"sh": [], "sz": []}
+    seen: dict[str, set[str]] = {"sh": set(), "sz": set()}
+    for entry in m_hqdns.split(","):
+        dm = re.match(r'([\w.]+):(\d+):', entry.strip())
+        if not dm or dm.group(2) != str(MARKET_PORT):
+            continue
+        key = _group(dm.group(1))
+        if key is None:
+            continue
+        try:
+            _, _, addrs = _socket.gethostbyname_ex(dm.group(1))
+        except OSError:
+            continue
+        for ip in addrs:
+            if ip not in seen[key]:
+                seen[key].add(ip)
+                grouped[key].append(ip)
+
+    if grouped["sh"]:
+        logger.info("L2 沪市服务器（shlv2）→ %d 个 IP: %s",
+                    len(grouped["sh"]), grouped["sh"][:5])
+    else:
+        logger.warning("M_hqdns 无 shlv2 域名（沪市 L2 不可用）")
+    if grouped["sz"]:
+        logger.info("L2 深市服务器（szlv2）→ %d 个 IP: %s",
+                    len(grouped["sz"]), grouped["sz"][:5])
+    else:
+        logger.warning("M_hqdns 无 szlv2 域名（深市 L2 不可用）")
+    return grouped
+
+
 # --- 客户端身份参数（PC 远航版，从 login_lv2.pcapng 的 passport 实测）---
 # 首次测试用 Mac 参数被 8901 拒（VerifyCode=-1, PromptText=-6:），服务器返回
 # thshq-hwyeast-globalthsindex-gateway，判定 passport 身份（Mac）与 PC 网关不符。
@@ -931,6 +1033,8 @@ def build_timeline_l2_query(
           LackTime=0,3,0,0,20031231,2,0,0\\r\\n    (注意 LackTime 非全0)
 
     ⚠ 必须在 ``__manual`` 登录的连接上发送（4214 通道需要 __manual 身份）。
+    ★ 2026-07-24 晚实测：单子帧 + init(MarketCode=32) + szlv2 IP 可拿到
+    hd3.1 响应（241 根，parse_timeline_l2_response 验证）。嵌套双子帧反而不必要。
 
     Args:
         code: 股票代码（如 ``"000938"``）。

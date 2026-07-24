@@ -122,7 +122,12 @@ class THSClient:
         self._snapshot_codes: set[str] = set()    # 已订阅的代码
         self._snapshot_cb = None                  # 用户回调 fn(code, market, price, volume)
         self._latest_price: dict[str, float] = {} # code → 最新现价（供 poll 取用）
-        self._push_sock = None                    # __manual 推送连接（独立于主连接）
+        # __manual 推送连接池，按沪深分服（shlv2=沪, szlv2=深）。
+        # ★ 2026-07-24 实测：沪深 L2 是两套独立服务器，IP 0 重叠。沪市票必须连
+        # shlv2 的 IP + init(16;144)，深市票必须连 szlv2 的 IP + init(32)，连错
+        # 市会导致 init 只回 210B、4214 注册 CodeListSize=0。详见
+        # resolve_l2_hosts_grouped() 与 HANDOFF_PUSH_INVESTIGATION §沪深分服突破。
+        self._push_socks: dict = {}               # {"sh": sock, "sz": sock}
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
@@ -993,6 +998,8 @@ class THSClient:
         code: str,
         market: int = 0,
         timeout: float = 12.0,
+        skip_init: bool = False,
+        use_main_ip: bool = False,
     ) -> list[dict]:
         """查当日分时图（逐点行情：现价/均价/量额，复刻 hexin 分时白线）。
 
@@ -1023,16 +1030,19 @@ class THSClient:
                 raise RuntimeError(f"connect 失败: {lr.error}")
         if market == 0:
             market = 17 if code.startswith("6") else 33
-        # 确保 __manual 推送连接存在
-        if self._push_sock is None:
+        # 确保 __manual 推送连接存在（按沪深分服）
+        from thspypc.protocol import pick_l2_market
+        key = pick_l2_market(market)
+        if key not in self._push_socks:
             # ★ 关闭主连接（实测：两条同 IP 同 Passport64 连接并存会导致
             # __manual 的 4214 订阅 CodeListSize=0。关掉主连接只留 __manual
             # 一条连接后 CodeListSize=1。kline/list_quotes 在推送期间不可用。）
             self._drop_connection()
-            sock = self._open_manual_push_connection()
+            sock = self._open_manual_push_connection(market, skip_init=skip_init,
+                                                      use_main_ip=use_main_ip)
             if sock is None:
-                raise RuntimeError("__manual 推送连接建立失败")
-            self._push_sock = sock
+                raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
+            self._push_socks[key] = sock
         return self._timeline_query_once(code, market, timeout)
 
     def _timeline_query_once(self, code: str, market: int, timeout: float) -> list[dict]:
@@ -1041,11 +1051,12 @@ class THSClient:
         必须先发 4214 订阅注册帧（注册到推送通道），服务器回 CodeListSize=1 后，
         才能发分时数据查询（DateTime=8192）。抓包确认 hexin 也是这个顺序。
         """
-        from thspypc.protocol import build_timeline_l2_query
+        from thspypc.protocol import build_timeline_l2_query, pick_l2_market
         import re as _re
-        sock = self._push_sock
+        key = pick_l2_market(market)
+        sock = self._push_socks.get(key)
         if sock is None:
-            raise RuntimeError("__manual 推送连接不可用")
+            raise RuntimeError(f"__manual[{key}] 推送连接不可用")
 
         # 步骤1: 先发 4214 订阅注册帧（如果该 code 还没订阅过）
         if code not in self._snapshot_codes:
@@ -1054,8 +1065,9 @@ class THSClient:
             try:
                 sock.sendall(sub_frame + b"\n")
             except OSError as e:
-                self._push_sock = None
+                self._push_socks.pop(key, None)
                 raise ConnectionError(f"订阅帧发送失败: {e}")
+            logger.info("timeline[%s]: 已发 4214 订阅帧，等注册响应...", code)
             # 读注册响应，等 CodeListSize≥1
             registered = False
             for _ in range(5):
@@ -1064,12 +1076,17 @@ class THSClient:
                 except (socket.timeout, OSError, ValueError):
                     break
                 m = _re.search(rb"CodeListSize=(\d+)", resp)
-                if m and int(m.group(1)) >= 1:
-                    registered = True
-                    self._snapshot_codes.add(code)
-                    break
+                if m:
+                    sz = int(m.group(1))
+                    logger.info("timeline[%s]: 订阅响应 CodeListSize=%d（%dB）%s",
+                                code, sz, len(resp),
+                                "✓注册成功" if sz >= 1 else "✗注册失败")
+                    if sz >= 1:
+                        registered = True
+                        self._snapshot_codes.add(code)
+                        break
             if not registered:
-                logger.warning("timeline: %s 4214 注册失败（CodeListSize=0）", code)
+                logger.warning("timeline[%s]: 4214 注册失败（CodeListSize=0 或无响应）", code)
                 # 继续尝试发查询（有些服务器注册和查询可合并响应）
 
         # 步骤2: 发 L2 分时数据查询（pageid=4214, DateTime=8192）
@@ -1079,12 +1096,14 @@ class THSClient:
         try:
             sock.sendall(frame + b"\n")
         except OSError as e:
-            self._push_sock = None
+            self._push_socks.pop(key, None)
             raise ConnectionError(f"查询帧发送失败: {e}")
-        # 分时响应与 K线同为 hd3.1 变体，复用累积读帧逻辑
+        logger.info("timeline[%s]: 已发 L2 分时查询（pageid=4214, DateTime=8192），等响应...", code)
+        # 分时响应是 hd3.1 flag=0x00b4 变体，用 parse_timeline_l2_response 解析
+        from thspypc.protocol import parse_timeline_l2_response
         all_recs: list[dict] = []
         got_data = False
-        for _ in range(20):
+        for i in range(20):
             try:
                 resp = read_frame(sock)
             except socket.timeout:
@@ -1096,18 +1115,23 @@ class THSClient:
                     break
                 raise ConnectionError(f"读取失败: {e}")
             if b"hd3.1\x00" in resp or b"hd1.0\x00" in resp:
-                recs = parse_kline_hd3_response(resp)
+                # ★ 分时用 parse_timeline_l2_response（flag=0x00b4），
+                #   K线用 parse_kline_hd3_response（flag=0x0042）。两者都试。
+                recs = parse_timeline_l2_response(resp)
+                if not recs:
+                    recs = parse_kline_hd3_response(resp)
                 if recs:
                     all_recs.extend(recs)
                     got_data = True
                     sock.settimeout(2.0)
+                    logger.info("timeline[%s]: 解出 %d 条分时记录", code, len(recs))
                     continue
                 continue
             if got_data:
                 break
         if all_recs:
             return all_recs
-        logger.warning("timeline: 未找到分时数据帧")
+        logger.warning("timeline[%s]: 未找到分时数据帧（共读 %d 帧）", code, i + 1)
         return []
 
     def history_timeline(
@@ -2030,33 +2054,35 @@ class THSClient:
         if market is None:
             market = 17 if code.startswith("6") else 33
 
-        # ★ 用 __manual 身份开独立推送连接（首次订阅时建立，后续复用）
-        if self._push_sock is None:
-            sock = self._open_manual_push_connection()
+        # ★ 按沪深分服选推送连接（shlv2=沪, szlv2=深）
+        from thspypc.protocol import pick_l2_market
+        key = pick_l2_market(market)
+        if key not in self._push_socks:
+            sock = self._open_manual_push_connection(market)
             if sock is None:
-                logger.error("snapshot_subscribe: __manual 推送连接建立失败")
+                logger.error("snapshot_subscribe: __manual[%s] 推送连接建立失败", key)
                 return False
-            self._push_sock = sock
-            logger.info("snapshot_subscribe: __manual 推送连接已建立")
+            self._push_socks[key] = sock
+            logger.info("snapshot_subscribe: __manual[%s] 推送连接已建立", key)
 
         # 发 pageid=4214 嵌套订阅帧
         self._instance += 1
         frame = build_snapshot_subscribe(code, market=market,
                                           seq=self._instance & 0xFFFF)
         try:
-            self._push_sock.sendall(frame + b"\n")
+            self._push_socks[key].sendall(frame + b"\n")
         except OSError as e:
             logger.error("snapshot_subscribe: 发送失败 %s，重连", e)
-            self._push_sock = None
+            self._push_socks.pop(key, None)
             return False
 
         # 读注册响应（CodeListSize=1 才算成功）
         import socket as _socket
-        self._push_sock.settimeout(5.0)
+        self._push_socks[key].settimeout(5.0)
         registered = False
         try:
             for _ in range(5):
-                body = read_frame(self._push_sock)
+                body = read_frame(self._push_socks[key])
                 if b"CodeListSize=" in body:
                     import re
                     m = re.search(rb"CodeListSize=(\d+)", body)
@@ -2087,37 +2113,90 @@ class THSClient:
         logger.info("snapshot_subscribe: 已订阅 %s（market=%d）", code, market)
         return True
 
-    def _open_manual_push_connection(self):
-        """用 __manual 身份开一条独立 8901 连接（推送通道专用）。
+    def _open_manual_push_connection(self, market: int, skip_init: bool = False,
+                                      use_main_ip: bool = False):
+        """用 __manual 身份开一条独立 8901 连接（推送通道专用，按沪深分服）。
 
         复用主连接的 Passport64/Mac64/IP，但 login 帧用 UserName=__manual。
-        登录后发 init（MarketCode=32 深市，复刻 hexin __manual 连接）激活
-        行情通道——之前认为"__manual 连接发 init 会被拒断连"是因为用了
-        MarketCode=16;144（沪市），改用 32 后 hexin 抓包确认可正常接受。
+        登录后默认发 init 激活行情通道（``skip_init=False``）。
 
-        ★ 主连接保持不断（kline/list_quotes 仍可用）。__manual 连接独立于
-        主连接，服务器允许同一 Passport64 开多条连接（hexin 也是多连接并存）。
+        ★ **按沪深选 L2 服务器**（2026-07-24 实测突破）：shlv2/szlv2 是两套独立
+        服务器（IP 0 重叠）。必须按 market 选对应域名解析出的 IP，且 init 的
+        MarketCode 匹配该市场，否则 init 只回 210B、4214 注册 CodeListSize=0::
+
+            沪市（17/16/144）→ shlv2 IP + init(MarketCode="16;144;")
+            深市（33/32）    → szlv2 IP + init(MarketCode="32;")
+
+        HANDOFF 旧结论"__manual 发 init(16) 被拒、改 32 正常"是误判——当时连的
+        是 szlv2 的深市 IP，发沪市 init(16) 当然被拒。真相是 IP 与 MarketCode
+        必须配套，而非 16 vs 32 谁对谁错。
+
+        IP 组里逐个尝试：连接失败或 init 响应过小（<5000B，说明连错了市或该
+        IP 不健康）则换下一个，直到找到能正常激活的 IP。
+
+        Args:
+            market: 17/33（snapshot 市场码）或 16/144/32（init 市场码）。
+                    用 :func:`pick_l2_market` 归约为 sh/sz 选服。
+            skip_init: 跳过 init 握手（调试用）。默认 False。
+            use_main_ip: 强制用主连接的 IP（调试用）。默认 False。``_replay_exact.py``
+                    的成功路径连的是 ``client._connected_ip``（主连接同 IP），
+                    而非 szlv2/shlv2 解析的 IP。设 True 复刻该路径，用于隔离
+                    "IP 来源"变量——若 True 能成、False 不能成，说明推送注册
+                    需要主连接先在该 IP 建立过普通会话（会话预热）。
+
+        Returns:
+            成功激活的 socket，或 None（全组 IP 都失败）。
         """
         import socket as _socket
-        from thspypc.protocol import resolve_l2_hosts
+        from thspypc.protocol import resolve_l2_hosts_grouped, pick_l2_market
         passport64 = build_passport64(self._auth)
-        # ★ 优先用 L2 服务器 IP（shlv2/szlv2 域名解析），非 L2 的 IP
-        # 不支持 4214 推送注册（init 只回 210B、CodeListSize=0）。
-        l2_ips = resolve_l2_hosts(self._auth.get("passport_bytes", b""))
-        # 当前主连接 IP 如果在 L2 列表里就用它，否则取 L2 列表第一个
-        if self._connected_ip in l2_ips:
-            host = self._connected_ip
-        elif l2_ips:
-            host = l2_ips[0]
-            logger.info("__manual: 主连接 IP %s 非 L2，改用 L2 IP %s",
-                        self._connected_ip, host)
+        key = pick_l2_market(market)
+        init_market_code = "16;144;" if key == "sh" else "32;"
+
+        if use_main_ip:
+            # 调试模式：强制用主连接 IP（复刻 _replay_exact 成功路径）
+            if not self._connected_ip:
+                logger.error("__manual: use_main_ip 但无主连接 IP")
+                return None
+            candidates = [self._connected_ip]
+            logger.info("__manual[%s] use_main_ip=True → 强制连主连接 IP %s",
+                        key, self._connected_ip)
         else:
-            host = self._connected_ip or "127.0.0.1"
-        logger.info("__manual 推送连接: 连接 %s:%d ...", host, MARKET_PORT)
+            # 按沪深分组解析 L2 服务器 IP（shlv2 / szlv2）
+            grouped = resolve_l2_hosts_grouped(self._auth.get("passport_bytes", b""))
+            candidates = list(grouped.get(key, []))
+            # 优先用当前主连接 IP（若它在该组里，省一次 DNS 命中）
+            if self._connected_ip and self._connected_ip in candidates:
+                candidates.remove(self._connected_ip)
+                candidates.insert(0, self._connected_ip)
+            if not candidates:
+                logger.error("__manual: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
+                return None
+
+        logger.info("__manual[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
+                    key, len(candidates), candidates[:3], init_market_code,
+                    "（skip_init）" if skip_init else "")
+
+        for host in candidates:
+            sock = self._try_open_manual_sock(host, passport64, key,
+                                               init_market_code, skip_init)
+            if sock is not None:
+                return sock
+            logger.info("__manual[%s] IP %s 不可用，换下一个", key, host)
+        logger.error("__manual[%s] 全部 %d 个候选 IP 都失败", key, len(candidates))
+        return None
+
+    def _try_open_manual_sock(self, host, passport64, key, init_market_code, skip_init=False):
+        """对单个 IP 执行 __manual 连接 → 登录 → init，成功返回 socket。
+
+        init 响应 <5000B 视为该 IP 不健康（连错市/未激活），返回 None 让调用方换 IP。
+        ``skip_init=True`` 时跳过 init（复刻 ``_replay_exact.py`` 的成功路径）。
+        """
+        import socket as _socket
         try:
             sock = _socket.create_connection((host, MARKET_PORT), timeout=15)
         except OSError as e:
-            logger.error("__manual 连接失败 %s: %s", host, e)
+            logger.warning("__manual[%s] 连接失败 %s: %s", key, host, e)
             return None
         login_body = build_manual_login_body(passport64, self.mac64)
         try:
@@ -2125,26 +2204,30 @@ class THSClient:
             sock.settimeout(8.0)
             resp = read_frame(sock)
             vc = ""
+            prompt = ""
             for line in resp.decode("gbk", "replace").replace("\r\n", "\n").split("\n"):
                 if line.startswith("VerifyCode="):
                     vc = line.split("=", 1)[1]
+                elif line.startswith("PromptText="):
+                    prompt = line.split("=", 1)[1]
             if vc != "0":
-                logger.error("__manual 登录失败 VerifyCode=%s", vc)
+                logger.error("__manual[%s] %s 登录失败 VerifyCode=%s PromptText=%s",
+                             key, host, vc, prompt or "(无)")
                 sock.close()
                 return None
+            logger.info("__manual[%s] %s 登录成功", key, host)
         except (OSError, ValueError) as e:
-            logger.error("__manual 登录异常: %s", e)
+            logger.error("__manual[%s] %s 登录异常: %s", key, host, e)
             sock.close()
             return None
-        # ★ 发 init(MarketCode=32) 激活 __manual 连接的行情通道（关键！）
-        # 之前 HANDOFF §2 说"__manual 连接发 init 会被拒断连"——那是因为用了
-        # MarketCode=16;144（沪市）。改用 32（深市）后实测正常（2026-07-24）：
-        # init 响应 23742B 完整配置帧，不断连，且 init 后 4214 订阅才拿到
-        # CodeListSize=1（不发 init → CodeListSize=0）。
+        if skip_init:
+            logger.info("__manual[%s] %s 跳过 init（skip_init）", key, host)
+            return sock
+        # ★ 发 init 激活行情通道。MarketCode 必须匹配该 IP 所属市场
+        # （shlv2→16;144 沪市，szlv2→32 深市），否则只回 210B 小帧。
         try:
-            init_frame = build_init_query(market_code="32;")
+            init_frame = build_init_query(market_code=init_market_code)
             sock.sendall(init_frame + b"\n")
-            # 排空 init 响应：配置帧可能分多个 TCP 段到达，用较长超时确保读完
             n_frames = 0
             n_bytes = 0
             for _ in range(30):
@@ -2155,12 +2238,17 @@ class THSClient:
                     n_bytes += len(b)
                 except (socket.timeout, OSError, ValueError):
                     break
-            logger.info("__manual init 完成（MarketCode=32，%d帧/%dB）", n_frames, n_bytes)
+            logger.info("__manual[%s] %s init 完成（MarketCode=%s，%d帧/%dB）",
+                        key, host, init_market_code, n_frames, n_bytes)
             if n_bytes < 5000:
-                logger.warning("__manual init 响应过小（%dB），可能未完整激活行情通道", n_bytes)
+                logger.warning("__manual[%s] %s init 响应过小（%dB），该 IP 未激活行情通道",
+                               key, host, n_bytes)
+                sock.close()
+                return None
         except OSError as e:
-            logger.warning("__manual init 异常: %s", e)
-            # init 失败可能是坏 IP，但仍返回 sock 让调用方尝试
+            logger.warning("__manual[%s] %s init 异常: %s", key, host, e)
+            sock.close()
+            return None
         return sock
 
     def latest_price(self, code: str) -> float | None:
@@ -2168,51 +2256,60 @@ class THSClient:
         return self._latest_price.get(code)
 
     def stop_snapshot(self) -> None:
-        """停止分时推送读取线程，关闭 __manual 推送连接（disconnect 时自动调用）。"""
+        """停止分时推送读取线程，关闭沪深两条 __manual 推送连接（disconnect 时自动调用）。"""
         self._snapshot_stop.set()
         if self._snapshot_thread and self._snapshot_thread.is_alive():
             self._snapshot_thread.join(timeout=3)
         self._snapshot_thread = None
-        if self._push_sock is not None:
+        for key, sock in list(self._push_socks.items()):
             try:
-                self._push_sock.close()
+                sock.close()
             except OSError:
                 pass
-            self._push_sock = None
+        self._push_socks.clear()
 
     def _snapshot_loop(self) -> None:
-        """后台读取 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
+        """后台读取沪深两条 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
 
-        读取 ``self._push_sock``（独立 __manual 连接，不影响主连接的查询/心跳）。
-        用短超时轮询 read_frame，遇到非快照帧（心跳响应、注册响应等）直接丢弃。
+        用 ``select`` 同时等待 ``self._push_socks`` 里的连接（最多沪深两条），
+        可读的就 ``read_frame``。遇到非快照帧（心跳响应、注册响应等）直接丢弃。
+        select 超时 1 秒，期间反复检查 ``_snapshot_stop`` 以便及时退出。
         """
+        import select as _select
         import socket as _socket
         while not self._snapshot_stop.is_set():
-            sock = self._push_sock
-            if sock is None:
+            socks = [s for s in self._push_socks.values() if s is not None]
+            if not socks:
                 if self._snapshot_stop.wait(1.0):
                     break
                 continue
             try:
-                sock.settimeout(1.0)
-                body = read_frame(sock)
-            except (_socket.timeout, OSError):
+                r, _, _ = _select.select(socks, [], [], 1.0)
+            except (OSError, ValueError):
+                if self._snapshot_stop.wait(1.0):
+                    break
                 continue
-            except ValueError:
-                # read_frame 偶尔在半帧处解析失败，跳过
-                continue
-            if not is_snapshot_push(body):
-                continue
-            rec = parse_snapshot_push(body)
-            if rec is None:
-                continue
-            self._latest_price[rec["code"]] = rec["price"]
-            if self._snapshot_cb is not None:
+            for sock in r:
                 try:
-                    self._snapshot_cb(rec["code"], rec["market"],
-                                      rec["price"], rec["volume"])
-                except Exception as e:
-                    logger.warning("snapshot 回调异常: %s", e)
+                    sock.settimeout(2.0)
+                    body = read_frame(sock)
+                except (_socket.timeout, OSError):
+                    continue
+                except ValueError:
+                    # read_frame 偶尔在半帧处解析失败，跳过
+                    continue
+                if not is_snapshot_push(body):
+                    continue
+                rec = parse_snapshot_push(body)
+                if rec is None:
+                    continue
+                self._latest_price[rec["code"]] = rec["price"]
+                if self._snapshot_cb is not None:
+                    try:
+                        self._snapshot_cb(rec["code"], rec["market"],
+                                          rec["price"], rec["volume"])
+                    except Exception as e:
+                        logger.warning("snapshot 回调异常: %s", e)
 
     def _heartbeat_loop(self) -> None:
         """心跳循环：8901 每 3 秒、9601 每 30 秒（10 个 3 秒周期）。

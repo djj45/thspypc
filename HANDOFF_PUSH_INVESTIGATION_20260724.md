@@ -243,5 +243,156 @@ hd3.1\0
    4214 订阅路径，盘中应有 71B 推送帧。
 2. **完善 client.py 集成**：`timeline()` 方法需简化连接生命周期（disconnect 主连接后
    只用 __manual 连接，或用独立脚本模式）。
-3. **IP 兼容性**：支持 push 的 IP 比例约 30%，需在 connect 层自动检测（init 响应
-   >5000B 的 IP 才用于推送连接）。
+3. ~~**IP 兼容性**：支持 push 的 IP 比例约 30%，需在 connect 层自动检测（init 响应
+   >5000B 的 IP 才用于推送连接）。~~ → **★ 已由「沪深分服」章节彻底解决**（见下）。
+
+---
+
+## ★★★★ 沪深 L2 分服突破（2026-07-24 续会话）
+
+> 上一节"四层根因"解决了**怎么发**订阅帧，但遗留一个困惑：**为什么只有约 30%
+> 的 IP 能成功**（init 回 23KB+、CodeListSize=1），其余 init 只回 210B、注册失败？
+> 本会话从 passport 的 `M_hqdns` 字段找到真因——**沪深 L2 是两套完全独立的服务器**，
+> 之前把它们的 IP 混在一起随便取，连错市必然失败。
+
+### 决定性证据：M_hqdns 完整拓扑（首次完整捕获）
+
+HTTP 80 鉴权响应的 passport 里 `M_hqdns` 字段下发**全部行情服务器域名**，格式为
+`域名:端口:市场码;:`，逗号分隔。实测原文（`tests/diag_l2_hosts.py` 打印）：
+
+```
+shlv2.123ths.com:8901:16;144;:,      ← 沪市 L2（主板16 + 科创板144）
+szlv2.123ths.com:8901:32;:,          ← 深市 L2（32）
+fu4.123ths.com:8901:96;128;88;URS;UCT;UNX;UCX;UME;216;48;:,   ← 异动/板块
+hkus.123ths.com:8901:176;112;:,      ← 港股（一组）
+hkus.123ths.com:8901:168;184;200;:,  ← 港股（二组）
+ifindhq.123ths.com:8901:232;120;104;56;:,   ← 国际行情
+fu2.123ths.com:8901:64;80;UGF;UZC;UDE;:,    ← 港股相关
+euhq.123ths.com:8901:160;:,          ← 欧洲
+fu6.123ths.com:8601:UZX;:,           ← 另端口（8601）
+usotc.123ths.com:8901:UNS;UHI;:,     ← 美股 OTC
+```
+
+**域名前缀直接对应市场**：`sh`lv2=沪、`sz`lv2=深、`hkus`=港、`euhq`=欧、
+`usotc`=美。**域名后的市场码**（16/144/32...）是该服务器服务的市场清单。
+
+### 铁证：shlv2 与 szlv2 的 IP 集合 0 重叠
+
+DNS 解析两组域名，IP 完全不交集：
+
+| 域名 | 市场 | IP 数 | 解析结果 |
+|------|------|-------|---------|
+| `shlv2.123ths.com` | 沪 16/144 | **5** | `8.134.115.123` `8.134.98.163` `1.1.113.11` `122.9.115.201` `122.9.202.190` |
+| `szlv2.123ths.com` | 深 32 | **9** | `139.9.198.250` `122.9.205.228` `8.134.112.142` `1.1.141.107` `121.37.31.87` `8.134.86.216` `122.9.214.229` `8.134.101.39` `8.134.99.165` |
+| **交集** | — | **0** | **完全无重叠** |
+
+（DNS 轮询，每次解析具体 IP 可能微变，但 sh/sz 两组**永远不交叉**。）
+
+### 重新解释本文件之前的所有"IP 困惑"
+
+| 旧困惑（本文件原文） | 真因（沪深分服视角） |
+|--------------------|--------------------|
+| §注意事项"支持 push 的 IP 比例约 30%" | 不是随机 30%。深市票（szlv2 9 个 IP）命中概率高、沪市票（shlv2 5 个）命中概率低，混合取样看似"约 30%" |
+| §注意事项"init 响应 >5000B 的 IP 才支持推送" | 真相是 **init 的 MarketCode 必须匹配 IP 所属市场**。连 szlv2 的深市 IP 却发 init(16;144 沪市) → 服务器只回 210B 小帧 |
+| §2 "`__manual` 连接发 init 用 MarketCode=16 被拒，改 32 正常" | **误判**。当时连的是 szlv2 的深市 IP，发沪市 init(16) 当然被拒。不是 16 vs 32 谁对，是 **IP 与 MarketCode 必须配套** |
+| "坏 IP 需重试换 IP" | 不是"坏"，是**连错市**。换到同市的另一个 IP 才对 |
+
+### 第五层根因：按沪深选服（补全四层表）
+
+原"四层根因"表需补第五层：
+
+| 层 | 条件 | 缺失后果 |
+|---|------|---------|
+| ① 账号 | level2 | 走 9354 无推送 |
+| ② 登录 | `__manual` | CodeListSize=0 |
+| ③ init | MarketCode=32 | CodeListSize=0 |
+| ④ 嵌套双子帧 | 0x0002+0x0009 | 零推送 |
+| **⑤ IP↔MarketCode 配套** | **沪票连 shlv2 IP + init(16;144)；深票连 szlv2 IP + init(32)** | **init 只回 210B、CodeListSize=0（即"30% IP 支持"假象）** |
+
+### 已落地的代码改造（2026-07-24）
+
+- `protocol.py`：
+  - `resolve_l2_hosts_grouped()` — 返回 `{"sh": [...], "sz": [...]}`，按 shlv2/szlv2 分组 DNS
+  - `pick_l2_market(market)` — 把 17/16/144→"sh"、32/33→"sz"，连接池路由键
+  - 旧 `resolve_l2_hosts()`（合并列表）保留，向后兼容
+- `client.py`：
+  - `_push_sock`（单连接）→ `_push_socks: dict`（沪深连接池，同时持有两条）
+  - `_open_manual_push_connection(market)` — 按 market 选 sh/sz 组，IP 逐个重试，
+    init 的 MarketCode 按市匹配（sh→`16;144;`、sz→`32;`）
+  - `_snapshot_loop` — `select` 同时等沪深两条连接（单线程，不新增线程）
+  - `snapshot_subscribe`/`timeline`/`_timeline_query_once` — 全部按 `pick_l2_market` 路由
+
+### 验证
+
+- `tests/diag_l2_hosts.py` — 打印 M_hqdns 原文 + shlv2/szlv2 分组 DNS + 交集对比（本节证据来源）
+- 分组函数端到端验证通过：sh=5 IP、sz=9 IP、合并 14=sh+sz 去重、pick_l2_market 路由正确
+- **盘中实测待办**：分别订阅沪市票（如 603118）和深市票（如 000938），确认两者都
+  `CodeListSize=1` + 收到 71B 推送（需交易时段 + L2 账号）
+
+### 关键文件（本会话新增/改动）
+
+- `src/thspypc/protocol.py` — `resolve_l2_hosts_grouped`、`pick_l2_market`（新增）
+- `src/thspypc/client.py` — `_push_socks` 池 + 按沪深分服（改造）
+- `tests/diag_l2_hosts.py` — 沪深分服诊断脚本（新增，本次验证用）
+
+
+---
+
+## ★★★ 最终成功：沪深分时端到端验证通过（2026-07-24 晚）
+
+> 经过一整晚的弯路（0x0a 卡点 → 抓包对照 → 各种错误假设），最终发现真因
+> **极简单：init 是必须的**。回退到下午（§分时查询完整链路）的成功配置后，
+> 沪深两市分时全部拿到 241 根。
+
+### 端到端验证结果
+
+| 票 | 市场 | L2 服务器 IP | init MarketCode | 结果 |
+|----|------|-------------|-----------------|------|
+| 000938 紫光 | 深 | `8.134.112.142`(szlv2) | `32;` 23742B | **241根** 41.01→41.45 (+1.07%) |
+| 603118 共进 | 沪 | `8.134.115.123`(shlv2) | `16;144;` 49191B | **241根** 15.75→15.77 (+0.13%) |
+
+沪深分服改造**端到端验证成功**：深市连 szlv2+init(32)，沪市连 shlv2+init(16;144)，
+各自独立、互不干扰、同时可查（连接池 `_push_socks` 持有沪深两条）。
+
+### 正确的五层根因（最终版）
+
+| 层 | 条件 | 缺失后果 |
+|---|------|---------|
+| ① 账号 | level2 | 走 9354 无推送 |
+| ② 登录 | `__manual` | CodeListSize=0 |
+| ③ **IP 分服** | **沪票连 shlv2 IP；深票连 szlv2 IP** | init 只回 210B（"30% IP 支持"假象） |
+| ④ **init 配套** | **init 的 MarketCode 匹配市场（沪16;144 / 深32）** | init 只回 210B、CodeListSize=0 |
+| ⑤ 嵌套双子帧订阅 | 0x0002+0x0009 | 零推送 |
+
+层③④是本会话核心突破（沪深分服），不可分割。
+
+### 本会话走过的弯路（记录以免重蹈）
+
+| 错误假设 | 实际 |
+|---------|------|
+| "init 不是注册的必要条件"（szlv2 不发 init 也 CodeListSize=1） | CodeListSize=1 ≠ 能拿数据。不发 init → 服务器回 0x0a 聚合帧而非 hd3.1。**init 必须发** |
+| "0x0a 是新格式需逆向" | 不是。0x0a 是缺 init 的降级响应。发 init 后直接回 hd3.1 |
+| "需要嵌套 5 子帧请求" | 不需要。单子帧（外层 0x0009）就够，hexin 多子帧是它自己画多条曲线用的 |
+| "主连接同 IP 是关键（会话预热）" | 不是。全新 szlv2 IP 也能成功 |
+| "Passport64 head128 签名不完整导致降级" | 不是。head128 没问题，纯粹是缺 init |
+
+### 最终正确的代码状态
+
+- `protocol.py`：
+  - `resolve_l2_hosts_grouped()` / `pick_l2_market()` — 沪深分组（新增，本次核心）
+  - `build_timeline_l2_query()` — **回退到单子帧版本**（8a45b4a），LackTime=`0,3,0,0,20031231,2,0,0`
+- `client.py`：
+  - `_push_socks: dict` — 沪深连接池（单连接→池改造）
+  - `_open_manual_push_connection(market)` — 按 market 选 sh/sz IP + init 配套 MarketCode
+  - `_snapshot_loop` — `select` 双连接
+  - `timeline(skip_init=False)` — **默认发 init**（skip_init 参数保留供调试，但默认 False）
+
+### 关键文件
+
+- `src/thspypc/protocol.py` — `resolve_l2_hosts_grouped`、`pick_l2_market`（新增）
+- `src/thspypc/client.py` — `_push_socks` 池 + 按沪深分服 + init 配套（改造）
+- `tests/test_timeline.py` — 分时获取测试（`--no-init`/`--main-ip` 调试开关 + INFO 日志）
+- `tests/diag_l2_hosts.py` — 沪深分服诊断（M_hqdns 拓扑 + IP 交集对比）
+- `captures_live/timeline_20260724_190949.pcap` — hexin L2 分时抓包（对照来源）
+- `captures_live/hexin_timeline_resp_000938.bin` — hexin 真实响应（hd3.1，241条，解析参照）
+- `captures_live/_stream1_raw.txt` — hexin stream1 原始 hex（请求序列）
