@@ -1007,15 +1007,33 @@ def build_timeline_query(
     return encode_frame(body)
 
 
-# L2 当日分时 DataType（35 个字段，2026-07-24 抓包 realtime_push_150041 真值）。
+# L2 当日分时 DataType（2026-07-26 核对：服务器实际返回 31 字段，见下）。
 # hexin L2 账号打开分时图走 pageid=4214（推送通道），用这套 level2 字段集；
 # 普通账号走 pageid=9354（上面 TIMELINE_DATATYPE，10 个基础字段）。
-# dt10=现价 dt13=量 dt19=额 dt14=均价 dt272/271/15/38=level2 扩展 dt6=昨收
+#
+# ★ 服务器忽略请求里的 DataType 列表，按 pageid=4214 固定字段集返回（2026-07-26
+#   实测：请求发 35 字段，服务器只回 31 个，且额外补 dt1/dt16）。本列表已对齐
+#   服务器实际返回的 31 字段（与 hexin_timeline_resp_000938.bin 字段表逐字段一致）。
+#
+# 字段含义（2026-07-26 实测 + 外部行情交叉验证，000938 收盘41.45/量360.54万手/额152.19亿）：
+#   dt1   = 分时 bar 序号（连续递增，非时间戳；parse 时映射到 bar_index）
+#   dt10  = 现价（分时白线；收盘=41.45 ✓）
+#   dt13  = 累计成交量（股；末根360,537,120=360.54万手 ✓）→ 分时图柱状 = 逐根差分
+#   dt14  = 累计主动买入量（股；dt14+dt15=dt13；上涨票占比>下跌票）
+#   dt15  = 累计主动卖出量（股；dt14+dt15=dt13）
+#   dt18  = 累计计数（/dt13≈0.2%，疑笔数衍生，未定论）
+#   dt19  = 累计成交额（元；末根152.19亿 ✓）；均价 = dt19/dt13 = 42.21（非 dt14！）
+#   dt227-dt229 = 大单金额曲线（主力净额=主动买额-主动卖额；000938 末根-4.31亿，
+#                 对应 hexin 分时图「大单金额」曲线，与 app 锚点-4.32亿 吻合）
+#   dt201-230（除上述）= 资金分级累计额/成交量细分（电脑版分时图不展示，手机版
+#                       分特大/大/中/小单时用到，本协议不分单）
+#   dt16/dt38/dt39/dt40 = 全 0xFFFFFFFF 哨兵，未填充（fmt=0x30 当整数读）
+#   dt54 = 全 0，未填充
 TIMELINE_L2_DATATYPE = [
-    272, 229, 14, 207, 271, 228, 13, 227, 19, 40,
-    226, 54, 18, 204, 39, 225, 10, 203, 210, 38,
-    224, 23, 202, 209, 223, 230, 15, 22, 201, 208,
-    6, 1110, 407, 1111, 380,
+    1, 16, 229, 14, 207, 15, 228, 13, 227, 19,
+    40, 226, 54, 18, 204, 39, 225, 10, 203, 210,
+    38, 224, 23, 202, 209, 223, 230, 15, 22, 201,
+    208,
 ]
 
 
@@ -1033,19 +1051,22 @@ def build_timeline_l2_query(
 
         \\x09 + 23字节二进制头(子帧0x0009 路由0x0201) + GBK 文本:
           CodeList=<extra>;<市场>(<代码>,);\\r\\n   (hexin 附带指数 399002)
-          DataType=<35个level2字段>,\\r\\n
+          DataType=<31个level2字段>,\\r\\n
           DateTime=8192(0-0)\\r\\n
           LackTime=0,3,0,0,20031231,2,0,0\\r\\n    (注意 LackTime 非全0)
 
     ⚠ 必须在 ``__manual`` 登录的连接上发送（4214 通道需要 __manual 身份）。
     ★ 2026-07-24 晚实测：单子帧 + init(MarketCode=32) + szlv2 IP 可拿到
     hd3.1 响应（241 根，parse_timeline_l2_response 验证）。嵌套双子帧反而不必要。
+    ★ 2026-07-26 核对：服务器忽略请求 DataType 列表，按 pageid=4214 固定返回
+    31 字段（与 TIMELINE_L2_DATATYPE 对齐）；列表填什么不影响响应。
 
     Args:
         code: 股票代码（如 ``"000938"``）。
         market: 市场码（33=深 17=沪）。
         extra_codelist: 附加代码（hexin 附带指数，如 ``"32(399002,);"``）。
-        datatype: 字段集（默认 TIMELINE_L2_DATATYPE，35 个 level2 字段）。
+        datatype: 字段集（默认 TIMELINE_L2_DATATYPE，31 个 level2 字段；
+            服务器实际返回值，仅作文档对齐，不影响响应）。
         seq: 序列号（hexin 用 0x105b，高字节 0x10）。
 
     Returns:
@@ -1108,6 +1129,222 @@ HISTORY_TIMELINE_BAR_SPAN = 355
 TIMELINE_BAR_EPOCH_ORDINAL = 675063   # date(1849, 4, 5).toordinal()
 TIMELINE_BAR_DAYS_SCALE = 2048        # 每日历日对应 2048 个 bar 单位
 TIMELINE_INTRADAY_BAR = 606           # 历史交易日日内 bar 偏移（盘前=960）
+
+
+# ── 集合竞价协议（2026-07-26 抓包 auction_20260726 破解）──
+#
+# 集合竞价数据（9:15-9:25 每 9 秒一次虚拟撮合）走与分时不同的协议：
+#   - 周期码 **7176**（分时是 8192、日K是 16384）
+#   - DateTime 两参数是 **unix 时间戳（秒）**，不是 bar 序号：
+#       DateTime=7176(<9:15:00 时间戳>-<9:25:00 时间戳>)
+#     如 2026-07-24：DateTime=7176(1784855700-1784856300)
+#   - 响应是 **hd1.0 帧 flag=0x003a**（不是 hd3.1），hs=20B/条，约 68 条记录
+#
+# 请求格式（pageid=4214 推送通道，hexin 打开分时图「集合竞价」小窗时发）::
+#
+#     CodeList=33(000938,);\r\n
+#     DataType=10,27,33,49,\r\n
+#     DateTime=7176(1784855700-1784856300)\r\n
+#     LackTime=0,0,0,0,0,0,0,0\r\n
+#     pageid=4214\r\n
+#
+# 响应字段（hd1.0 字段表 fc=5，2026-07-26 用 9:21:03 锚点逐字段验证）：
+#   dt1  = unix 时间戳（秒级，9:15:00-9:24:57 每 9 秒一条）
+#   dt10 = 集合竞价撮合价（虚拟开盘价，逐 9 秒收敛）
+#   dt49 = 累计竞价量（单位：股，÷100=手）  ← 锚点 954000=9540手 ✓
+#   dt27 = 未匹配量（单位：股，÷100=手）    ← 锚点 1200=12手 ✓
+#   dt33 = 无效字段（盘后/实时均 0，非竞昨比）
+#
+# ★ 竞昨比/换手率是 hexin 客户端**本地算的衍生值**（dt49÷本地缓存的昨量/流通
+#   股本），不在竞价响应里。9:21:03 锚点反推：换手0.03%=9540手÷28.6亿股 ✓
+AUCTION_PERIOD = 7176   # DateTime 第一参数（集合竞价周期码）
+AUCTION_DATATYPE = [10, 27, 33, 49]
+
+
+def build_auction_query(
+    code: str,
+    market: int = 33,
+    trade_date=None,
+    datatype: list[int] | None = None,
+    seq: int = 0x0079,
+) -> bytes:
+    """构造**集合竞价**查询请求（pageid=4214 推送通道，周期码 7176）。
+
+    与 :func:`build_timeline_l2_query`（盘中分时，周期码 8192）的差异（2026-07-26
+    抓包 auction_20260726 逐字节对照确认）::
+
+        - DateTime 第一参数 = 7176（分时是 8192）
+        - DateTime 括号两参数是 **unix 时间戳（秒）**：
+            DateTime=7176(<9:15:00 时间戳>-<9:25:00 时间戳>)
+          如 2026-07-24：DateTime=7176(1784855700-1784856300)
+          （分时是 ``8192(0-0)`` 当日 / bar 序号历史回忆，语义完全不同）
+        - DataType 用 4 个竞价字段（分时是 31 个 level2 字段）
+        - **路由 0xfc01**（分时是 0x0201）、**hdr[15]=0x40 / hdr[17]=0x08 /
+          hdr[18]=0x1c**（分时这三个字节为 0/0/0x20）、seq 高字节 0x01（分时是
+          0x10）——同为 pageid=4214 推送通道，但路由+标记位区分竞价 vs 分时；
+          子帧类型仍 0x0009
+        - LackTime 全 0（分时是 ``0,3,0,0,20031231,2,0,0``）
+
+    沪深两市集合竞价时段相同（9:15-9:25），无需区分；仅 ``market`` 码不同。
+
+    ⚠ 必须在 ``__manual`` 登录的连接上发送（4214 通道需要 __manual 身份），
+       与 :func:`build_timeline_l2_query` 共用同一条推送连接。
+
+    Args:
+        code: 股票代码（如 ``"000938"``）。
+        market: 市场码（33=深 17=沪）。
+        trade_date: 交易日。``None``（默认）= 最近交易日（服务器返回最近交易日
+            数据，DateTime 用 ``(0-0)``，与 :func:`build_timeline_l2_query` 一致）；
+            传 ``date``/``datetime`` = 指定交易日（算该日 9:15/9:25 unix 时间戳）。
+            ★ 历史日期的 DateTime 参数格式基于当日抓包推断（仍是 unix 时间戳，
+              因参数语义是「时间区间」）；若实测不符需在此调整。
+        datatype: 字段集（默认 :data:`AUCTION_DATATYPE` = ``[10,27,33,49]``）。
+        seq: 序列号（hexin 用 0x105b，高字节 0x10）。
+
+    Returns:
+        完整请求帧字节（含 fdfdfdfd magic），可直接 sendall。
+    """
+    if datatype is None:
+        datatype = AUCTION_DATATYPE
+    dt_str = ",".join(str(d) for d in datatype) + ","
+    main_cl = f"{market}({code},);"
+
+    # DateTime 参数：trade_date=None 用 (0-0)（最近交易日）；否则算 9:15/9:25 时间戳
+    if trade_date is None:
+        dt_args = "0-0"
+    else:
+        from datetime import time as _time
+        # 兼容 date / datetime 输入
+        d = trade_date.date() if hasattr(trade_date, "date") and callable(trade_date.date) else trade_date
+        t915 = datetime.combine(d, _time(9, 15, 0))
+        t925 = datetime.combine(d, _time(9, 25, 0))
+        # .timestamp() 按 local 时区（CST=UTC+8），与抓包真值一致
+        ts915 = int(t915.timestamp())
+        ts925 = int(t925.timestamp())
+        dt_args = f"{ts915}-{ts925}"
+
+    text = (
+        f"CodeList={main_cl}\r\nDataType={dt_str}\r\n"
+        f"DateTime={AUCTION_PERIOD}({dt_args})\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={SNAPSHOT_PAGEID}\r\n"
+    ).encode("gbk")
+    # 23 字节头（2026-07-26 抓包 auction_20260726 逐字节对照真值）：
+    #   与 build_timeline_l2_query 的差异：路由 0xfc01（非 0x0201）、
+    #   hdr[18]=0x1c（非 0x20）、seq 高字节 0x01（非 0x10）。
+    #   子帧类型仍 0x0009、pageid 仍 4214（同走推送通道，但路由标记区分竞价 vs 分时）。
+    hdr = bytearray(23)
+    hdr[0] = 0x09
+    hdr[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", hdr, 5, (seq & 0xFF) | 0x0100)  # seq 高字节 0x01（hexin 真值）
+    hdr[7:11] = b"\x12\x00\x09\x00"     # 子帧 0x0009
+    hdr[11] = 0xfc; hdr[12] = 0x01       # 路由 0xfc01（竞价专用，分时是 0x0201）
+    hdr[15] = 0x40                        # 竞价标记位 1（分时为 0）
+    hdr[17] = 0x08                        # 竞价标记位 2（分时为 0）
+    hdr[18] = 0x1c                        # 竞价标记位 3（分时是 0x20）
+    struct.pack_into("<I", hdr, 19, len(text))
+    body = bytes(hdr) + text
+    return encode_frame(body)
+
+
+def parse_auction_response(body: bytes) -> list[dict]:
+    """解析集合竞价响应（hd1.0 帧 flag=0x003a，pageid=4214 推送通道）。
+
+    与盘中分时响应（:func:`parse_timeline_l2_response`，hd3.1 flag=0x00b4）的差异
+    （2026-07-26 抓包确认）::
+
+        - 响应是 **hd1.0 帧**（分时是 hd3.1）
+        - flag=0x003a（分时是 0x00b4）
+        - 记录区**直接定长明文**（无 BitRLE 压缩，hd3.1 才有 BitRLE+位平面转置）
+        - hs=20B/条，约 68 条记录（9:15:00-9:24:57 每 9 秒一次虚拟撮合）
+
+    字段（hd1.0 字段表 fc=5，2026-07-26 用 9:21:03 锚点逐字段验证）：
+        time ← dt1（unix 时间戳秒，转 datetime；非 bar 序号）
+        dt10 = 集合竞价撮合价（虚拟开盘价，逐 9 秒收敛）
+        dt49 = 累计竞价量（股，÷100=手）   ← 锚点 954000=9540手 ✓
+        dt27 = 未匹配量（股，÷100=手）       ← 锚点 1200=12手 ✓
+        dt33 = 无效字段（盘后/实时均 0）
+
+    Args:
+        body: 完整 TCP 帧体（含 ``hd1.0`` 标记）。
+
+    Returns:
+        集合竞价记录列表，每条 ``{time, dt10, dt49, dt27, ...}``。
+        非竞价帧（无 hd1.0 / flag≠0x003a）返回空。
+
+    ⚠ **当前仅支持深市**（flag=0x003a，68 条等间距 20B 记录）。沪市响应虽含 9:15-9:25
+    时间戳，但封装格式不同（非 hd1.0 flag=0x003a 帧，记录非 20B 等间距），需另抓
+    沪市样本破解后扩展。沪市请求返回空列表（不报错）。
+    """
+    pos = 0
+    records: list[dict] = []
+    # 一个响应里可能含多个 hd1.0 帧（不同 flag），遍历找竞价帧 flag=0x003a。
+    # 注意 body 里也可能含二进制噪声恰好出现 "hd1.0" 字节序列，靠 flag+dc+hs 校验排除。
+    while True:
+        p = body.find(b"hd1.0", pos)
+        if p < 0:
+            break
+        pos = p + 6
+        base = p + 6   # 跳过 hd1.0\0
+        if len(body) < base + 10:
+            continue
+        dc = struct.unpack("<I", body[base:base+4])[0]
+        flag = struct.unpack("<H", body[base+4:base+6])[0]
+        hs = struct.unpack("<H", body[base+6:base+8])[0]
+        fc = struct.unpack("<H", body[base+8:base+10])[0]
+        # 竞价帧特征：flag=0x003a，fc=5，hs=20（dt1/dt10/dt49/dt27/dt33 各 4B）
+        if flag != 0x003a or dc == 0 or dc > 200 or hs == 0 or fc == 0:
+            continue
+        fields = _parse_hd_field_table(body, base + 10, fc)
+        rec_off = base + 10 + fc * 4
+        if len(body) < rec_off + dc * hs:
+            continue
+        # 记录区前有个 ~22B 壳头（含 ``!000938`` 代码标记），首条 dt1 不是时间戳
+        # 而是壳头字节。扫描首个「dt1 落在 unix 时间戳区间 且 +hs 处≈dt1+9」定位
+        # 真实数据起点（参考 parse_history_timeline_response 的扫描模式）。
+        data_start = -1
+        scan_end = min(rec_off + hs * 3, len(body) - hs)
+        for off in range(rec_off, scan_end):
+            v = struct.unpack("<I", body[off:off+4])[0]
+            if 1_700_000_000 < v < 1_800_000_000:
+                # 校验：+hs 处（下一条 dt1）应是 v + 9 秒（每 9 秒一次撮合）
+                v_next = struct.unpack("<I", body[off+hs:off+hs+4])[0]
+                if v_next == v + 9 or v_next == v + 10:
+                    data_start = off
+                    break
+        if data_start < 0:
+            continue
+        for r in range(dc):
+            row = body[data_start + r*hs: data_start + (r+1)*hs]
+            if len(row) < hs:
+                break
+            rec: dict = {}
+            off = 0
+            for dt, fmt, width in fields:
+                chunk = row[off: off + width]
+                off += width
+                if len(chunk) < width:
+                    break
+                if width == 4:
+                    raw = struct.unpack("<I", chunk)[0]
+                    if dt == 1:
+                        # dt1 = unix 时间戳（秒），非 bar 序号；转 datetime
+                        # 校验合理范围（1.7e9~1.8e9 ≈ 2024-2027），噪声跳过
+                        if 1_700_000_000 < raw < 1_800_000_000:
+                            try:
+                                rec["time"] = datetime.fromtimestamp(raw)
+                            except (OSError, ValueError, OverflowError):
+                                rec["time"] = None
+                                rec["ts"] = raw
+                        else:
+                            rec["ts"] = raw
+                    else:
+                        rec[f"dt{dt}"] = decode_ths_float(raw)
+                else:
+                    rec[f"dt{dt}_raw"] = chunk
+            records.append(rec)
+        if records:
+            return records   # 命中竞价帧即返回
+    return records
 
 
 def date_to_timeline_bar(d: datetime) -> int:
@@ -2545,14 +2782,18 @@ def parse_timeline_l2_response(body: bytes) -> list[dict]:
         - dc=482 是两只票合计（各 241 根），不是单票根数
         - BitRLE + 位平面转置与 K线完全相同
 
-    壳头结构（44B）::
+    壳头结构（44B，2026-07-26 沪深实测）::
 
-        [0:5]   市场码 + 标记(0x20)     ← 指数（如 399002）
+        [0:5]   市场码 + 标记(0x20/0x10)  ← 指数（深 399002 / 沪 1A0002）
         [5:12]  6B ASCII 代码 + padding
         [12:22] padding
-        [22:23] 标记 0x21               ← 个股（如 000938）
-        [23:30] 6B ASCII 代码 + padding
+        [22:23] 市场标记字节             ← 个股：0x21=深(33) / 0x11=沪(17)
+        [23:30] 6B ASCII 代码 + padding  ← 个股代码（如 000938 / 603118）
         [30:44] padding/f1 标记
+
+    ⚠ 个股标记字节随市场不同：深市 0x21、沪市 0x11（= 市场码 33/17 的低字节，
+    与 :func:`build_timeline_l2_query` 的 ``market`` 参数一致）。早期版本只认
+    0x21 导致沪市 ``code`` 解析为空——已在下方用 ``(0x11, 0x21)`` 双标记修复。
 
     解码后按 hs 切分行，前 dc//2 行是第一只票，后 dc//2 行是第二只票。
     本函数返回**个股**分时记录（跳过指数）。
@@ -2561,8 +2802,8 @@ def parse_timeline_l2_response(body: bytes) -> list[dict]:
         body: 完整 TCP 帧体（含 ``hd3.1\\0`` 标记）。
 
     Returns:
-        个股分时记录列表，每条 ``{code, time, dt10, dt13, dt19, ...}``。
-        非分时帧返回空。
+        个股分时记录列表，每条 ``{code, bar_index, dt10, dt13, dt19, ...}``。
+        非分时帧返回空。字段含义见 :data:`TIMELINE_L2_DATATYPE` 注释。
     """
     pos = body.find(b"hd3.1\x00")
     if pos < 0:
@@ -2587,8 +2828,10 @@ def parse_timeline_l2_response(body: bytes) -> list[dict]:
     # 提取两只票代码
     idx_code = shell[5:11].split(b"\x00")[0].decode("ascii", errors="replace")
     stock_code = ""
+    # 个股标记字节 = 市场码低字节：0x21=深(33) 0x11=沪(17)。早期只认 0x21，
+    # 导致沪市 code 解析为空（2026-07-26 实测 603118 修复）。
     for off in range(22, 30):
-        if shell[off] == 0x21:
+        if shell[off] in (0x11, 0x21):
             stock_code = shell[off+1:off+7].split(b"\x00")[0].decode("ascii", errors="replace")
             break
     bitrle_off = shell_off + 44

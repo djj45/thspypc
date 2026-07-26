@@ -1144,6 +1144,140 @@ class THSClient:
         logger.warning("timeline[%s]: 未找到分时数据帧（共读 %d 帧）", code, i + 1)
         return []
 
+    def auction(
+        self,
+        code: str,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+        skip_init: bool = False,
+        use_main_ip: bool = False,
+    ) -> list[dict]:
+        """查集合竞价（9:15-9:25 每 9 秒一次虚拟撮合：撮合价/累计量/未匹配量）。
+
+        与 :meth:`timeline` 走**同一条** ``__manual`` 推送连接（同为 pageid=4214
+        通道），只是请求用周期码 7176 + unix 时间戳参数（2026-07-26 抓包确认）。
+        连接管理与 :meth:`timeline` 完全相同（沪深分服 + 后台预热另一市）。
+
+        ⚠️ 与 :meth:`timeline` 一样会断主连接（只留 ``__manual`` 推送连接），
+           推送期间 kline/list_quotes 不可用。
+
+        Args:
+            code: 股票代码（纯数字，如 ``"000938"``）。
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
+            trade_date: 交易日。``None``（默认）= 最近交易日；传 ``date``/``datetime``
+                = 指定交易日（算该日 9:15/9:25 unix 时间戳）。沪深竞价时段相同。
+                ★ 历史日期的 DateTime 格式基于当日抓包推断，若实测不符需调整。
+            timeout: 单次 read_frame 超时（秒）。
+
+        Returns:
+            集合竞价记录列表，每条 ``{time, dt10(撮合价), dt49(累计量·股),
+            dt27(未匹配量·股), dt33}``，按时间正序（9:15:00-9:24:57，约 68 条）。
+            非交易日/无竞价数据时返回空列表。
+
+        Raises:
+            RuntimeError: 未登录或 ``__manual`` 连接建立失败。
+        """
+        if self._auth is None:
+            lr = self.connect()
+            if not lr.success:
+                raise RuntimeError(f"connect 失败: {lr.error}")
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        # 复用 timeline 的连接管理（同为 pageid=4214 推送通道）
+        from thspypc.protocol import pick_l2_market
+        key = pick_l2_market(market)
+        if key not in self._push_socks:
+            with self._push_lock:
+                preheat_t = self._preheat_threads.get(key)
+            if preheat_t is not None and preheat_t.is_alive():
+                logger.info("auction[%s]: 等待预热[%s]连接完成...", code, key)
+                preheat_t.join(timeout=20)
+            if key not in self._push_socks:
+                self._drop_connection()
+                sock = self._open_manual_push_connection(market, skip_init=skip_init,
+                                                          use_main_ip=use_main_ip)
+                if sock is None:
+                    raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
+                self._push_socks[key] = sock
+            self._preheat_other_market(key)
+        return self._auction_query_once(code, market, trade_date, timeout)
+
+    def _auction_query_once(
+        self, code: str, market: int, trade_date, timeout: float,
+    ) -> list[dict]:
+        """在 __manual 推送连接上发集合竞价请求（周期码 7176）并解析响应。
+
+        连接/订阅逻辑与 :meth:`_timeline_query_once` 完全相同（4214 通道共享），
+        仅请求帧和响应解析不同：
+          - 请求：:func:`build_auction_query`（周期码 7176 + unix 时间戳）
+          - 响应：hd1.0 flag=0x003a，用 :func:`parse_auction_response` 解析
+        """
+        from thspypc.protocol import build_auction_query, pick_l2_market
+        import re as _re
+        key = pick_l2_market(market)
+        sock = self._push_socks.get(key)
+        if sock is None:
+            raise RuntimeError(f"__manual[{key}] 推送连接不可用")
+
+        # 步骤1: 4214 订阅注册（与 timeline 共享 _snapshot_codes，同 code 不重复订阅）
+        if code not in self._snapshot_codes:
+            sub_frame = build_snapshot_subscribe(code, market=market, seq=0)
+            sock.settimeout(5.0)
+            try:
+                sock.sendall(sub_frame + b"\n")
+            except OSError as e:
+                self._push_socks.pop(key, None)
+                raise ConnectionError(f"订阅帧发送失败: {e}")
+            logger.info("auction[%s]: 已发 4214 订阅帧，等注册响应...", code)
+            registered = False
+            for _ in range(5):
+                try:
+                    resp = read_frame(sock)
+                except (socket.timeout, OSError, ValueError):
+                    break
+                m = _re.search(rb"CodeListSize=(\d+)", resp)
+                if m:
+                    sz = int(m.group(1))
+                    logger.info("auction[%s]: 订阅响应 CodeListSize=%d（%dB）%s",
+                                code, sz, len(resp),
+                                "✓" if sz >= 1 else "✗")
+                    if sz >= 1:
+                        registered = True
+                        self._snapshot_codes.add(code)
+                        break
+            if not registered:
+                logger.warning("auction[%s]: 4214 注册失败（CodeListSize=0 或无响应）", code)
+
+        # 步骤2: 发集合竞价查询（pageid=4214, 周期码 7176）
+        frame = build_auction_query(code, market=market, trade_date=trade_date)
+        sock.settimeout(timeout)
+        try:
+            sock.sendall(frame + b"\n")
+        except OSError as e:
+            self._push_socks.pop(key, None)
+            raise ConnectionError(f"查询帧发送失败: {e}")
+        dt_desc = "最近交易日" if trade_date is None else str(trade_date)
+        logger.info("auction[%s]: 已发竞价查询（pageid=4214, 周期7176, %s），等响应...",
+                    code, dt_desc)
+        # 竞价响应是 hd1.0 flag=0x003a 变体
+        from thspypc.protocol import parse_auction_response
+        for i in range(20):
+            try:
+                resp = read_frame(sock)
+            except socket.timeout:
+                raise
+            except (OSError, ValueError) as e:
+                raise ConnectionError(f"读取失败: {e}")
+            if b"hd1.0" in resp:
+                recs = parse_auction_response(resp)
+                if recs:
+                    logger.info("auction[%s]: 解出 %d 条竞价记录", code, len(recs))
+                    return recs   # 拿到数据立即返回（与 timeline 一致）
+                continue
+        logger.warning("auction[%s]: 未找到竞价数据帧（共读 %d 帧）", code, i + 1)
+        return []
+
     def history_timeline(
         self,
         code: str,
