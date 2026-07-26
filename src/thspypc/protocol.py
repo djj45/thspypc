@@ -357,6 +357,10 @@ def generate_mac64() -> str:
 
     返回 base64 字符串（与 hexin.exe 生成的一致）。
     仅 Windows 可用（依赖 iphlpapi.dll）。
+
+    网卡不足 4 个时（如禁用了虚拟网卡/WiFi 断开），用已有 MAC 循环填充到 4 个，
+    而非报错——Mac64 的 4 个槽位本质是固定长度填充物，服务器不强校验每个槽的
+    唯一性（实测重复 MAC 也能 VerifyCode=0）。
     """
     import base64
 
@@ -368,13 +372,14 @@ def generate_mac64() -> str:
             macs.append(bytes(info.Address[:6]))
         ptr = info.Next
 
-    if len(macs) < 4:
-        raise RuntimeError(
-            f"网卡数不足 4 个（GetAdaptersInfo 只返回 {len(macs)} 个 MAC），"
-            "无法生成 Mac64"
-        )
+    if not macs:
+        raise RuntimeError("GetAdaptersInfo 未返回任何 6 字节 MAC 网卡，无法生成 Mac64")
 
-    raw = bytes([MAC64_HEADER]) + b"".join(macs)
+    # 不足 4 个时循环复用已有 MAC 补齐（保持 24 字节固定长度）
+    while len(macs) < 4:
+        macs.append(macs[len(macs) % len(macs)] if macs else b"\x00" * 6)
+
+    raw = bytes([MAC64_HEADER]) + b"".join(macs[:4])
     return base64.b64encode(raw).decode()
 
 
