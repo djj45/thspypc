@@ -1274,17 +1274,15 @@ def _parse_auction_sh(body: bytes) -> list[dict]:
     - 每条 tick 变长 7-30 字节，**字段省略尾部 0x00 字节**（ths_float 变长存储）
     - 无价格变化的 tick 不含价字段（沿用前值）
 
-    **时间戳编码（关键，2026-07-26 实跑帧破解）**：
+    **时间戳编码（关键，2026-07-27 修正为跨日通用）**：
 
     沪市 tick 时间戳在 body 内**乱序散布**（不同时段数据交织，非按时间排列），
-    且用 **3 字节压缩格式**——完整 unix 时间戳 LE32 = ``[byte0, byte1, 0x62, 0x6a]``，
-    其中 ``byte1`` 随分钟进位（9:15-9:16 是 0xbc，9:17-9:20 是 0xbd，9:21+ 是 0xbe），
-    ``byte2=0x62`` ``byte3=0x6a`` 固定（CST 上午 9 点段的高位字节）。扫描时匹配
-    ``[byte0, byte1, 0x62]`` 三字节（byte1 ∈ 0xbc..0xbe），重建时间戳用固定 byte3=0x6a。
+    用 4 字节 LE32 = ``[b0, b1, b2, 0x6a]``，其中 byte3=0x6a 恒定（CST 上午段高位），
+    b0/b1/b2 随日期变化（如 7-24 是 b1∈bc..be/b2=0x62，7-27 是 b1∈b1..b3/b2=0x66）。
+    **不能写死字节范围**——扫描时匹配 byte3=0x6a，重建完整 LE32，用
+    :func:`_auction_ts_in_range`（跨日通用，只看时分秒）过滤。
 
-    这种 3 字节扫描比 4 字节扫描多找回约一半的 tick（4 字节扫描要求 byte3=0x6a
-    连续出现，但沪市存储时常把 byte3 位置的字段数据嵌在时间戳后，4 字节匹配失败）。
-    同时 body 内数据乱序，**去重必须按时间戳排序**，不能按 off 顺序（off 顺序会
+    body 内数据乱序，**去重必须按时间戳排序**，不能按 off 顺序（off 顺序会
     因时段交织而时间戳回跳，丢掉整段数据）。
 
     字段（与深市语义一致，但编码不同）::
@@ -1312,15 +1310,15 @@ def _parse_auction_sh(body: bytes) -> list[dict]:
         按时间正序（9:15:00-9:24:57，约 160-170 条）。无法识别时返回空列表。
     """
     records: list[dict] = []
-    # 扫描 3 字节压缩时间戳：[byte0, byte1∈0xbc..0xbe, 0x62] + 固定 byte3=0x6a
-    # 重建 LE32 时间戳，落在 9:15-9:25 时段的为候选。
-    # body 内 tick 乱序散布（不同时段交织），用 dict 去重保留首个 off，最后按 ts 排序。
+    # 扫描 4 字节时间戳 [b0, b1, b2, 0x6a]：byte3=0x6a 恒定（CST 上午段高位），
+    # b0/b1/b2 随日期变化（7-24 是 b1∈bc..be/b2=62，7-27 是 b1∈b1..b3/b2=66），
+    # 不能写死字节范围。改为：扫 byte3=0x6a，重建完整 LE32，用 _auction_ts_in_range
+    # （跨日通用，只看时分秒）过滤。body 内 tick 乱序散布，按 ts 去重保留首个 off。
     ts_map: dict[int, int] = {}   # ts -> off
-    for i in range(len(body) - 2):
-        b1 = body[i + 1]
-        if body[i + 2] != 0x62 or not (0xbc <= b1 <= 0xbe):
+    for i in range(len(body) - 3):
+        if body[i + 3] != 0x6a:
             continue
-        ts = (body[i] | (b1 << 8) | (0x62 << 16) | (0x6a << 24)) & 0xFFFFFFFF
+        ts = (body[i] | (body[i + 1] << 8) | (body[i + 2] << 16) | (0x6a << 24)) & 0xFFFFFFFF
         if not _auction_ts_in_range(ts):
             continue
         if ts not in ts_map:
