@@ -5,9 +5,9 @@
 
 背景
 ----
-跨样本对比发现：同一只票 603118，不同抓包的 dt49/dt33 fmt 子标记完全不同
-（单帧 [0x11,0x1a] vs superorder [0x22,0x34]），呈 1/2/4 倍数关系。沪市用的是
-【参数化变长编码】，需要多次抓包锁定 N 的取值与触发条件。
+跨样本对比发现：同一只票 603118，不同抓包的 dt49/dt33 附加字节完全不同。
+2026-07-27 的同日双样本进一步确认，附加字节会随位对齐发生旋转/换位，不能再把
+它们直接解释成字段宽度 N；需要保留原始字节并对照控制流。
 
 `test_auction.py` 只返回解析后的 dict，丢弃了原始字节；本脚本复用 client 的
 登录/连接，但直接截获 __manual 推送连接上的原始响应帧并保存为 .bin，供离线
@@ -78,14 +78,19 @@ def parse_field_table_fmt(body: bytes) -> list[tuple[int, list[int]]]:
     start = body.find(b"\x0a\x70\x04")
     if start < 0:
         return []
-    # 找个股壳（0x11 + 6 位数字）
+    # 找个股壳。历史样本是 ``0x11 + 6 位数字``，近期响应也见过
+    # ``0x11 + 6M03118`` 这种带市场字节的 7 字节形式；不能只认连续数字。
     shell_pos = -1
     for i in range(start + 2, min(len(body), start + 60)):
-        if body[i] == 0x11 and i + 6 < len(body):
-            code = body[i + 1:i + 7]
-            if re.match(rb"^\d{6}$", code):
-                shell_pos = i
-                break
+        if body[i] != 0x11:
+            continue
+        payload6 = body[i + 1:i + 7]
+        payload7 = body[i + 1:i + 8]
+        plain_code = re.fullmatch(rb"\d{6}", payload6)
+        market_code = re.fullmatch(rb"\d[A-Za-z]\d{5}", payload7)
+        if plain_code or market_code:
+            shell_pos = i
+            break
     if shell_pos < 0:
         return []
     table = body[start:shell_pos]
@@ -115,12 +120,17 @@ def fetch_raw_auction(client: THSClient, code: str, market: int,
     timeout 默认 30s（比 client.auction 默认 12s 更宽裕，沪市 shlv2 响应慢）。
     """
     import thspypc.protocol as proto
-    captured: dict[str, bytes | None] = {"resp": None}
+    captured: dict[str, bytes | None] = {"resp": None, "parsed_resp": None}
     original = proto.parse_auction_response
 
     def spy(resp: bytes):
         captured["resp"] = resp
-        return original(resp)
+        result = original(resp)
+        # 优先保留真正被解析出竞价记录的帧；否则保留最后收到的帧，
+        # 便于分析服务器返回了哪一种 hd 变体。
+        if result:
+            captured["parsed_resp"] = resp
+        return result
 
     proto.parse_auction_response = spy
     try:
@@ -128,7 +138,7 @@ def fetch_raw_auction(client: THSClient, code: str, market: int,
         client.auction(code, market=market, trade_date=trade_date, timeout=timeout)
     finally:
         proto.parse_auction_response = original
-    return captured["resp"]
+    return captured["parsed_resp"] or captured["resp"]
 
 
 
@@ -141,23 +151,18 @@ def save_and_report(code: str, resp: bytes, idx: int, out_dir: str) -> None:
         f.write(resp)
     print(f"  ✓ 保存 {fname} ({len(resp)}B)")
 
-    # 解析字段表 fmt
+    # 解析字段表观测值。除 0x70 外的附加字节可能是跨字节控制位片段，
+    # 当前只忠实打印，不能解释成字段宽度参数。
     fields = parse_field_table_fmt(resp)
     if fields:
-        print(f"  字段表 fmt 参数:")
+        print(f"  字段表 fmt/控制流观测值:")
         for dt, fmt in fields:
             name = {10: "价", 49: "量", 27: "未匹配", 33: "额"}.get(dt, "?")
             fmt_hex = ",".join(f"0x{b:02x}" for b in fmt)
             print(f"    dt{dt}({name}): fmt=[{fmt_hex}]")
-        # 单独高亮 dt49/dt33 的 N 值
-        dt49 = next((f for d, f in fields if d == 49), [])
-        dt33 = next((f for d, f in fields if d == 33), [])
-        if dt49 and dt33:
-            # N = dt49子标记 / 17（基准）
-            sub49 = dt49[0] if dt49[0] != 0x70 else dt49[1]
-            print(f"  ★ dt49 子标记={sub49} (N≈{sub49/17:.1f}x基准17)")
+        print("  注：附加字节可能跨 0x70 前后移动；请勿按 N 倍数直接解释。")
     else:
-        print(f"  ⚠ 未找到字段表（可能不是竞价帧）")
+        print("  ⚠ 未识别字段表（控制字节可能穿过字段表/个股壳）")
 
 
 def main() -> int:
@@ -228,9 +233,9 @@ def main() -> int:
                     time.sleep(args.interval)
 
         print(f"\n{'=' * 64}")
-        print("完成。对比每次抓包的 dt49/dt33 fmt 子标记：")
-        print("  - 若同一只票多次抓的 N 值不同 → N 随机")
-        print("  - 若相同 → N 会话内稳定")
+        print("完成。对比每次抓包的 dt49/dt33 fmt/控制流观测值：")
+        print("  - 保留附加字节相对 0x70 的前后位置")
+        print("  - 用 analyze_auction_varlen.py 与同日 oracle 做逐 tick 对齐")
         return 0
     finally:
         client.disconnect()

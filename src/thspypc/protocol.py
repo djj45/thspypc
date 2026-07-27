@@ -455,6 +455,26 @@ def read_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _read_frame_body_length(sock: socket.socket) -> int:
+    """读取 8 位 ASCII hex 帧长，兼容服务器偶发的第 5 个 ``0xfd``。
+
+    正常帧头是 ``fd fd fd fd + 8字节长度``。shlv2 实测偶尔返回五个连续
+    ``fd``；旧实现命中前四个后会把第五个当成长度首字节，得到
+    ``b'\\xfd000007b'`` 并在 ``int(..., 16)`` 处失败。这里把长度窗口前端
+    多出的原始 ``0xfd`` 逐个滑掉，再补读尾部字节。
+    """
+    len_str = read_exact(sock, 8)
+    extra_magic = 0
+    while len_str.startswith(b"\xfd"):
+        extra_magic += 1
+        if extra_magic > 8:
+            raise ValueError("帧头连续 0xfd 过多，无法定位长度字段")
+        len_str = len_str[1:] + read_exact(sock, 1)
+    if not re.fullmatch(rb"[0-9A-Fa-f]{8}", len_str):
+        raise ValueError(f"非法帧长度字段: {len_str!r}")
+    return int(len_str, 16)
+
+
 def read_frame(sock: socket.socket) -> bytes:
     """读取一帧：扫描 magic → 读 8 位 ASCII hex 长度 → 读 body。"""
     magic = bytearray()
@@ -467,8 +487,7 @@ def read_frame(sock: socket.socket) -> bytes:
             magic.pop(0)
         if bytes(magic) == FRAME_MAGIC:
             break
-    len_str = read_exact(sock, 8)
-    body_len = int(len_str, 16)
+    body_len = _read_frame_body_length(sock)
     return read_exact(sock, body_len)
 
 
@@ -1253,7 +1272,7 @@ def build_auction_query(
 
 
 def _auction_ts_in_range(ts: int) -> bool:
-    """unix 时间戳是否落在集合竞价时段（CST 9:15:00-9:25:59）。
+    """unix 时间戳是否落在集合竞价时段（CST 9:15:00-9:25:00）。
 
     跨日通用：只看时:分:秒，不看日期。用于沪市变长响应里识别真实时间戳
     （过滤恰好落在 1.7e9~1.8e9 区间的二进制噪声）。用本地时区（Windows 上
@@ -1264,38 +1283,30 @@ def _auction_ts_in_range(ts: int) -> bool:
     except (OSError, ValueError, OverflowError):
         return False
     hms = d.hour * 3600 + d.minute * 60 + d.second
-    return 9 * 3600 + 15 * 60 <= hms <= 9 * 3600 + 26 * 60
+    return 9 * 3600 + 15 * 60 <= hms <= 9 * 3600 + 25 * 60
 
 
 def _parse_auction_sh(body: bytes) -> list[dict]:
-    """解析沪市集合竞价响应（shlv2 服务器变长推送格式）。
+    """启发式解析沪市集合竞价原始响应。
 
-    沪市响应与深市（hd1.0 flag=0x003a 定长 20B/条）**根本不同**（2026-07-26 抓包
-    auction_20260726_135504 + 2026-07-26 实跑帧逐字节分析）：shlv2 返回 **逐 tick
-    变长推送**——
+    .. warning::
 
-    - 无规范的 hd1.0\\0 帧头（"hd1.0" 后跟 0xc9 而非 \\0，dc/flag/hs/fc 域无法
-      直接解读），路由标记 0xfc01（与请求一致）
-    - 记录区是 **9:15:00-9:24:57 每 3 秒一条 tick**（深市是每 9 秒），约 160-170 条
-    - 每条 tick 变长 7-30 字节，**字段省略尾部 0x00 字节**（ths_float 变长存储）
-    - 无价格变化的 tick 不含价字段（沿用前值）
+       这是为保持兼容而保留的旧扫描器，不是已经破解的变长协议解码器。2026-07-27
+       的多股票、多变体语料和 thsdk 真值证明，同一逻辑结果会由服务器随机选用
+       多种外层打包状态；原始 ``hd1.*`` 字节不能直接按固定 CHQuote 头或逐 tick
+       记录解释。变体专属字节也不能简单删除，它们携带重建固定头/记录流所需状态。
 
-    **时间戳编码（关键，2026-07-27 修正为跨日通用）**：
-
-    沪市 tick 时间戳在 body 内**乱序散布**（不同时段数据交织，非按时间排列），
-    用 4 字节 LE32 = ``[b0, b1, b2, 0x6a]``，其中 byte3=0x6a 恒定（CST 上午段高位），
-    b0/b1/b2 随日期变化（如 7-24 是 b1∈bc..be/b2=0x62，7-27 是 b1∈b1..b3/b2=0x66）。
-    **不能写死字节范围**——扫描时匹配 byte3=0x6a，重建完整 LE32，用
-    :func:`_auction_ts_in_range`（跨日通用，只看时分秒）过滤。
-
-    body 内数据乱序，**去重必须按时间戳排序**，不能按 off 顺序（off 顺序会
-    因时段交织而时间戳回跳，丢掉整段数据）。
+    当前实现只在原始字节中寻找形似竞价时间戳和价格的片段，因此可能漏报、误报，
+    也尚不能解析 dt49/dt27。代码中的模 3 过滤只是旧数据上的降噪启发式；真实
+    thsdk 时间间隔已经观察到 2、3、4 秒及更长间隔，不能把它当作协议约束。
 
     字段（与深市语义一致，但编码不同）::
 
         time ← dt1（unix 时间戳秒，3 字节压缩识别，转 datetime）
         dt10 = 撮合价（变长：b0 标记前的 LE16 尾数 ÷1000；仅价格变化的 tick 含此字段）
-        dt49/dt27/dt33 = 量/未匹配/额（变长编码，边界规则未完全破解，暂不解析）
+        dt49/dt27/dt33 = 量/未匹配/额（有前值状态的变长编码，边界规则未完全破解，
+        暂不解析）。dt49 已确认会省略与前值相同的 LE 低位字节前缀；值完全不变时
+        整个字段省略，剩余载荷中仍可能夹入控制字节。
 
     价格解析（已用 603118 9:15:03 锚点 15.01、600276 9:15:50 锚点 54.71 验证）：
 
@@ -1313,22 +1324,51 @@ def _parse_auction_sh(body: bytes) -> list[dict]:
 
     Returns:
         沪市竞价记录列表，每条 ``{time, dt10}``（无 b0 的 tick 沿用前价），
-        按时间正序（9:15:00-9:24:57，约 160-170 条）。无法识别时返回空列表。
+        按时间正序（9:15:00-9:24:57，通常约 200 条）。无法识别时返回空列表。
     """
     records: list[dict] = []
-    # 扫描 4 字节时间戳 [b0, b1, b2, 0x6a]：byte3=0x6a 恒定（CST 上午段高位），
-    # b0/b1/b2 随日期变化（7-24 是 b1∈bc..be/b2=62，7-27 是 b1∈b1..b3/b2=66），
-    # 不能写死字节范围。改为：扫 byte3=0x6a，重建完整 LE32，用 _auction_ts_in_range
-    # （跨日通用，只看时分秒）过滤。body 内 tick 乱序散布，按 ts 去重保留首个 off。
-    ts_map: dict[int, int] = {}   # ts -> off
+    # 扫描时间戳变体：标准形式类似 [b0,b1,66,6a]，控制字节可能落在
+    # [b0,b1] 之后，也可能把 b0/b1 隔开（688825 实测 09:15:10 =
+    # 1e 43 b1 66 6a）。日期标记目前见过 0x62/0x66；不把 b1 的具体日期
+    # 范围写死，最终由时分秒范围过滤二进制噪声。
+    ts_candidates: dict[int, int] = {}   # ts -> off
+    time_markers = (0x62, 0x66)
+    # 第一遍只扫 b0/b1 相邻的旧形态；这些 offset 已用 603118 oracle 验证，
+    # 必须全局优先，不能被记录区内碰巧成立的弱插入候选覆盖。
     for i in range(len(body) - 3):
-        if body[i + 3] != 0x6a:
+        for marker in time_markers:
+            if marker not in body[i + 2:i + 4]:
+                continue
+            ts = ((0x6a << 24) | (marker << 16) |
+                  (body[i + 1] << 8) | body[i]) & 0xFFFFFFFF
+            if _auction_ts_in_range(ts):
+                ts_candidates.setdefault(ts, i)
+
+    # 第二遍仅补第一遍不存在的 [b0,ctrl,b1,marker,...]。高位 0x6a 可能存在，
+    # 也可能被控制流替代（ed f8 b1 66 44）；“仅补缺”是消除假 offset 的关键。
+    for i in range(len(body) - 4):
+        marker = body[i + 3]
+        if marker not in time_markers:
             continue
-        ts = (body[i] | (body[i + 1] << 8) | (body[i + 2] << 16) | (0x6a << 24)) & 0xFFFFFFFF
+        ts = ((0x6a << 24) | (marker << 16) |
+              (body[i + 2] << 8) | body[i]) & 0xFFFFFFFF
         if not _auction_ts_in_range(ts):
-            continue
-        if ts not in ts_map:
-            ts_map[ts] = i
+                continue
+        ts_candidates.setdefault(ts, i)
+
+    if len(ts_candidates) < 3:
+        return records
+
+    # 旧兼容启发式：用候选时间的模 3 众数压制扫描假阳性。thsdk 真值已证明
+    # 真实 tick 并非严格 3 秒节拍，所以这一步会漏掉部分记录；在外层打包算法
+    # 破解前保留旧行为，避免悄然扩大生产解析器的误报面。
+    residue_counts: dict[int, int] = {}
+    for ts in ts_candidates:
+        residue = ts % 3
+        residue_counts[residue] = residue_counts.get(residue, 0) + 1
+    cadence_residue = max(residue_counts, key=residue_counts.get)
+    ts_map = {ts: off for ts, off in ts_candidates.items()
+              if ts % 3 == cadence_residue}
     if len(ts_map) < 3:
         return records
     # 按时间戳排序（body 内数据乱序，必须按 ts 排序而非 off）
@@ -1412,9 +1452,9 @@ def parse_auction_response(body: bytes) -> list[dict]:
         - 记录区**直接定长明文**（无 BitRLE 压缩，hd3.1 才有 BitRLE+位平面转置）
         - hs=20B/条，约 68 条记录（9:15:00-9:24:57 每 9 秒一次虚拟撮合）
 
-    **沪市**（shlv2，变长推送格式）—— 2026-07-26 抓包 auction_20260726_135504
-    逐字节破解：详见 :func:`_parse_auction_sh`。沪市是逐 tick 变长推送（每 3 秒
-    一条，约 80-90 条），与深市定长格式完全不同，由独立的沪市分支解析。
+    **沪市**（shlv2，外层变长打包格式）—— 同一逻辑结果可随机返回多种字节
+    变体；当前仅由 :func:`_parse_auction_sh` 做兼容性启发式扫描，尚未完整还原
+    外层状态流，不能假定固定 3 秒节拍。
 
     字段（hd1.0 字段表 fc=5，2026-07-26 用 9:21:03 锚点逐字段验证）：
         time ← dt1（unix 时间戳秒，转 datetime；非 bar 序号）
@@ -3698,8 +3738,7 @@ def read_frame_realorder(sock: socket.socket) -> bytes:
             magic.pop(0)
         if bytes(magic) == FRAME_MAGIC:
             break
-    len_str = read_exact(sock, 8)
-    body_len = int(len_str, 16) + 1  # 9601 响应 len = 实际body - 1
+    body_len = _read_frame_body_length(sock) + 1  # 9601 响应 len = 实际body - 1
     return read_exact(sock, body_len)
 
 

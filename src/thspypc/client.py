@@ -1256,7 +1256,10 @@ class THSClient:
 
         # 步骤2: 发集合竞价查询（pageid=4214, 周期码 7176）
         frame = build_auction_query(code, market=market, trade_date=trade_date)
-        sock.settimeout(timeout)
+        # timeout 是本次竞价查询的总等待上限，而不是每个无关帧都重新计时。
+        # 沪市服务器可能先推送若干不能解析的控制帧；若每轮都使用完整
+        # timeout，原来的 20 轮最多会阻塞 20×timeout。
+        deadline = time.monotonic() + timeout
         try:
             sock.sendall(frame + b"\n")
         except OSError as e:
@@ -1268,18 +1271,24 @@ class THSClient:
         # 竞价响应是 hd1.0 flag=0x003a 变体
         from thspypc.protocol import parse_auction_response
         for i in range(20):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(min(timeout, remaining))
             try:
                 resp = read_frame(sock)
             except socket.timeout:
                 raise
             except (OSError, ValueError) as e:
                 raise ConnectionError(f"读取失败: {e}")
-            if b"hd1.0" in resp:
-                recs = parse_auction_response(resp)
-                if recs:
-                    logger.info("auction[%s]: 解出 %d 条竞价记录", code, len(recs))
-                    return recs   # 拿到数据立即返回（与 timeline 一致）
-                continue
+            # 沪市竞价响应的头部有多个变体：除了字面量 ``hd1.0``，
+            # 抓包还见过 ``hd 0x93 1.0`` 等形式。不能先用字面量门控，
+            # 否则真实沪市帧会被直接丢弃，随后每个循环再等待一个完整 timeout。
+            # 让协议层自行区分深市标准帧与沪市变长帧。
+            recs = parse_auction_response(resp)
+            if recs:
+                logger.info("auction[%s]: 解出 %d 条竞价记录", code, len(recs))
+                return recs   # 拿到数据立即返回（与 timeline 一致）
         logger.warning("auction[%s]: 未找到竞价数据帧（共读 %d 帧）", code, i + 1)
         return []
 
