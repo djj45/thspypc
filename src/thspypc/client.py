@@ -96,7 +96,12 @@ class THSClient:
                  enable_heartbeat: bool = True):
         self.username = username
         self.password = password
-        self.imei = imei if imei is not None else generate_imei()
+        # ⚠ 空串视为 None：部分测试脚本从 .env 读 THS_IMEI 时若该值为空（如
+        # THS_IMEI=''），会得到空串而非 None。空串 imei 会导致 HTTP 鉴权拿到
+        # 坏 passport → 所有 TCP login VerifyCode=-1。用 `imei or None` 把空串
+        # 归一化为 None，触发自动生成，杜绝这类脚本踩坑。
+        self.imei = imei or None
+        self.imei = self.imei if self.imei is not None else generate_imei()
         self.mac64 = mac64 if mac64 is not None else generate_mac64()
         self.enable_heartbeat = enable_heartbeat
         self._sock: socket.socket | None = None
