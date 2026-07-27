@@ -96,3 +96,33 @@ def test_older_captures_select_fixed_or_stateful_inner_parser():
     assert stateful_records[15]["dt33"] == 1100
     assert stateful_records[16]["time"].strftime("%H:%M:%S") == "09:16:14"
     assert stateful_records[16]["dt10"] == 54.51
+
+
+def test_auction_sentinel_fields_return_none():
+    """dt27/dt33 的「无值」哨兵（0x80000000/0xFFFFFFFF）应归一化为 None，
+    与真实数值 0.0 区分；dt10/dt49 不受影响。
+
+    实测六股语料（2026-07-27）：集合竞价撮合时被动方总被吃光，dt27 在大量
+    tick 上为哨兵（该方向无未匹配委托）；dt33 后期多为哨兵。
+    """
+    capture_dir = Path(__file__).resolve().parents[1] / "captures_live"
+    # 603118 定长帧：dt27 前 ~40 条是哨兵 0x80000000（文档 19.4 实测）
+    paths = sorted((capture_dir).glob("auction_raw_603118_20260727_*.bin"))
+    if not paths:
+        pytest.skip("本机没有 603118 的 7-27 原始竞价语料")
+
+    records = parse_auction_response(paths[0].read_bytes())
+    assert len(records) == 200
+
+    # dt27 应至少出现一个 None（哨兵），且 None 与 float 共存
+    dt27_values = [r["dt27"] for r in records]
+    assert any(v is None for v in dt27_values), "dt27 应有哨兵（None）"
+    assert any(isinstance(v, float) for v in dt27_values), "dt27 应有真值（float）"
+
+    # dt33 后期全哨兵（文档 19.5：9:17 后 dt33 多为 0x80000000）
+    dt33_values = [r["dt33"] for r in records]
+    assert any(v is None for v in dt33_values), "dt33 应有哨兵（None）"
+
+    # dt10/dt49 六股实测从不带哨兵，必须全是 float
+    assert all(isinstance(r["dt10"], float) for r in records)
+    assert all(isinstance(r["dt49"], float) for r in records)

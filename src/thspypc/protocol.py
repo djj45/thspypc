@@ -1336,6 +1336,27 @@ TIMELINE_INTRADAY_BAR = 606           # 历史交易日日内 bar 偏移（盘�
 AUCTION_PERIOD = 7176   # DateTime 第一参数（集合竞价周期码）
 AUCTION_DATATYPE = [10, 27, 33, 49]
 
+# 集合竞价响应里的「无值」哨兵。实测六股语料（2026-07-27，600276/600519/601318/
+# 603118/688825/688981）：dt27(未匹配量) 和 dt33(额) 字段在「该方向无未匹配委托」
+# 或「无有效值」时，字节流写的是 0x80000000（=ths_float 的除法标记位 + 尾数 0），
+# 不是真 0。dt1/dt10/dt49 三字段六股全部变体里从不出现哨兵。
+# decode_ths_float 把 0x80000000 解成 0.0，会丢失「无委托」语义，故在竞价字段层
+# 显式感知：哨兵 → None，真 0 → 0.0。
+_AUCTION_SENTINELS = frozenset({0x80000000, 0xFFFFFFFF})
+# 受哨兵语义影响的字段（dt27 未匹配量 / dt33 额）。dt10/dt49 实测从不带哨兵。
+_AUCTION_SENTINEL_FIELDS = frozenset({27, 33})
+
+
+def _auction_value(raw: int, dt: int) -> float | None:
+    """竞价字段解码：dt27/dt33 的哨兵值归一化为 None，其余走 ths_float。
+
+    哨兵 0x80000000 / 0xFFFFFFFF 表示该字段无有效值（如某方向无未匹配委托），
+    与真实数值 0.0 语义不同——返回 None 让调用方可区分。
+    """
+    if dt in _AUCTION_SENTINEL_FIELDS and raw in _AUCTION_SENTINELS:
+        return None
+    return decode_ths_float(raw)
+
 
 def build_auction_query(
     code: str,
@@ -1682,13 +1703,19 @@ def parse_auction_response(body: bytes) -> list[dict]:
         dt27 = 未匹配量（股，÷100=手）       ← 锚点 1200=12手 ✓
         dt33 = 无效字段（盘后/实时均 0）
 
+    dt27 / dt33 的「无值」哨兵（``0x80000000`` / ``0xFFFFFFFF``）归一化为
+    :data:`None`，与真实数值 ``0.0`` 区分。实测集合竞价撮合时被动方总被吃光，
+    故 dt27 在大量 tick 上为哨兵（该方向无未匹配委托）；dt33 后期多为哨兵。
+    dt10 / dt49 六股全部变体实测从不带哨兵。
+
     Args:
         body: 完整 TCP 帧体（含 ``hd1.0`` 标记）。
 
     Returns:
         集合竞价记录列表。定长内层返回
         ``{time, dt10, dt49, dt27, dt33}``；兼容回退仅返回
-        ``{time, dt10}``。非竞价帧返回空。
+        ``{time, dt10}``。非竞价帧返回空。``dt27`` / ``dt33`` 的值类型为
+        ``float | None``（哨兵 → None）。
     """
     original_body = body
     if body.startswith(b"\x0a"):
@@ -1764,7 +1791,7 @@ def parse_auction_response(body: bytes) -> list[dict]:
                             rec["ts"] = raw
                             frame_valid = False
                     else:
-                        rec[f"dt{dt}"] = decode_ths_float(raw)
+                        rec[f"dt{dt}"] = _auction_value(raw, dt)
                 else:
                     rec[f"dt{dt}_raw"] = chunk
             frame_records.append(rec)
@@ -1801,7 +1828,7 @@ def parse_auction_response(body: bytes) -> list[dict]:
                             state_valid = False
                             break
                     else:
-                        rec[f"dt{dt}"] = decode_ths_float(raw)
+                        rec[f"dt{dt}"] = _auction_value(raw, dt)
                 state_records.append(rec)
             if state_valid and len(state_records) == dc:
                 return state_records
