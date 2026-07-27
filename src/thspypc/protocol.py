@@ -48,18 +48,17 @@ AUTH_PORT = 80
 # 不存在"退化"一说。注释中的"新/旧集群"分组已无实际意义，保留 IP 仅为扩充回退池。
 MARKET_PORT = 8901
 MARKET_HOSTS = [
-    # 2026-07-23 实测可用（hexin 抓包 / thspypc init 握手后验证）
-    "122.9.115.201",
-    "8.134.101.39",
+    # 通用行情服务器 IP（2026-07-23 实测可用，hexin 抓包 / init 握手后验证）。
+    # ⚠ 仅放通用服务器，不放 lv2 IP——主连接普通 login 连 lv2 会被拒。
+    # lv2 IP（shlv2/szlv2）由 resolve_l2_hosts_grouped() 动态解析，专供 L2 推送连接。
+    # 已确认的 lv2 IP（勿混入）：shlv2=122.9.115.201/122.9.202.190/8.134.98.163/
+    #   szlv2=8.134.101.39/121.37.31.87
     "8.134.146.31",
     "47.101.161.13",
     "139.159.135.214",
     "122.9.204.225",
-    "122.9.202.190",   # init 握手后实测可用（此前误判为"退化"，实为缺 init）
     "122.9.125.190",
     "116.63.108.136",
-    "8.134.98.163",
-    "121.37.31.87",
     "8.138.46.177",
     "8.145.212.55",
 ]
@@ -96,13 +95,20 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
         m_hqdns = m.group(1)
 
     # M_hqdns 格式: domain:port:markets;:,domain:port:markets;:,...
-    # 提取所有 :8901 的域名
+    # 提取所有 :8901 的域名，但排除 lv2 域名（shlv2/szlv2）。
+    # ★ lv2 服务器只接受 __manual 登录 + 配套 init，普通 login（主连接用的
+    # build_login_body_pc）连 lv2 IP 会被服务器立即 FIN 关闭（表现为"连接已关闭"，
+    # 收不到 VerifyCode）。lv2 域名由 resolve_l2_hosts_grouped() 专用于 L2 推送
+    # 连接，主连接只解析通用行情域名（fu4/fu2/hkus/ifindhq/euhq/usotc）。
     domains = []
     for entry in m_hqdns.split(","):
         # entry 如 "shlv2.123ths.com:8901:16;144;:"
         dm = re.match(r'([\w.]+):(\d+):', entry.strip())
         if dm and dm.group(2) == str(MARKET_PORT):
-            domains.append(dm.group(1))
+            domain = dm.group(1)
+            if "lv2" in domain:   # shlv2=沪L2 / szlv2=深L2，主连接禁用
+                continue
+            domains.append(domain)
 
     if not domains:
         return []
@@ -121,7 +127,7 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
             continue  # DNS 解析失败，跳过
 
     if ips:
-        logger.info("M_hqdns 动态解析 %d 个域名 → %d 个 IP: %s",
+        logger.info("M_hqdns 动态解析 %d 个通用行情域名（已排除 lv2）→ %d 个 IP: %s",
                     len(domains), len(ips), ips[:5])
     return ips
 
