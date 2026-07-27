@@ -1281,10 +1281,8 @@ class THSClient:
                 raise
             except (OSError, ValueError) as e:
                 raise ConnectionError(f"读取失败: {e}")
-            # 沪市竞价响应的头部有多个变体：除了字面量 ``hd1.0``，
-            # 抓包还见过 ``hd 0x93 1.0`` 等形式。不能先用字面量门控，
-            # 否则真实沪市帧会被直接丢弃，随后每个循环再等待一个完整 timeout。
-            # 让协议层自行区分深市标准帧与沪市变长帧。
+            # 沪市通常返回 cmd=0x0a 外层压缩，协议层会先正规化为固定
+            # hd1.0 表体；不能在这里用字面量 hd1.0 提前门控。
             recs = parse_auction_response(resp)
             if recs:
                 logger.info("auction[%s]: 解出 %d 条竞价记录", code, len(recs))

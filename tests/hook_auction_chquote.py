@@ -1,10 +1,13 @@
 #!/usr/bin/env python
-r"""Dump the normalized CHQuote buffer from a running THS client with Frida.
+r"""Dump fixed-header buffers at confirmed CHQuote parsers in a running client.
 
 The Shanghai auction bytes captured from the socket still contain an outer
-stateful packing layer.  CHQuoteFile receives the buffer after that layer has
-been normalized, so dumping its input gives us the missing raw -> normalized
-pair needed to recover the codec.
+stateful packing layer. The hlib 2.3.4 request path passes its own transport
+payload to CHQuoteFile unchanged, and existing 4214/7176 captures do not use
+that transport protocol. Offline RTTI, constructor, vtable, and caller analysis
+confirms the hexin RVA below is CHQuoteFile's vtable +0x14 parse method. Its
+input is a fixed hd*/hq* buffer, so this probe records the downstream side of
+the still-unlocated 4214/7176 normalization boundary.
 
 The locally installed Frida Python runtime is currently:
     C:\Users\23027\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe
@@ -30,17 +33,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Values are RVAs, not preferred virtual addresses.  They are tied to the
 # binaries inspected on 2026-07-27:
-#   hexin.exe preferred VA 0x167c8b0, image base 0x400000
-#   hlib.dll  preferred VA 0x1003eec0, image base 0x10000000
+#   hexin.exe CHQuoteFile vtable +0x14, RVA 0x127c8b0
+#   hlib.dll 2.3.4 CHQuoteFile vtable +0x14, RVA 0x3ea40
 HOOKS = {
     "hexin.exe": 0x127C8B0,
-    "hlib.dll": 0x3EEC0,
+    "hlib.dll": 0x3EA40,
 }
 
 AGENT = r"""
 const hookRvas = {
   "hexin.exe": 0x127c8b0,
-  "hlib.dll": 0x3eec0
+  "hlib.dll": 0x3ea40
 };
 const installed = new Set();
 

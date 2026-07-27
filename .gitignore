@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+*.obj
 
 # Virtual environments
 .venv
@@ -20,6 +21,7 @@ data/
 captures_live/
 *.pcap
 *.pcapng
+baratol*.log
 
 # 例外：stock_list 重放模板（公开的请求帧，不含账号/行情数据，需随代码提交）
 !src/thspypc/data/

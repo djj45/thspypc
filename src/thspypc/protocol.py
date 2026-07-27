@@ -491,6 +491,157 @@ def read_frame(sock: socket.socket) -> bytes:
     return read_exact(sock, body_len)
 
 
+_MAX_NORMALIZED_8901_SIZE = 16 * 1024 * 1024
+
+
+def normalize_8901_response(body: bytes) -> bytes:
+    """解开 8901 响应 ``cmd=0x0a`` 的外层压缩，返回客户端实际分发的帧体。
+
+    算法逐分支移植自 hexin.exe RVA ``0xf74260``。命令字节后的前四字节是
+    大端序输出长度，后面是以位控制字驱动、带 64K 三字节哈希字典的压缩流。
+    已经是明文帧的输入保持原样返回。
+
+    Raises:
+        ValueError: ``cmd=0x0a`` 帧头、压缩流或回溯引用无效。
+    """
+    if not body.startswith(b"\x0a"):
+        return body
+
+    payload = body[1:]
+    if len(payload) < 9:
+        raise ValueError("8901 压缩响应过短")
+    expected_size = struct.unpack_from(">I", payload)[0]
+    if not 4 <= expected_size <= _MAX_NORMALIZED_8901_SIZE:
+        raise ValueError(f"非法 8901 正规化长度: {expected_size}")
+
+    # 原函数为压缩区分配的是整个 payload 长度，却只复制 payload[4:]，
+    # 并允许最后一个控制分支预读到分配块的对齐尾部。显式补零可复现其
+    # 预期边界语义，同时避免依赖 malloc 返回块里的历史内容。
+    source = payload[4:] + b"\0" * 32
+    output = bytearray(expected_size + 8)
+    output[:4] = source[:4]
+    output_pos = 4
+    source_pos = 5
+    control = source[4]
+    bits_left = 8
+    dictionary = [0] * 0x10000
+
+    def read_bit() -> bool:
+        nonlocal control, bits_left, source_pos
+        bit = bool(control & 0x80)
+        control = (control << 1) & 0xFF
+        bits_left -= 1
+        if bits_left == 0:
+            if source_pos >= len(source):
+                # 原函数在消费完当前控制字节后会预取下一字节，即使当前
+                # 匹配分支已经足够填满输出；此时补零只影响不会再使用的预取值。
+                control = 0
+            else:
+                control = source[source_pos]
+                source_pos += 1
+            bits_left = 8
+        return bit
+
+    def read_source_byte() -> int:
+        nonlocal source_pos
+        if source_pos >= len(source):
+            raise ValueError("8901 压缩字节流提前结束")
+        value = source[source_pos]
+        source_pos += 1
+        return value
+
+    def history_key() -> int:
+        value = (output[output_pos - 3] << 4) ^ output[output_pos - 2]
+        return ((value << 7) ^ output[output_pos - 1]) & 0xFFFF
+
+    def append_byte(value: int) -> None:
+        nonlocal output_pos
+        if output_pos >= len(output):
+            raise ValueError("8901 正规化输出越界")
+        output[output_pos] = value
+        output_pos += 1
+
+    def append_reference(reference_pos: int) -> None:
+        if not 0 <= reference_pos < output_pos:
+            raise ValueError(f"非法 8901 回溯引用: {reference_pos}")
+        append_byte(output[reference_pos])
+
+    while output_pos < expected_size:
+        if not read_bit():
+            dictionary[history_key()] = output_pos
+            append_byte(read_source_byte())
+            dictionary[history_key()] = output_pos
+            append_byte(read_source_byte())
+            continue
+
+        if not read_bit():
+            dictionary[history_key()] = output_pos
+            append_byte(read_source_byte())
+
+        key = history_key()
+        reference = dictionary[key]
+        dictionary[key] = output_pos
+        append_reference(reference)
+
+        if not read_bit():
+            continue
+        append_reference(reference + 1)
+
+        fourth_bit = read_bit()
+        fifth_bit = read_bit()
+        if not fourth_bit:
+            if fifth_bit:
+                append_reference(reference + 2)
+            continue
+
+        append_reference(reference + 2)
+        append_reference(reference + 3)
+        if not fifth_bit:
+            continue
+
+        append_reference(reference + 4)
+        sixth_bit = read_bit()
+        if not sixth_bit:
+            seventh_bit = read_bit()
+            eighth_bit = read_bit()
+            if seventh_bit:
+                append_reference(reference + 5)
+                append_reference(reference + 6)
+                if eighth_bit:
+                    append_reference(reference + 7)
+            elif eighth_bit:
+                append_reference(reference + 5)
+            continue
+
+        for offset in range(5, 9):
+            append_reference(reference + offset)
+        seventh_bit = read_bit()
+        eighth_bit = read_bit()
+        if not seventh_bit:
+            if eighth_bit:
+                append_reference(reference + 9)
+            continue
+
+        append_reference(reference + 9)
+        append_reference(reference + 10)
+        if not eighth_bit:
+            continue
+        append_reference(reference + 11)
+
+        reference_pos = reference + 12
+        while True:
+            count = read_source_byte()
+            for _ in range(max(0, count - 1)):
+                if output_pos >= expected_size:
+                    break
+                append_reference(reference_pos)
+                reference_pos += 1
+            if count != 0xFF or source_pos >= len(source):
+                break
+
+    return bytes(output[:expected_size])
+
+
 # =============================================================================
 # HTTP 三步鉴权（原样复用自 thspy，链路通用）
 # =============================================================================
@@ -1287,11 +1438,13 @@ def _auction_ts_in_range(ts: int) -> bool:
 
 
 def _parse_auction_sh(body: bytes) -> list[dict]:
-    """启发式解析沪市集合竞价原始响应。
+    """启发式解析无法完成外层正规化的沪市集合竞价原始响应。
 
     .. warning::
 
-       这是为保持兼容而保留的旧扫描器，不是已经破解的变长协议解码器。2026-07-27
+       这是为损坏帧和旧语料保持兼容的回退扫描器。正常 ``cmd=0x0a`` 响应会先由
+       :func:`normalize_8901_response` 解开外层；只有内层无法按定长行验收时才进入
+       这里。2026-07-27
        的多股票、多变体语料和 thsdk 真值证明，同一逻辑结果会由服务器随机选用
        多种外层打包状态；原始 ``hd1.*`` 字节不能直接按固定 CHQuote 头或逐 tick
        记录解释。变体专属字节也不能简单删除，它们携带重建固定头/记录流所需状态。
@@ -1442,6 +1595,70 @@ def _parse_auction_sh(body: bytes) -> list[dict]:
     return records
 
 
+def _split_auction_state_rows(
+    body: bytes,
+    data_start: int,
+    dc: int,
+    hs: int,
+) -> list[bytes]:
+    """Recover rows after a field-state byte omission shifts fixed offsets.
+
+    Some normalized Shanghai auction frames keep the logical ``hs=20``
+    schema but omit a zero high byte from the last field of one row. Later
+    rows remain ordinary 20-byte rows, only shifted by one byte. Use direct
+    LE32 ``dt1`` timestamps as row anchors and restore trailing zero bytes in
+    short rows.
+    """
+    if dc < 1 or hs < 4 or data_start + 4 > len(body):
+        return []
+
+    first_ts = struct.unpack_from("<I", body, data_start)[0]
+    try:
+        first_time = datetime.fromtimestamp(first_ts)
+    except (OSError, ValueError, OverflowError):
+        return []
+    if not _auction_ts_in_range(first_ts):
+        return []
+
+    anchors = [data_start]
+    previous_ts = first_ts
+    for _ in range(1, dc):
+        expected = anchors[-1] + hs
+        candidates: list[tuple[int, int, int]] = []
+        search_start = max(data_start, expected - 4)
+        search_end = min(len(body) - 4, expected + 4)
+        for off in range(search_start, search_end + 1):
+            ts = struct.unpack_from("<I", body, off)[0]
+            try:
+                value = datetime.fromtimestamp(ts)
+            except (OSError, ValueError, OverflowError):
+                continue
+            if (
+                value.date() == first_time.date()
+                and _auction_ts_in_range(ts)
+                and 0 < ts - previous_ts <= 180
+            ):
+                candidates.append((abs(off - expected), off, ts))
+        if not candidates:
+            return []
+        _, off, previous_ts = min(candidates)
+        anchors.append(off)
+
+    data_end = min(len(body), data_start + dc * hs)
+    rows: list[bytes] = []
+    for index, off in enumerate(anchors):
+        end = anchors[index + 1] if index + 1 < len(anchors) else data_end
+        row = body[off:end]
+        if not hs - 4 <= len(row) <= hs + 4:
+            return []
+        if len(row) < hs:
+            row += b"\x00" * (hs - len(row))
+        elif any(value not in (0x00, 0x80) for value in row[hs:]):
+            return []
+        rows.append(row[:hs])
+    return rows
+
+
 def parse_auction_response(body: bytes) -> list[dict]:
     """解析集合竞价响应（pageid=4214 推送通道，沪深两市格式不同）。
 
@@ -1452,9 +1669,11 @@ def parse_auction_response(body: bytes) -> list[dict]:
         - 记录区**直接定长明文**（无 BitRLE 压缩，hd3.1 才有 BitRLE+位平面转置）
         - hs=20B/条，约 68 条记录（9:15:00-9:24:57 每 9 秒一次虚拟撮合）
 
-    **沪市**（shlv2，外层变长打包格式）—— 同一逻辑结果可随机返回多种字节
-    变体；当前仅由 :func:`_parse_auction_sh` 做兼容性启发式扫描，尚未完整还原
-    外层状态流，不能假定固定 3 秒节拍。
+    **沪市**（shlv2）原始响应使用 ``cmd=0x0a`` 外层压缩。解析器先调用
+    :func:`normalize_8901_response`，还原 ``0x1600`` 包装和 ``hd1.0`` 表体。
+    若内层全部记录都通过定长行时间戳校验，则按字段表返回五字段结果；若仅有
+    行尾高位零字节被省略，则按直接 ``dt1`` 重锚并恢复短行。其他未知旧变体才
+    回退到 :func:`_parse_auction_sh` 启发式扫描。
 
     字段（hd1.0 字段表 fc=5，2026-07-26 用 9:21:03 锚点逐字段验证）：
         time ← dt1（unix 时间戳秒，转 datetime；非 bar 序号）
@@ -1467,9 +1686,17 @@ def parse_auction_response(body: bytes) -> list[dict]:
         body: 完整 TCP 帧体（含 ``hd1.0`` 标记）。
 
     Returns:
-        集合竞价记录列表，每条 ``{time, dt10, dt49, dt27, ...}``（深市）或
-        ``{time, dt10}``（沪市，量/未匹配/额暂未破解）。非竞价帧返回空。
+        集合竞价记录列表。定长内层返回
+        ``{time, dt10, dt49, dt27, dt33}``；兼容回退仅返回
+        ``{time, dt10}``。非竞价帧返回空。
     """
+    original_body = body
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("集合竞价 0x0a 外层正规化失败，回退原始扫描: %s", exc)
+
     pos = 0
     records: list[dict] = []
     # 一个响应里可能含多个 hd1.0 帧（不同 flag），遍历找竞价帧 flag=0x003a。
@@ -1487,30 +1714,33 @@ def parse_auction_response(body: bytes) -> list[dict]:
         hs = struct.unpack("<H", body[base+6:base+8])[0]
         fc = struct.unpack("<H", body[base+8:base+10])[0]
         # 竞价帧特征：flag=0x003a，fc=5，hs=20（dt1/dt10/dt49/dt27/dt33 各 4B）
-        if flag != 0x003a or dc == 0 or dc > 200 or hs == 0 or fc == 0:
+        if flag != 0x003a or dc == 0 or dc > 1000 or hs == 0 or fc == 0:
             continue
         fields = _parse_hd_field_table(body, base + 10, fc)
         rec_off = base + 10 + fc * 4
         if len(body) < rec_off + dc * hs:
             continue
         # 记录区前有个 ~22B 壳头（含 ``!000938`` 代码标记），首条 dt1 不是时间戳
-        # 而是壳头字节。扫描首个「dt1 落在 unix 时间戳区间 且 +hs 处≈dt1+9」定位
-        # 真实数据起点（参考 parse_history_timeline_response 的扫描模式）。
+        # 而是壳头字节。扫描首个「连续三条 dt1 都递增且步长不超过 10 秒」定位
+        # 真实数据起点。深市样本约 9 秒一步，沪市正规化后的 200 条记录约 3 秒一步。
         data_start = -1
-        scan_end = min(rec_off + hs * 3, len(body) - hs)
+        scan_end = min(rec_off + hs * 3, len(body) - hs * 2)
         for off in range(rec_off, scan_end):
             v = struct.unpack("<I", body[off:off+4])[0]
             if 1_700_000_000 < v < 1_800_000_000:
-                # 校验：+hs 处（下一条 dt1）应是 v + 9 秒（每 9 秒一次撮合）
                 v_next = struct.unpack("<I", body[off+hs:off+hs+4])[0]
-                if v_next == v + 9 or v_next == v + 10:
+                v_third = struct.unpack("<I", body[off+hs*2:off+hs*2+4])[0]
+                if 1 <= v_next - v <= 10 and 1 <= v_third - v_next <= 10:
                     data_start = off
                     break
         if data_start < 0:
             continue
+        frame_records: list[dict] = []
+        frame_valid = True
         for r in range(dc):
             row = body[data_start + r*hs: data_start + (r+1)*hs]
             if len(row) < hs:
+                frame_valid = False
                 break
             rec: dict = {}
             off = 0
@@ -1532,16 +1762,56 @@ def parse_auction_response(body: bytes) -> list[dict]:
                                 rec["ts"] = raw
                         else:
                             rec["ts"] = raw
+                            frame_valid = False
                     else:
                         rec[f"dt{dt}"] = decode_ths_float(raw)
                 else:
                     rec[f"dt{dt}_raw"] = chunk
-            records.append(rec)
-        if records:
-            return records   # 命中竞价帧即返回
-    # 深市 flag=0x003a 帧未命中 → 尝试沪市变长格式（shlv2 服务器）
+            frame_records.append(rec)
+        if frame_valid and len(frame_records) == dc:
+            return frame_records
+        state_rows = (
+            _split_auction_state_rows(body, data_start, dc, hs)
+            if len(fields) == fc and sum(width for _, _, width in fields) == hs
+            else []
+        )
+        if state_rows:
+            state_records: list[dict] = []
+            state_valid = True
+            for row in state_rows:
+                rec: dict = {}
+                off = 0
+                for dt, fmt, width in fields:
+                    chunk = row[off: off + width]
+                    off += width
+                    if len(chunk) < width:
+                        state_valid = False
+                        break
+                    if width != 4:
+                        rec[f"dt{dt}_raw"] = chunk
+                        continue
+                    raw = struct.unpack("<I", chunk)[0]
+                    if dt == 1:
+                        if not 1_700_000_000 < raw < 1_800_000_000:
+                            state_valid = False
+                            break
+                        try:
+                            rec["time"] = datetime.fromtimestamp(raw)
+                        except (OSError, ValueError, OverflowError):
+                            state_valid = False
+                            break
+                    else:
+                        rec[f"dt{dt}"] = decode_ths_float(raw)
+                state_records.append(rec)
+            if state_valid and len(state_records) == dc:
+                return state_records
+        logger.debug(
+            "集合竞价 hd1.0 记录区不是完整定长行流（dc=%d），回退原始扫描",
+            dc,
+        )
+    # 正规化后的 flag=0x003a 帧未命中 → 尝试旧的沪市原始流兼容扫描。
     if not records:
-        sh_records = _parse_auction_sh(body)
+        sh_records = _parse_auction_sh(original_body)
         if sh_records:
             return sh_records
     return records

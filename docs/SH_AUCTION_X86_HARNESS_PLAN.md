@@ -1,6 +1,6 @@
 # 沪市竞价 32 位离线 Harness 实施计划
 
-> 状态：待实施
+> 状态：hlib 请求链已排除；hexin CHQuoteFile 入口已由内存快照静态确认
 > 创建日期：2026-07-27
 > 工作分支：`feat/stock-list-full`
 > 目标：在不附加、不修改 `hexin.exe` 的前提下，把 `hlib.dll` 的沪市竞价解析链搬进
@@ -41,12 +41,12 @@ socket 原始响应（A/B/C/D/E）
 ### 2.1 `hlib.dll`
 
 ```text
-路径：D:\同花顺软件\同花顺\hlib.dll
+路径：C:\同花顺软件\同花顺\hlib.dll
 位数：32 位
-文件版本：2.2.0
-大小：2,193,400 bytes
+文件版本：2.3.4
+大小：4,752,616 bytes
 SHA-256：
-7A2FEDE76C5C0B219A158475767861248447F633DB55A1A8B6A16577C3F3C01A
+07F371026341E0F9B88232274DBE4252A185C56D589CD35F50531921879550D7
 首选 image base：0x10000000
 ```
 
@@ -54,25 +54,31 @@ SHA-256：
 
 | 作用 | RVA | 首选虚拟地址 |
 |---|---:|---:|
-| `CHQuoteFile` 构造函数 | `0x3e970` | `0x1003e970` |
-| `CHQuoteFile` 解析入口（vtable `+0x14`） | `0x3eec0` | `0x1003eec0` |
-| 通用 `hd1.` 版本判断 | `0x41190` | `0x10041190` |
-| 固定头元数据构造 | `0x40ff0` | `0x10040ff0` |
-| 固定头记录解析入口 | `0x3e730` | `0x1003e730` |
-| 构造并调用 `CHQuoteFile` 的上层包装 | `0x66480` | `0x10066480` |
-| `CHQuoteFile` 构造调用点 | `0x664e1` | `0x100664e1` |
-| `CHQuoteFile` 解析调用点 | `0x66517` | `0x10066517` |
-| 包装函数的已知调用点 | `0x75cbc` | `0x10075cbc` |
-| 同步请求/输出缓冲区路径候选 | `0x7c640` | `0x1007c640` |
+| `CHQuoteFile` 构造函数 | `0x3e4f0` | `0x1003e4f0` |
+| `CHQuoteFile` 主虚表 | `0x16bf30` | `0x1016bf30` |
+| `CHQuoteFile` 解析入口（vtable `+0x14`） | `0x3ea40` | `0x1003ea40` |
+| `CHQuoteFile` 记录数 getter | `0x3e910` | `0x1003e910` |
+| 通用 `hd1.` 版本判断 | `0x40d10` | `0x10040d10` |
+| 固定头对象方法簇 | `0x35770`~`0x35970` | `0x10035770`~`0x10035970` |
+| 构造并调用 `CHQuoteFile` 的上层包装 | `0x66c90` | `0x10066c90` |
+| `CHQuoteFile` 构造调用点 | `0x66cf1` | `0x10066cf1` |
+| `CHQuoteFile` 解析调用点 | `0x66d42` | `0x10066d42` |
+| 包装函数的直接调用点 | `0x7672d` / `0x7703a` / `0x77848` | 见 RVA |
 
-注意：`0x7c640` 依赖大型已初始化对象、线程、网络状态和回调，首版 Harness **不得**
-直接盲调。先从 `0x66517` 的输入缓冲区向上反向切片，找出最后一个可独立调用的转换
-函数。
+本版本使用 VMProtect：磁盘 PE 的 `.text/.rdata/.data` 节 `SizeOfRawData=0`，代码在
+`LoadLibraryExW` 后才出现在内存中。已新增
+`tests/native/hlib_harness/hlib_harness.exe dump-image` 与
+`tests/reverse_hlib_memory.py`，后续静态分析必须基于加载后的内存映像。
+
+旧版 2.2.0 的 `0x3e970/0x3eec0/0x66480/0x66517` 等地址仅作为历史对照，**不得**
+用于 2.3.4。对 `0x66d42` 输入的反向切片已经完成：该链路从 hlib 自己的传输包
+剥掉 11 字节头后原样复制 payload，没有发现把 4214/7176 随机变体改写为固定
+CHQuote 头的步骤。
 
 ### 2.2 `hexin.exe`
 
 ```text
-路径：D:\同花顺软件\同花顺\hexin.exe
+路径：C:\同花顺软件\同花顺\hexin.exe
 文件版本：2019, 4, 3, 1
 产品版本：9,60,20,31
 大小：17,107,232 bytes
@@ -81,8 +87,50 @@ SHA-256：
 ```
 
 反调试风险集中在主程序。当前解析入口反汇编虚拟地址是 `0x167c8b0`，image base 为
-`0x400000`，所以真正 RVA 是 `0x127c8b0`。除非离线路线被证伪，不在主程序上做
-动态附加。
+`0x400000`，所以真正 RVA 是 `0x127c8b0`。2026-07-27 的任务管理器快照已提供
+完整加载后映像，不需要为了确认此入口而动态附加主程序。
+
+```text
+DMP：C:\Users\23027\AppData\Local\Temp\hexin.DMP
+DMP 大小：1,382,519,709 bytes
+DMP SHA-256：
+D16BEAFACA2A37750FFC857208D666C901D2688BC5E203A44AFFAD9AFF7F9BA3
+快照中的 hexin base：0x00d50000
+快照中的目标 VA：0x01fcc8b0
+加载映像：captures_live\hexin.loaded.bin（47,886,336 bytes，完整覆盖）
+```
+
+加载映像中的 RTTI 名称、构造函数写虚表和三个外部虚调用共同确认：
+
+| 作用 | RVA |
+|---|---:|
+| `CHQuoteFile` 构造函数 | `0x127c570` |
+| `CHQuoteFile` 主虚表 | `0x1acb2bc` |
+| `CHQuoteFile::parse`（vtable `+0x14`） | `0x127c8b0` |
+| 固定头分类/读取 | `0x136c430` |
+| 外部构造调用点 | `0x685de3` / `0xa6ab61` / `0xaa4111` |
+| 对应 parse 虚调用点 | `0x685e04` / `0xa6ab82` / `0xaa412a` |
+
+ABI 为 `thiscall parse(this, buffer, length, mode)`，由被调函数 `ret 0x0c`。入口先
+调用 `0x136c430`，后者识别 `hq1.`、`hq6.`、`hd1.`、`hd1.3`、`hd3.*`、
+`hd4.1` 和 `hd5.*`，并直接读取 `DWORD[+6]`、`WORD[+0xc]`、
+`WORD[+0xe]` 等固定头字段。因此 `0x127c8b0` 已不是候选，但它本身也不负责把
+4214/7176 网络随机头改成固定头。
+
+### 2.3 `thsdk`
+
+```text
+源码壳：D:\code\thsdk-main
+本机可运行 hq.dll：
+C:\Users\23027\AppData\Local\Programs\Python\Python314\Lib\site-packages\thsdk\libs\windows\hq.dll
+版本：1.7.18
+大小：8,697,856 bytes
+SHA-256：1480DF5AB19844A5307FA65966DE19E3CC2B4F20C057012EAF1F5985F87B6949
+```
+
+`D:\code\thsdk-main` 只有 Python API 壳，不含 `hq.dll`。thsdk 的 Go 协议与
+hexin.exe 的 4214/7176 协议不同；它继续只作为业务真值来源，不作为本协议的
+归一化实现来源。
 
 ## 3. 非目标
 
@@ -209,7 +257,7 @@ using Parse = int (__thiscall *)(
 );
 ```
 
-在 `0x10066517` 的调用现场，调用方依次压入：
+在 `hlib + 0x66d42` 的调用现场，调用方依次压入：
 
 ```text
 mode = 0
@@ -223,8 +271,8 @@ ECX = CHQuoteFile this
 ### 操作
 
 1. 先分配至少 `0x40` 字节、零初始化且自然对齐的对象内存。
-2. 调用 `base + 0x3e970` 构造函数。
-3. 通过对象 vtable `+0x14` 和直接 `base + 0x3eec0` 两种方式核对入口一致性。
+2. 调用 `base + 0x3e4f0` 构造函数。
+3. 通过对象 vtable `+0x14` 和直接 `base + 0x3ea40` 两种方式核对入口一致性。
 4. 使用一份已知合法的标准固定头 `hd1.0` 响应做正向控制。
 5. 使用截断响应做错误控制，确认返回错误而不是越界。
 6. 再输入沪市 A/B/C 原始响应，预期失败；失败是本阶段的正确结果。
@@ -290,7 +338,7 @@ b5 00 00 00          # 181 条
 
 ### 目标
 
-定位最后一个同时满足以下条件的转换边界：
+确认 `CHQuoteFile` 的输入由谁产生，并判断 hlib 链上是否存在以下转换边界：
 
 ```text
 输入：含 ServerCost / Ihd1.* 的原始网络字节
@@ -300,21 +348,56 @@ b5 00 00 00          # 181 条
 ### 已知调用关系
 
 ```text
-hlib + 0x75cbc
-  → hlib + 0x66480
-    → hlib + 0x664e1  构造 CHQuoteFile
-    → hlib + 0x66517  调用解析入口
+hlib + 0x7672d / 0x7703a / 0x77848
+  → hlib + 0x66c90
+    → hlib + 0x66cf1  构造 CHQuoteFile
+    → hlib + 0x66d42  调用解析入口
+
+三个调用者
+  → hlib + 0x7d3b0   同步请求/等待调度器
+    → hlib + 0x79f60 收到响应后复制 payload
+      → hlib + 0x75750 把等待对象中的 payload 复制给调用者
+        → hlib + 0x66c90
 ```
 
-### 静态步骤
+### 已完成的静态结论
 
-1. 从 `0x66517` 标出 `input` 和 `input_size` 的来源。
-2. 追踪承载该缓冲区的容器对象：数据指针、当前长度、容量。
-3. 对 `0x66480` 的所有调用点做参数回溯，不只看 `0x75cbc`。
-4. 标出所有可能写入该容器的函数。
-5. 搜索原始前缀文字和固定头字面量的交叉引用。
-6. 区分“网络请求/等待函数”“普通缓冲区复制”“真正内容转换”。
-7. 对候选函数建立输入、输出、状态对象和错误返回的伪代码。
+1. `0x66c90` 的 `input_size` 来自 `0x19190`，即字符串对象 `+0x10`；`input`
+   来自 `0x19210`，按 16 字节 SSO 阈值返回内联区或堆指针。
+2. `0x7d3b0` 有 7 个直接调用点，构造的请求包为：
+
+   ```text
+   0x9e8da711 (4B)
+   payload_size + 11 (4B)
+   operation (2B)
+   zero (1B)
+   request payload
+   ```
+
+   它还负责请求登记、事件等待、超时和回调，因此是状态化传输调度器，不是内容
+   归一化纯函数。
+3. 收包对象的方法 `0x757a0` 返回 `frame_size - 11`，`0x75800` 返回
+   `frame + 11`。分发函数 `0x7a890` 按 `frame + 8` 的 16 位类型路由。
+4. 找到等待请求后，`0x79f60` 只把 `(frame + 11, frame_size - 11)` 追加到结果
+   缓冲区并唤醒事件；`0x75750` 又将该缓冲区原样复制给上层。
+5. 因此，从 hlib 收包分发到 `CHQuoteFile::parse` 之间没有字节重写。现有
+   4214/7176 抓包变体不能被此链转换为固定头；更可能的解释是 hexin 的
+   4214/7176 走另一套解析链，或者此前截取的响应边界与 hlib 的 payload 边界
+   不是同一层。
+6. 已扫描本机现有全部 `.pcap/.pcapng/.bin` 语料；除 hlib 内存映像中的代码常量
+   外，没有任何文件包含传输 magic `11 a7 8d 9e`。当前 4214/7176 语料与这条
+   hlib 请求协议不同。
+
+### 后续静态步骤
+
+1. 已从任务管理器 DMP 提取 `hexin.exe` 的完整加载映像，并确认
+   `RVA 0x127c8b0` 的 RTTI、虚表、ABI 和三个调用方。
+2. 已定位固定头分类器 `0x136c430`；它不接受现有 4214/7176 原始随机头。
+3. 继续从三个调用方反向定位实际 4214 响应分发，优先跟踪输入缓冲区的最后一次
+   分配/改写。`0xaa3ff0` 路径只在服务名为 `snappy` 时调用 `0xaa6a90` 解压，
+   暂无证据表明它是目标正规化器。
+4. 动态条件恢复后，对同一响应保存 socket、正规化器输出和 CHQuote 入口三个
+   边界，逐字节比较第一个变化点。
 
 ### 排除规则
 
@@ -326,7 +409,8 @@ hlib + 0x75cbc
 - 输入输出通过多层虚函数回调，尚未确定实际实现；
 - 需要客户端窗口、账号对象或行情连接。
 
-此时继续下钻，直到找到纯转换函数或最小可构造状态。
+`0x7d3b0` 已命中上述多项排除规则，不能加入 Harness 的 `normalize` 命令。后续
+Harness 只继续承担 hlib 指纹、内存映像和 CHQuote ABI 基线验证。
 
 ## 10. 阶段 5：提取外层归一化函数
 
@@ -436,7 +520,9 @@ _transpose_bitplane_0x1763410
 
 ### A. `hlib.dll` 中包含完整归一化函数
 
-这是首选路线：在 Harness 内提取、记录、转写、回归。
+当前 hlib 请求链已经排除此分支：`0x7a890 → 0x79f60 → 0x75750 → 0x66c90`
+原样传递 payload。除非后续证明 socket 字节在构造 hlib frame 之前已经被另一层
+改写，否则不再把 `0x7d3b0` 及其等待对象当作归一化候选。
 
 ### B. `hlib.dll` 只有固定头解析，归一化位于 `hexin.exe`
 
@@ -476,13 +562,18 @@ _transpose_bitplane_0x1763410
 ## 14. 实施顺序清单
 
 ```text
-[ ] 安装并验证 MSVC x86 工具链
-[ ] 创建 tests/native/hlib_harness/
-[ ] 实现 DLL 加载和 SHA-256/RVA fail-closed 校验
-[ ] 准备标准固定头正样本
-[ ] 验证 CHQuoteFile 构造及解析 ABI
-[ ] 用 A/B/C 原始响应建立预期失败基线
-[ ] 从 0x66517 输入缓冲区向上反向切片
+[x] 安装并验证 MSVC x86 工具链
+[x] 创建 tests/native/hlib_harness/
+[x] 实现 DLL 加载和 SHA-256/RVA fail-closed 校验
+[x] 准备标准固定头正样本
+[x] 验证 CHQuoteFile 构造及解析 ABI
+[x] 用沪市原始响应建立预期失败基线
+[x] 从 0x66d42 反向切片到 hlib 收包分发
+[x] 排除 0x7d3b0 请求/等待调度器和普通 payload 复制
+[x] 扫描 pcap/bin，确认 4214/7176 语料不含 hlib frame magic
+[x] 从任务管理器 DMP 提取完整加载后 hexin 映像
+[x] 确认 hexin CHQuoteFile 虚表、解析 ABI 和固定头字段读取
+[ ] 定位 hexin.exe 的 4214/7176 实际响应分发
 [ ] 找到纯转换函数或最小状态边界
 [ ] Harness 输出 raw/normalized/metadata
 [ ] 在自有进程中动态跟踪候选函数
@@ -495,15 +586,20 @@ _transpose_bitplane_0x1763410
 
 ## 15. 下一次继续时的第一批动作
 
-1. 检查机器是否已经有 `cl.exe` 和 x86 库；没有则安装 Build Tools x86 组件。
-2. 建立最小 PE32 `hlib_harness.exe`，只加载 DLL 并打印基址/指纹。
-3. 给所有已知 RVA 加入口字节签名校验。
-4. 找一份标准固定头正样本。
-5. 验证 `0x3e970` + `0x3eec0` ABI。
-6. 成功后立刻提交这一最小里程碑，再进入上游归一化函数定位。
+1. 从 `0x685e04`、`0xa6ab82`、`0xaa412a` 三个已确认 parse 调用点继续反向切片，
+   找实际承载 4214/7176 的调用方及最后一次缓冲区改写。
+2. 用 `tests/reverse_hexin_minidump.py search` 复查后续 DMP 是否同时保留某一
+   原始样本和 `hd1.0 + record_count` 固定头；当前 DMP 只有其他业务的固定头
+   堆缓冲区，没有六股目标样本。
+3. 在隔离、受信任的调试条件具备后，只采集三个边界：
+   socket frame、解析器输入、`CHQuoteFile` 输入，并比较第一个变化点。
+4. 为新生成的 `hlib_harness.exe` 取得组织认可的代码签名或正式策略例外，再复核
+   68 记录样本的 `record_count=68`；此项不阻塞静态分析。
+5. 找到真实转换边界后再新增 `normalize` 命令，并导出同一逻辑数据 A/B/C 的输出
+   做逐字节比较。
 
 不要从“继续多抓几支股票”开始。当前最高价值的新数据是：
 
 ```text
-同一原始 A/B/C 响应在外层归一化之后的固定 CHQuote 缓冲区
+同一响应在 socket、hexin 解析入口、CHQuote 入口三个边界的精确字节快照
 ```
