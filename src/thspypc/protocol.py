@@ -1246,16 +1246,171 @@ def build_auction_query(
     return encode_frame(body)
 
 
+def _auction_ts_in_range(ts: int) -> bool:
+    """unix 时间戳是否落在集合竞价时段（CST 9:15:00-9:25:59）。
+
+    跨日通用：只看时:分:秒，不看日期。用于沪市变长响应里识别真实时间戳
+    （过滤恰好落在 1.7e9~1.8e9 区间的二进制噪声）。用本地时区（Windows 上
+    即 CST，与 :func:`datetime.fromtimestamp` 默认行为一致）。
+    """
+    try:
+        d = datetime.fromtimestamp(ts)
+    except (OSError, ValueError, OverflowError):
+        return False
+    hms = d.hour * 3600 + d.minute * 60 + d.second
+    return 9 * 3600 + 15 * 60 <= hms <= 9 * 3600 + 26 * 60
+
+
+def _parse_auction_sh(body: bytes) -> list[dict]:
+    """解析沪市集合竞价响应（shlv2 服务器变长推送格式）。
+
+    沪市响应与深市（hd1.0 flag=0x003a 定长 20B/条）**根本不同**（2026-07-26 抓包
+    auction_20260726_135504 + 2026-07-26 实跑帧逐字节分析）：shlv2 返回 **逐 tick
+    变长推送**——
+
+    - 无规范的 hd1.0\\0 帧头（"hd1.0" 后跟 0xc9 而非 \\0，dc/flag/hs/fc 域无法
+      直接解读），路由标记 0xfc01（与请求一致）
+    - 记录区是 **9:15:00-9:24:57 每 3 秒一条 tick**（深市是每 9 秒），约 160-170 条
+    - 每条 tick 变长 7-30 字节，**字段省略尾部 0x00 字节**（ths_float 变长存储）
+    - 无价格变化的 tick 不含价字段（沿用前值）
+
+    **时间戳编码（关键，2026-07-26 实跑帧破解）**：
+
+    沪市 tick 时间戳在 body 内**乱序散布**（不同时段数据交织，非按时间排列），
+    且用 **3 字节压缩格式**——完整 unix 时间戳 LE32 = ``[byte0, byte1, 0x62, 0x6a]``，
+    其中 ``byte1`` 随分钟进位（9:15-9:16 是 0xbc，9:17-9:20 是 0xbd，9:21+ 是 0xbe），
+    ``byte2=0x62`` ``byte3=0x6a`` 固定（CST 上午 9 点段的高位字节）。扫描时匹配
+    ``[byte0, byte1, 0x62]`` 三字节（byte1 ∈ 0xbc..0xbe），重建时间戳用固定 byte3=0x6a。
+
+    这种 3 字节扫描比 4 字节扫描多找回约一半的 tick（4 字节扫描要求 byte3=0x6a
+    连续出现，但沪市存储时常把 byte3 位置的字段数据嵌在时间戳后，4 字节匹配失败）。
+    同时 body 内数据乱序，**去重必须按时间戳排序**，不能按 off 顺序（off 顺序会
+    因时段交织而时间戳回跳，丢掉整段数据）。
+
+    字段（与深市语义一致，但编码不同）::
+
+        time ← dt1（unix 时间戳秒，3 字节压缩识别，转 datetime）
+        dt10 = 撮合价（变长：b0 标记前的 LE16 尾数 ÷1000；仅价格变化的 tick 含此字段）
+        dt49/dt27/dt33 = 量/未匹配/额（变长编码，边界规则未完全破解，暂不解析）
+
+    价格解析（已用 603118 9:15:03 锚点 15.01、600276 9:15:50 锚点 54.71 验证）：
+
+        时间戳 off+4 起是字段区。找首个 0xb0 字节（ths_float exp=3 除 1000 标记），
+        候选价格有两个来源：字段区 rec[0:2] LE16 ÷1000（多数 b0@3 记录的价格尾数
+        在记录开头）和 b0 紧邻前 2 字节 ÷1000（b0@2 记录或 rec[0] 是前字段的情况）。
+        价格合理性范围 1-2000 元（覆盖低价股 ~5 元到高价股 ~1700 元茅台）。
+
+        候选选择策略（解决 ``rec[0]`` 有时是前字段数据、有时是价尾数的问题）：
+        有前价时，选与前价偏差 < 20% 的候选（过滤误匹配时间戳字段里的 b0 噪声）；
+        无前价（首条）时，优先取 rec[0:2]。无 b0 或无合理候选的 tick 沿用前价。
+
+    Args:
+        body: 沪市单帧响应体（含 Ihd1.0 标记 + 字段表 + 变长记录区）。
+
+    Returns:
+        沪市竞价记录列表，每条 ``{time, dt10}``（无 b0 的 tick 沿用前价），
+        按时间正序（9:15:00-9:24:57，约 160-170 条）。无法识别时返回空列表。
+    """
+    records: list[dict] = []
+    # 扫描 3 字节压缩时间戳：[byte0, byte1∈0xbc..0xbe, 0x62] + 固定 byte3=0x6a
+    # 重建 LE32 时间戳，落在 9:15-9:25 时段的为候选。
+    # body 内 tick 乱序散布（不同时段交织），用 dict 去重保留首个 off，最后按 ts 排序。
+    ts_map: dict[int, int] = {}   # ts -> off
+    for i in range(len(body) - 2):
+        b1 = body[i + 1]
+        if body[i + 2] != 0x62 or not (0xbc <= b1 <= 0xbe):
+            continue
+        ts = (body[i] | (b1 << 8) | (0x62 << 16) | (0x6a << 24)) & 0xFFFFFFFF
+        if not _auction_ts_in_range(ts):
+            continue
+        if ts not in ts_map:
+            ts_map[ts] = i
+    if len(ts_map) < 3:
+        return records
+    # 按时间戳排序（body 内数据乱序，必须按 ts 排序而非 off）
+    sorted_ts = sorted(ts_map.keys())
+    # 第一遍：收集所有 tick 的价格候选（rec[0:2] 和 b0-2），用于建立基准价
+    tick_candidates: list[tuple[int, list[float]]] = []   # (ts, candidates)
+    for ts in sorted_ts:
+        off = ts_map[ts]
+        rec = body[off + 4: off + 32]
+        b0_pos = -1
+        for j in range(min(len(rec), 6)):
+            if rec[j] == 0xb0:
+                b0_pos = j
+                break
+        cands: list[float] = []
+        if b0_pos >= 0:
+            if len(rec) >= 2:
+                m0 = struct.unpack("<H", rec[0:2])[0]
+                p0 = m0 / 1000.0
+                if 1.0 <= p0 <= 2000.0:
+                    cands.append(p0)
+            if b0_pos >= 2:
+                m1 = struct.unpack("<H", rec[b0_pos-2:b0_pos])[0]
+                p1 = m1 / 1000.0
+                if 1.0 <= p1 <= 2000.0:
+                    cands.append(p1)
+        tick_candidates.append((ts, cands))
+
+    # 建立基准价：找前 N 个有候选的 tick，取所有候选里 "使最多候选聚集" 的值
+    # （即簇中心）。避免首条误匹配锁定错误基准。
+    seed_cands: list[float] = []
+    for _, cs in tick_candidates:
+        if cs:
+            seed_cands.extend(cs)
+        if len(seed_cands) >= 10:
+            break
+    base_price: float | None = None
+    if seed_cands:
+        # 找一个值，使最多的候选落在其 ±20% 范围内
+        best_count = 0
+        for anchor in seed_cands:
+            lo, hi = anchor * 0.8, anchor * 1.2
+            cnt = sum(1 for c in seed_cands if lo <= c <= hi)
+            if cnt > best_count:
+                best_count = cnt
+                base_price = anchor
+
+    # 第二遍：用基准价作首条 prev_price，逐条解析
+    prev_price = base_price
+    for ts, cands in tick_candidates:
+        price: float | None = None
+        if cands:
+            if prev_price is not None:
+                close = [p for p in cands
+                         if abs(p - prev_price) / prev_price < 0.2]
+                if close:
+                    close.sort(key=lambda p: abs(p - prev_price))
+                    price = close[0]
+                # 无 close：b0 是误匹配（字段噪声），沿用前价
+            else:
+                price = cands[0]
+        if price is not None:
+            prev_price = price
+        elif prev_price is not None:
+            price = prev_price   # 无 b0 或候选都不合理：沿用前价（价格未变）
+        try:
+            t = datetime.fromtimestamp(ts)
+        except (OSError, ValueError, OverflowError):
+            t = None
+        records.append({"time": t, "dt10": price})
+    return records
+
+
 def parse_auction_response(body: bytes) -> list[dict]:
-    """解析集合竞价响应（hd1.0 帧 flag=0x003a，pageid=4214 推送通道）。
+    """解析集合竞价响应（pageid=4214 推送通道，沪深两市格式不同）。
 
-    与盘中分时响应（:func:`parse_timeline_l2_response`，hd3.1 flag=0x00b4）的差异
-    （2026-07-26 抓包确认）::
+    **深市**（szlv2，hd1.0 帧 flag=0x003a）::
 
-        - 响应是 **hd1.0 帧**（分时是 hd3.1）
+        - 响应是 hd1.0 帧（分时是 hd3.1）
         - flag=0x003a（分时是 0x00b4）
         - 记录区**直接定长明文**（无 BitRLE 压缩，hd3.1 才有 BitRLE+位平面转置）
         - hs=20B/条，约 68 条记录（9:15:00-9:24:57 每 9 秒一次虚拟撮合）
+
+    **沪市**（shlv2，变长推送格式）—— 2026-07-26 抓包 auction_20260726_135504
+    逐字节破解：详见 :func:`_parse_auction_sh`。沪市是逐 tick 变长推送（每 3 秒
+    一条，约 80-90 条），与深市定长格式完全不同，由独立的沪市分支解析。
 
     字段（hd1.0 字段表 fc=5，2026-07-26 用 9:21:03 锚点逐字段验证）：
         time ← dt1（unix 时间戳秒，转 datetime；非 bar 序号）
@@ -1268,12 +1423,8 @@ def parse_auction_response(body: bytes) -> list[dict]:
         body: 完整 TCP 帧体（含 ``hd1.0`` 标记）。
 
     Returns:
-        集合竞价记录列表，每条 ``{time, dt10, dt49, dt27, ...}``。
-        非竞价帧（无 hd1.0 / flag≠0x003a）返回空。
-
-    ⚠ **当前仅支持深市**（flag=0x003a，68 条等间距 20B 记录）。沪市响应虽含 9:15-9:25
-    时间戳，但封装格式不同（非 hd1.0 flag=0x003a 帧，记录非 20B 等间距），需另抓
-    沪市样本破解后扩展。沪市请求返回空列表（不报错）。
+        集合竞价记录列表，每条 ``{time, dt10, dt49, dt27, ...}``（深市）或
+        ``{time, dt10}``（沪市，量/未匹配/额暂未破解）。非竞价帧返回空。
     """
     pos = 0
     records: list[dict] = []
@@ -1344,6 +1495,11 @@ def parse_auction_response(body: bytes) -> list[dict]:
             records.append(rec)
         if records:
             return records   # 命中竞价帧即返回
+    # 深市 flag=0x003a 帧未命中 → 尝试沪市变长格式（shlv2 服务器）
+    if not records:
+        sh_records = _parse_auction_sh(body)
+        if sh_records:
+            return sh_records
     return records
 
 
