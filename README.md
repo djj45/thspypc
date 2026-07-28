@@ -1,14 +1,14 @@
-# thspypc — 同花顺 Windows PC 远航版行情协议纯 Python 实现
+# thspypc — 同花顺 Windows PC 免费版行情协议纯 Python 实现
 
-模仿 [thspy](https://github.com/djj45/thspy)（Mac 版逆向）的登录实现，改成 **Windows PC 远航版协议**，连 **8901** 端口。**已实测登录成功（VerifyCode=0），含 Level2 账号。行情查询已打通（个股列表实时行情）。**
+模仿 [thspy](https://github.com/djj45/thspy)（Mac 版逆向）的登录实现，改成 **Windows PC 免费版协议**，连 **8901** 端口。**已实测登录成功（VerifyCode=0），含 Level2 账号。行情查询已打通（个股列表实时行情）。**
 
-> 本项目源自对真实 hexin.exe（PC 远航版）的抓包分析。协议参考见 `D:\code\ths_takehome\ths\PROTOCOL.md`。
+> 本项目源自对真实 hexin.exe（PC 免费版）的抓包分析。协议参考见 `D:\code\ths_takehome\ths\PROTOCOL.md`。
 
 ## ✅ 已实现
 
 - HTTP 三步鉴权（RSA 公钥 → unified_login → mainverify）
 - head128 + passport64 构造（PC 版 ACCOUNT_TYPE 前缀）
-- PC 远航版 login 帧构造（8901 端口）+ **login 后自动 init 握手**激活行情通道
+- PC 免费版 login 帧构造（8901 端口）+ **login 后自动 init 握手**激活行情通道
 - **M_hqdns 动态域名解析**：从 passport 解析服务器域名 → DNS 查询拿最新 IP（不硬编码）
 - 多 IP 冗余连接 + 失败诊断
 - **设备指纹全自动生成**：`generate_imei()` + `generate_mac64()`（算法已逆向，无需抓包）
@@ -379,7 +379,68 @@ with THSClient("账号", "密码") as client:
     client.list_quotes(["600056"])  # ✓ 仍可用（心跳维持了连接）
 ```
 
+## 集合竞价（`auction`）
+
+查 9:15-9:25 集合竞价的逐 tick 撮合数据（虚拟开盘价/累计量/买卖未匹配量）。
+
+```python
+from datetime import date
+records = client.auction("603118", trade_date=date(2026, 7, 27))
+# records[0] = {"time": datetime(2026,7,27,9,15,1), "dt10": 14.19, "dt49": 600.0,
+#               "dt27": None, "dt33": 11500.0}
+```
+
+### 五字段语义（全部已确定，六股 × thsdk oracle 全量验证）
+
+| 字段 | 含义 | 单位 | 验证状态 |
+|------|------|------|---------|
+| `time` (dt1) | unix 时间戳 | 秒 | ✅ 六股 ±2s 全命中 |
+| `dt10` | 集合竞价撮合价 | 元 | ✅ 六股 100% 精确 |
+| `dt49` | 累计竞价成交量 | 股（÷100=手）| ✅ 六股 100% 命中 |
+| `dt27` | **买方**未匹配委托量 = thsdk buy2 | 股 | ✅ 六股 ~100% 命中 |
+| `dt33` | **卖方**未匹配委托量 = thsdk sell2 | 股 | ✅ 六股 ~100% 命中 |
+
+`dt27` / `dt33` 的「无值」哨兵（`0x80000000`）归一化为 `None`，与真实 `0.0` 区分。
+集合竞价撮合时被动方总被吃光，故每条 tick 恰好一侧为 `None`。
+
+### ⚠ dt 号跨接口语义不同（极易混淆）
+
+同一 dt 号在不同接口含义完全不同——dt 号是协议槽位号，语义由字段表定义：
+
+| dt 号 | 竞价（本接口）| 分时（`timeline`）| `list_quotes` |
+|------|--------------|------------------|---------------|
+| dt27 | 买方未匹配量 | — | — |
+| dt33 | **卖方未匹配量** | **成交额** | **注册制上市日** |
+
+**不要把竞价的 `dt33`（卖方未匹配量）和分时的 `dt33`（成交额）混为一谈。**
+
+### 沪市响应的两层算法（逆向难点，已破解）
+
+沪市 `auction()` 的原始响应走 `cmd=0x0a` 外层压缩，不是明文：
+
+```
+网络原始字节（cmd=0x0a 压缩流）
+  → normalize_8901_response()：解开自研 LZ77 变体（位控制字 + 64K 哈希字典）
+  → hd1.0 固定头 + 字段表 + 定长记录区（5 字段 × 4B = 20B/行）
+  → parse_auction_response()：按字段表解码
+```
+
+**99% 的逆向难度在外层 LZ**：它自研无格式签名、控制位序非标准、用非标准哈希函数。
+早期会话曾把外层压缩的字典引用表象误判为"内层参数化变长编码"，走了大量弯路。
+外层算法移植自 hexin.exe RVA `0xf74260`（Unicorn 模拟逐字节对照纯 Python），
+详见 `HANDOFF_SUPERORDER_20260726.md` 第十七~二十章。
+
+深市响应同样有 `cmd=0x0a` 外层压缩，但内层结构与沪市差异较大（响应含全天
+分时数据、dc 字段编码不同），当前深市竞价解析不完整，详见
+`HANDOFF_SUPERORDER_20260726.md` §20.6。
+
 ## 安装
+with THSClient("账号", "密码") as client:
+    client.connect()
+    # 心跳后台自动运行，可随时查询
+    time.sleep(60)  # 静置 1 分钟
+    client.list_quotes(["600056"])  # ✓ 仍可用（心跳维持了连接）
+```
 
 ```bash
 cd D:\code\ths_takehome\thspypc

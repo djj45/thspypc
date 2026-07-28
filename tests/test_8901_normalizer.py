@@ -102,8 +102,8 @@ def test_auction_sentinel_fields_return_none():
     """dt27/dt33 的「无值」哨兵（0x80000000/0xFFFFFFFF）应归一化为 None，
     与真实数值 0.0 区分；dt10/dt49 不受影响。
 
-    实测六股语料（2026-07-27）：集合竞价撮合时被动方总被吃光，dt27 在大量
-    tick 上为哨兵（该方向无未匹配委托）；dt33 后期多为哨兵。
+    dt27=买方未匹配量、dt33=卖方未匹配量。集合竞价撮合时被动方总被吃光，
+    故每条 tick 恰好一侧为哨兵（None）；dt10/dt49 六股实测从不带哨兵。
     """
     capture_dir = Path(__file__).resolve().parents[1] / "captures_live"
     # 603118 定长帧：dt27 前 ~40 条是哨兵 0x80000000（文档 19.4 实测）
@@ -119,10 +119,62 @@ def test_auction_sentinel_fields_return_none():
     assert any(v is None for v in dt27_values), "dt27 应有哨兵（None）"
     assert any(isinstance(v, float) for v in dt27_values), "dt27 应有真值（float）"
 
-    # dt33 后期全哨兵（文档 19.5：9:17 后 dt33 多为 0x80000000）
+    # dt33 同理（卖方未匹配量，也会出现哨兵）
     dt33_values = [r["dt33"] for r in records]
     assert any(v is None for v in dt33_values), "dt33 应有哨兵（None）"
 
     # dt10/dt49 六股实测从不带哨兵，必须全是 float
     assert all(isinstance(r["dt10"], float) for r in records)
     assert all(isinstance(r["dt49"], float) for r in records)
+
+
+def test_auction_dt27_dt33_match_thsdk_buy2_sell2():
+    """dt27≡thsdk buy2（买方未匹配），dt33≡thsdk sell2（卖方未匹配）。
+
+    六股 × thsdk oracle 全量对照（2026-07-27）：约 99.5% 精确匹配，少量偏差
+    是两通道 ±1~2 秒时间戳错位。本测试用 ±2 秒窗口对照，验证绝大多数 tick
+    上 dt27=buy2、dt33=sell2 同时成立。
+    """
+    import bisect
+    import json
+
+    capture_dir = Path(__file__).resolve().parents[1] / "captures_live"
+    code = "603118"
+    raw_paths = sorted((capture_dir).glob(f"auction_raw_{code}_20260727_*.bin"))
+    oracle_paths = sorted((capture_dir).glob(f"_thsdk_auction_USHA{code}_*.json"))
+    if not raw_paths or not oracle_paths:
+        pytest.skip("本机没有 603118 的 7-27 raw + thsdk oracle 语料")
+
+    oracle = {}
+    for row in json.loads(oracle_paths[-1].read_text(encoding="utf-8"))["data"]:
+        values = list(row.values())
+        oracle[int(values[0])] = (int(values[2]), int(values[3]))  # buy2, sell2
+    oracle_ts = sorted(oracle)
+    sentinel = 0x80000000
+
+    records = parse_auction_response(raw_paths[0].read_bytes())
+    matched = compared = 0
+    for rec in records:
+        t = rec.get("time")
+        if t is None:
+            continue
+        ts = int(t.timestamp())
+        idx = bisect.bisect_left(oracle_ts, ts)
+        candidates = oracle_ts[max(0, idx - 1):idx + 2]
+        if not candidates:
+            continue
+        nearest = min(candidates, key=lambda x: abs(x - ts))
+        if abs(nearest - ts) > 2:
+            continue
+        buy2, sell2 = oracle[nearest]
+        buy2 = 0 if buy2 == sentinel else buy2
+        sell2 = 0 if sell2 == sentinel else sell2
+        d27 = rec["dt27"] or 0
+        d33 = rec["dt33"] or 0
+        compared += 1
+        if abs(d27 - buy2) < 1 and abs(d33 - sell2) < 1:
+            matched += 1
+
+    # 允许少量 ±1~2 秒错位；六股实测最差 603118 也 > 95% 匹配
+    assert compared > 100, "对照样本不足"
+    assert matched / compared > 0.95, f"dt27/dt33 与 buy2/sell2 匹配率过低: {matched}/{compared}"
