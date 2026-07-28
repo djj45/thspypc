@@ -8,7 +8,7 @@
 
 - HTTP 三步鉴权（RSA 公钥 → unified_login → mainverify）
 - head128 + passport64 构造（PC 版 ACCOUNT_TYPE 前缀）
-- PC 免费版 login 帧构造（8901 端口）+ **login 后自动 init 握手**激活行情通道
+- PC 免费版 login 帧构造（8901 端口），VerifyCode=0 后直接复用 MAIN 长连接
 - **M_hqdns 动态域名解析**：从 passport 解析服务器域名 → DNS 查询拿最新 IP（不硬编码）
 - 多 IP 冗余连接 + 失败诊断
 - **设备指纹全自动生成**：`generate_imei()` + `generate_mac64()`（算法已逆向，无需抓包）
@@ -606,24 +606,33 @@ thspypc/
 ## 服务器 IP 动态获取 + 测速选最优
 
 thspypc 不硬编码服务器 IP——HTTP 鉴权返回的 passport 里有 `M_hqdns` 字段
-（域名列表），`resolve_market_hosts()` 解析这些域名拿到当前可用的 8901 IP
-（DNS 轮询，每次可能不同）。hexin 客户端也是这么做的（抓包确认：它并发 DNS 查询
-`shlv2.123ths.com`/`szlv2.123ths.com` 等域名拿 IP，按运营商分组）。硬编码的
-`MARKET_HOSTS` 仅作 DNS 解析失败时的回退。
+（域名列表）。A 股 MAIN 连接由 `resolve_market_hosts()` 只解析
+`ifindhq.123ths.com`；`fu4`、`hkus`、`euhq` 等条目属于其他市场组，虽然可以完成
+普通 login，但不会响应沪深 `list_quotes`。L2 连接则分别解析
+`shlv2.123ths.com` / `szlv2.123ths.com`。硬编码的 `MARKET_HOSTS` 仅作 MAIN DNS
+解析失败时的回退。
 
-拿到 ~70 个 IP 后，`connect()` 会**并发 TCP 握手测延迟**（`_probe_fastest_hosts`），
-选最快的 7 个 login——复刻同花顺「测试 IP」功能的机制（抓包确认：同花顺并发 TCP
-连多个 IP 测 SYN→SYN-ACK 往返时间，最快 122.9.115.201=28ms）。纯 TCP 握手不发 login，
-不触发 VerifyCode=-1。测速整体 ~1s（70 个 IP 并发），login 稳定 ~2s。
+拿到当前约 12 个 ifindhq IP 后，`connect()` 会并发 TCP 握手测延迟，再从排序后的
+IP 池轮换选择最多 7 个 login。测速缓存只在缓存 IP 仍属于当前 DNS 候选时复用，
+避免旧域名分组或过期 DNS 结果重新混入 MAIN。纯 TCP 握手不发 login，不触发
+VerifyCode=-1。
 
-## init 握手激活行情通道
+## L2 分服 init
 
-login 成功后 `connect()` 自动发 init 请求（`_send_init_handshake`）激活行情查询通道——
-不发 init 直接 `list_quotes` 会超时（抓包确认 hexin 每条连接 LOGIN→INIT→行情查询）。
+MAIN 普通登录连接在 `VerifyCode=0` 后可直接发送 `list_quotes`，`connect()` 不向它
+发送带 `MarketCode` 的 init。2026-07-28 活网对照确认：把默认
+`MarketCode=16;144;` init 发到 MAIN，会让部分已登录服务器立即关闭连接。
 
-init 响应是**服务器配置帧**（~49KB，含 S-OS/S-Version 等元数据），不是全量代码表
-（代码表是 `stock_list()` 重放序列才触发）。实测稳定返回 1 帧，读 1 帧即激活通道，
-`list_quotes` 立即可用。
+带市场配置的 init 属于 `__manual` L2 通道：
+
+- 沪市：连接 `shlv2`，发送 `MarketCode=16;144;`
+- 深市：连接 `szlv2`，发送 `MarketCode=32;`
+
+`stock_list()` 仍会显式重放抓包确认的完整启动序列，其中包含 init 请求；这是获取
+全量代码表的独立业务流程，不属于 MAIN 登录握手。
+
+修正后的活网 A/B 验证共 4 轮：关闭心跳 2 轮、开启心跳 2 轮，四轮均完成登录、
+立即查询和等待后二次查询；开启心跳的两轮各发送 2 次心跳后连接仍正常。
 
 ## License
 

@@ -64,7 +64,6 @@ def test_main_login_success_records_basic_access(monkeypatch):
         ),
     )
     monkeypatch.setattr(client, "_start_heartbeat", lambda: None)
-    monkeypatch.setattr(client, "_send_init_handshake", lambda: None)
     monkeypatch.setattr("thspypc.client.save_ip_state", lambda *_args: None)
 
     result = client._do_tcp_login_raw(

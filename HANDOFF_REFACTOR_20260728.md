@@ -1113,9 +1113,18 @@ codex/refactor-protocol-foundation
 - `THSClient.connect()`、二维码/缓存凭证路径、外部 Passport64 登录、
   `__manual` 票据刷新和 9601 登录均已改为通过 `AuthService` 构造登录身份。
   `_auth` 继续镜像当前认证 dict，兼容已有板块代码、诊断脚本和测试注入；原有
-  主连接 IP 测速/轮换、20 秒复用窗口、并发登录、init、心跳和错误分类没有下沉，
-  因而线上握手顺序不变。扫码/缓存路径原先向 `_do_tcp_login()` 传入不存在的
-  `max_retries` 参数也已修正；
+  主连接 IP 测速/轮换、20 秒复用窗口、并发登录、心跳和错误分类没有下沉。
+  2026-07-28 活网修正 MAIN 普通登录不再发送 L2 init；带 MarketCode 的 init
+  只保留在 `__manual + shlv2/szlv2` 分服和显式 stock-list 重放流程。扫码/缓存
+  路径原先向 `_do_tcp_login()` 传入不存在的 `max_retries` 参数也已修正；
+- 同次活网排查进一步确认 MAIN 的 A 股请求只应路由到 `ifindhq.123ths.com`。
+  `fu4/hkus/euhq` 节点可以返回 VerifyCode=0，但不响应沪深 `list_quotes`；
+  旧实现又向 MAIN 发送默认 `MarketCode=16;144;` 的 L2 init，导致部分节点立即
+  FIN。修正后 MAIN 不发 init，DNS 只取 ifindhq；测速缓存若含当前候选集以外的
+  IP 会失效重测，避免旧的跨域名缓存绕过筛选；
+- 修正后的活网矩阵 4/4 通过：`enable_heartbeat=False` 两轮和 `True` 两轮均完成
+  登录、立即行情查询和等待后二次查询；有心跳两轮各发送 2 次心跳后连接仍存活，
+  排除首秒断连由心跳触发；
 - 普通账号登录差异的扩展点明确落在 `LoginProtocolProfile`：未来拿到普通账号
   抓包后，可单独提供 product/securities/HTTP version/TCP version/qsid/
   account_type 以及是否支持 `__manual`，并注入 `AuthService`，无需改业务
@@ -1130,7 +1139,7 @@ codex/refactor-protocol-foundation
 AuthService 接入并完成旧 RealOrder 源块清理后的扩大离线回归：
 
 ```text
-267 passed, 2 skipped, 1 deselected
+274 passed, 2 skipped, 1 deselected
 ```
 
 其中两个 skip 是本机缺少部分历史分时可选语料；deselected 项是

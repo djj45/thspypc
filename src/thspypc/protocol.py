@@ -156,35 +156,30 @@ logger = logging.getLogger(__name__)
 AUTH_HOST = "auth.10jqka.com.cn"
 AUTH_PORT = 80
 
-# PC 免费版主行情服务器（8901）。多 IP 冗余，抓包实测。
-# 登录时按顺序尝试，任一成功即可。
-# 注意：实测部分 IP 只做登录网关、对行情请求(CodeList)无响应（timeout），
-# 行情查询需要连到真正处理 CodeList 的服务器（标 ★ 的是实测能返回
-# hd1.0/hd3.1 数据的 IP）。把这些排在前面提高 list_quotes 命中率。
+# PC 免费版 A 股 MAIN 行情服务器（8901）。仅保留 ifindhq 域名的历史解析结果；
+# fu4/hkus/euhq 等市场组能完成普通 login，但不会响应沪深 list_quotes。
 #
 # ⚠ 这是 DNS 解析失败时的回退 IP 列表。正常运行走 :func:`resolve_market_hosts`
 # 从 passport 的 M_hqdns 动态解析（拿到当前最新 IP）。
 #
-# 历史误判澄清（2026-07-23 最终结论）：此前认为旧 IP（122.9.202.190 等）"退化为
-# 纯登录网关、行情查询超时"，**已被推翻**。真正根因是 login 后缺 init 握手帧——
-# connect() 直接发行情查询导致超时。补上 init 握手后（见 client._send_init_handshake），
-# 旧 IP 同样能正常返回 list_quotes/stock_list_hot 行情。新旧 IP 都是行情网关，
-# 不存在"退化"一说。注释中的"新/旧集群"分组已无实际意义，保留 IP 仅为扩充回退池。
+# 2026-07-28 活网修正：MAIN 普通登录在 VerifyCode=0 后可直接 list_quotes，
+# 不发送带 MarketCode 的 init。该 init 属于 __manual + shlv2/szlv2 分服；
+# 把默认 MarketCode=16;144; 发到 MAIN 会让部分服务器立即关闭连接。
 MARKET_PORT = 8901
 MARKET_HOSTS = [
-    # 通用行情服务器 IP（2026-07-23 实测可用，hexin 抓包 / init 握手后验证）。
-    # ⚠ 仅放通用服务器，不放 lv2 IP——主连接普通 login 连 lv2 会被拒。
-    # lv2 IP（shlv2/szlv2）由 resolve_l2_hosts_grouped() 动态解析，专供 L2 推送连接。
-    # 已确认的 lv2 IP（勿混入）：shlv2=122.9.115.201/122.9.202.190/8.134.98.163/
-    #   szlv2=8.134.101.39/121.37.31.87
-    "8.134.146.31",
-    "47.101.161.13",
+    # ifindhq.123ths.com 解析快照（2026-07-28）。
+    "8.132.233.199",
+    "8.132.233.143",
+    "1.94.58.146",
+    "1.1.182.181",
+    "119.3.156.145",
+    "8.134.123.179",
+    "8.145.213.52",
+    "1.94.9.136",
+    "115.175.74.247",
     "139.159.135.214",
-    "122.9.204.225",
-    "122.9.125.190",
-    "116.63.108.136",
-    "8.138.46.177",
-    "8.145.212.55",
+    "8.145.212.60",
+    "8.134.121.153",
 ]
 
 
@@ -192,10 +187,10 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
     """从 passport 的 M_hqdns 字段解析域名，DNS 查询得到 8901 服务器 IP 列表。
 
     hexin 客户端不硬编码 IP——HTTP 鉴权返回的 passport 里有 M_hqdns 字段，
-    格式如 ``shlv2.123ths.com:8901:16;144;:,szlv2.123ths.com:8901:32;:,...``，
-    含多个域名。hexin DNS 解析这些域名拿到当前可用的 IP（DNS 轮询，每次可能
-    不同），并发连接。这是 thspypc 拿到最新可用 IP 的正确方式（硬编码快照
-    会过时——2026-07-23 实测旧 IP 退化为纯登录网关）。
+    格式如 ``ifindhq.123ths.com:8901:232;120;104;56;:``，并同时包含
+    fu4/hkus/euhq/lv2 等其他市场组。2026-07-28 无 MAIN init 活网矩阵确认：
+    ifindhq 节点连续返回沪深 list_quotes；其他市场组可以保持登录连接，但
+    沪市查询超时。因此 A 股 MAIN 连接只解析 ifindhq。
 
     Args:
         passport_bytes: HTTP 鉴权返回的原始 passport_bytes（含 M_hqdns 字段）。
@@ -219,20 +214,15 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
         m_hqdns = m.group(1)
 
     # M_hqdns 格式: domain:port:markets;:,domain:port:markets;:,...
-    # 提取所有 :8901 的域名，但排除 lv2 域名（shlv2/szlv2）。
-    # ★ lv2 服务器只接受 __manual 登录 + 配套 init，普通 login（主连接用的
-    # build_login_body_pc）连 lv2 IP 会被服务器立即 FIN 关闭（表现为"连接已关闭"，
-    # 收不到 VerifyCode）。lv2 域名由 resolve_l2_hosts_grouped() 专用于 L2 推送
-    # 连接，主连接只解析通用行情域名（fu4/fu2/hkus/ifindhq/euhq/usotc）。
+    # MAIN A 股查询只使用 ifindhq。其他域名属于不同市场组；shlv2/szlv2
+    # 则由 resolve_l2_hosts_grouped() 路由到 __manual L2 连接。
     domains = []
     for entry in m_hqdns.split(","):
-        # entry 如 "shlv2.123ths.com:8901:16;144;:"
         dm = re.match(r'([\w.]+):(\d+):', entry.strip())
         if dm and dm.group(2) == str(MARKET_PORT):
-            domain = dm.group(1)
-            if "lv2" in domain:   # shlv2=沪L2 / szlv2=深L2，主连接禁用
-                continue
-            domains.append(domain)
+            domain = dm.group(1).lower()
+            if domain == "ifindhq.123ths.com" or domain.startswith("ifindhq."):
+                domains.append(dm.group(1))
 
     if not domains:
         return []
@@ -251,7 +241,7 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
             continue  # DNS 解析失败，跳过
 
     if ips:
-        logger.info("M_hqdns 动态解析 %d 个通用行情域名（已排除 lv2）→ %d 个 IP: %s",
+        logger.info("M_hqdns 动态解析 %d 个 MAIN A股域名（ifindhq）→ %d 个 IP: %s",
                     len(domains), len(ips), ips[:5])
     return ips
 
