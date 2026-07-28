@@ -1,5 +1,5 @@
 """
-thspypc.blocks — 同花顺(THS) 板块管理模块（PC 远航版）。
+thspypc.blocks — 同花顺(THS) 板块管理模块（PC 免费版）。
 
 移植自 thspy（Mac 版），纯 Python 实现，提供板块/股票分组的序列化、解析与
 增删改查所需的协议原语、数据模型与异常体系。走标准 HTTPS（443），不依赖

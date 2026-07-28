@@ -1,11 +1,11 @@
 """
-同花顺 Windows PC 远航版行情协议层 — 纯 Python 实现。
+同花顺 Windows PC 免费版行情协议层 — 纯 Python 实现。
 
-移植自 thspy（Mac 版），针对 PC 远航版（8901 端口）改造：
+移植自 thspy（Mac 版），针对 PC 免费版（8901 端口）改造：
   - HTTP 三步鉴权链路原样复用（先用 Mac 参数验证 8901 是否接受）
   - 帧编解码（FD FD FD FD + ASCII hex 长度）原样复用
   - head128 / passport64 构造算法原样复用
-  - login 帧重写为 PC 远航版格式（抓包实测，比 Mac 版更简洁）
+  - login 帧重写为 PC 免费版格式（抓包实测，比 Mac 版更简洁）
   - 端口 8901（PC 主行情），服务器 IP 从抓包取（不走 M_hqdns）
 
 参考：D:\\code\\ths\\PROTOCOL.md（§2 帧格式、§4 握手、§4.2.1 普通/L2 对照）
@@ -24,7 +24,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# 协议常量（PC 远航版）
+# 协议常量（PC 免费版）
 # =============================================================================
 FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
 
@@ -32,7 +32,7 @@ FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
 AUTH_HOST = "auth.10jqka.com.cn"
 AUTH_PORT = 80
 
-# PC 远航版主行情服务器（8901）。多 IP 冗余，抓包实测。
+# PC 免费版主行情服务器（8901）。多 IP 冗余，抓包实测。
 # 登录时按顺序尝试，任一成功即可。
 # 注意：实测部分 IP 只做登录网关、对行情请求(CodeList)无响应（timeout），
 # 行情查询需要连到真正处理 CodeList 的服务器（标 ★ 的是实测能返回
@@ -295,7 +295,7 @@ def resolve_l2_hosts_grouped(passport_bytes: bytes) -> dict[str, list[str]]:
     return grouped
 
 
-# --- 客户端身份参数（PC 远航版，从 login_lv2.pcapng 的 passport 实测）---
+# --- 客户端身份参数（PC 免费版，从 login_lv2.pcapng 的 passport 实测）---
 # 首次测试用 Mac 参数被 8901 拒（VerifyCode=-1, PromptText=-6:），服务器返回
 # thshq-hwyeast-globalthsindex-gateway，判定 passport 身份（Mac）与 PC 网关不符。
 # 改用抓包里 PC Level2 passport 的真实值：
@@ -306,14 +306,14 @@ VERSION_HTTP = "9.60.20.0031"         # mainverify 的 version 参数 → passpo
 TA_APPID = "2022021114090152"
 UA_GBK = "同花顺/7.0.10 CFNetwork/1333.0.4 Darwin/21.5.0"
 
-# PC 远航版 login 帧的版本号（抓包实测）
+# PC 免费版 login 帧的版本号（抓包实测）
 C_VERSION_PC = "E029.60.20.0031"
 
 # mainverify 的 qsid。PC 版 passport 的 M_qs=6800，推断 qsid=6800（Mac 是 7004）。
 QSID = "6800"
 
 # head128 的账号类型标签（5 字节前缀）。
-# Mac 版 (thspy): 44 04 2d 80 00；PC 远航版实测: be 06 06 80 00。
+# Mac 版 (thspy): 44 04 2d 80 00；PC 免费版实测: be 06 06 80 00。
 # 用 Mac 值时服务器返回 PromptText=-300（head128 校验失败）；
 # 改 PC 值后通过 head128 校验。
 ACCOUNT_TYPE = bytes([0xbe, 0x06, 0x06, 0x80, 0x00])
@@ -851,12 +851,12 @@ def build_passport64(auth_info: dict, mac_b64: str = "") -> str:
 
 
 # =============================================================================
-# PC 远航版 login 帧（重写 — 按抓包实测字段集）
+# PC 免费版 login 帧（重写 — 按抓包实测字段集）
 # =============================================================================
 
 def build_login_body_pc(passport64: str, mac_b64: str) -> bytes:
     """
-    构造 PC 远航版 login 帧 body。
+    构造 PC 免费版 login 帧 body。
 
     抓包实测字段集（8901 端口，hexin 冷启动抓包确认）：
         Ask=login
@@ -3883,7 +3883,7 @@ def decode_name_frame(body: bytes) -> dict:
 
 # =============================================================================
 # 短线精灵（DXJL）—— 9601 端口 qurealorder 历史翻页
-# （移植自 thspy，PC 远航版复用同一 9601 协议）
+# （移植自 thspy，PC 免费版复用同一 9601 协议）
 # =============================================================================
 
 # 9601 短线精灵/异动服务器（抓包确认）

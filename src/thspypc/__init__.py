@@ -1,5 +1,5 @@
 """
-thspypc — 同花顺 Windows PC 远航版行情协议纯 Python 实现。
+thspypc — 同花顺 Windows PC 免费版行情协议纯 Python 实现。
 
 第一版：仅登录打通（HTTP 鉴权 → 8901 TCP login → VerifyCode 验证）。
 后续按需扩展行情查询。

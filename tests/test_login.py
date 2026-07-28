@@ -130,7 +130,7 @@ def main() -> int:
         print(f"  VerifyCode = {result.verify_code}")
         if result.reply_fields:
             print(f"  响应字段: {result.reply_fields}")
-        print("\n  → PC 远航版 8901 登录链路走通。")
+        print("\n  → PC 免费版 8901 登录链路走通。")
         print("  → 下一步可加行情查询（K线/盘口/逐笔）。")
         return 0
     else:
