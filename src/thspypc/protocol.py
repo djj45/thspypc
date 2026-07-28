@@ -501,8 +501,12 @@ def normalize_8901_response(body: bytes) -> bytes:
     大端序输出长度，后面是以位控制字驱动、带 64K 三字节哈希字典的压缩流。
     已经是明文帧的输入保持原样返回。
 
+    部分响应（如深市盘后历史帧）的压缩流在输出填满 expected_size 前几字节
+    就用完，剩余位置是 0x00 填充——此时 ``read_source_byte`` 越界返回 0，
+    与 ``read_bit`` 的边界处理一致，而非抛错。
+
     Raises:
-        ValueError: ``cmd=0x0a`` 帧头、压缩流或回溯引用无效。
+        ValueError: ``cmd=0x0a`` 帧头非法、声明长度越界或回溯引用无效。
     """
     if not body.startswith(b"\x0a"):
         return body
@@ -545,7 +549,11 @@ def normalize_8901_response(body: bytes) -> bytes:
     def read_source_byte() -> int:
         nonlocal source_pos
         if source_pos >= len(source):
-            raise ValueError("8901 压缩字节流提前结束")
+            # 末尾零填充区：部分响应（如深市盘后历史帧）的压缩流在 expected_size
+            # 之前几字节就用完，剩余位置本就是 0x00 填充。返回 0 让主循环自然填满，
+            # 与 read_bit 越界返回 control=0 的边界处理一致。真正损坏的流会在
+            # append_reference 处因引用未填充位置而失败。
+            return 0
         value = source[source_pos]
         source_pos += 1
         return value
@@ -1692,6 +1700,68 @@ def _split_auction_state_rows(
     return rows
 
 
+def _split_auction_history_segment(
+    body: bytes, base: int, hs: int, fc: int,
+) -> list[dict]:
+    """从盘后历史帧（dc 字段非标准、含竞价+全天分时）中切出竞价段。
+
+    盘后查历史竞价时，深市服务器返回的特殊帧 dc 字段不是标准 LE32 记录数
+    （值 >1000），且响应含 9:15-15:00 全天数据。竞价段在记录区开头，结构
+    与盘中帧一致（定长 hs 字节/行，dt1 为 unix 时间戳）。
+
+    本函数用时间戳锚点定位竞价段起点，按 hs 步进切行，直到时间戳离开
+    9:15-9:25 区间。返回五字段记录列表，失败返回空。
+    """
+    fields = _parse_hd_field_table(body, base + 10, fc)
+    if len(fields) != fc or sum(w for _, _, w in fields) != hs:
+        return []
+    rec_off = base + 10 + fc * 4
+    # 扫描首条「连续三条 dt1 都递增且步长不超过 10 秒」定位竞价段起点
+    data_start = -1
+    scan_end = min(rec_off + hs * 3, len(body) - hs * 2)
+    for off in range(rec_off, scan_end):
+        v = struct.unpack("<I", body[off:off + 4])[0]
+        if 1_700_000_000 < v < 1_800_000_000:
+            v_next = struct.unpack("<I", body[off + hs:off + hs + 4])[0]
+            v_third = struct.unpack("<I", body[off + hs * 2:off + hs * 2 + 4])[0]
+            if 1 <= v_next - v <= 10 and 1 <= v_third - v_next <= 10:
+                data_start = off
+                break
+    if data_start < 0:
+        return []
+    # 按 hs 步进切竞价段（时间戳落在 9:15-9:25 的连续行）
+    records: list[dict] = []
+    off = data_start
+    while off + hs <= len(body):
+        raw_ts = struct.unpack("<I", body[off:off + 4])[0]
+        if not 1_700_000_000 < raw_ts < 1_800_000_000:
+            break
+        if not _auction_ts_in_range(raw_ts):
+            break
+        row = body[off:off + hs]
+        rec: dict = {}
+        fo = 0
+        for dt, _fmt, width in fields:
+            chunk = row[fo:fo + width]
+            fo += width
+            if len(chunk) < width:
+                return []
+            if width == 4:
+                raw = struct.unpack("<I", chunk)[0]
+                if dt == 1:
+                    try:
+                        rec["time"] = datetime.fromtimestamp(raw)
+                    except (OSError, ValueError, OverflowError):
+                        return []
+                else:
+                    rec[f"dt{dt}"] = _auction_value(raw, dt)
+            else:
+                rec[f"dt{dt}_raw"] = chunk
+        records.append(rec)
+        off += hs
+    return records if records else []
+
+
 def parse_auction_response(body: bytes) -> list[dict]:
     """解析集合竞价响应（pageid=4214 推送通道，沪深两市格式不同）。
 
@@ -1756,7 +1826,17 @@ def parse_auction_response(body: bytes) -> list[dict]:
         hs = struct.unpack("<H", body[base+6:base+8])[0]
         fc = struct.unpack("<H", body[base+8:base+10])[0]
         # 竞价帧特征：flag=0x003a，fc=5，hs=20（dt1/dt10/dt49/dt27/dt33 各 4B）
-        if flag != 0x003a or dc == 0 or dc > 1000 or hs == 0 or fc == 0:
+        if flag != 0x003a or hs == 0 or fc == 0:
+            continue
+        # 盘后历史帧：dc 字段非标准 LE32（编码不同，值 >1000），响应含竞价+全天
+        # 分时。盘中正常帧 dc 是标准 LE32（<1000）。对历史帧用时间戳扫描确定
+        # 竞价段记录数，替代 dc 走定长路径。
+        if dc > 1000:
+            history_recs = _split_auction_history_segment(body, base, hs, fc)
+            if history_recs:
+                return history_recs
+            continue
+        if dc == 0:
             continue
         fields = _parse_hd_field_table(body, base + 10, fc)
         rec_off = base + 10 + fc * 4

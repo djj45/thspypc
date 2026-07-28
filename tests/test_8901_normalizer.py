@@ -245,3 +245,38 @@ def test_shenzhen_auction_decodes_five_fields():
     # 深市 7-28 实测四字段全部 68/68
     assert price_ok == compared, f"深市价匹配 {price_ok}/{compared}"
     assert vol_ok == compared, f"深市量匹配 {vol_ok}/{compared}"
+
+
+def test_auction_history_frame_extracts_auction_segment():
+    """盘后历史帧（dc 字段非标准、含全天分时）应切出竞价段五字段。
+
+    深市盘后查历史竞价时，服务器返回含 9:15-15:00 全天数据的特殊帧（dc>1000，
+    非 LE32）。normalize 修复后能解开外层 LZ，再由 _split_auction_history_segment
+    按时间戳切出 9:15-9:25 竞价段。三只深市票（000938/000001/300033）验证。
+    """
+    capture_dir = Path(__file__).resolve().parents[1] / "captures_live"
+    # 历史帧 >10KB（盘中帧 <2KB）
+    cases = [
+        ("000938", 69),  # 竞价段约 69 条
+        ("000001", None),
+        ("300033", None),
+    ]
+    found_any = False
+    for code, expected_count in cases:
+        paths = [p for p in sorted(capture_dir.glob(f"auction_raw_{code}_20260728_*.bin"))
+                 if p.stat().st_size > 10000]
+        if not paths:
+            continue
+        found_any = True
+        records = parse_auction_response(paths[0].read_bytes())
+        assert len(records) > 0, f"{code} 历史帧应解出竞价段"
+        assert set(records[0]) == {"time", "dt10", "dt49", "dt27", "dt33"}
+        # 全部记录应落在 9:15-9:25
+        for rec in records:
+            assert rec["time"] is not None
+            assert rec["time"].hour == 9 and 15 <= rec["time"].minute <= 25
+        assert all(rec["dt10"] is not None for rec in records), f"{code} 价不应为 None"
+        if expected_count is not None:
+            assert len(records) == expected_count, f"{code} 期望 {expected_count} 条，实际 {len(records)}"
+    if not found_any:
+        pytest.skip("本机没有深市盘后历史帧语料")
