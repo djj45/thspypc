@@ -14,7 +14,19 @@ thspypc — 同花顺 Windows PC 免费版行情协议纯 Python 实现。
         print("登录成功" if result.success else f"失败: {result.error}")
 """
 from .client import THSClient, LoginResult
-from .models import DepthLevel, DepthQuote
+from .models import (
+    AccountEvidence,
+    AccountKind,
+    AccountProfile,
+    Capability,
+    DepthLevel,
+    DepthQuote,
+    Support,
+)
+from .features.account_profile import (
+    AccountEvidenceRecorder,
+    build_account_profile,
+)
 from .client import (
     market_from_code,
     default_stock_cache_path,
@@ -70,7 +82,10 @@ from .parse_hfd1 import parse_hfd1_response
 
 __version__ = "0.1.0"
 __all__ = [
-    "THSClient", "LoginResult", "DepthLevel", "DepthQuote",
+    "THSClient", "LoginResult",
+    "AccountEvidence", "AccountKind", "AccountProfile", "Capability", "Support",
+    "AccountEvidenceRecorder", "build_account_profile",
+    "DepthLevel", "DepthQuote",
     "market_from_code", "default_stock_cache_path",
     "save_stock_codes", "load_stock_codes", "is_stock_cache_expired",
     "MARKET_HOSTS", "MARKET_PORT", "C_VERSION_PC", "LIST_QUOTE_DATATYPE_DEFAULT",

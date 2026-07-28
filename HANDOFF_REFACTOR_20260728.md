@@ -28,6 +28,9 @@
 5. 每条 socket 只能有一个收帧所有者；锁必须覆盖发送和完整响应读取。
 6. 离线测试先通过，活网测试只作为额外验收。
 7. 不清理或提交工作区里现存的 `_*.py`、抓包分析草稿和未跟踪文件。
+8. 账号等级不能直接散落成 `if level2`；登录差异、账号能力、连接可用性和
+   行情请求方案必须分别建模。普通账号未验证的能力保持 `UNKNOWN`，不能猜测为
+   支持或不支持。
 
 不要以“文件行数变少”作为唯一目标。真正目标是让依赖方向稳定：
 
@@ -88,6 +91,26 @@ import thspypc.protocol as proto
 
 部分诊断脚本还会导入下划线开头的内部函数。因此第一阶段必须保留
 `protocol.py` 文件作为兼容门面，不能直接把它和同名目录互换后一次性重写。
+
+### 2.4 当前把 Level2 账号行为写进了门面和连接层
+
+当前实现和样本主要基于 Level2 账号，普通账号虽然已有部分协议真值，但还没有
+端到端接入：
+
+- 登录后只打印 passport 的 `level2/userclass/qsuserclass`，没有形成可供业务
+  路由使用的账号能力模型；
+- HTTP 产品参数、`ACCOUNT_TYPE`、TCP login 字段集来自当前 PC Level2 样本，
+  尚未封装成可替换的登录协议配置；
+- `timeline()` 直接等同于 `__manual + pageid=4214` 的 L2 分时，而普通账号已经
+  确认使用主连接 `pageid=9354` 请求-响应；
+- `auction()`、`snapshot_subscribe()` 和当前历史分时协议都默认需要 L2 通道；
+- `_push_socks` 是否存在被当成能力判断，但“有权限”“passport 含 L2 地址”
+  和“本次 DNS/socket 可用”是三件不同的事；
+- `connect_with_passport64()` 没有明文 passport 字段，账号等级只能是未知，
+  不能按普通账号处理。
+
+因此不能通过复制一个 `NormalTHSClient` 解决。目标是保留单一 `THSClient`
+公开门面，在内部按“账号能力 → 请求方案 → 连接角色”选择实现。
 
 ## 3. 目标目录
 
@@ -433,6 +456,18 @@ realorder         9601
 
 连接角色应使用枚举或明确 key，不要继续让各业务方法自行拼 `"sh"` / `"sz"`。
 
+每种连接角色还要声明登录身份和前置能力：
+
+```text
+MAIN        普通 8901；STANDARD 身份；普通/L2 账号共用
+SH_L2       shlv2；MANUAL 身份；init(16;144)；要求沪市 L2 能力
+SZ_L2       szlv2；MANUAL 身份；init(32)；要求深市 L2 能力
+REALORDER   9601；能力是否对普通账号开放需要活网确认
+```
+
+普通账号不能解析后就顺手预热 `SH_L2/SZ_L2`。`ConnectionManager.acquire(role)`
+应先检查账号能力，再解析地址和建 socket；权限不足与 DNS/网络失败必须是不同错误。
+
 ### 6.2 解决 L2 socket 的读所有权
 
 这是重构最重要的不变量。
@@ -510,6 +545,120 @@ AuthService        最后迁移，登录链路风险最高
 
 五档盘口适合作为第一个 service 样板，因为已有纯 builder/parser、公开类型和离线
 测试。历史分时适合作为第二个，用来验证 L2 通道抽象。
+
+### 6.5 普通账号兼容合同
+
+不要建立 `NormalTHSClient` / `Level2THSClient` 两套门面。账号差异用组合对象表达，
+建议先在 `models.py` 增加以下内部模型，待稳定后再决定哪些公开导出：
+
+```python
+class Capability(Enum):
+    BASIC_QUOTE = auto()
+    BASIC_TIMELINE = auto()
+    L2_TIMELINE = auto()
+    L2_AUCTION = auto()
+    L2_SNAPSHOT_PUSH = auto()
+    L2_HISTORY_TIMELINE = auto()
+    REALORDER = auto()
+
+
+class Support(Enum):
+    YES = auto()
+    NO = auto()
+    UNKNOWN = auto()
+
+
+@dataclass(frozen=True)
+class AccountProfile:
+    kind: Literal["standard", "level2", "unknown"]
+    capabilities: Mapping[Capability, Support]
+    passport_fields: Mapping[str, str]
+```
+
+必须使用三态能力：
+
+- `YES`：passport 字段和已验证行为都证明可用；
+- `NO`：有普通账号对照样本或明确权限响应证明不可用；
+- `UNKNOWN`：缺少字段、外部 Passport64 登录、或尚未完成普通账号实测。
+
+`level2` 字段、`userclass/qsuserclass`、`M_hqdns` 中的 `shlv2/szlv2` 都只是
+能力证据，不能单独兼任账号类型、连接健康状态和业务成功状态。字段值映射在拿到
+普通账号脱敏样本前不得猜测。
+
+登录协议参数也要从全局常量收拢为配置对象：
+
+```python
+@dataclass(frozen=True)
+class LoginProtocolProfile:
+    product: str
+    qsid: str
+    http_version: str
+    tcp_version: str
+    account_type: bytes
+    supports_manual_identity: bool
+```
+
+当前已经验证的参数先成为默认 profile，builder 默认参数继续生成完全相同的字节。
+普通账号抓包确认后再增加 profile。登录编排通过内部 `LoginStrategy`/`AuthTicket`
+边界完成，不在 `full_http_auth()` 里持续堆账号分支：
+
+```python
+class LoginStrategy(Protocol):
+    def authenticate(self, credentials, device) -> AuthTicket: ...
+    def build_login(self, ticket, identity: LoginIdentity) -> bytes: ...
+```
+
+`AuthTicket` 至少保留原始 passport、解析字段、服务器目录和 `AccountProfile`。
+`THSClient` 后续可增加默认值为 `"auto"` 的账号模式提示；现有构造参数和调用方式
+保持不变。自动协商只能在明确的鉴权/权限拒绝时切换策略，不能把网络 timeout 当成
+账号类型证据。
+
+业务 service 根据账号能力选择请求计划：
+
+| 功能 | 普通账号计划 | Level2 账号计划 |
+|------|--------------|-----------------|
+| `list_quotes` / `kline` / `depth_quote` | `MAIN` | `MAIN` |
+| `timeline(mode="auto")` | `MAIN + pageid=9354` | `SH_L2/SZ_L2 + pageid=4214` |
+| `timeline(mode="basic")` | 强制 `9354` | 强制 `9354`，用于对照 |
+| `timeline(mode="level2")` | 明确权限错误 | 严格使用 L2 通道 |
+| `auction` | 协议确认前报不支持 | `SH_L2/SZ_L2 + 4214/7176` |
+| `market_snapshot` | `MAIN + hfd1.0` | `MAIN + hfd1.0` |
+| `snapshot_subscribe` | 明确不支持逐 tick 推送 | L2 4214 推送 |
+| `history_timeline` | 普通协议确认前报不支持 | L2 4417 |
+| `realorder` | 待普通账号活网确认 | 保持现有 9601 行为 |
+
+`timeline()` 返回值继续保持 `list[dict]`；L2 多出的 `dt201-230` 等字段作为可选
+原始字段存在，不能为了统一结果而伪造普通账号没有的数据。
+
+新增 `errors.py` 时至少区分：
+
+```text
+CapabilityUnavailableError     账号明确没有所需权限
+UnsupportedAccountFeatureError 当前账号类型的协议尚未实现
+ChannelUnavailableError        有权限，但 DNS/socket/init 失败
+ProtocolError                  收到帧但无法识别或解析
+```
+
+权限不足不能继续与无行情数据共用 `[]`/`False`。空列表只表示请求成功但没有数据；
+为了兼容已有调用方，错误语义调整应单独提交，并在发行说明中明确。
+
+普通账号实现前必须先保存脱敏真值：
+
+```text
+HTTP 主验证请求参数与 passport 关键字段
+普通 TCP login 请求/响应
+M_hqdns 服务器目录
+pageid=9354 沪深各一份请求与响应
+普通账号调用 4214/7176/9601 时的明确权限失败表现
+```
+
+对应离线测试至少覆盖：
+
+- 普通账号 profile 永远不建立或预热 `SH_L2/SZ_L2`；
+- Level2 `timeline(auto)` 仍生成当前 4214 字节并选择对应市场 L2 连接；
+- 普通账号 `timeline(auto)` 生成 9354 字节并只使用 `MAIN`；
+- `UNKNOWN` 不被静默当成普通或 L2，严格能力调用给出可诊断错误；
+- 权限不足、网络失败、协议错误和真正无数据的返回语义互不混淆。
 
 ## 7. 依赖和导入规则
 
@@ -642,12 +791,14 @@ refactor: extract market compression codecs
 
 ```text
 refactor: extract generic hd codecs
+refactor: model account capabilities and login profiles
 refactor: extract quote protocol
 refactor: extract kline protocol
 refactor: extract timeline protocol
 refactor: centralize managed market connections
 refactor: extract quote service
 refactor: extract timeline service
+feat: route standard accounts through basic timeline
 fix: route historical timeline through l2 session
 ```
 
@@ -740,3 +891,271 @@ git push
 - 为下一次 `hd.py` / `quote_protocol.py` 迁移留下清晰边界。
 
 完成后把实际提交号、测试结果和未完成项追加到本文顶部，再开始下一阶段。
+
+## 16. 当前执行进度（2026-07-28）
+
+当前工作分支：
+
+```text
+codex/refactor-protocol-foundation
+```
+
+已完成但尚未提交：
+
+- `tests/test_public_api.py` 冻结顶层、协议和 transport 公开导入；
+- `codecs/framing.py`：`FRAME_MAGIC`、帧编码和同步读帧；
+- `codecs/numeric.py`：`decode_ths_float`；
+- `codecs/compression.py`：8901 正规化、BitRLE、位平面转置；
+- `codecs/hd.py`：通用字段表、记录区、hd1.0 和标准 hd3.1；
+- `protocol.py` 对以上名字继续兼容 re-export，测试确认新旧入口是同一函数对象；
+- `models.py` 增加 `AccountKind`、`Capability`、`Support` 和不可变
+  `AccountProfile`；后续增加不可变 `AccountEvidence`，分别记录 MAIN、L2
+  entitlement、manual 登录、L2 init 和各业务响应的三态证据；
+- `features/account_profile.py`：提供保守的 `build_account_profile(evidence)`；
+  passport 文本仅原样保存，不解释空 `level2` 等字段。明确普通 entitlement
+  才把账号归为 STANDARD 并关闭 L2；manual 成功本身不宣称 L2，init/业务成功
+  只提升已观察能力，矛盾证据直接报错；
+- `AccountEvidenceRecorder`：线程安全、原子地演进证据快照；MAIN ready、
+  entitlement、manual/init 和业务能力均为显式更新，更新前验证矛盾。超时、DNS、
+  RST 和 parser 失败走 `record_transient_failure()` 保持原快照，不会把瞬时故障
+  误写成权限 NO；
+- recorder 已接入实际状态变化点：MAIN TCP 登录成功记录基础行情；manual
+  VerifyCode=0 只记录 manual YES；仅通过大响应验收的 L2 init 记录市场访问 YES；
+  只有明确“无 Level2/L2 权限”文本才记录普通 entitlement，stale passport 和一般
+  VerifyCode/网络失败不降权；订阅、分时、竞价、历史分时及基础行情只有解析出
+  有效结果后才提升对应能力；
+- `errors.py` 建立权限不足、账号协议未实现、通道不可用和协议解析错误分类；
+- `features/auth_protocol.py` 收拢当前已验证的登录 profile，现有 HTTP/TCP 登录
+  常量从默认 profile 读取；
+- `features/quote_protocol.py`：列表行情 builder、五档盘口 builder/parser 及字段
+  常量完成单一实现迁移，完整请求字节 SHA 保持不变；
+- `features/kline_protocol.py`：K 线周期/字段常量、builder、hd3.1 parser 和时间
+  helper 完成单一实现迁移；日、周、5 分钟请求帧的完整字节 SHA 保持不变；
+- `services/kline.py`：新增 MAIN-only `KlineService`，普通与 Level2 账号均只要求
+  `BASIC_QUOTE=YES`；一次请求锁覆盖发送、通知帧过滤、最多 16 帧读取和多 hd3.1
+  帧合并。首个数据帧前 timeout 继续作为连接失败，拿到数据后的 2 秒收尾 timeout
+  正常结束；收到 K 线帧但 parser 为空时抛 `ProtocolError`，成功后回写 MAIN
+  证据；
+- 公开 `kline()` 在显式 service context 后 opt-in 委托 `KlineService`，未配置时
+  保留旧 `_kline_query_once()`。重连、服务器 IP 轮换、坏 IP 黑名单以及“小于请求
+  根数 50%”的完整性重试仍留在 client 编排层，迁移没有改变这些活网策略；
+- 修复迁移前 `_kline_decode_time` 声明丢失、函数体落在分时 parser 返回语句之后
+  而不可达的问题；日期、Unix 时间戳和日内 bar 序号均有离线合同测试；
+- `features/timeline_protocol.py`：明确拆分普通账号 `pageid=9354` 与 Level2 账号
+  `pageid=4214` 两个当日分时 builder，并迁移 Level2 hd3.1 parser；沪深两市四种
+  请求帧 SHA 均保持不变，真实 `000938` Level2 语料可解析 241 点；
+- `features/history_timeline_protocol.py`：迁移历史分时日期/bar 换算、三段嵌套
+  builder、状态省略 parser 和行锚点 helper；请求 SHA、日期锚点、89–92 字节
+  物理行恢复和真实语料结果保持不变；
+- `_transport/session.py`、`connection.py`、`connection_manager.py`：建立
+  `MAIN/SH_L2/SZ_L2/REALORDER` 角色、登录身份、每连接 single-flight 锁、
+  capability 先行检查、连接缓存和关闭生命周期；顶层 `transport.py` 保持兼容导出；
+- `ConnectionManager` 的 opener 合同现明确为“返回已完成对应身份登录及 init 的
+  role-ready socket”，因此 opener 创建的 wrapper 自动标记 ready；`adopt()` 仍
+  要求调用方显式传入旧 socket 的 init 证据，4214 协调器会在发送前拒绝未 init
+  的借用连接；
+- 新增 `OpenedConnection(socket, owns_socket, initialized, request_lock)` 作为
+  opener 的结构化返回值；旧 opener 直接返回 socket 的形式保持兼容并默认由
+  manager 拥有、已 ready。结构化形式允许旧 client 建连后把 socket 登记为借用，
+  同时共享原请求锁，避免双重关闭；
+- `ConnectionManager.adopt()`：可把已经完成登录/init 的旧 socket 收编到角色
+  registry，并复用旧 request lock；默认只借用、不接管关闭责任，也可显式转移
+  所有权。同一 socket 重复收编幂等且可提升 init 状态，不同 socket 抢占同一角色
+  或同一 socket 跨角色复用均被拒绝，收编不能绕过账号 capability 检查；
+- `ConnectionManager.update_profile()`：账号证据演进后可原子替换不可变画像；
+  画像读取、角色 capability 校验和连接表变更由同一把锁保护。能力升级保留已有
+  MAIN wrapper；降级为普通/UNKNOWN、L2 市场访问不再为 YES 时摘除 L2 wrapper，
+  REALORDER 不再明确为 YES 时同样摘除。失效过程等待正在进行的单连接请求结束；
+  manager 自有 socket 会关闭，借用 socket 只让 wrapper 失效，真实关闭仍归旧
+  client；
+- `THSClient.configure_service_context(profile)` / `sync_service_connections()`：
+  在调用方显式提供不可变 `AccountProfile` 后，内部建立无隐式联网 opener 的
+  service registry，并借用 `_sock` 与 `_push_socks`；主连接复用 `_sock_lock`，
+  L2 连接使用每市场 request lock，旧 client 仍负责关闭；context 持有共享
+  `L2SubscriptionCoordinator` 和长生命周期 Quote/Timeline/Auction service。
+  重复同步、socket 替换、profile 偷换、普通账号误收编 L2 和 disconnect 后
+  wrapper 失效均有离线合同；
+- `configure_service_context()` 现可省略 profile，从该 client 已记录的证据生成
+  保守画像；已有 context 可通过 `refresh_service_profile_from_evidence()`（或再次
+  省略 profile 调用 configure）刷新。刷新不会自动重新收编刚因降级失效的旧 L2
+  socket，避免普通账号画像把遗留 push socket 再次注册；
+- `configure_service_context(..., allow_open=True)` 提供显式受控 opener；默认
+  `False` 仍禁止隐式联网。opt-in 后 MAIN 通过旧 `connect()`，沪深 L2 通过旧
+  `__manual + init` 建连，并立即登记回 `_sock/_push_socks`；manager 仅借用并
+  共享旧锁，重复 acquire 不重复建连，失败分类为通道错误，context 建立后不能
+  偷换 open 模式；
+- `services/timeline.py`：建立 `auto/basic/level2` 纯路由策略。普通账号 auto
+  选择 `MAIN + pageid=9354`，Level2 auto 按市场选择 `SH_L2/SZ_L2 +
+  pageid=4214`；未知账号不作静默推断；
+- `TimelineService.timeline()` 已接通可离线验证的 Level2 4214 工作流：角色获取、
+  请求发送和响应匹配共用每连接锁；普通账号 basic 在 opener 前明确报
+  `UnsupportedAccountFeatureError`，等待真实 9354 响应 parser；公开
+  `timeline()` 在显式配置 service context 后 opt-in 委托，Level2 缺 socket、
+  未 init 或有后台快照读者时均拒绝发送，未配置时保留旧活网路径；
+- `TimelineService.history_timeline()` 已接通 Level2 4417 工作流：要求
+  `L2_HISTORY_TIMELINE=YES`，按沪深获取 L2 角色，识别明文 hd1.0 与 0x0a
+  压缩候选；普通/未知账号和未知能力均在 opener 前失败，未 init 的借用连接也
+  在发送前失败；公开 `history_timeline()` 在显式配置 context 后 opt-in 委托到
+  该 L2 工作流，未配置时暂时保留旧 MAIN 实验路径；
+- `services/quote.py`：建立第一个业务 service 样板，只获取 `MAIN` 并把发送、
+  最多 8 帧响应匹配和解析放在同一个连接锁生命周期内；通知帧、无数据和明确
+  parser 失败分别处理；公开 `list_quotes()` 和 `depth_quote()` 在显式配置
+  service context 后 opt-in 委托该 service，未配置时仍走原实现。协议错误分别
+  兼容为空列表/空字典，五档盘口原有 transport 重连次数和市场推断保持不变；
+- `features/stock_list_protocol.py`：迁移 `DataType=199112` 排序分页 builder、
+  分页元数据以及 16-bit dc 的 hd3.1/hd1.0 变体 parser；默认、翻页和自定义排序
+  三组完整请求 SHA 保持不变，真实抓包首帧仍解析 59 条且前三条代码一致。
+  `protocol.py` 只兼容 re-export，诊断脚本依赖的压缩私有 helper 也继续保留；
+- `services/stock_list.py`：新增 MAIN-only `StockListService.ranked()`，普通与
+  Level2 账号均要求 `BASIC_QUOTE=YES` 并只获取 MAIN；分页期间跳过通知帧、按
+  code 去重、保留旧实现的“达到 count 后返回完整最后一页”行为。声明有数据但
+  parser 为空时抛 `ProtocolError`，真正空页仍返回空列表；成功页回写 MAIN 证据；
+- 公开 `stock_list_hot()` 在显式 service context 后 opt-in 委托
+  `StockListService`，参数和本机名称缓存填充行为保持不变；未配置 context 时
+  继续走旧实现；
+- 同一 `features/stock_list_protocol.py` 继续迁移 `build_init_query()`、
+  `parse_init_response()` 和严格的重放容器 parser。默认/自定义 init 请求 SHA
+  保持不变，包内重放资源固定为 4 段（10690/5468/8223/2839B），截断、非法段数
+  和尾随字节均拒绝。真正的全量语料是
+  `list_quote_fields_20260723_203100_resp_stream0.bin` 第 39 帧，可稳定解析
+  `dc=7479, unk=0x18, hs=71` 和 7479 条代码；此前计划点名的
+  `init_frame_43.bin` 只有正规化后的服务器信息，不含全量 hd3.1 表；
+- `StockListService.full_list()` 在 MAIN 的 single-flight 生命周期内原样发送
+  四个启动重放段（不追加换行），保持 0.3 秒段间节奏、总超时和拿到全量表后的
+  3 秒收尾窗口；选取最大代码表，明确区分大帧 parser 失败，并支持注入响应读取、
+  时钟、sleep 和重放段做离线测试。普通与 Level2 画像均只使用 MAIN；
+- 公开 `stock_list()` 在显式 service context 后 opt-in 委托 `full_list()`，
+  未配置 context 时继续保留旧重放实现；本机名称目录读取仍位于 client 边界，
+  service 不反向依赖 `THSClient`；
+- `features/stock_name_protocol.py`：迁移 `build_upstockname_request()`、名称段
+  扫描、纯文本 GBK parser、代码/名称过滤和块编码启发式；默认与自定义请求 SHA
+  保持不变。真实 `upstockname_stream37_server.bin` 仍解析 22 个文本段和 3510
+  个键，`stream35` 的 `name_16_16` 仍明确返回 `skipped`，没有猜测未破解 LZ；
+  `protocol.py` 对 builder/parser 及历史私有 helper 继续同对象 re-export；
+- `services/stock_name.py`：新增 MAIN-only 增量名称工作流，持有单连接锁覆盖未封帧
+  请求发送与多帧读取，合并 `names/by_segment/skipped/segments`，普通与 Level2
+  账号均只要求 MAIN 基础行情能力。通知帧得到结构化空结果，成功解析文本段或识别
+  块状段后才回写 MAIN 证据；
+- 公开 `fetch_stock_names()` 在显式 service context 后 opt-in 委托
+  `StockNameService`，未配置时保留旧探索路径。网络服务不会自动发送股票列表启动
+  重放，也不会把本机 `load_hexin_names()` 当作协议响应；后者仍是 A 股名称的默认
+  可靠来源；
+- `features/auction_protocol.py`：完成周期/字段/哨兵常量、请求 builder、竞价
+  时间窗、状态短行恢复、盘后历史段切分、沪市旧流启发式扫描和总 parser 的
+  单一实现迁移；标准 hd1.0、0x0a 压缩、多打包状态和历史段真实语料结果保持
+  不变，沪深最近交易日与指定日期请求 SHA 保持不变；
+- `features/snapshot_protocol.py`：完成 snapshot 协议单一实现收拢。除 4214
+  双子帧订阅 builder 外，MAIN 全市场 `build_market_snapshot_query()`、
+  71B L2 push 的 `parse_snapshot_push()` / `is_snapshot_push()` 及两组字段常量
+  均已迁入；默认/自定义 MAIN 请求和沪深/自定义 L2 请求完整 SHA 保持不变，
+  `protocol.py` 只兼容 re-export；
+- `services/market_snapshot.py`：新增 MAIN-only `MarketSnapshotService`，普通与
+  Level2 账号均只要求 `BASIC_QUOTE=YES`，在同一 MAIN 请求锁内跳过通知帧并匹配
+  `hfd1.0`；收到 HFD1 却解析为空时抛 `ProtocolError`，仅通知/超时返回空列表，
+  成功后回写 MAIN 证据。历史 `hfd1_0_response.bin` 离线语料稳定解析 1209 条，
+  结构锚点已冻结，旧启发式数值没有被提升为可靠行情合同；
+- 公开 `market_snapshot()` 在显式 service context 后 opt-in 委托
+  `MarketSnapshotService`，未配置时保留旧 MAIN 路径。它和 4214 L2 逐 tick push
+  是两类独立协议：前者普通/Level2 共用 MAIN，后者仍要求
+  `L2_SNAPSHOT_PUSH=YES` 和市场 L2 socket；该 MAIN service 不参与 L2 push 的
+  注册和收帧；
+- `services/subscription.py`：建立按 `ManagedConnection + market + code` 记忆的
+  L2 注册协调器；只在 `CodeListSize>=1` 后记成功，同连接复用、换连接重注册，
+  每连接独立串行化注册，不阻塞另一市场；
+- 公开 `snapshot_subscribe()` 在显式 service context 后 opt-in 使用账号能力、
+  `SH_L2/SZ_L2` 角色和共享 `L2SubscriptionCoordinator`。普通账号、未知账号、
+  缺少 socket 和未完成 init 均在发送前得到明确错误；`CodeListSize=0` 继续兼容
+  旧门面的 `False` 返回，重复订阅在同一 live connection 上不重复发送注册帧；
+- L2 push 没有提取第二个 reader service：原 `_snapshot_loop` 继续作为唯一后台
+  收帧者，callback、`latest_price()`、`stop_snapshot()` 和 disconnect 语义保持
+  不变。同步注册和后台读取现在共用 `_push_request_locks[market]`，新增代码注册
+  不会再与 reader 并发 `recv`；Timeline/Auction/history_timeline 在后台 reader
+  存活时仍明确拒绝同步读取；
+- `services/auction.py`：组合 Level2 集合竞价工作流，明确要求
+  `L2_AUCTION=YES`，按市场选择 `SH_L2/SZ_L2`，跳过通知帧并只解析 `0x0a`
+  或 `hd1.0` 候选；与 `TimelineService` 均在查询前确认 4214 注册，两者可共享
+  协调器避免同连接同代码重复注册；普通账号、未知账号、未知能力和非法市场均在
+  opener 前失败；公开 `auction()` 在显式配置 service context 后 opt-in 委托，
+  未配置时保留旧活网路径。opt-in 模式下普通账号、缺少 L2 socket 和后台快照线程
+  抢占读权都有明确错误；
+- `features/realorder_protocol.py`：收拢 9601 的 `qurealorder` 历史分页、
+  `subrealorder` 实时订阅、`pushrealorder` parser、len-minus-one 帧读取、
+  30 秒心跳以及异动类别/过滤常量；查询、订阅和心跳请求字节已用长度与 SHA
+  冻结，历史 hq1.0 与 push 记录有合成语料合同，`protocol.py` 继续保持同对象
+  兼容导出。旧 RealOrder 源块已经从 `protocol.py` 物理删除，模块完整
+  `__all__` 和包级历史入口均有同对象回归合同。8901 的 `subreal` 前置序列仍
+  属于 L2 snapshot，不并入 9601 模块；
+- `_transport/MarketSession` 与 `ManagedConnection` 新增只读 `receive()` 上下文，
+  允许无需先发送请求地独占 socket 收帧。9601 的发送、查询响应读取、push 读取、
+  心跳和关闭现在都共享同一 request lock；
+- `services/realorder.py`：新增 `RealOrderService`，只获取 `REALORDER` 角色并明确
+  要求 `Capability.REALORDER=YES`。历史查询在同一锁生命周期内发送并匹配 hq1.0，
+  若查询响应前夹入 push 帧则暂存，后续 `receive_pushes()` 优先交付，不让查询
+  错读推送；实时接收每帧短暂持锁，给分页查询和非阻塞心跳留下调度机会，不创建
+  第二个后台 reader；
+- 公开 `dxjl_page()` / `dxjl_latest()` / `dxjl_history()` /
+  `subscribe_realtime()` / `receive_pushes()` / `receive_pushes_locked()` 在显式
+  service context 后 opt-in 委托 `RealOrderService`，未配置时保留旧 9601 行为。
+  9601 借用连接共享 `_realorder_lock`，心跳忙时跳过本轮，不与业务读写竞争；
+- 普通账号的 RealOrder 能力仍未做乐观假设：只有画像中
+  `REALORDER=YES` 才允许 9601 路由，包括未来经活网证据确认的普通账号；
+  `REALORDER=NO` 和 `UNKNOWN` 都在 opener 前失败。也就是说普通账号兼容入口已经
+  预留，但不会把 Level2 账号当前可用的 9601 行为误当成普通账号事实；
+- `features/auth_protocol.py`：在原有 `LoginProtocolProfile` 基础上收拢
+  signature/head128、Passport64 过滤、passport 字段解析、普通身份与
+  `__manual` 身份 login body、login 响应解析。`protocol.py` 的历史公开名称绑定
+  到同一批函数，普通和 `__manual` 登录帧长度/SHA 未变化；该纯协议层不接触
+  socket、账号画像或 capability；
+- `services/auth.py`：新增 `AuthService` 和不可变 `AuthMaterial`。一次 HTTP
+  鉴权生成同代 `auth_info/passport_fields/passport64/profile/generation` 快照，
+  MAIN、沪深 L2 `__manual` 和 REALORDER 均消费同一份 Passport64；重新鉴权会
+  原子替换 current generation，已经交给在途连接的旧快照不被修改；
+- `THSClient.connect()`、二维码/缓存凭证路径、外部 Passport64 登录、
+  `__manual` 票据刷新和 9601 登录均已改为通过 `AuthService` 构造登录身份。
+  `_auth` 继续镜像当前认证 dict，兼容已有板块代码、诊断脚本和测试注入；原有
+  主连接 IP 测速/轮换、20 秒复用窗口、并发登录、init、心跳和错误分类没有下沉，
+  因而线上握手顺序不变。扫码/缓存路径原先向 `_do_tcp_login()` 传入不存在的
+  `max_retries` 参数也已修正；
+- 普通账号登录差异的扩展点明确落在 `LoginProtocolProfile`：未来拿到普通账号
+  抓包后，可单独提供 product/securities/HTTP version/TCP version/qsid/
+  account_type 以及是否支持 `__manual`，并注入 `AuthService`，无需改业务
+  service 或连接角色。当前默认仍是唯一经过字节与活网验证的 Level2 profile；
+  不根据空 `level2`、`userclass` 文本或普通身份登录成功猜测普通账号协议。
+  `AuthService` 只暴露 passport 字段作为证据，账号种类和能力仍由
+  `AccountEvidenceRecorder` 在 MAIN/L2/9601 的明确行为之后判定；
+- `Capability.L2_MARKET_ACCESS` 单独表达 `__manual` L2 市场通道权限，避免把某个
+  具体业务能力同时当作账号类型和 socket 健康状态；
+- 登录帧长度和 SHA 回归确认普通身份与 `__manual` 身份字节均未变化。
+
+AuthService 接入并完成旧 RealOrder 源块清理后的扩大离线回归：
+
+```text
+267 passed, 2 skipped, 1 deselected
+```
+
+其中两个 skip 是本机缺少部分历史分时可选语料；deselected 项是
+`tests/test_stock_cache.py::test_live`。单独运行时账号登录成功，
+随后服务端在股票列表回放段发送期间以 WinError 10053 中止连接。真实 K 线抓包
+`kline_20260724_000441_resp_stream1.bin` 也已离线回放成功：15 帧、18,846 根记录
+均能解析；诊断脚本中 373 根历史前复权记录因价格为负不满足其金融约束，因此脚本
+沿用旧逻辑返回非零，不属于 parser 迁移失败。
+
+全量 `pytest -q` 仍会收集旧活网/本机工具测试，已知非重构失败：
+
+```text
+tests/test_stock_list.py::test_offline  配置的 tshark.exe 路径不存在
+tests/test_stock_list.py::test_live     活网连接可能被服务器中止
+tests/test_stock_cache.py::test_live     登录成功后活网连接被服务器中止
+```
+
+本轮初步重构至此完成。旧认证 builder/parser 和旧 RealOrder 源块均已从
+`protocol.py` 物理删除，历史名称分别 compatibility re-export 到
+`features/auth_protocol.py` 与 `features/realorder_protocol.py`。删除后遗留的
+RealOrder framing import 已清理，8901 心跳和 snapshot 前置 `subreal` 仍保留在
+原兼容层；公开协议导出与包级历史导出均已离线核对，不改变协议字节或 service
+行为。
+普通账号 9354 parser、普通账号专用 profile 的真实字段和普通账号 9601 行为仍
+明确属于下一阶段，必须等待对应账号抓包/活网证据后再实现。
+`market_snapshot_with_quotes()` 暂不下沉或自动组合 `StockListService`，它仍是
+client 边界上的显式混合策略，避免名称目录、全市场 HFD1 和逐批行情在 service
+内部形成隐式网络瀑布。

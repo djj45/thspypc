@@ -41,6 +41,60 @@
   按股票市场选对应 IP + 配套 init MarketCode（沪 16;144 / 深 32）。
   ★ **后台预热**：首次建好某市连接后异步预热另一市，跨市切换 0.44s（复刻 hexin 秒加载）。
 
+## 代码架构
+
+公开使用入口仍是 `THSClient`，但协议实现已经从原来的单体 `protocol.py` 拆成分层
+模块。`protocol.py` 目前主要承担历史 API 的兼容导出；新增实现应放入对应的新模块，
+避免再次扩大兼容层。
+
+```text
+src/thspypc/
+|-- client.py               # THSClient 门面、旧调用兼容和连接生命周期
+|-- models.py               # 账号证据、账号画像、能力和行情数据模型
+|-- codecs/                 # 帧、压缩、数值及 hd1/hd3 基础编解码
+|-- features/               # 各业务的纯协议 builder/parser
+|-- _transport/             # 按角色管理的 socket、会话和请求锁
+|-- services/               # 能力校验、连接选择及完整业务工作流
+|-- protocol.py             # 历史协议 API 兼容层
+`-- transport.py            # 旧 transport API 兼容层
+```
+
+典型调用链：
+
+```text
+THSClient
+  -> AuthService / AccountEvidenceRecorder
+  -> ConnectionManager
+  -> QuoteService / KlineService / TimelineService / ...
+  -> features/*_protocol.py
+  -> codecs/
+```
+
+各层职责：
+
+- `codecs` 只处理可复用的二进制格式，不感知账号、市场权限或业务流程。
+- `features` 提供无网络副作用的请求构造和响应解析，适合使用抓包语料做离线回归。
+- `_transport` 以 `MAIN`、`SH_L2`、`SZ_L2`、`REALORDER` 等角色管理连接和读写所有权。
+- `services` 根据 `AccountProfile` 和 `Capability` 选择连接并组合完整工作流。
+- `THSClient` 保持现有公开调用方式；显式配置 service context 后可使用新的服务层路径。
+
+### 普通账号兼容边界
+
+当前默认登录 profile 和已经验证的行情路径基于 **Level2 账号**。重构已为普通账号
+预留独立的 `LoginProtocolProfile`、账号证据收集、三态能力模型
+（`YES` / `NO` / `UNKNOWN`）以及按连接角色路由的扩展点：
+
+- 普通账号可以使用独立的 product、version、qsid、account type，并声明是否支持
+  `__manual` 登录身份，无需修改业务 service。
+- 账号类型和能力依据 MAIN/L2/9601 的明确响应证据生成，不根据 passport 中某个
+  文本字段或一次普通身份登录成功进行猜测。
+- 只有明确为 `YES` 的能力才会进入对应专用通道；`NO` 和 `UNKNOWN` 会在创建连接
+  前返回明确错误，避免普通账号误走 Level2 请求。
+
+普通账号的 9354 行情 parser、普通账号 profile 的真实字段以及普通账号 9601 行为
+仍需对应账号抓包和活网验证，目前不应视为已经实现。详细设计和重构进度见
+`HANDOFF_REFACTOR_20260728.md`。
+
 ## 三种登录方式
 
 ### 方式 1：账号密码（imei/Mac64 自动生成）

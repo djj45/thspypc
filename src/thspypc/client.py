@@ -15,8 +15,16 @@ import time
 from dataclasses import dataclass, field
 
 from . import protocol
-from .models import DepthQuote
-from .transport import MarketSession
+from .models import AccountProfile, Capability, DepthQuote, Support
+from .features.account_profile import AccountEvidenceRecorder
+from .features.auth_protocol import LoginIdentity
+from .services.auth import AuthService
+from .transport import (
+    ConnectionManager,
+    ConnectionRole,
+    MarketSession,
+    OpenedConnection,
+)
 from .protocol import (
     LIST_QUOTE_DATATYPE_DEFAULT,
     MARKET_HOSTS,
@@ -30,14 +38,12 @@ from .protocol import (
     build_kline_query,
     build_list_quote_query,
     build_depth_quote_query,
-    build_login_body_pc,
     build_passport64,
     build_qurealorder_query,
     build_stock_list_query,
     build_upstockname_request,
     build_history_timeline_query,
     build_snapshot_subscribe,
-    build_manual_login_body,
     build_timeline_query,
     decode_name_frame,
     encode_frame,
@@ -57,7 +63,6 @@ from .protocol import (
     SNAPSHOT_PAGEID,
     SNAPSHOT_PAGEID_SUB,
     parse_login_response,
-    parse_passport_fields,
     parse_qurealorder_response,
     parse_pushrealorder_response,
     parse_stock_list_response,
@@ -110,6 +115,19 @@ class THSClient:
         self.enable_heartbeat = enable_heartbeat
         self._sock: socket.socket | None = None
         self._auth: dict | None = None
+        self._auth_service = AuthService(
+            username,
+            password,
+            self.imei,
+            self.mac64,
+            # Resolve the module global at call time so existing monkeypatch and
+            # diagnostic hooks around full_http_auth remain effective.
+            authenticator=lambda account, secret, imei_value: full_http_auth(
+                account,
+                secret,
+                imei_value,
+            ),
+        )
         # 板块/自选股管理（HTTPS，登录后初始化）
         self._blocks = None              # BlockManager 实例
         self._http_cookies: dict | None = None
@@ -142,7 +160,24 @@ class THSClient:
         # resolve_l2_hosts_grouped() 与 HANDOFF_PUSH_INVESTIGATION §沪深分服突破。
         self._push_socks: dict = {}               # {"sh": sock, "sz": sock}
         self._push_lock = threading.Lock()        # 保护 _push_socks 并发（预热线程 vs 主线程）
+        self._push_request_locks = {
+            "sh": threading.RLock(),
+            "sz": threading.RLock(),
+        }
+        self._push_initialized: set[str] = set()
         self._preheat_threads: dict[str, threading.Thread] = {}  # 预热线程（主流程可 join 等待）
+        self._service_connections: ConnectionManager | None = None
+        self._service_allow_open = False
+        self._account_evidence = AccountEvidenceRecorder()
+        self._service_subscriptions = None
+        self._kline_service = None
+        self._market_snapshot_service = None
+        self._quote_service = None
+        self._stock_list_service = None
+        self._stock_name_service = None
+        self._timeline_service = None
+        self._auction_service = None
+        self._realorder_service = None
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
@@ -157,6 +192,249 @@ class THSClient:
             self._probe_cache = (time.time(), _ips)
             logger.debug("从磁盘加载 IP 状态：%d 个 IP，offset=%d",
                          len(_ips), self._login_rr_offset)
+
+    def configure_service_context(
+        self,
+        profile: AccountProfile | None = None,
+        *,
+        allow_open: bool = False,
+    ) -> ConnectionManager:
+        """Create or refresh the internal service registry from legacy sockets."""
+        inferred_profile = profile is None
+        if profile is None:
+            profile = self.observed_account_profile
+
+        if self._service_connections is None:
+            def unavailable_opener(spec):
+                raise OSError(
+                    f"旧 client 尚未向 service 提供建连器: {spec.role.value}"
+                )
+
+            self._service_allow_open = allow_open
+            self._service_connections = ConnectionManager(
+                profile,
+                (
+                    self._open_service_connection
+                    if allow_open
+                    else unavailable_opener
+                ),
+            )
+            from .services import (
+                AuctionService,
+                KlineService,
+                L2SubscriptionCoordinator,
+                MarketSnapshotService,
+                QuoteService,
+                RealOrderService,
+                StockListService,
+                StockNameService,
+                TimelineService,
+            )
+
+            self._service_subscriptions = L2SubscriptionCoordinator(
+                evidence=self._account_evidence,
+            )
+            self._kline_service = KlineService(
+                self._service_connections,
+                evidence=self._account_evidence,
+            )
+            self._market_snapshot_service = MarketSnapshotService(
+                self._service_connections,
+                evidence=self._account_evidence,
+            )
+            self._quote_service = QuoteService(
+                self._service_connections,
+                evidence=self._account_evidence,
+            )
+            self._stock_list_service = StockListService(
+                self._service_connections,
+                evidence=self._account_evidence,
+            )
+            self._stock_name_service = StockNameService(
+                self._service_connections,
+                evidence=self._account_evidence,
+            )
+            self._timeline_service = TimelineService(
+                self._service_connections,
+                subscriptions=self._service_subscriptions,
+                evidence=self._account_evidence,
+            )
+            self._auction_service = AuctionService(
+                self._service_connections,
+                subscriptions=self._service_subscriptions,
+                evidence=self._account_evidence,
+            )
+            self._realorder_service = RealOrderService(
+                self._service_connections,
+                self._next_request_instance,
+            )
+        elif self._service_allow_open != allow_open:
+            raise ValueError("service context 的 allow_open 模式不可中途切换")
+        elif inferred_profile:
+            self._service_connections.update_profile(profile)
+            return self._service_connections
+        elif self._service_connections.profile != profile:
+            raise ValueError("service context 已绑定其他 AccountProfile")
+
+        self.sync_service_connections()
+        return self._service_connections
+
+    @property
+    def observed_account_profile(self) -> AccountProfile:
+        """Return the profile derived only from evidence observed by this client."""
+        return self._account_evidence.profile()
+
+    def refresh_service_profile_from_evidence(self) -> AccountProfile:
+        """Apply current observations without re-adopting retired sockets."""
+        manager = self._service_connections
+        if manager is None:
+            raise RuntimeError("configure_service_context() has not been called")
+        profile = self.observed_account_profile
+        manager.update_profile(profile)
+        return profile
+
+    def _open_service_connection(self, spec) -> OpenedConnection:
+        """Open through legacy login code while retaining legacy ownership."""
+        if spec.role is ConnectionRole.MAIN:
+            if self._sock is None:
+                result = self.connect()
+                if not result.success or self._sock is None:
+                    raise OSError(
+                        f"MAIN 登录失败: {result.error or result.detail}"
+                    )
+            return OpenedConnection(
+                socket=self._sock,
+                owns_socket=False,
+                initialized=True,
+                request_lock=self._sock_lock,
+            )
+
+        l2_role = {
+            ConnectionRole.SH_L2: ("sh", 17),
+            ConnectionRole.SZ_L2: ("sz", 33),
+        }.get(spec.role)
+        if l2_role is not None:
+            key, market = l2_role
+            with self._push_lock:
+                current = self._push_socks.get(key)
+                initialized = key in self._push_initialized
+            if current is None:
+                if self._auth is None:
+                    result = self.connect()
+                    if not result.success:
+                        raise OSError(
+                            f"L2 前置登录失败: "
+                            f"{result.error or result.detail}"
+                        )
+                self._drop_connection()
+                opened = self._open_manual_push_connection(market)
+                if opened is None:
+                    raise OSError(f"__manual[{key}] 建连或 init 失败")
+                with self._push_lock:
+                    current = self._push_socks.get(key)
+                    if current is None:
+                        self._push_socks[key] = opened
+                        self._push_initialized.add(key)
+                        current = opened
+                    else:
+                        opened.close()
+                    initialized = key in self._push_initialized
+            return OpenedConnection(
+                socket=current,
+                owns_socket=False,
+                initialized=initialized,
+                request_lock=self._push_request_locks[key],
+            )
+
+        if spec.role is ConnectionRole.REALORDER:
+            if self._realorder_sock is None:
+                self._connect_realorder_server()
+            if self._realorder_sock is None:
+                raise OSError("realorder 建连失败")
+            return OpenedConnection(
+                socket=self._realorder_sock,
+                owns_socket=False,
+                initialized=True,
+                request_lock=self._realorder_lock,
+            )
+
+        raise OSError(f"不支持的连接角色: {spec.role.value}")
+
+    def sync_service_connections(self) -> ConnectionManager:
+        """Synchronize borrowed wrappers with the sockets currently held here."""
+        manager = self._service_connections
+        if manager is None:
+            raise RuntimeError("请先调用 configure_service_context(profile)")
+
+        with self._push_lock:
+            push_sockets = dict(self._push_socks)
+            initialized = set(self._push_initialized)
+        with self._sock_lock:
+            main_socket = self._sock
+        with self._realorder_lock:
+            realorder_socket = self._realorder_sock
+
+        for key, role in (
+            ("sh", ConnectionRole.SH_L2),
+            ("sz", ConnectionRole.SZ_L2),
+        ):
+            self._sync_service_role(
+                manager,
+                role,
+                push_sockets.get(key),
+                request_lock=self._push_request_locks[key],
+                initialized=key in initialized,
+            )
+        self._sync_service_role(
+            manager,
+            ConnectionRole.MAIN,
+            main_socket,
+            request_lock=self._sock_lock,
+            initialized=main_socket is not None,
+        )
+        if (
+            manager.profile.support(Capability.REALORDER)
+            is Support.YES
+        ):
+            self._sync_service_role(
+                manager,
+                ConnectionRole.REALORDER,
+                realorder_socket,
+                request_lock=self._realorder_lock,
+                initialized=realorder_socket is not None,
+            )
+        else:
+            manager.close(ConnectionRole.REALORDER)
+        return manager
+
+    def _next_request_instance(self) -> int:
+        self._instance += 1
+        return self._instance
+
+    @staticmethod
+    def _sync_service_role(
+        manager: ConnectionManager,
+        role: ConnectionRole,
+        sock,
+        *,
+        request_lock,
+        initialized: bool,
+    ) -> None:
+        current = manager.peek(role)
+        if current is not None and current.socket is not sock:
+            manager.close(role)
+            current = None
+        if sock is None:
+            if current is not None:
+                manager.close(role)
+            return
+        manager.adopt(
+            role,
+            sock,
+            request_lock=request_lock,
+            owns_socket=False,
+            initialized=initialized,
+        )
 
     def connect(self) -> LoginResult:
         """账号密码登录：HTTP 鉴权 → 构造 PC login 帧 → 连 8901 → 验证。
@@ -191,8 +469,8 @@ class THSClient:
         # ---- 第 1 步：HTTP 三步鉴权 ----
         try:
             logger.info("开始 HTTP 三步鉴权 (account=%s)...", self.username)
-            self._auth = full_http_auth(self.username, self.password, self.imei)
-            passport_fields = parse_passport_fields(self._auth["passport_bytes"])
+            material = self._refresh_auth_material()
+            passport_fields = dict(material.passport_fields)
             logger.info("HTTP 鉴权成功，passport 含 %d 个字段", len(passport_fields))
             logger.debug("passport 关键字段: account=%s, userclass=%s, level2=%s",
                          passport_fields.get("account", "?"),
@@ -403,7 +681,7 @@ class THSClient:
         Returns:
             LoginResult。成功后 self._sock 可用于 list_quotes()。
         """
-        login_body = build_login_body_pc(passport64, self.mac64)
+        login_body = self._auth_service.login_body_for_passport(passport64)
         return self._do_tcp_login_raw(login_body, passport_fields={})
 
     def _http_auth_and_tcp_login(self, account: str, password: str) -> LoginResult:
@@ -412,8 +690,8 @@ class THSClient:
         connect_with_qrcode / connect_cached 共用此方法。
         """
         try:
-            self._auth = full_http_auth(account, password, self.imei)
-            passport_fields = parse_passport_fields(self._auth["passport_bytes"])
+            material = self._refresh_auth_material(account, password)
+            passport_fields = dict(material.passport_fields)
             logger.info("HTTP 鉴权成功（account=%s），passport 含 %d 个字段",
                         account[:6] + "***", len(passport_fields))
         except Exception as e:
@@ -421,7 +699,30 @@ class THSClient:
             return LoginResult(success=False, error="http_auth_failed", detail=str(e))
 
         self._init_blocks()
-        return self._do_tcp_login(passport_fields, max_retries=1)
+        return self._do_tcp_login(passport_fields)
+
+    def _refresh_auth_material(
+        self,
+        account: str | None = None,
+        password: str | None = None,
+    ):
+        """Refresh one passport generation and mirror the legacy ``_auth``."""
+        material = self._auth_service.authenticate(account, password)
+        self._auth = material.legacy_auth_info()
+        return material
+
+    def _current_passport64(self) -> str:
+        """Return service material, falling back to legacy test injection."""
+        material = self._auth_service.current
+        if (
+            material is not None
+            and self._auth is not None
+            and dict(material.auth_info) == self._auth
+        ):
+            return material.passport64
+        if self._auth is None:
+            raise RuntimeError("HTTP authentication material is not available")
+        return build_passport64(self._auth)
 
     def _do_tcp_login(self, passport_fields: dict) -> LoginResult:
         """构造 PC login 帧并连 8901（connect / connect_with_qrcode 共用）。
@@ -429,8 +730,8 @@ class THSClient:
         前置条件：self._auth 已通过 full_http_auth 设置。
         """
         # ---- 构造 PC login 帧 ----
-        passport64 = build_passport64(self._auth)
-        login_body = build_login_body_pc(passport64, self.mac64)
+        passport64 = self._current_passport64()
+        login_body = self._auth_service.login_body_for_passport(passport64)
         logger.debug("PC login 帧构造完成，body %d 字节", len(login_body))
         return self._do_tcp_login_raw(login_body, passport_fields)
 
@@ -488,6 +789,7 @@ class THSClient:
             self._connected_ip = host
             self._start_heartbeat()
             self._send_init_handshake()
+            self._account_evidence.record_main_ready(passport_fields)
             logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
             return LoginResult(
                 success=True,
@@ -527,6 +829,9 @@ class THSClient:
                     self._connected_ip = host
                     self._start_heartbeat()
                     self._send_init_handshake()
+                    self._account_evidence.record_main_ready(
+                        passport_fields
+                    )
                     logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
                     return LoginResult(
                         success=True,
@@ -811,6 +1116,21 @@ class THSClient:
             datatype = LIST_QUOTE_DATATYPE_DEFAULT
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        if self._service_connections is not None:
+            from .errors import ProtocolError
+
+            self.sync_service_connections()
+            try:
+                return self._quote_service.list_quotes(
+                    codes,
+                    market=market,
+                    datatype=datatype,
+                    pageid=pageid,
+                    timeout=timeout,
+                )
+            except ProtocolError as exc:
+                logger.warning("list_quotes: %s", exc)
+                return []
 
         frame = build_list_quote_query(codes, market=market, datatype=datatype,
                                        pageid=pageid)
@@ -874,6 +1194,19 @@ class THSClient:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
+                if self._service_connections is not None:
+                    from .errors import ProtocolError
+
+                    self.sync_service_connections()
+                    try:
+                        return self._quote_service.depth_quote(
+                            code,
+                            market=market,
+                            timeout=timeout,
+                        )
+                    except ProtocolError as exc:
+                        logger.warning("depth_quote: %s", exc)
+                        return {}
                 return self._depth_quote_once(code, market, timeout)
             except (ConnectionError, OSError, TimeoutError) as e:
                 last_err = f"{type(e).__name__}: {e}"
@@ -972,8 +1305,31 @@ class THSClient:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
-                recs = self._kline_query_once(code, market, period_code, count,
-                                              fuquan, timeout)
+                if self._service_connections is not None:
+                    from .errors import ProtocolError
+
+                    self.sync_service_connections()
+                    try:
+                        recs = self._kline_service.kline(
+                            code,
+                            market=market,
+                            period=period_code,
+                            count=count,
+                            fuquan=fuquan,
+                            timeout=timeout,
+                        )
+                    except ProtocolError as exc:
+                        logger.warning("kline: %s", exc)
+                        recs = []
+                else:
+                    recs = self._kline_query_once(
+                        code,
+                        market,
+                        period_code,
+                        count,
+                        fuquan,
+                        timeout,
+                    )
                 # ★ 数据完整性校验：部分坏 IP（116.63.x / 119.3.x 等）"成功"返回但
                 # 只给最近部分数据（day 121/336、week 26、month 7，§14j）。这种截断
                 # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）视为坏 IP。
@@ -1085,6 +1441,26 @@ class THSClient:
         Raises:
             RuntimeError: 未登录或 ``__manual`` 连接建立失败。
         """
+        if self._service_connections is not None:
+            from .errors import ChannelUnavailableError
+
+            if (
+                self._snapshot_thread is not None
+                and self._snapshot_thread.is_alive()
+            ):
+                raise ChannelUnavailableError(
+                    "l2_snapshot",
+                    "后台快照线程正在读取 4214 连接",
+                )
+            if market == 0:
+                market = 17 if code.startswith("6") else 33
+            self.sync_service_connections()
+            return self._timeline_service.timeline(
+                code,
+                market=market,
+                timeout=timeout,
+            )
+
         if self._auth is None:
             # 未登录则自动 connect（拿 Passport64 用于 __manual 登录）
             lr = self.connect()
@@ -1113,6 +1489,8 @@ class THSClient:
                 if sock is None:
                     raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
                 self._push_socks[key] = sock
+                if not skip_init:
+                    self._push_initialized.add(key)
             # ★ 后台预热另一市连接（复刻 hexin 启动即双连，避免首次切市等 init）
             self._preheat_other_market(key)
         return self._timeline_query_once(code, market, timeout)
@@ -1138,6 +1516,7 @@ class THSClient:
                 sock.sendall(sub_frame + b"\n")
             except OSError as e:
                 self._push_socks.pop(key, None)
+                self._push_initialized.discard(key)
                 raise ConnectionError(f"订阅帧发送失败: {e}")
             logger.info("timeline[%s]: 已发 4214 订阅帧，等注册响应...", code)
             # 读注册响应，等 CodeListSize≥1
@@ -1169,6 +1548,7 @@ class THSClient:
             sock.sendall(frame + b"\n")
         except OSError as e:
             self._push_socks.pop(key, None)
+            self._push_initialized.discard(key)
             raise ConnectionError(f"查询帧发送失败: {e}")
         logger.info("timeline[%s]: 已发 L2 分时查询（pageid=4214, DateTime=8192），等响应...", code)
         # 分时响应是 hd3.1 flag=0x00b4 变体，用 parse_timeline_l2_response 解析
@@ -1245,6 +1625,27 @@ class THSClient:
         Raises:
             RuntimeError: 未登录或 ``__manual`` 连接建立失败。
         """
+        if self._service_connections is not None:
+            from .errors import ChannelUnavailableError
+
+            if (
+                self._snapshot_thread is not None
+                and self._snapshot_thread.is_alive()
+            ):
+                raise ChannelUnavailableError(
+                    "l2_snapshot",
+                    "后台快照线程正在读取 4214 连接",
+                )
+            if market == 0:
+                market = 17 if code.startswith("6") else 33
+            self.sync_service_connections()
+            return self._auction_service.auction(
+                code,
+                market=market,
+                trade_date=trade_date,
+                timeout=timeout,
+            )
+
         if self._auth is None:
             lr = self.connect()
             if not lr.success:
@@ -1267,6 +1668,8 @@ class THSClient:
                 if sock is None:
                     raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
                 self._push_socks[key] = sock
+                if not skip_init:
+                    self._push_initialized.add(key)
             self._preheat_other_market(key)
         return self._auction_query_once(code, market, trade_date, timeout)
 
@@ -1295,6 +1698,7 @@ class THSClient:
                 sock.sendall(sub_frame + b"\n")
             except OSError as e:
                 self._push_socks.pop(key, None)
+                self._push_initialized.discard(key)
                 raise ConnectionError(f"订阅帧发送失败: {e}")
             logger.info("auction[%s]: 已发 4214 订阅帧，等注册响应...", code)
             registered = False
@@ -1326,6 +1730,7 @@ class THSClient:
             sock.sendall(frame + b"\n")
         except OSError as e:
             self._push_socks.pop(key, None)
+            self._push_initialized.discard(key)
             raise ConnectionError(f"查询帧发送失败: {e}")
         dt_desc = "最近交易日" if trade_date is None else str(trade_date)
         logger.info("auction[%s]: 已发竞价查询（pageid=4214, 周期7176, %s），等响应...",
@@ -1395,6 +1800,25 @@ class THSClient:
         """
         if market == 0:
             market = self._market_for_code(code)
+        if self._service_connections is not None:
+            from .errors import ChannelUnavailableError
+
+            if (
+                self._snapshot_thread is not None
+                and self._snapshot_thread.is_alive()
+            ):
+                raise ChannelUnavailableError(
+                    "l2_snapshot",
+                    "后台快照线程正在读取 L2 连接",
+                )
+            self.sync_service_connections()
+            return self._timeline_service.history_timeline(
+                code,
+                market=market,
+                date=date,
+                timeout=timeout,
+            )
+
         last_err = ""
         for attempt in range(retries + 1):
             if not self.is_connected:
@@ -1472,6 +1896,8 @@ class THSClient:
                 except OSError:
                     pass
                 self._sock = None
+            if self._service_connections is not None:
+                self._service_connections.close(ConnectionRole.MAIN)
         self.stop_heartbeat()
 
     def stock_list_hot(
@@ -1520,6 +1946,25 @@ class THSClient:
         """
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        if self._service_connections is not None:
+            self.sync_service_connections()
+            stocks = self._stock_list_service.ranked(
+                count=count,
+                timeout=timeout,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+                max_pages=max_pages,
+            )
+            if with_names and stocks:
+                stockname_dir = (
+                    with_names if isinstance(with_names, str) else None
+                )
+                name_map = THSClient.load_hexin_names(stockname_dir)
+                for stock in stocks:
+                    name = name_map.get(stock["code"], "")
+                    if name:
+                        stock["name"] = name
+            return stocks
 
         # markets 对齐 hexin 抓包真值（stock_list.pcap）：17=沪 22=深A 151=北交所。
         # 注意 33 是深市另一类（非深A 主板/创业板），抓包确认排序查询用的是 22 不是 33。
@@ -1641,6 +2086,19 @@ class THSClient:
         """
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        if self._service_connections is not None:
+            self.sync_service_connections()
+            stocks = self._stock_list_service.full_list(timeout=timeout)
+            if with_names and stocks:
+                stockname_dir = (
+                    with_names if isinstance(with_names, str) else None
+                )
+                name_map = THSClient.load_hexin_names(stockname_dir)
+                for stock in stocks:
+                    name = name_map.get(stock["code"], "")
+                    if name:
+                        stock["name"] = name
+            return stocks
 
         # 加载重放段（4 个请求 segment，提取自 cold_start.pcap stream 44）
         replay_path = os.path.join(os.path.dirname(__file__), "data",
@@ -1878,6 +2336,12 @@ class THSClient:
         """
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        if self._service_connections is not None:
+            self.sync_service_connections()
+            return self._market_snapshot_service.snapshot(
+                markets=markets,
+                timeout=timeout,
+            )
         return self._market_snapshot_on_main_sock(markets=markets, timeout=timeout)
 
     def market_snapshot_with_quotes(
@@ -2004,6 +2468,20 @@ class THSClient:
         """
         if self._sock is None:
             raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        if self._service_connections is not None:
+            self.sync_service_connections()
+            result = self._stock_name_service.fetch(
+                market=market,
+                stock_name_ver=stock_name_ver,
+                timeout=timeout,
+            )
+            logger.info(
+                "fetch_stock_names(market=%s): 解出 %d 条名称，跳过 %d 个块状段",
+                market,
+                len(result["names"]),
+                len(result["skipped"]),
+            )
+            return result
 
         req = build_upstockname_request(market, stock_name_ver)
         names_result: dict = {
@@ -2196,8 +2674,11 @@ class THSClient:
         if self._realorder_sock or self._auth is None:
             return
         try:
-            passport64 = build_passport64(self._auth)
-            login_body = build_login_body_pc(passport64, self.mac64)
+            passport64 = self._current_passport64()
+            login_body = self._auth_service.login_body_for_passport(
+                passport64,
+                LoginIdentity.STANDARD,
+            )
             sock = socket.create_connection((REALORDER_HOST, REALORDER_PORT), timeout=15)
             sock.sendall(encode_frame(login_body) + b"\n")
             resp = read_frame(sock)
@@ -2272,19 +2753,51 @@ class THSClient:
             True=订阅请求已发送（CodeListSize≥1）；False=注册失败或未登录。
         """
         if self._auth is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+            if self._service_connections is None:
+                raise RuntimeError("未登录，请先 connect() / connect_cached()")
         if market is None:
             market = 17 if code.startswith("6") else 33
 
         # ★ 按沪深分服选推送连接（shlv2=沪, szlv2=深）
         from thspypc.protocol import pick_l2_market
         key = pick_l2_market(market)
+        if self._service_connections is not None:
+            from .errors import ProtocolError
+
+            role = (
+                ConnectionRole.SH_L2
+                if key == "sh"
+                else ConnectionRole.SZ_L2
+            )
+            self.sync_service_connections()
+            connection = self._service_connections.acquire(
+                role,
+                capability=Capability.L2_SNAPSHOT_PUSH,
+            )
+            try:
+                self._service_subscriptions.ensure_registered(
+                    connection,
+                    code,
+                    market=market,
+                    timeout=5.0,
+                )
+            except ProtocolError as exc:
+                logger.warning(
+                    "snapshot_subscribe: %s 注册失败: %s",
+                    code,
+                    exc,
+                )
+                return False
+            self._activate_snapshot_subscription(code, market, callback)
+            return True
+
         if key not in self._push_socks:
             sock = self._open_manual_push_connection(market)
             if sock is None:
                 logger.error("snapshot_subscribe: __manual[%s] 推送连接建立失败", key)
                 return False
             self._push_socks[key] = sock
+            self._push_initialized.add(key)
             logger.info("snapshot_subscribe: __manual[%s] 推送连接已建立", key)
             # ★ 后台预热另一市连接
             self._preheat_other_market(key)
@@ -2293,37 +2806,49 @@ class THSClient:
         self._instance += 1
         frame = build_snapshot_subscribe(code, market=market,
                                           seq=self._instance & 0xFFFF)
-        try:
-            self._push_socks[key].sendall(frame + b"\n")
-        except OSError as e:
-            logger.error("snapshot_subscribe: 发送失败 %s，重连", e)
-            self._push_socks.pop(key, None)
-            return False
+        with self._push_request_locks[key]:
+            try:
+                self._push_socks[key].sendall(frame + b"\n")
+            except OSError as e:
+                logger.error("snapshot_subscribe: 发送失败 %s，重连", e)
+                self._push_socks.pop(key, None)
+                self._push_initialized.discard(key)
+                return False
 
-        # 读注册响应（CodeListSize=1 才算成功）
-        import socket as _socket
-        self._push_socks[key].settimeout(5.0)
-        registered = False
-        try:
-            for _ in range(5):
-                body = read_frame(self._push_socks[key])
-                if b"CodeListSize=" in body:
-                    import re
-                    m = re.search(rb"CodeListSize=(\d+)", body)
-                    size = int(m.group(1)) if m else 0
-                    if size >= 1:
-                        registered = True
-                    logger.info("snapshot_subscribe: CodeListSize=%d（%s）",
-                                size, "注册成功" if registered else "注册失败")
-                    break
-        except (_socket.timeout, OSError, ValueError):
-            pass
+            # 读注册响应（CodeListSize=1 才算成功）
+            import socket as _socket
+            self._push_socks[key].settimeout(5.0)
+            registered = False
+            try:
+                for _ in range(5):
+                    body = read_frame(self._push_socks[key])
+                    if b"CodeListSize=" in body:
+                        import re
+                        m = re.search(rb"CodeListSize=(\d+)", body)
+                        size = int(m.group(1)) if m else 0
+                        if size >= 1:
+                            registered = True
+                        logger.info("snapshot_subscribe: CodeListSize=%d（%s）",
+                                    size, "注册成功" if registered else "注册失败")
+                        break
+            except (_socket.timeout, OSError, ValueError):
+                pass
 
         if not registered:
             logger.warning("snapshot_subscribe: %s 注册失败（CodeListSize=0，"
                            "检查账号是否有 L2 权限）", code)
             return False
 
+        self._activate_snapshot_subscription(code, market, callback)
+        return True
+
+    def _activate_snapshot_subscription(
+        self,
+        code: str,
+        market: int,
+        callback,
+    ) -> None:
+        """Record a registration and ensure the single push reader is running."""
         self._snapshot_codes.add(code)
         if callback is not None:
             self._snapshot_cb = callback
@@ -2335,7 +2860,6 @@ class THSClient:
             self._snapshot_thread.start()
             logger.debug("分时推送读取线程已启动")
         logger.info("snapshot_subscribe: 已订阅 %s（market=%d）", code, market)
-        return True
 
     def _preheat_other_market(self, current_key: str) -> None:
         """后台异步预热另一市的 __manual 连接（复刻 hexin 启动即双连行为）。
@@ -2359,6 +2883,7 @@ class THSClient:
                     with self._push_lock:
                         if other not in self._push_socks:  # 防竞争（主线程可能已建）
                             self._push_socks[other] = sock
+                            self._push_initialized.add(other)
                             logger.info("预热[%s] 连接已就绪（后台）", other)
                         else:
                             sock.close()  # 主线程抢先建了，关掉重复的
@@ -2455,8 +2980,7 @@ class THSClient:
                     logger.warning("__manual[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
                                    key)
                 try:
-                    self._auth = full_http_auth(self.username, self.password, self.imei)
-                    fresh = build_passport64(self._auth)
+                    fresh = self._refresh_auth_material().passport64
                     logger.info("__manual[%s] 已拿到新鲜 Passport64，重试一轮", key)
                     return _try_round(fresh, allow_refresh=False)
                 except Exception as e:
@@ -2464,7 +2988,7 @@ class THSClient:
             logger.error("__manual[%s] 全部候选 IP 都失败", key)
             return None
 
-        passport64 = build_passport64(self._auth)
+        passport64 = self._current_passport64()
         key = pick_l2_market(market)
         init_market_code = "16;144;" if key == "sh" else "32;"
         return _try_round(passport64, allow_refresh=True)
@@ -2481,7 +3005,10 @@ class THSClient:
         except OSError as e:
             logger.warning("__manual[%s] 连接失败 %s: %s", key, host, e)
             return None
-        login_body = build_manual_login_body(passport64, self.mac64)
+        login_body = self._auth_service.login_body_for_passport(
+            passport64,
+            LoginIdentity.MANUAL,
+        )
         try:
             sock.sendall(encode_frame(login_body) + b"\n")
             sock.settimeout(8.0)
@@ -2497,12 +3024,18 @@ class THSClient:
                 logger.error("__manual[%s] %s 登录失败 VerifyCode=%s PromptText=%s",
                              key, host, vc, prompt or "(无)")
                 sock.close()
+                if self._is_explicit_l2_permission_rejection(prompt):
+                    self._account_evidence.record_l2_entitlement(
+                        Support.NO
+                    )
+                    self._account_evidence.record_manual_login(Support.NO)
                 # 票据失效（"通行证被修改痕迹"等）→ 返回特殊标记，让调用方
                 # 立即重新鉴权，不再浪费剩余 IP（旧逻辑要试完全部 9 个才重试）
                 if "通行证" in prompt or "身份" in prompt:
                     return "stale_passport"
                 return None
             logger.info("__manual[%s] %s 登录成功", key, host)
+            self._account_evidence.record_manual_login(Support.YES)
         except (OSError, ValueError) as e:
             logger.error("__manual[%s] %s 登录异常: %s", key, host, e)
             sock.close()
@@ -2542,11 +3075,25 @@ class THSClient:
                                key, host, n_bytes)
                 sock.close()
                 return None
+            self._account_evidence.record_l2_init(Support.YES)
         except OSError as e:
             logger.warning("__manual[%s] %s init 异常: %s", key, host, e)
             sock.close()
             return None
         return sock
+
+    @staticmethod
+    def _is_explicit_l2_permission_rejection(prompt: str) -> bool:
+        normalized = prompt.lower().replace(" ", "")
+        return any(
+            marker in normalized
+            for marker in (
+                "无level2权限",
+                "没有level2权限",
+                "无l2权限",
+                "没有l2权限",
+            )
+        )
 
     def latest_price(self, code: str) -> float | None:
         """取某代码的最新现价（snapshot_subscribe 后由推送线程更新）。"""
@@ -2559,12 +3106,17 @@ class THSClient:
             self._snapshot_thread.join(timeout=3)
         self._snapshot_thread = None
         for key, sock in list(self._push_socks.items()):
-            try:
-                sock.close()
-            except OSError:
-                pass
+            with self._push_request_locks[key]:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         self._push_socks.clear()
+        self._push_initialized.clear()
         self._preheat_threads.clear()
+        if self._service_connections is not None:
+            self._service_connections.close(ConnectionRole.SH_L2)
+            self._service_connections.close(ConnectionRole.SZ_L2)
 
     def _snapshot_loop(self) -> None:
         """后台读取沪深两条 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
@@ -2576,7 +3128,13 @@ class THSClient:
         import select as _select
         import socket as _socket
         while not self._snapshot_stop.is_set():
-            socks = [s for s in self._push_socks.values() if s is not None]
+            with self._push_lock:
+                socket_items = [
+                    (key, sock)
+                    for key, sock in self._push_socks.items()
+                    if sock is not None
+                ]
+            socks = [sock for _, sock in socket_items]
             if not socks:
                 if self._snapshot_stop.wait(1.0):
                     break
@@ -2588,14 +3146,28 @@ class THSClient:
                     break
                 continue
             for sock in r:
-                try:
-                    sock.settimeout(2.0)
-                    body = read_frame(sock)
-                except (_socket.timeout, OSError):
+                key = next(
+                    (
+                        candidate_key
+                        for candidate_key, candidate in socket_items
+                        if candidate is sock
+                    ),
+                    None,
+                )
+                if key is None:
                     continue
-                except ValueError:
-                    # read_frame 偶尔在半帧处解析失败，跳过
-                    continue
+                with self._push_request_locks[key]:
+                    with self._push_lock:
+                        if self._push_socks.get(key) is not sock:
+                            continue
+                    try:
+                        sock.settimeout(2.0)
+                        body = read_frame(sock)
+                    except (_socket.timeout, OSError):
+                        continue
+                    except ValueError:
+                        # read_frame 偶尔在半帧处解析失败，跳过
+                        continue
                 if not is_snapshot_push(body):
                     continue
                 rec = parse_snapshot_push(body)
@@ -2635,10 +3207,21 @@ class THSClient:
             if tick % 10 == 0 and self._realorder_sock:
                 try:
                     self._hb_seq_9601 += 1
-                    with self._realorder_lock:
-                        if self._realorder_sock:
-                            self._realorder_sock.sendall(
-                                build_heartbeat_9601(self._hb_seq_9601) + b"\n")
+                    if self._realorder_service is not None:
+                        sent = self._realorder_service.send_heartbeat(
+                            self._hb_seq_9601
+                        )
+                        if not sent:
+                            logger.debug(
+                                "9601 连接正在处理业务请求，跳过本轮心跳"
+                            )
+                    else:
+                        with self._realorder_lock:
+                            if self._realorder_sock:
+                                self._realorder_sock.sendall(
+                                    build_heartbeat_9601(self._hb_seq_9601)
+                                    + b"\n"
+                                )
                 except OSError as e:
                     logger.debug("9601 心跳发送失败（不影响查询）: %s", e)
 
@@ -2663,6 +3246,9 @@ class THSClient:
         Returns:
             list[dict]，每项含 时间(微秒戳)/市场/代码/异动类型/异动编码/金额/涨跌幅。
         """
+        if self._realorder_service is not None:
+            self.sync_service_connections()
+            return self._realorder_service.dxjl_page(market, endtime_us)
         try:
             self._instance += 1
             body = build_qurealorder_query(self._instance, market, endtime_us)
@@ -2681,6 +3267,9 @@ class THSClient:
         Returns:
             list[dict]，按时间倒序（最新在前）。非交易时段可能为空。
         """
+        if self._realorder_service is not None:
+            self.sync_service_connections()
+            return self._realorder_service.dxjl_latest(markets=markets)
         now_us = int(time.time() * 1_000_000)
         all_recs = []
         for mk in markets:
@@ -2700,6 +3289,12 @@ class THSClient:
         Returns:
             list[dict]，按时间倒序。
         """
+        if self._realorder_service is not None:
+            self.sync_service_connections()
+            return self._realorder_service.dxjl_history(
+                pages=pages,
+                markets=markets,
+            )
         now_us = int(time.time() * 1_000_000)
         all_recs = []
         cursor = now_us
@@ -2729,6 +3324,10 @@ class THSClient:
         Args:
             markets: 市场代码列表，默认 [16,32,151,48]（沪/深/北交所/板块）。
         """
+        if self._realorder_service is not None:
+            self.sync_service_connections()
+            self._realorder_service.subscribe_realtime(markets)
+            return
         from .protocol import SUBREALORDER_MARKETS, build_subrealorder_query
         if markets is None:
             markets = SUBREALORDER_MARKETS
@@ -2763,6 +3362,13 @@ class THSClient:
             list[dict]，每项 ``{代码, 市场, raw_bytes}``。callback 模式下返回空列表。
             非交易时段返回空列表（无推送）。
         """
+        if self._realorder_service is not None:
+            self.sync_service_connections()
+            records, _ = self._realorder_service.receive_pushes(
+                timeout=timeout,
+                callback=callback,
+            )
+            return records
         if not self._realorder_sock:
             raise RuntimeError("9601 未连接，请先 subscribe_realtime()")
         all_recs = []
@@ -2810,6 +3416,15 @@ class THSClient:
         Returns:
             本次收到的推送帧数（不含心跳/其他帧）。
         """
+        if self._realorder_service is not None:
+            self.sync_service_connections()
+            _, frame_count = self._realorder_service.receive_pushes(
+                timeout=timeout,
+                callback=callback,
+                full_frame_callback=full_frame_callback,
+                continue_on_timeout=True,
+            )
+            return frame_count
         if not self._realorder_sock:
             raise RuntimeError("9601 未连接，请先 subscribe_realtime()")
         frame_count = 0
@@ -2855,6 +3470,8 @@ class THSClient:
         """
         self.stop_heartbeat()
         self.stop_snapshot()
+        if self._service_connections is not None:
+            self._service_connections.close_all()
         for attr, lock in (("_sock", self._sock_lock),
                            ("_realorder_sock", self._realorder_lock)):
             with lock:

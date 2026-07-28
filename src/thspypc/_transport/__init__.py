@@ -1,16 +1,14 @@
-"""Compatibility exports for transport primitives."""
+"""Internal connection primitives."""
 
-from ._transport import (
+from .connection import (
     CONNECTION_SPECS,
-    ConnectionManager,
     ConnectionRole,
     ConnectionSpec,
     LoginIdentity,
     ManagedConnection,
-    MarketSession,
-    OpenedConnection,
-    SocketLike,
 )
+from .connection_manager import ConnectionManager, OpenedConnection
+from .session import MarketSession, SocketLike
 
 __all__ = [
     "CONNECTION_SPECS",

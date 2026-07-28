@@ -1,0 +1,227 @@
+"""Wire and parser contracts for stock-list ranking pages."""
+
+import hashlib
+import struct
+from pathlib import Path
+
+import pytest
+
+import thspypc.protocol as protocol
+from thspypc.features import stock_list_protocol
+from thspypc.features.stock_list_protocol import (
+    build_init_query,
+    build_stock_list_query,
+    parse_init_response,
+    parse_stock_list_replay,
+    parse_stock_list_response,
+)
+
+
+def _hd10_page(records, *, total=None, begin=0):
+    rows = b"".join(
+        b"\x00\x00\x00\x00"
+        + bytes([market])
+        + code.encode("ascii")
+        for market, code in records
+    )
+    fields = b"\x05\x00\x00\x07\xc8\x00\x00\x04"
+    hd10 = (
+        b"hd1.0\x00"
+        + struct.pack("<HHHHH", len(records), 0x0100, 0, 11, 2)
+        + fields
+        + rows
+    )
+    count = len(records)
+    if total is None:
+        total = count
+    metadata = (
+        f"SortTotal={total}\r\n"
+        f"SortBegin={begin}\r\n"
+        f"SortCount={count}\r\n"
+        f"SortDataCount={count}\r\n"
+    ).encode("ascii")
+    return metadata + hd10
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_sha"),
+    [
+        (
+            {},
+            "624431fd537d380f26d787429f47268c623c930fe73881905fbae898c2471fb9",
+        ),
+        (
+            {"sort_begin": 1361},
+            "195e8cf799462445bbf6fb8fed328caf5b709167b05ccb940eeb7cbc574ca5e5",
+        ),
+        (
+            {
+                "sort_count": 20,
+                "datatype": [48],
+                "sort_by": 48,
+                "sort_dir": "A",
+                "seq": 9,
+            },
+            "c21230f41e4d1108be274144654e3e9796d88d2f73ac6180510a4dbafb012b42",
+        ),
+    ],
+)
+def test_stock_list_builder_wire_contract(kwargs, expected_sha):
+    request = build_stock_list_query(**kwargs)
+
+    assert hashlib.sha256(request).hexdigest() == expected_sha
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_sha"),
+    [
+        (
+            {},
+            "760450e14e8d0c040c54c51d8890e9e2647f40948e58b03aeed2e553c1ba842b",
+        ),
+        (
+            {
+                "config_ver": "20260728",
+                "market_code": "16;32;",
+                "c_modules": "MEQT;X",
+                "seq": 7,
+            },
+            "93116a17e865f01d1ec712ca2a4ccafbbfaeae7532dc1fa2ee2f1f7ca272ea5e",
+        ),
+    ],
+)
+def test_init_builder_wire_contract(kwargs, expected_sha):
+    request = build_init_query(**kwargs)
+
+    assert hashlib.sha256(request).hexdigest() == expected_sha
+
+
+def test_hd10_page_parser_preserves_market_and_metadata():
+    body = _hd10_page(
+        [(17, "600519"), (33, "000001")],
+        total=5210,
+        begin=59,
+    )
+
+    result = parse_stock_list_response(body)
+
+    assert result["sort_total"] == 5210
+    assert result["sort_begin"] == 59
+    assert result["sort_count"] == 2
+    assert result["sort_data_count"] == 2
+    assert result["stocks"] == [
+        {"code": "600519", "name": "", "market": 17},
+        {"code": "000001", "name": "", "market": 33},
+    ]
+
+
+def test_captured_hd31_page_matches_known_codes():
+    path = (
+        Path(__file__).parents[1]
+        / "captures_live"
+        / "list_quote_fields_20260723_232604_resp_stream0.bin"
+    )
+    if not path.exists():
+        pytest.skip("optional captured stock-list stream is unavailable")
+    stream = path.read_bytes()
+    body_size = int(stream[4:12], 16)
+    body = stream[12 : 12 + body_size]
+
+    result = parse_stock_list_response(body)
+
+    assert result["sort_total"] == 5210
+    assert result["sort_data_count"] == 59
+    assert len(result["stocks"]) == 59
+    assert [item["code"] for item in result["stocks"][:3]] == [
+        "300062",
+        "301587",
+        "301292",
+    ]
+
+
+def test_captured_init_table_decodes_full_stock_list():
+    path = (
+        Path(__file__).parents[1]
+        / "captures_live"
+        / "list_quote_fields_20260723_203100_resp_stream0.bin"
+    )
+    if not path.exists():
+        pytest.skip("optional captured init stock table is unavailable")
+    stream = path.read_bytes()
+    frame_offset = 38752
+    body_size = int(stream[frame_offset + 4 : frame_offset + 12], 16)
+    body = stream[
+        frame_offset + 12 : frame_offset + 12 + body_size
+    ]
+
+    result = parse_init_response(body)
+
+    assert result["hd31_frames"] == [
+        {"pos": 222, "dc": 7479, "unk": 0x18, "hs": 71, "fc": 2}
+    ]
+    assert len(result["stocks"]) == 7479
+    assert [item["code"] for item in result["stocks"][:3]] == [
+        "1B0853",
+        "1B0863",
+        "600000",
+    ]
+    assert [item["code"] for item in result["stocks"][-3:]] == [
+        "920982",
+        "920985",
+        "920992",
+    ]
+
+
+def test_replay_resource_has_four_complete_segments():
+    path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "thspypc"
+        / "data"
+        / "stock_list_replay.bin"
+    )
+    data = path.read_bytes()
+
+    segments = parse_stock_list_replay(data)
+
+    assert hashlib.sha256(data).hexdigest() == (
+        "b3ee3dd166a1d8aad86ddd076c9e45a5c4ec35ef6283736f3f04f057e0714b5f"
+    )
+    assert [len(segment) for segment in segments] == [
+        10690,
+        5468,
+        8223,
+        2839,
+    ]
+    assert all(segment.startswith(b"\xfd\xfd\xfd\xfd") for segment in segments)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"\x00\x00\x00\x00",
+        b"\x01\x00\x00\x00",
+        b"\x01\x00\x00\x00\x05\x00\x00\x00abc",
+        b"\x01\x00\x00\x00\x01\x00\x00\x00ab",
+    ],
+)
+def test_replay_parser_rejects_invalid_container(data):
+    with pytest.raises(ValueError, match="stock-list replay"):
+        parse_stock_list_replay(data)
+
+
+def test_protocol_facade_reexports_single_implementation():
+    assert (
+        protocol.build_stock_list_query
+        is stock_list_protocol.build_stock_list_query
+    )
+    assert (
+        protocol.parse_stock_list_response
+        is stock_list_protocol.parse_stock_list_response
+    )
+    assert protocol.build_init_query is stock_list_protocol.build_init_query
+    assert (
+        protocol.parse_init_response
+        is stock_list_protocol.parse_init_response
+    )

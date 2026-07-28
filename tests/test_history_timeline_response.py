@@ -14,6 +14,8 @@ from thspypc.protocol import (
     parse_history_timeline_response,
     timeline_bar_to_date,
 )
+import thspypc.protocol as protocol
+from thspypc.features import history_timeline_protocol
 
 
 FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
@@ -81,6 +83,21 @@ def test_history_timeline_date_encoding_matches_thsdk_business_date():
     assert date_to_timeline_bar("2026-05-13") == 132_475_486
     assert date_to_timeline_bar("2026-05-14") == 132_477_534
     assert timeline_bar_to_date(132_477_534).date().isoformat() == "2026-05-14"
+
+
+def test_protocol_reexports_history_timeline_implementations():
+    assert (
+        protocol.build_history_timeline_query
+        is history_timeline_protocol.build_history_timeline_query
+    )
+    assert (
+        protocol.parse_history_timeline_response
+        is history_timeline_protocol.parse_history_timeline_response
+    )
+    assert (
+        protocol.date_to_timeline_bar
+        is history_timeline_protocol.date_to_timeline_bar
+    )
 
 
 def test_stock_history_query_matches_captured_three_part_request():

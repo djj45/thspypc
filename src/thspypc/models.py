@@ -5,7 +5,91 @@
 """
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
+from typing import Literal, Mapping, TypedDict
+
+
+class AccountKind(str, Enum):
+    """Coarse account classification; feature routing uses capabilities."""
+
+    STANDARD = "standard"
+    LEVEL2 = "level2"
+    UNKNOWN = "unknown"
+
+
+class Capability(str, Enum):
+    """Granular permissions used when selecting request plans."""
+
+    BASIC_QUOTE = "basic_quote"
+    BASIC_TIMELINE = "basic_timeline"
+    L2_MARKET_ACCESS = "l2_market_access"
+    L2_TIMELINE = "l2_timeline"
+    L2_AUCTION = "l2_auction"
+    L2_SNAPSHOT_PUSH = "l2_snapshot_push"
+    L2_HISTORY_TIMELINE = "l2_history_timeline"
+    REALORDER = "realorder"
+
+
+class Support(str, Enum):
+    """Tri-state capability evidence."""
+
+    YES = "yes"
+    NO = "no"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class AccountEvidence:
+    """Independent, auditable observations used to build an account profile."""
+
+    main_market_access: Support = Support.UNKNOWN
+    l2_entitlement: Support = Support.UNKNOWN
+    manual_login: Support = Support.UNKNOWN
+    l2_market_init: Support = Support.UNKNOWN
+    l2_timeline: Support = Support.UNKNOWN
+    l2_auction: Support = Support.UNKNOWN
+    l2_snapshot_push: Support = Support.UNKNOWN
+    l2_history_timeline: Support = Support.UNKNOWN
+    realorder: Support = Support.UNKNOWN
+    passport_fields: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "passport_fields",
+            MappingProxyType(dict(self.passport_fields)),
+        )
+
+
+@dataclass(frozen=True)
+class AccountProfile:
+    """Account capabilities derived from explicit, separately stored evidence."""
+
+    kind: AccountKind = AccountKind.UNKNOWN
+    capabilities: Mapping[Capability, Support] = field(default_factory=dict)
+    passport_fields: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "capabilities",
+            MappingProxyType(dict(self.capabilities)),
+        )
+        object.__setattr__(
+            self,
+            "passport_fields",
+            MappingProxyType(dict(self.passport_fields)),
+        )
+
+    def support(self, capability: Capability) -> Support:
+        """Return explicit support evidence, defaulting to ``UNKNOWN``."""
+        return self.capabilities.get(capability, Support.UNKNOWN)
+
+    def supports(self, capability: Capability) -> bool:
+        """Return whether a capability is explicitly supported."""
+        return self.support(capability) is Support.YES
 
 
 class DepthLevel(TypedDict):
