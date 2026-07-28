@@ -430,9 +430,10 @@ records = client.auction("603118", trade_date=date(2026, 7, 27))
 外层算法移植自 hexin.exe RVA `0xf74260`（Unicorn 模拟逐字节对照纯 Python），
 详见 `HANDOFF_SUPERORDER_20260726.md` 第十七~二十章。
 
-深市响应同样有 `cmd=0x0a` 外层压缩，但内层结构与沪市差异较大（响应含全天
-分时数据、dc 字段编码不同），当前深市竞价解析不完整，详见
-`HANDOFF_SUPERORDER_20260726.md` §20.6。
+深市响应格式与沪市**完全一致**（`cmd=0x0a` 外层压缩 + hd1.0 定长内层），盘中
+请求五字段解析 100% 通过（000938/000001 经 thsdk oracle 验证）。仅**盘后查
+历史竞价**时服务器会返回含全天分时的特殊帧，需单独处理（边缘场景，详见
+`HANDOFF_SUPERORDER_20260726.md` §21）。
 
 ## 安装
 with THSClient("账号", "密码") as client:

@@ -178,3 +178,70 @@ def test_auction_dt27_dt33_match_thsdk_buy2_sell2():
     # 允许少量 ±1~2 秒错位；六股实测最差 603118 也 > 95% 匹配
     assert compared > 100, "对照样本不足"
     assert matched / compared > 0.95, f"dt27/dt33 与 buy2/sell2 匹配率过低: {matched}/{compared}"
+
+
+def test_shenzhen_auction_decodes_five_fields():
+    """深市竞价盘中响应与沪市同格式（cmd=0x0a + hd1.0 定长），五字段全部正确。
+
+    7-28 盘中 × thsdk oracle 验证：000938 价/量/买/卖 全部 68/68 精确匹配。
+    注意：盘后查历史会返回含全天分时的特殊帧（dc 编码不同），本测试用盘中帧。
+    """
+    import bisect
+    import json
+
+    capture_dir = Path(__file__).resolve().parents[1] / "captures_live"
+    code = "000938"
+    # 选最小的（盘中帧 ~1.4KB，盘后历史帧 ~62KB）
+    raw_paths = [p for p in sorted(capture_dir.glob(f"auction_raw_{code}_20260728_*.bin"))
+                 if p.stat().st_size < 10000]
+    oracle_paths = sorted(capture_dir.glob(f"_thsdk_auction_USZA{code}_*.json"))
+    if not raw_paths or not oracle_paths:
+        pytest.skip("本机没有 000938 的 7-28 盘中 raw + thsdk oracle 语料")
+
+    records = parse_auction_response(raw_paths[0].read_bytes())
+    assert len(records) == 68, f"深市 000938 盘中应有 68 条，实际 {len(records)}"
+    assert set(records[0]) == {"time", "dt10", "dt49", "dt27", "dt33"}
+
+    # 五字段对照 thsdk oracle
+    oracle = {}
+    for row in json.loads(oracle_paths[-1].read_text(encoding="utf-8"))["data"]:
+        values = list(row.values())
+        oracle[int(values[0])] = {
+            "price": float(values[1]),
+            "vol": int(values[-1]),
+            "buy2": int(values[2]),
+            "sell2": int(values[3]),
+        }
+    oracle_ts = sorted(oracle)
+    sentinel = 0x80000000
+
+    price_ok = vol_ok = buy_ok = sell_ok = compared = 0
+    for rec in records:
+        t = rec.get("time")
+        if t is None:
+            continue
+        ts = int(t.timestamp())
+        idx = bisect.bisect_left(oracle_ts, ts)
+        candidates = oracle_ts[max(0, idx - 1):idx + 2]
+        if not candidates:
+            continue
+        nearest = min(candidates, key=lambda x: abs(x - ts))
+        if abs(nearest - ts) > 3:
+            continue
+        o = oracle[nearest]
+        buy2 = 0 if o["buy2"] == sentinel else o["buy2"]
+        sell2 = 0 if o["sell2"] == sentinel else o["sell2"]
+        compared += 1
+        if abs(rec["dt10"] - o["price"]) < 0.005:
+            price_ok += 1
+        if abs(rec["dt49"] - o["vol"]) < 1:
+            vol_ok += 1
+        if abs((rec["dt27"] or 0) - buy2) < 1:
+            buy_ok += 1
+        if abs((rec["dt33"] or 0) - sell2) < 1:
+            sell_ok += 1
+
+    assert compared > 50, "对照样本不足"
+    # 深市 7-28 实测四字段全部 68/68
+    assert price_ok == compared, f"深市价匹配 {price_ok}/{compared}"
+    assert vol_ok == compared, f"深市量匹配 {vol_ok}/{compared}"
