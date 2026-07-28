@@ -1,7 +1,7 @@
 [project]
 name = "thspypc"
 version = "0.1.0"
-description = "同花顺 Windows PC 远航版行情协议纯 Python 实现（8901 端口登录）"
+description = "同花顺 Windows PC 免费版行情协议纯 Python 实现（8901 端口登录）"
 readme = "README.md"
 authors = [
     { name = "djj45", email = "djj45djj46@gmail.com" }
@@ -15,6 +15,9 @@ dependencies = [
 [project.optional-dependencies]
 qr = [
     "qrcode>=7.0",
+]
+dev = [
+    "pytest>=8.0",
 ]
 
 [build-system]

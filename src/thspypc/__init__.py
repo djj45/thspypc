@@ -1,8 +1,7 @@
 """
 thspypc — 同花顺 Windows PC 免费版行情协议纯 Python 实现。
 
-第一版：仅登录打通（HTTP 鉴权 → 8901 TCP login → VerifyCode 验证）。
-后续按需扩展行情查询。
+提供登录、行情列表、K线、分时、竞价、五档盘口、异动与板块管理等能力。
 
 设备指纹（Mac64 / imei）均已逆向，完全本地自动生成，脱离抓包运行。
 
@@ -15,6 +14,7 @@ thspypc — 同花顺 Windows PC 免费版行情协议纯 Python 实现。
         print("登录成功" if result.success else f"失败: {result.error}")
 """
 from .client import THSClient, LoginResult
+from .models import DepthLevel, DepthQuote
 from .client import (
     market_from_code,
     default_stock_cache_path,
@@ -33,6 +33,8 @@ from .protocol import (
     generate_imei, generate_mac64,
     # 行情查询（个股列表）
     build_list_quote_query, parse_hd1_response, parse_hd3_response, decode_ths_float,
+    # 五档盘口
+    build_depth_quote_query, parse_depth_quote_response, DEPTH_QUOTE_DATATYPE,
     # K线（hd3.1 变体，flag=0x0042/0x0046）
     parse_kline_hd3_response, build_kline_query, KLINE_DATATYPE,
     KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
@@ -68,7 +70,7 @@ from .parse_hfd1 import parse_hfd1_response
 
 __version__ = "0.1.0"
 __all__ = [
-    "THSClient", "LoginResult",
+    "THSClient", "LoginResult", "DepthLevel", "DepthQuote",
     "market_from_code", "default_stock_cache_path",
     "save_stock_codes", "load_stock_codes", "is_stock_cache_expired",
     "MARKET_HOSTS", "MARKET_PORT", "C_VERSION_PC", "LIST_QUOTE_DATATYPE_DEFAULT",
@@ -78,6 +80,7 @@ __all__ = [
     "build_login_body_pc", "build_manual_login_body", "parse_login_response", "parse_passport_fields",
     "generate_imei", "generate_mac64",
     "build_list_quote_query", "parse_hd1_response", "parse_hd3_response", "decode_ths_float",
+    "build_depth_quote_query", "parse_depth_quote_response", "DEPTH_QUOTE_DATATYPE",
     "parse_kline_hd3_response", "build_kline_query", "KLINE_DATATYPE",
     "KLINE_PERIOD_DAY", "KLINE_PERIOD_WEEK", "KLINE_PERIOD_MONTH",
     "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN", "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",

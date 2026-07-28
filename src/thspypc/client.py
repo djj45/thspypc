@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 
 from . import protocol
+from .models import DepthQuote
+from .transport import MarketSession
 from .protocol import (
     LIST_QUOTE_DATATYPE_DEFAULT,
     MARKET_HOSTS,
@@ -27,6 +29,7 @@ from .protocol import (
     build_init_query,
     build_kline_query,
     build_list_quote_query,
+    build_depth_quote_query,
     build_login_body_pc,
     build_passport64,
     build_qurealorder_query,
@@ -45,6 +48,7 @@ from .protocol import (
     KLINE_PERIOD_60MIN, KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
     parse_hd1_response,
     parse_hd3_response,
+    parse_depth_quote_response,
     parse_kline_hd3_response,
     parse_history_timeline_response,
     parse_init_response,
@@ -117,7 +121,11 @@ class THSClient:
         # 心跳（后台线程，connect 成功后自动启动）
         self._heartbeat_thread: threading.Thread | None = None
         self._heartbeat_stop = threading.Event()
-        self._sock_lock = threading.Lock()              # 保护 8901 socket send
+        # 8901 没有可直接关联请求/响应的 request id，必须串行化完整请求生命周期。
+        # 保留 _sock_lock 名称兼容已有诊断脚本；语义从“只保护 send”升级为
+        # “保护 send + 全部响应读取”。RLock 允许连接治理代码在同线程内复用。
+        self._sock_lock = threading.RLock()
+        self._market_session = MarketSession(lambda: self._sock, self._sock_lock)
         self._realorder_lock = threading.Lock()         # 保护 9601 socket send
         self._hb_seq_8901 = 0
         self._hb_seq_9601 = 0
@@ -806,38 +814,96 @@ class THSClient:
 
         frame = build_list_quote_query(codes, market=market, datatype=datatype,
                                        pageid=pageid)
-        self._sock.settimeout(timeout)
         # 每帧后跟 b"\n"（2026-07-17 实时抓包确认：hexin 每个帧 trailing 都是 0a，
         # login/行情/心跳帧无一例外；不加 \n 服务器不响应）。
-        # sendall 加锁，避免与心跳线程交错。
-        with self._sock_lock:
-            if self._sock:
-                self._sock.sendall(frame + b"\n")
-
-        # 循环读帧，跳过 CodeListSize/MarketTime 等文本帧，取首个 hd 数据帧。
-        # 最多读 8 帧避免无限等待（8901 通常 1-3 帧内出数据）。
-        for _ in range(8):
-            resp = read_frame(self._sock)
-            if b"hd3.1\x00" in resp:
-                recs = parse_hd3_response(resp)
-                if recs:
-                    return recs
-                # hd3.1 标记在但解析失败（非 BitRLE 变体）→ 继续读下一帧
-                logger.warning("收到 hd3.1 帧但解析为空（可能非 BitRLE 变体），"
-                               "原始头 24B: %s", resp[:24].hex(" "))
-                continue
-            if b"hd1.0" in resp:
-                recs = parse_hd1_response(resp)
-                if recs:
-                    return recs
-                logger.warning("收到 hd1.0 帧但解析为空，原始头 24B: %s",
-                               resp[:24].hex(" "))
-                continue
-            # 文本帧（CodeListSize= 等），跳过
-            logger.debug("跳过非数据帧: %s",
-                         resp[:40].decode("gbk", errors="replace")[:40])
+        # MarketSession 持有完整请求锁，避免其他查询或心跳在响应读取期间插入帧。
+        with self._market_session.request(frame, timeout=timeout) as sock:
+            # 循环读帧，跳过 CodeListSize/MarketTime 等文本帧，取首个 hd 数据帧。
+            # 最多读 8 帧避免无限等待（8901 通常 1-3 帧内出数据）。
+            for _ in range(8):
+                resp = read_frame(sock)
+                if b"hd3.1\x00" in resp:
+                    recs = parse_hd3_response(resp)
+                    if recs:
+                        return recs
+                    # hd3.1 标记在但解析失败（非 BitRLE 变体）→ 继续读下一帧
+                    logger.warning("收到 hd3.1 帧但解析为空（可能非 BitRLE 变体），"
+                                   "原始头 24B: %s", resp[:24].hex(" "))
+                    continue
+                if b"hd1.0" in resp:
+                    recs = parse_hd1_response(resp)
+                    if recs:
+                        return recs
+                    logger.warning("收到 hd1.0 帧但解析为空，原始头 24B: %s",
+                                   resp[:24].hex(" "))
+                    continue
+                # 文本帧（CodeListSize= 等），跳过
+                logger.debug("跳过非数据帧: %s",
+                             resp[:40].decode("gbk", errors="replace")[:40])
         logger.warning("list_quotes: 8 帧内未找到 hd 数据帧")
         return []
+
+    def depth_quote(
+        self,
+        code: str,
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 2,
+    ) -> DepthQuote:
+        """查询个股五档买卖盘及涨跌停封单额。
+
+        当前协议字段覆盖买卖各五档，并非 Level2 十档。盘后服务器仍会返回最后
+        一份盘口快照。返回值包含 ``buy``、``sell``、``seal_amount``、
+        ``seal_type`` 和原始 ``fields``；无盘口数据时返回空字典。
+
+        Args:
+            code: 六位股票代码。
+            market: 0=按代码推断，17=沪市，33=深市。
+            timeout: 单次响应读取超时（秒）。
+            retries: 连接异常后的重试次数。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        last_err = ""
+        for attempt in range(retries + 1):
+            if not self.is_connected:
+                logger.info("depth_quote: 连接不可用，connect（attempt %d/%d）",
+                            attempt + 1, retries)
+                lr = self.connect()
+                if not lr.success:
+                    last_err = f"connect 失败: {lr.error}"
+                    continue
+            try:
+                return self._depth_quote_once(code, market, timeout)
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("depth_quote %s 失败（attempt %d）: %s",
+                               code, attempt + 1, last_err)
+                self._drop_connection()
+        raise RuntimeError(f"depth_quote {code} 重试 {retries} 次仍失败: {last_err}")
+
+    def _depth_quote_once(self, code: str, market: int, timeout: float) -> DepthQuote:
+        """在当前 8901 连接上完成一次五档盘口请求。"""
+        if self._sock is None:
+            raise RuntimeError("未登录")
+        frame = build_depth_quote_query(code, market=market)
+        with self._market_session.request(frame, timeout=timeout) as sock:
+            for _ in range(8):
+                try:
+                    resp = read_frame(sock)
+                except ValueError:
+                    logger.debug("depth_quote: read_frame magic 错位，丢弃一段重试")
+                    try:
+                        sock.recv(8192)
+                    except OSError:
+                        raise ConnectionError("连接已关闭")
+                    continue
+                result = parse_depth_quote_response(resp)
+                if result:
+                    return result
+                logger.debug("depth_quote: 跳过非盘口帧 %dB", len(resp))
+        logger.warning("depth_quote: 8 帧内未找到五档盘口数据帧")
+        return {}
 
     # K线周期名 → 周期码（kline/timeline 方法共用）
     _KLINE_PERIOD_CODES = {
@@ -945,56 +1011,45 @@ class THSClient:
             raise RuntimeError("未登录")
         frame = build_kline_query(code, market=market, period=period,
                                   fuquan=fuquan, count=count)
-        self._sock.settimeout(timeout)
-        with self._sock_lock:
-            if not self._sock:
-                raise ConnectionError("连接已关闭")
-            self._sock.sendall(frame + b"\n")
-        # 循环读帧，跳过文本/ACK 帧，累积所有 hd3.1 K线数据帧（响应可能分多帧）。
-        # 旧实现只取首个 hd3.1 帧，当服务器把大盘 K线分帧返回时会截断（实测 day
-        # 偶发只拿 121/336 根）。改为累积合并：读到首个数据帧后继续读，把同批
-        # hd3.1 帧的记录全部合并，直到读到非 hd3.1 帧（如下个请求的 ACK）或超时。
-        all_recs: list[dict] = []
-        got_data = False
-        for _ in range(16):
-            try:
-                resp = read_frame(self._sock)
-            except socket.timeout:
-                if got_data:
-                    break  # 已拿到数据，后续无更多帧，正常结束
-                raise  # 没拿到任何数据，向上抛 timeout 触发重试
-            except ValueError:
-                # read_frame magic 对齐失败（半帧/推送帧错位），丢一段继续找下个帧边界
-                logger.debug("kline: read_frame magic 错位，丢弃一段重试")
+        with self._market_session.request(frame, timeout=timeout) as sock:
+            # 循环读帧，跳过文本/ACK 帧，累积所有 hd3.1 K线数据帧（响应可能分多帧）。
+            # 旧实现只取首个 hd3.1 帧，当服务器把大盘 K线分帧返回时会截断（实测 day
+            # 偶发只拿 121/336 根）。改为累积合并：读到首个数据帧后继续读，把同批
+            # hd3.1 帧的记录全部合并，直到读到非 hd3.1 帧（如下个请求的 ACK）或超时。
+            all_recs: list[dict] = []
+            got_data = False
+            for _ in range(16):
                 try:
-                    self._sock.recv(8192)
-                except OSError:
-                    raise ConnectionError("连接已关闭")
+                    resp = read_frame(sock)
+                except socket.timeout:
+                    if got_data:
+                        break  # 已拿到数据，后续无更多帧，正常结束
+                    raise  # 没拿到任何数据，向上抛 timeout 触发重试
+                except ValueError:
+                    # read_frame magic 对齐失败（半帧/推送帧错位），丢一段继续找下个帧边界
+                    logger.debug("kline: read_frame magic 错位，丢弃一段重试")
+                    try:
+                        sock.recv(8192)
+                    except OSError:
+                        raise ConnectionError("连接已关闭")
+                    if got_data:
+                        # 已有数据，排空后停止（避免残留污染下次请求）
+                        break
+                    continue
+                if b"hd3.1\x00" in resp:
+                    recs = parse_kline_hd3_response(resp)
+                    if recs:
+                        all_recs.extend(recs)
+                        got_data = True
+                        # 已拿到首帧数据，缩短超时快速确认有无后续帧（避免等满 timeout）
+                        sock.settimeout(2.0)
+                        continue  # 继续读，可能还有后续帧
+                    logger.debug("kline: 收到 hd3.1 但解析为空，继续读")
+                    continue
                 if got_data:
-                    # 已有数据，排空后停止（避免残留污染下次请求）
+                    # 已拿到数据，这帧是下个请求的 ACK/文本帧，停止累积
                     break
-                continue
-                # read_frame magic 对齐失败（半帧/推送帧错位），丢一段继续找下个帧边界
-                logger.debug("kline: read_frame magic 错位，丢弃一段重试")
-                try:
-                    self._sock.recv(8192)
-                except OSError:
-                    raise ConnectionError("连接已关闭")
-                continue
-            if b"hd3.1\x00" in resp:
-                recs = parse_kline_hd3_response(resp)
-                if recs:
-                    all_recs.extend(recs)
-                    got_data = True
-                    # 已拿到首帧数据，缩短超时快速确认有无后续帧（避免等满 timeout）
-                    self._sock.settimeout(2.0)
-                    continue  # 继续读，可能还有后续帧
-                logger.debug("kline: 收到 hd3.1 但解析为空，继续读")
-                continue
-            if got_data:
-                # 已拿到数据，这帧是下个请求的 ACK/文本帧，停止累积
-                break
-            logger.debug("kline: 跳过非数据帧 %dB", len(resp))
+                logger.debug("kline: 跳过非数据帧 %dB", len(resp))
         if all_recs:
             return all_recs
         logger.warning("kline: 未找到 hd3.1 K线数据帧")
@@ -1361,35 +1416,31 @@ class THSClient:
         if self._sock is None:
             raise RuntimeError("未登录")
         frame = build_history_timeline_query(code, date=date, market=market)
-        self._sock.settimeout(timeout)
-        with self._sock_lock:
-            if not self._sock:
-                raise ConnectionError("连接已关闭")
-            self._sock.sendall(frame + b"\n")
-        # 循环读帧，跳过文本/ACK 帧，取首个 hd1.0 历史分时数据帧
-        for _ in range(8):
-            try:
-                resp = read_frame(self._sock)
-            except ValueError:
-                logger.debug("history_timeline: read_frame magic 错位，丢弃一段重试")
+        with self._market_session.request(frame, timeout=timeout) as sock:
+            # 循环读帧，跳过文本/ACK 帧，取首个 hd1.0 历史分时数据帧
+            for _ in range(8):
                 try:
-                    self._sock.recv(8192)
-                except OSError:
-                    raise ConnectionError("连接已关闭")
-                continue
-            if b"hd1.0" in resp:
-                recs = parse_history_timeline_response(resp)
-                if recs:
-                    return recs
-                logger.debug("history_timeline: 收到 hd1.0 但解析为空（可能 level2 变长帧），继续读")
-                continue
-            if b"hd3.1\x00" in resp:
-                # 部分响应走 hd3.1 变体，复用 kline 解码尝试
-                recs = parse_kline_hd3_response(resp)
-                if recs:
-                    return recs
-                continue
-            logger.debug("history_timeline: 跳过非数据帧 %dB", len(resp))
+                    resp = read_frame(sock)
+                except ValueError:
+                    logger.debug("history_timeline: read_frame magic 错位，丢弃一段重试")
+                    try:
+                        sock.recv(8192)
+                    except OSError:
+                        raise ConnectionError("连接已关闭")
+                    continue
+                if b"hd1.0" in resp:
+                    recs = parse_history_timeline_response(resp)
+                    if recs:
+                        return recs
+                    logger.debug("history_timeline: 收到 hd1.0 但解析为空（可能 level2 变长帧），继续读")
+                    continue
+                if b"hd3.1\x00" in resp:
+                    # 部分响应走 hd3.1 变体，复用 kline 解码尝试
+                    recs = parse_kline_hd3_response(resp)
+                    if recs:
+                        return recs
+                    continue
+                logger.debug("history_timeline: 跳过非数据帧 %dB", len(resp))
         logger.warning("history_timeline: 8 帧内未找到历史分时数据帧")
         return []
 
@@ -2565,9 +2616,11 @@ class THSClient:
             if self._sock:
                 try:
                     self._hb_seq_8901 += 1
-                    with self._sock_lock:
-                        if self._sock:
-                            self._sock.sendall(build_heartbeat_8901(self._hb_seq_8901) + b"\n")
+                    sent = self._market_session.try_send(
+                        build_heartbeat_8901(self._hb_seq_8901)
+                    )
+                    if not sent:
+                        logger.debug("8901 连接正在处理业务请求，跳过本轮心跳")
                 except OSError as e:
                     logger.debug("8901 心跳发送失败（不影响查询）: %s", e)
             # 9601 心跳（每 30 秒 = 每 10 个 tick）

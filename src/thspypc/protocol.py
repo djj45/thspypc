@@ -21,6 +21,8 @@ import time
 import urllib.parse
 from datetime import datetime
 
+from .models import DepthLevel, DepthQuote
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -2288,7 +2290,7 @@ def build_depth_quote_query(
     return encode_frame(body)
 
 
-def parse_depth_quote_response(body: bytes) -> dict:
+def parse_depth_quote_response(body: bytes) -> DepthQuote:
     """解析个股五档盘口响应，返回五档买卖盘 + 封单额（涨停/跌停自动判断）。
 
     响应是 hd1.0 单股帧（dc=1），字段表含 dt24（买一价）。本函数定位该帧、
@@ -2348,8 +2350,8 @@ def parse_depth_quote_response(body: bytes) -> dict:
             rec[f"dt{dt}"] = decode_ths_float(struct.unpack("<I", chunk)[0])
 
     # 组装五档买卖盘
-    def build_levels(level_fields):
-        out = []
+    def build_levels(level_fields) -> list[DepthLevel]:
+        out: list[DepthLevel] = []
         for level, pk, qk in level_fields:
             p = rec.get(f"dt{pk}")
             q = rec.get(f"dt{qk}")

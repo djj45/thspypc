@@ -18,6 +18,8 @@
 - **个股列表行情查询**（`list_quotes`）：hd1.0/hd3.1 响应解析，纯 Python 移植
   hexin.exe 真实机器码（BitRLE 解码 + 位平面转置），无 unicorn 依赖。实测解出
   600056 等股票的 现价/昨收/开盘/涨幅/竞价金额
+- **个股五档盘口**（`depth_quote`）：买卖各五档价格/挂单量、档位金额以及
+  涨跌停封单额。注意当前是五档快照，不是 Level2 十档。
 - **全市场股票列表**（`stock_list`）：重放 hexin 启动序列，~6 秒拿全市场 7400+ 代码
   全部代码（约7500+条），hd3.1 BitRLE 解码，自动翻页
 - **热门股排序查询**（`stock_list_hot`）：DataType=199112 排序查询（同花顺打开 A 股
@@ -172,6 +174,24 @@ with THSClient("账号", "密码") as client:
 | 1111 | dt87 | 日期 + 小数 |
 
 > 封单额/首次涨停时间/主力净额 → 从推送帧本地计算，不走列表请求。
+
+## 个股五档盘口（`depth_quote`）
+
+`depth_quote` 复用登录后的 8901 长连接，自动按代码推断沪深市场。盘后仍可取
+服务器保存的最后一份盘口快照：
+
+```python
+with THSClient("账号", "密码") as client:
+    client.connect()
+    depth = client.depth_quote("600519")
+    for level in depth.get("buy", []):
+        print(level["level"], level["price"], level["qty"], level["amount"])
+    print("封单类型:", depth.get("seal_type"))
+    print("封单额:", depth.get("seal_amount"))
+```
+
+返回的 `buy`/`sell` 各包含最多五档。`seal_amount` 单位为元；正常交易状态为
+`0.0`，涨停或跌停时分别按买一或卖一的价格与挂单量计算。
 
 ## 全市场股票列表（`stock_list`）
 
@@ -429,6 +449,9 @@ records = client.auction("603118", trade_date=date(2026, 7, 27))
 早期会话曾把外层压缩的字典引用表象误判为"内层参数化变长编码"，走了大量弯路。
 外层算法移植自 hexin.exe RVA `0xf74260`（Unicorn 模拟逐字节对照纯 Python），
 详见 `HANDOFF_SUPERORDER_20260726.md` 第十七~二十章。
+后续逆向建议先阅读[同花顺协议逆向方法论与实战复盘](docs/THS_REVERSE_ENGINEERING_PLAYBOOK.md)，
+其中总结了本次分层判定、语料设计、DMP 加载映像重建、Unicorn 原生 oracle 和
+回归验收方法。
 
 深市响应格式与沪市**完全一致**（`cmd=0x0a` 外层压缩 + hd1.0 定长内层），盘中
 请求五字段解析 100% 通过（000938/000001 经 thsdk oracle 验证）。仅**盘后查
