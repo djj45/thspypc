@@ -1369,9 +1369,11 @@ class THSClient:
         **与当日分时的区别**：历史分时用独立的 pageid=4417 协议，DataType 含 level2
         大单字段（201-230），对应 hexin 分时图的「大单金额」第二条曲线。
 
-        ⚠ **响应解码当前仅支持定长帧**（指数 1A0002 类，dc=0x040000f2 hs=88 fc=22）。
-        个股 level2 变长帧（如紫光 000938，记录 93/94 字节交替）的逐点解码待后续
-        优化——但请求能正确发出并拿到响应，服务器返回的原始帧可用于离线分析。
+        响应若为 ``cmd=0x0a`` 会先解开 8901 字典压缩；指数和个股块再按 241 点
+        ``bar_index`` 序列锚定。服务器偶发返回连 bar 高位也省略的强状态变体，
+        解析器会拒绝错位数据。本方法当前仍是实验接口：请求发送沿用主行情连接，
+        尚未迁移到已实测成功的 ``__manual + 对应市场 L2 服务器 + init`` 通道。
+        ``retries`` 只方便收集不同响应变体，不能代替完整状态机解码。
 
         Args:
             code: 股票代码（如 ``"000938"``；指数用 ``"1A0002"``）。
@@ -1385,7 +1387,8 @@ class THSClient:
         Returns:
             记录列表，每条 ``{bar_index, dt10, dt13, dt19, dt22, dt23, ...}``。
             dt10=现价、dt13=成交量、dt19=成交额、dt201-230=level2 大单金额。
-            定长帧（指数）可正确解出；变长 level2 帧（个股）当前可能返回空或部分。
+            指数和完整锚点型个股帧均可解；服务器确实缺少某个 bar 时保留其余有效点，
+            不凭空补值。
 
         Raises:
             RuntimeError: 重试 ``retries`` 次后仍失败。
@@ -1402,7 +1405,14 @@ class THSClient:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
-                return self._history_timeline_once(code, date, market, timeout)
+                records = self._history_timeline_once(code, date, market, timeout)
+                if records:
+                    return records
+                last_err = "收到强状态省略帧或未找到历史分时数据"
+                logger.info(
+                    "history_timeline %s %s 未获得可验证变体，重请求（attempt %d/%d）",
+                    code, date, attempt + 1, retries + 1,
+                )
             except (ConnectionError, OSError, TimeoutError) as e:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
@@ -1417,7 +1427,8 @@ class THSClient:
             raise RuntimeError("未登录")
         frame = build_history_timeline_query(code, date=date, market=market)
         with self._market_session.request(frame, timeout=timeout) as sock:
-            # 循环读帧，跳过文本/ACK 帧，取首个 hd1.0 历史分时数据帧
+            # 循环读帧，跳过文本/ACK 帧。cmd=0x0a 压缩帧在原始字节中不保证
+            # 含字面量 hd1.0，必须先交给历史分时解析器正规化。
             for _ in range(8):
                 try:
                     resp = read_frame(sock)
@@ -1428,12 +1439,9 @@ class THSClient:
                     except OSError:
                         raise ConnectionError("连接已关闭")
                     continue
-                if b"hd1.0" in resp:
-                    recs = parse_history_timeline_response(resp)
-                    if recs:
-                        return recs
-                    logger.debug("history_timeline: 收到 hd1.0 但解析为空（可能 level2 变长帧），继续读")
-                    continue
+                recs = parse_history_timeline_response(resp, code=code)
+                if recs:
+                    return recs
                 if b"hd3.1\x00" in resp:
                     # 部分响应走 hd3.1 变体，复用 kline 解码尝试
                     recs = parse_kline_hd3_response(resp)

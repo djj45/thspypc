@@ -1300,19 +1300,19 @@ HISTORY_TIMELINE_BAR_SPAN = 355
 # **首条分时 bar 的全局序号**，编码规则（4 个日期锚点逐字节验证一致）::
 #
 #     bar_start = (目标日期 - EPOCH).days × 2048 + INTRADAY_BAR_OFFSET
-#              = (目标日期.toordinal() - 675063) × 2048 + 606
+#              = (目标日期.toordinal() - 675064) × 2048 + 606
 #
-# 即「自 1849-04-05 起的日历日数 × 2048 + 日内偏移 606」。日历日（含周末），
-# 非交易日。1849-04-05 是同花顺内部基准日（ordinal=675063），物理含义未知但
-# 数值稳定——4 锚点（2026-05-13/14、06-30、07-23）反推 epoch 全为该日。
+# 即「自 1849-04-06 起的日历日数 × 2048 + 日内偏移 606」。日历日（含周末），
+# 非交易日。此前仅按 UI 操作日期标注时把 epoch 误写成 1849-04-05；2026-07-28
+# 用 399002/000001 响应逐点对照 thsdk 后确认整体存在一天偏移，正确 ordinal=675064。
 #
 # 日内偏移：历史交易日恒 606；当日盘前请求是 960（预测值，开盘前用）。
 # 取历史日期时统一用 606。
 #
 # 验证锚点（arg1 只依赖日期，与股票无关）：
-#   2026-05-13 → 132477534   2026-06-30 → 132575838
-#   2026-05-14 → 132479582   2026-07-23 → 132622942
-TIMELINE_BAR_EPOCH_ORDINAL = 675063   # date(1849, 4, 5).toordinal()
+#   2026-05-13 → 132475486   2026-06-30 → 132573790
+#   2026-05-14 → 132477534   2026-07-23 → 132620894
+TIMELINE_BAR_EPOCH_ORDINAL = 675064   # date(1849, 4, 6).toordinal()
 TIMELINE_BAR_DAYS_SCALE = 2048        # 每日历日对应 2048 个 bar 单位
 TIMELINE_INTRADAY_BAR = 606           # 历史交易日日内 bar 偏移（盘前=960）
 
@@ -1984,25 +1984,27 @@ def build_history_timeline_query(
     inner_seq: int = 0x0000,
     dt_prev_off: int = -61,
     date=None,
+    benchmark_market: int | None = None,
+    benchmark_code: str | None = None,
 ) -> bytes:
     """构造 8901 端口**历史分时（回忆）**请求帧（嵌套子帧结构）。
 
-    请求格式（2026-07-24 抓包 pageid=4417 逐字节确认，文档 §14h）::
+    请求格式（2026-07-24 PCAP 逐字节确认）：
 
-        外层帧: cmd=0x09, 子帧 0x0009, 路由 0x017c, [18]=0x20
-                文本: CodeList=<m>(<code>,);\\r\\n
-                      DataType=<26个level2字段>,\\r\\n
-                      DateTime=8192(<bar_start>-<bar_start+355>)\\r\\n   ★bar序号区间
-                      DTPrevOff=-61\\r\\n
-                      LackTime=0,3,0,0,0,0,0,0\\r\\n
-                      pageid=4417\\r
-        内层子帧(紧跟): 00 16 00 00 + inner_seq + 12 00 02 00(子帧0x0002)
-                        + 7c 02(路由0x027c) + 文本: CodeList=<m>(<code>,);\\r\\npageid=4417\\r
+    - 指数：``cmd=09 + 完整查询(0x0009/0x0158) + 指数壳(0x0002/0x0258)``。
+    - 个股：``cmd=09 + 目标壳(0x0002/0x0058) +
+      基准指数+目标股完整查询(0x0009/0x0158) + 基准壳(0x0002/0x0258)``。
+
+    当前只对深市个股复刻抓包中的 ``32(399002,)`` 伴随序列。2026-07-28
+    已在正确的 ``__manual + szlv2 + init(32)`` 连接上证明该代码可替换为
+    ``33(000001,)``，因此它不是服务器硬编码依赖。三段是否为服务器接受请求的
+    最小形态仍须做主动 A/B；此前在主行情连接上的断连不能作为“缺壳必断”的证据。
+    沪市个股尚无对应历史分时请求抓包，不自动猜测伴随指数。
 
     与当日分时（build_timeline_query）的区别：
       - **pageid 4417**（当日是 9354）
-      - **子帧 0x0009** + 路由 0x017c（当日是单层 0x0002 + 0x000a）
-      - **嵌套结构**（外层 0x0009 + 内层 0x0002 壳）
+      - **子帧 0x0009** + 路由 0x0158（当日是单层 0x0002 + 0x000a）
+      - **嵌套结构**（个股为目标壳 + 混合查询 + 基准壳）
       - **DataType 26 个 level2 字段**（含 201-230 大单金额，当日无）
       - DateTime 带具体 bar 序号区间（当日是 0-0）
       - 多 ``DTPrevOff=-61``（含义待确认，抓包恒为 -61）
@@ -2011,7 +2013,7 @@ def build_history_timeline_query(
     的两个大数是该交易日**首条分时 bar 的全局序号**，编码已破解（4 锚点验证，
     见 :func:`date_to_timeline_bar`）::
 
-        bar_start = (目标日期 - 1849-04-05).days × 2048 + 606
+        bar_start = (目标日期 - 1849-04-06).days × 2048 + 606
 
     传 ``date`` 参数即可自动换算（推荐），无需手算 bar_start。
 
@@ -2026,6 +2028,9 @@ def build_history_timeline_query(
         seq: 外层帧序列标签。
         inner_seq: 内层子帧序列标签。
         dt_prev_off: DTPrevOff 值（抓包恒 -61，含义待确认）。
+        benchmark_market: 个股混合查询的伴随代码市场码；深市个股在两项均为
+            None 时复刻 PC 抓包，自动使用 32。沪市不自动猜测。
+        benchmark_code: 个股混合查询的伴随代码；深市个股默认 ``399002``。
 
     Returns:
         完整请求帧字节（含 fdfdfdfd magic），可直接 sendall。
@@ -2039,131 +2044,307 @@ def build_history_timeline_query(
     dt_str = ",".join(str(d) for d in datatype) + ","
     bar_end = bar_start + HISTORY_TIMELINE_BAR_SPAN
 
-    # 外层文本（DataType/DateTime/DTPrevOff/LackTime 行，末尾 \r\n）
-    outer_text = (
-        f"CodeList={market}({code},);\r\nDataType={dt_str}\r\n"
+    is_stock = code.isdigit() and not code.startswith("399")
+    if (
+        benchmark_market is None
+        and benchmark_code is None
+        and is_stock
+        and market == 33
+    ):
+        benchmark_market, benchmark_code = 32, "399002"
+    if (benchmark_market is None) != (benchmark_code is None):
+        raise ValueError("benchmark_market 和 benchmark_code 必须同时提供")
+
+    target_list = f"{market}({code},);"
+    benchmark_list = (
+        f"{benchmark_market}({benchmark_code},);"
+        if benchmark_market is not None and benchmark_code is not None
+        else ""
+    )
+    if benchmark_list and benchmark_market == market:
+        # 同市场多代码使用一个 market 分组；避免 ``33(a,);33(b,);``
+        # 被服务端当成两个具有独立游标语义的列表。
+        query_list = f"{market}({benchmark_code},{code},);"
+    else:
+        query_list = benchmark_list + target_list
+
+    full_text = (
+        f"CodeList={query_list}\r\nDataType={dt_str}\r\n"
         f"DateTime={TIMELINE_PERIOD}({bar_start}-{bar_end})\r\n"
         f"DTPrevOff={dt_prev_off}\r\n"
         f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r\n"
     ).encode("gbk")
-
-    # 内层子帧文本（壳，仅 CodeList + pageid，末尾 \r\n）
-    inner_text = (
-        f"CodeList={market}({code},);\r\npageid={pageid}\r\n"
+    target_text = (
+        f"CodeList={target_list}\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    tail_text = (
+        f"CodeList={benchmark_list or target_list}\r\npageid={pageid}\r\n"
     ).encode("gbk")
 
-    # 内层子帧头（22B，抓包逐字节确认）：00 16 00 00 + inner_seq + 12 00 02 00
-    #   + 7c 02(路由0x027c) + 00×5 + 00 + 文本长度(LE16, =字节数) + 00 00
-    inner_hdr = bytearray(22)
-    inner_hdr[0:4] = b"\x00\x16\x00\x00"
-    struct.pack_into("<H", inner_hdr, 4, inner_seq & 0xFFFF)
-    inner_hdr[6:10] = b"\x12\x00\x02\x00"   # 子帧 0x0002
-    inner_hdr[10:12] = b"\x7c\x02"           # 路由 0x027c
-    struct.pack_into("<H", inner_hdr, 18, len(inner_text))
-    inner_frame = bytes(inner_hdr) + inner_text
+    def subframe_header(
+        subtype: int,
+        route: int,
+        sequence: int,
+        text_length: int,
+        history_flag: bool = False,
+    ) -> bytes:
+        header = bytearray(22)
+        header[0:4] = b"\x00\x16\x00\x00"
+        struct.pack_into("<H", header, 4, sequence & 0xFFFF)
+        header[6:10] = b"\x12\x00" + struct.pack("<H", subtype)
+        struct.pack_into("<H", header, 10, route)
+        if history_flag:
+            header[17] = 0x20
+        struct.pack_into("<I", header, 18, text_length)
+        return bytes(header)
 
-    # 外层帧头（23B）：cmd 0x09 + 00 16 00 00 + seq + 12 00 09 00(子帧0x0009)
-    #   + 7c 01(路由0x017c) + 00×5 + 20(★[18]=0x20，历史分时特有) + 文本长度 + 00 00
-    outer_hdr = bytearray(23)
-    outer_hdr[0] = 0x09
-    outer_hdr[1:5] = b"\x00\x16\x00\x00"
-    struct.pack_into("<H", outer_hdr, 5, seq & 0xFFFF)
-    outer_hdr[7:11] = b"\x12\x00\x09\x00"   # 子帧 0x0009
-    outer_hdr[11:13] = b"\x7c\x01"           # 路由 0x017c
-    outer_hdr[18] = 0x20                      # 抓包真值（当日分时/盘口此位=0x00）
-    struct.pack_into("<H", outer_hdr, 19, len(outer_text))
-    body = bytes(outer_hdr) + outer_text + inner_frame
+    full_frame = (
+        subframe_header(0x0009, 0x0158, seq, len(full_text), history_flag=True)
+        + full_text
+    )
+    tail_frame = (
+        subframe_header(0x0002, 0x0258, inner_seq, len(tail_text))
+        + tail_text
+    )
+    if benchmark_list:
+        prefix_frame = (
+            subframe_header(0x0002, 0x0058, inner_seq, len(target_text))
+            + target_text
+        )
+        body = b"\x09" + prefix_frame + full_frame + tail_frame
+    else:
+        body = b"\x09" + full_frame + tail_frame
     return encode_frame(body)
 
 
-def parse_history_timeline_response(body: bytes) -> list[dict]:
-    """解析历史分时响应（hd1.0 嵌套壳变体 dc=0x040000f2），返回逐点行情。
+_HISTORY_TIMELINE_BAR_OFFSETS = tuple(
+    list(range(0, 30))
+    + list(range(34, 94))
+    + list(range(98, 129))
+    + list(range(227, 286))
+    + list(range(290, 350))
+    + [354]
+)
+_HISTORY_TIMELINE_MIN_ANCHORED_ROWS = 200
+_HISTORY_TIMELINE_STOCK_CORE_FIELDS = [
+    (1, 0x30, 0, 4),
+    (10, 0x70, 0, 4),
+    (13, 0x70, 0, 4),
+    (19, 0x70, 0, 4),
+    (22, 0x70, 0, 4),
+    (23, 0x70, 0, 4),
+]
 
-    响应结构（2026-07-24 抓包确认，文档 §14h）::
+
+def _history_timeline_first_row(
+    body: bytes,
+    search_start: int,
+    search_end: int,
+    hs: int,
+    code: str | None,
+) -> int:
+    """Find the first bar after a selected instrument shell."""
+    if code:
+        code_offset = body.find(code.encode("ascii"), search_start, search_end)
+        if code_offset < 0:
+            return -1
+        search_start = code_offset + len(code)
+        search_end = min(search_end, search_start + 512)
+
+    for off in range(search_start, max(search_start, search_end - hs - 8)):
+        bar = struct.unpack_from("<I", body, off)[0]
+        if (
+            not 100_000_000 < bar < 200_000_000
+            or bar % TIMELINE_BAR_DAYS_SCALE != TIMELINE_INTRADAY_BAR
+        ):
+            continue
+        next_bar = struct.pack("<I", bar + 1)
+        if any(
+            body[candidate:candidate + 4] == next_bar
+            for candidate in range(off + max(4, hs - 4), off + hs + 5)
+        ):
+            return off
+    return -1
+
+
+def _history_timeline_row_anchors(
+    body: bytes,
+    first_row: int,
+    block_end: int,
+    hs: int,
+) -> list[tuple[int, int]]:
+    """Recover rows whose four-byte bar index is present on the wire.
+
+    The logical trading-day schedule contains 241 positions. Individual-stock
+    blocks append 1-4 state bytes after the declared ``hs=88`` core, so physical
+    rows cannot be sliced at a fixed width. The bar index remains the strongest
+    boundary in the fully anchored wire family. A server frame may omit one or
+    two schedule positions; later anchors are still retained.
+    """
+    first_bar = struct.unpack_from("<I", body, first_row)[0]
+    rows = [(first_row, first_bar)]
+    previous_offset = first_row
+    for delta in _HISTORY_TIMELINE_BAR_OFFSETS[1:]:
+        expected_bar = first_bar + delta
+        offset = body.find(
+            struct.pack("<I", expected_bar),
+            previous_offset + max(4, hs - 4),
+            block_end,
+        )
+        if offset < 0 or offset + hs > block_end:
+            continue
+        rows.append((offset, expected_bar))
+        previous_offset = offset
+    return rows
+
+
+def _decode_history_timeline_rows(
+    body: bytes,
+    rows: list[tuple[int, int]],
+    fields: list[tuple[int, int, int, int]],
+    hs: int,
+) -> list[dict]:
+    records: list[dict] = []
+    for row_offset, bar_index in rows:
+        if row_offset + hs > len(body):
+            break
+        record: dict = {}
+        field_offset = row_offset
+        for dt, _fmt, _flags, width in fields:
+            chunk = body[field_offset:field_offset + width]
+            field_offset += width
+            if len(chunk) < width:
+                return []
+            if width != 4:
+                record[f"dt{dt}_raw"] = chunk
+                continue
+            if dt == 1:
+                # Some wire families replace the high byte with a state byte.
+                # Anchored rows use the schedule-derived logical value instead
+                # of trusting the physical LE32 unconditionally.
+                record["bar_index"] = bar_index
+            else:
+                record[f"dt{dt}"] = decode_ths_float(
+                    struct.unpack("<I", chunk)[0]
+                )
+        records.append(record)
+    return records
+
+
+def parse_history_timeline_response(
+    body: bytes,
+    code: str | None = None,
+) -> list[dict]:
+    """解析历史分时响应，返回可验证的逐点行情。
+
+    沪深个股的大响应通常先套 ``cmd=0x0a`` 字典压缩。本函数先调用
+    :func:`normalize_8901_response`，再处理正规 ``hd1.0`` 表体。压缩流里偶然
+    保留下来的字面量 ``hd1.0`` 不是字段头，不能直接解释。
+
+    正规化后的响应结构（2026-07-24 抓包确认，文档 §14h）::
 
         hd1.0\\0
-        + dc(LE32)            ← 0x040000f2：高16位0x0004=嵌套壳标记，低16位=记录数(242)
+        + dc(LE32)            ← 0x040000f2；低16位含 241 个点和壳/尾记录
         + flag(LE16=0x007e)
-        + hs(LE16=88)         ← 单条记录字节长度（= 字段表 width 累加）
+        + hs(LE16=88)         ← 逻辑字段区长度（= 字段表 width 累加）
         + fc(LE16=22)         ← 字段数
         + 字段表(fc×4B)       ← dt1/10/13/19/22/23/201-230，width 全=4
-        + ~110B 壳头           ← 含 ff*8 padding + dt5 代码标记
-        + 记录区: dc_low 条，每条 hs 字节，行主序明文
+        + 一个或多个个股壳     ← 市场码、代码、padding
+        + 241 点记录区
+
+    指数块的物理行通常恰为 88 字节；个股块在 88 字节逻辑字段后还带 1-4 个
+    状态字节，所以物理行常见 89-92 字节。本函数不按 93/94 等经验长度硬切，
+    而用交易日 241 点的 ``bar_index`` 序列重新锚定每行。``code`` 用于从
+    hexin 常见的“指数 + 个股”混合响应中选择目标块。
+
+    少数更强的状态省略帧会连 ``bar_index`` 的中高位也省略。若完整锚点少于
+    200 条，本函数返回空列表，让客户端重请求随机出现的完整锚点变体；绝不把
+    错位字节伪装成 242 条有效记录。
 
     dt1（时间字段）= 该 bar 的**全局序号**（首条 = 请求里的 bar_start，每条 +1）。
-    非交易日时间戳——是 hexin 内部连续 bar 编号，无法直接还原成 HH:MM。
+    午间和集合竞价边界有固定跳号，不是全日简单 ``+1``。
     其它字段（dt10 现价/dt13 量/dt19 额/dt201-230 大单）用 decode_ths_float。
 
     Args:
         body: 完整 TCP 帧体（含 hd1.0 标记）。
+        code: 可选目标代码。混合响应应传入，例如 ``"000938"``；省略时选第一块。
 
     Returns:
         记录列表，每条 ``{bar_index, dt10, dt13, dt19, dt22, dt23, ...}``。
         dt10=现价、dt13=成交量、dt19=成交额、dt201-230=level2 大单金额。
-        未找到历史分时帧（dc 高16位≠0x0004 或字段表不含 dt10）时返回空列表。
+        未找到历史分时帧或帧属于尚未安全恢复的强状态省略变体时返回空列表。
     """
-    pos = body.find(b"hd1.0")
-    if pos < 0:
-        return []
-    base = pos + 6  # 跳过 hd1.0\0
-    if base + 10 > len(body):
-        return []
-    dc = struct.unpack("<I", body[base:base+4])[0]
-    # 历史分时帧：dc = 0x0400xxxx（高16位=0x0400 嵌套壳标记，低16位=记录数）
-    if (dc >> 16) != 0x0400:
-        return []
-    nrec = dc & 0xFFFF           # 低 16 位 = 记录数（242）
-    flag = struct.unpack("<H", body[base+4:base+6])[0]
-    hs = struct.unpack("<H", body[base+6:base+8])[0]
-    fc = struct.unpack("<H", body[base+8:base+10])[0]
-    if nrec == 0 or hs == 0 or fc == 0 or fc > 40:
-        return []
-    ftoff = base + 10
-    ft = body[ftoff:ftoff + fc*4]
-    if len(ft) < fc*4:
-        return []
-    fields = [(ft[i*4], ft[i*4+1], ft[i*4+2], ft[i*4+3]) for i in range(fc)]
-    # 字段表必须含 dt10（现价），否则不是历史分时帧
-    if not any(f[0] == 10 for f in fields):
-        return []
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("历史分时 0x0a 外层正规化失败: %s", exc)
+            return []
 
-    # 记录区前有壳头（~110B padding + 代码标记），定位首条记录：
-    # dt1 是第一个字段，首条 dt1 值 = 请求的 bar_start（1.3 亿级大数）。
-    # 扫描字段表后，找首个「dt1 落在 bar 序号区间 且 +hs 处 = dt1+1」的位置
-    # （壳头有干扰值，用 dt1+1 校验排除噪声）。
-    recoff = ftoff + fc*4
-    rec0_off = -1
-    scan_end = min(recoff + hs * 3, len(body) - hs)
-    for off in range(recoff, scan_end):
-        v = struct.unpack("<I", body[off:off+4])[0]
-        if 100_000_000 < v < 200_000_000:
-            # 校验：+hs 处（下一条记录的 dt1）应是 v+1
-            v_next = struct.unpack("<I", body[off+hs:off+hs+4])[0]
-            if v_next == v + 1:
-                rec0_off = off
-                break
-    if rec0_off < 0:
-        return []
+    pos = 0
+    while True:
+        marker = body.find(b"hd1.0", pos)
+        if marker < 0:
+            return []
+        pos = marker + 6
+        base = marker + 6
+        if base + 10 > len(body):
+            continue
+        dc = struct.unpack("<I", body[base:base + 4])[0]
+        flag = struct.unpack("<H", body[base + 4:base + 6])[0]
+        hs = struct.unpack("<H", body[base + 6:base + 8])[0]
+        fc = struct.unpack("<H", body[base + 8:base + 10])[0]
+        if (
+            (dc >> 16) != 0x0400
+            or (dc & 0xFFFF) == 0
+            or flag not in (0x007E, 0x0082)
+            or hs not in (88, 92)
+            or fc not in (22, 23)
+        ):
+            continue
 
-    recs: list[dict] = []
-    for ri in range(nrec):
-        o = rec0_off + ri * hs
-        if o + hs > len(body):
-            break
-        rec: dict = {}
-        fo = o
-        for dt, fmt, fl, w in fields:
-            chunk = body[fo:fo+w]
-            fo += w
-            if w == 4:
-                raw = struct.unpack("<I", chunk)[0]
-                if dt == 1:
-                    # dt1 是 bar 全局序号（整数），不用 float 解码
-                    rec["bar_index"] = raw
-                else:
-                    rec[f"dt{dt}"] = decode_ths_float(raw)
-        recs.append(rec)
-    return recs
+        next_marker = body.find(b"hd1.0", pos)
+        block_end = next_marker if next_marker >= 0 else len(body)
+        if flag == 0x007E:
+            field_table = base + 10
+            raw_table = body[field_table:field_table + fc * 4]
+            if len(raw_table) < fc * 4:
+                continue
+            fields = [
+                (
+                    raw_table[index * 4],
+                    raw_table[index * 4 + 1],
+                    raw_table[index * 4 + 2],
+                    raw_table[index * 4 + 3],
+                )
+                for index in range(fc)
+            ]
+            if (
+                not any(field[0] == 10 for field in fields)
+                or sum(field[3] for field in fields) != hs
+            ):
+                continue
+            search_start = field_table + fc * 4
+        else:
+            # flag=0x0082 个股表逻辑上是 23×4B（比指数多 dt54），但
+            # 字段表本身也可能省略状态字节。价/量/额/买卖盘六个前导字段
+            # 始终位于状态省略之前；在完整 codec 恢复前只发布这组安全字段。
+            fields = _HISTORY_TIMELINE_STOCK_CORE_FIELDS
+            search_start = base + 10
+
+        first_row = _history_timeline_first_row(
+            body,
+            search_start,
+            block_end,
+            hs,
+            code,
+        )
+        if first_row < 0:
+            continue
+        rows = _history_timeline_row_anchors(body, first_row, block_end, hs)
+        if len(rows) < _HISTORY_TIMELINE_MIN_ANCHORED_ROWS:
+            continue
+        return _decode_history_timeline_rows(body, rows, fields, hs)
 
 
 # =============================================================================
