@@ -77,3 +77,67 @@ tools/reverse/       一次性逆向和诊断脚本
 ```
 
 在目录迁移完成前，新代码至少要有无需账号的离线测试，活网脚本不能作为唯一验收。
+
+## 前端 / API 层接入约束
+
+当后续需要为同花顺风格前端（自选股 + K线 + 分时 + 盘口 + 异动 + 板块）提供
+HTTP 接口时，应在 `THSClient` 之上增加一层 `api.py`（或独立服务进程）。但该层
+**不是现在就要做的事**，它的正确性取决于下层先收尾的两个前置条件。
+
+### 分层位置
+
+```text
+前端（React/Vue/桌面客户端）
+        ↓  HTTP / JSON / WebSocket
+api.py        路由 + 鉴权 + JSON 序列化 + 请求编排
+        ↓
+THSClient（公开门面）/ services（opt-in）
+        ↓
+features → codecs
+```
+
+`api.py` 的职责应严格限定为协议无关的 HTTP 适配，不重复承担下层已解决的职责：
+
+| 该做 | 不该做（已下沉到下层） |
+|------|----------------------|
+| HTTP 路由（`/api/kline?code=600519&period=day`） | 协议字节构造（features） |
+| 参数校验、鉴权、限流 | 通道选择、能力检查（services） |
+| 协议字段翻译（`dt10`→`price`、`dt6`→`prevClose`） | socket 读写与锁（_transport） |
+| 请求编排（一次页面加载并发取 quotes+kline+depth） | 字段含义映射（features parser） |
+| 错误码统一（`CapabilityUnavailableError`→403、`ChannelUnavailableError`→503） | — |
+
+### 抽 api.py 之前的两个前置条件
+
+`tests/web_dashboard.py` 已暴露核心矛盾：它在 HTTP 层加了一把全局 `_query_lock`
+来绕过 `list_quotes` 的「锁 send 不锁 read」缺陷（见该文件 §285-289 注释）。
+这说明 socket 读所有权问题没真正下沉，只是被 web 层打了补丁。因此抽 `api.py`
+之前必须先：
+
+1. **MAIN 业务默认切到 service 路径**：`list_quotes`/`kline`/`depth_quote` 等目前
+   是 opt-in（显式 `configure_service_context` 才走 service），默认走旧路径直接
+   碰 `_sock`。只有全切到 service，`api.py` 才能依赖稳定的「请求锁覆盖 send+read」
+   语义，无需自己加全局锁。
+
+2. **socket 读所有权由 `_transport` 统一保障**：让 `ManagedConnection` /
+   `ConnectionManager` 保证单连接串行读，使 `_query_lock` 这类 web 层补丁可以删除。
+   这是连接不变量 §5（不允许功能方法脱离 session 新增「只锁 send、锁外 read」）的
+   最终落地——目前 MAIN 旧路径仍是该不变量的违规点。
+
+前置条件达成后，`web_dashboard.py` 的 `_query_lock` 应能直接删除；届时 `api.py`
+就是一层薄薄的 HTTP 适配，没有连接治理负担。
+
+### 不同前端规模的决策
+
+- **数据校验看板**（如现有 `web_dashboard.py`）：无需单独抽 `api.py`，handler 直调
+  client + 全局锁够用，抽出反而过度设计。
+- **同花顺级正式前端**：必须抽 `api.py`，且先满足上述两个前置条件。
+- **前后端分进程/分仓库**：`api.py` 是必须的 HTTP 边界，还需额外考虑：
+  长连接复用（一个 API 进程常驻 8901，多前端共享）、会话管理（扫码登录态）、
+  推送（WebSocket 转发 9601 异动 / 4214 快照）。
+
+### 字段翻译约定
+
+`api.py` 应把协议槽位号（`dt10`/`dt6`/`dt27`/`dt33`）翻译成前端友好的稳定语义
+名（`price`/`prevClose`/...）。注意同一 dt 号跨接口语义不同（见 README「dt 号跨
+接口语义不同」表），翻译必须按接口绑定，不能全局映射。L2 多出的 `dt201-230` 等
+字段作为可选扩展存在，不能为了统一结果而伪造普通账号没有的数据。
