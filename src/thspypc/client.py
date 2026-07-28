@@ -882,6 +882,7 @@ class THSClient:
         self._last_connect_ts = time.time()
         self._account_evidence.record_main_ready(passport_fields)
         self._start_heartbeat()
+        self._send_init_handshake()
         logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
         return LoginResult(
             success=True,
@@ -890,6 +891,61 @@ class THSClient:
             reply_fields=reply_fields,
             passport_fields=passport_fields,
         )
+
+    def _send_init_handshake(self, timeout: float = 2.0) -> None:
+        """login 后发 init 请求激活行情通道，读取 init 响应（服务器配置帧）。
+
+        hexin 客户端 login 后紧跟 init 请求（subtype 0x0001），服务器据此
+        激活该连接的行情查询通道。不发 init 直接查 K线会超时
+        （list_quotes 走 hd1.0/hd3.1 不强依赖 init，但 K线 hd3.1 flag=0x0042/0x0046
+        要求 init 激活通道才响应——实测 MAIN login 跳过 init 后 kline 全超时，
+        list_quotes 仍正常，故 init 缺失会被 list_quotes 的成功掩盖）。
+
+        init 响应是**服务器配置帧**（~49KB，含 S-OS/S-Version/SName 等元数据），
+        不是全量代码表（代码表是 stock_list() 重放序列才触发）。实测稳定返回
+        1 帧（多次验证），0.1s 即到达。读完这 1 帧配置即激活行情通道。
+        """
+        try:
+            req = build_init_query()
+            with self._sock_lock:
+                self._sock.sendall(req + b"\n")
+                # 读配置帧并彻底排空缓冲区：先 timeout 秒等第 1 帧（配置帧），
+                # 再用 0.3s 短超时循环读，直到无数据（排空残留帧/半帧）。
+                # 残留半帧会让首个 K线请求的 read_frame 从错位位置扫 magic → 解析失败
+                # 或误判连接关闭。循环排空能避免首请求偶发 ConnectionError。
+                self._sock.settimeout(timeout)
+                n = 0
+                # 第 1 帧：配置帧（~49KB），等它到达
+                try:
+                    read_frame(self._sock)
+                    n += 1
+                except (socket.timeout, OSError):
+                    pass
+                except ValueError:
+                    # magic 对齐失败（偶发），丢一段继续
+                    try:
+                        self._sock.settimeout(0.5)
+                        self._sock.recv(8192)
+                    except Exception:
+                        pass
+                # 循环排空后续帧（配置帧后可能跟推送帧/ACK），每帧 0.3s 超时
+                # 最多读 8 帧（防异常情况死循环），正常 1-2 帧即超时退出
+                self._sock.settimeout(0.3)
+                for _ in range(8):
+                    try:
+                        read_frame(self._sock)
+                        n += 1
+                    except (socket.timeout, OSError):
+                        break  # 无更多数据，排空完成
+                    except ValueError:
+                        # 半帧/magic 错位，丢一段继续排空
+                        try:
+                            self._sock.recv(8192)
+                        except Exception:
+                            break
+                logger.debug("init 握手完成（读 %d 帧，行情通道已激活，缓冲区已排空）", n)
+        except Exception as e:
+            logger.warning("init 握手失败（行情查询可能超时）: %s", e)
 
     def _probe_fastest_hosts(self, hosts: list[str], timeout: float = 1.0,
                              use_cache: bool = True) -> list[str]:

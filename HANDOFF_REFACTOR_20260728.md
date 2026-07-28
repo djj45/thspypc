@@ -1125,6 +1125,28 @@ codex/refactor-protocol-foundation
 - 修正后的活网矩阵 4/4 通过：`enable_heartbeat=False` 两轮和 `True` 两轮均完成
   登录、立即行情查询和等待后二次查询；有心跳两轮各发送 2 次心跳后连接仍存活，
   排除首秒断连由心跳触发；
+- ★ 2026-07-29 活网验证推翻「MAIN 不发 init」结论：上述修正把 MAIN 登录收尾
+  重构为 `_finalize_main_login`，但**误删了 `_send_init_handshake()` 调用和整个
+  方法**，导致 kline 回归。跨分支对照实验定位根因：旧分支 `feat/stock-list-full`
+  登录后调 init（`client.py:490`），kline 能收到响应（仅 parser 有 NameError）；
+  新分支 `1cf409d` 删了 init，kline 跨 4 个 IP 全超时，而 `list_quotes`/`depth_quote`
+  仍正常（hd1.0/hd3.1 不强依赖 init，掩盖了回归）。`build_kline_query` 字节两分支
+  完全一致（sha8 `897f7634`），故回归不在 builder，而在登录后没发 init 激活通道。
+  K线走 hd3.1 flag=0x0042/0x0046，服务器要求 init（subtype 0x0001）激活通道才响应；
+  补回 `_send_init_handshake` 后 kline 立即恢复（实测返回 6 根日K，7/21–7/28）。
+  「不发 L2 MarketCode init」的正确含义是：MAIN 不走 `__manual` L2 manual 路径
+  （那是 shlv2/szlv2 专用 init(16;144)/(32)）；但 MAIN 自己的 `build_init_query()`
+  配置帧是激活 A 股行情通道的必要步骤。之前观察到的「带 MarketCode init 在 fu4/hkus/euhq
+  节点 FIN」是**节点选错**（非 ifindhq），不是 init 本身的问题——DNS 收窄到 ifindhq 后，
+  带 `MarketCode=16;144;` 的 MAIN init 稳定激活通道且不触发 FIN；
+- 同次活网验证还顺带修复了 `test_stock_cache::test_live` 和 `test_stock_list::test_live`：
+  这两个之前因 init 缺失导致 stock-list 重放通道未激活而失败，补回 init 后均通过；
+- `tests/test_main_login_finalization.py` 的两个契约已修正：原断言
+  `sock.sent == []`（MAIN 登录后什么都不发）违背 hexin 协议，改为断言
+  `_send_init_handshake` 被调用（激活行情通道）+ 旧 socket 正确关闭替换；
+- 活网新旧路径逐字段对比（`tests/test_service_live.py`，opt-in service context）
+  3/3 一致：`list_quotes`/`depth_quote`/`kline` 在同一次连接、同一服务器数据上，
+  旧协议路径与新 service 路径解析结果逐字段相同，确认重构未改变 MAIN 业务协议行为；
 - 普通账号登录差异的扩展点明确落在 `LoginProtocolProfile`：未来拿到普通账号
   抓包后，可单独提供 product/securities/HTTP version/TCP version/qsid/
   account_type 以及是否支持 `__manual`，并注入 `AuthService`，无需改业务
