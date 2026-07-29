@@ -46,7 +46,7 @@ CONNECTION_SPECS = {
     ),
     ConnectionRole.SH_L2: ConnectionSpec(
         role=ConnectionRole.SH_L2,
-        identity=LoginIdentity.MANUAL,
+        identity=LoginIdentity.STANDARD,
         port=8901,
         market_codes=(17,),
         required_capability=Capability.L2_MARKET_ACCESS,
@@ -54,7 +54,7 @@ CONNECTION_SPECS = {
     ),
     ConnectionRole.SZ_L2: ConnectionSpec(
         role=ConnectionRole.SZ_L2,
-        identity=LoginIdentity.MANUAL,
+        identity=LoginIdentity.STANDARD,
         port=8901,
         market_codes=(33,),
         required_capability=Capability.L2_MARKET_ACCESS,

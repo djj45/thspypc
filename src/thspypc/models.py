@@ -24,12 +24,16 @@ class Capability(str, Enum):
 
     BASIC_QUOTE = "basic_quote"
     BASIC_TIMELINE = "basic_timeline"
+    BASIC_HISTORY_TIMELINE = "basic_history_timeline"
+    BASIC_AUCTION = "basic_auction"
     L2_MARKET_ACCESS = "l2_market_access"
     L2_TIMELINE = "l2_timeline"
     L2_AUCTION = "l2_auction"
     L2_SNAPSHOT_PUSH = "l2_snapshot_push"
     L2_HISTORY_TIMELINE = "l2_history_timeline"
     REALORDER = "realorder"
+    REALORDER_BASIC_ANOMALIES = "realorder_basic_anomalies"
+    REALORDER_LEVEL2_ANOMALIES = "realorder_level2_anomalies"
 
 
 class Support(str, Enum):

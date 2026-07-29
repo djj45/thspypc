@@ -35,17 +35,19 @@ def test_default_profile_preserves_current_protocol_constants():
     assert LoginIdentity.MANUAL.value == "manual"
 
 
-def test_profile_migration_does_not_change_login_frame_bytes():
+def test_level2_standard_and_manual_login_frame_bytes():
     passport64 = "A" * 64
     mac64 = "GHRdIuxqLKg7diotlao7dioNtao7diodpQ=="
 
     standard = build_login_body_pc(passport64, mac64)
     manual = build_manual_login_body(passport64, mac64)
 
-    assert len(standard) == 248
+    assert len(standard) == 282
     assert hashlib.sha256(standard).hexdigest() == (
-        "76f67ceb967761980a867b439b7c385895499a324789cc6da745b863223f23f6"
+        "21f723611f7682a9b47bca7419630fc3"
+        "e96f7f8e6aaa3c6514688fe9f7271f08"
     )
+    assert b"UserName=thsuser\nPassword=thsuser\n" in standard
     assert len(manual) == 288
     assert hashlib.sha256(manual).hexdigest() == (
         "913835f0f6369da6c2ef63345b6f988037e7256c4ca020ada71c929775aec294"

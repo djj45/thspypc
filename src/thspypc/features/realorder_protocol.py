@@ -23,6 +23,64 @@ DXJL_DATATYPE = (
     "1074269401,1074269403"
 )
 
+# 2026-07-29 普通账号 UI 可选的 23 类。编号来自官方客户端
+# ShortGeniusFuncDetailInfo.ini，并由普通账号抓包确认该账号仍可登录、查询和订阅
+# REALORDER；权限差异发生在异动类别，而不是 9601 通道本身。
+STANDARD_REALORDER_CATEGORY_IDS = (
+    1074269398,  # 大笔买入
+    1074269399,  # 大笔卖出
+    1074269396,  # 单笔冲涨
+    1074269397,  # 单笔冲跌
+    1074269393,  # 区间放量涨
+    1074269394,  # 区间放量跌
+    1074269395,  # 区间放量平
+    1074269400,  # 涨停封板
+    1074269401,  # 打开涨停板
+    1074269402,  # 跌停封板
+    1074269403,  # 打开跌停板
+    1074269404,  # 急速拉升
+    1074269405,  # 猛烈打压
+    1074269410,  # 涨停大减
+    1074269411,  # 跌停大减
+    1074269412,  # 强势封涨停
+    1074269422,  # 强势封跌停
+    1074269408,  # 逼近涨停
+    1074269409,  # 逼近跌停
+    4132267,     # 笼子触涨停
+    4132268,     # 笼子触跌停
+    723865,      # 涨幅突破
+    723866,      # 跌幅突破
+)
+
+# 2026-07-17 Level2 账号在短线精灵“全选”时抓到的完整 53 类请求顺序。
+# 普通账号不展示/不支持其中另外 30 类，不能把它们混进普通账号的“全部”。
+ALL_REALORDER_CATEGORY_IDS = (
+    1074269398, 1074269399, 1074269396, 1074269397,
+    592572, 592574, 592573, 592575,
+    1074269393, 1074269394, 1074269395,
+    1074269400, 1074269401, 1074269402, 1074269403,
+    1074269404,
+    1074269423, 1074269424, 1074269425, 1074269426, 1074269427,
+    1074269405,
+    1074269428, 1074269429, 1074269430, 1074269431, 1074269432,
+    1074269410, 1074269411, 1074269412, 1074269422,
+    133994, 133995,
+    1074269408, 1074269409,
+    133990, 133991, 133794, 133795, 133796, 133797,
+    133996, 133998, 133997, 133999,
+    4132267, 4132268, 4132269, 4132270, 4132271, 4132272,
+    723865, 723866,
+)
+
+_STANDARD_REALORDER_CATEGORY_ID_SET = frozenset(
+    STANDARD_REALORDER_CATEGORY_IDS
+)
+LEVEL2_ONLY_REALORDER_CATEGORY_IDS = tuple(
+    category_id
+    for category_id in ALL_REALORDER_CATEGORY_IDS
+    if category_id not in _STANDARD_REALORDER_CATEGORY_ID_SET
+)
+
 ANOMALY_GROUP_PREFIX = {
     **{value: 0x40080C00 for value in range(0xD1, 0xF9)},
     **{value: 0x00090A00 for value in range(0xBC, 0xC0)},
@@ -74,6 +132,9 @@ ANOMALY_BYTE_MAP = {
     0xD7: "大笔卖出",
     0xD1: "区间放量涨",
     0xD2: "区间放量跌",
+    0xD3: "区间放量平",
+    0xD4: "单笔冲涨",
+    0xD5: "单笔冲跌",
     0xD8: "涨停封板",
     0xDA: "跌停封板",
     0xD9: "打开涨停板",
@@ -100,6 +161,10 @@ ANOMALY_BYTE_MAP = {
     0xBD: "特大被动买",
     0xBE: "特大主动卖",
     0xBF: "特大被动卖",
+    0xAB: "笼子触涨停",
+    0xAC: "笼子触跌停",
+    0x99: "涨幅突破",
+    0x9A: "跌幅突破",
 }
 
 SUBREALORDER_MARKETS = [16, 32, 151, 48]
@@ -119,9 +184,17 @@ def build_datatype(
     volume_min: int | None = None,
     amount_min: int | None = None,
 ) -> str:
-    """Build the comma-separated real-order datatype filter."""
-    if anomaly_bytes == "all":
-        anomaly_bytes = sorted(ANOMALY_GROUP_PREFIX)
+    """Build the comma-separated real-order datatype filter.
+
+    ``"standard"`` means the 23 categories available to an ordinary account.
+    ``"all"`` means the 53-category Level2 UI selection captured on wire.
+    Explicit iterables continue to contain low-byte anomaly identifiers.
+    """
+    category_ids = None
+    if anomaly_bytes == "standard":
+        category_ids = STANDARD_REALORDER_CATEGORY_IDS
+    elif anomaly_bytes == "all":
+        category_ids = ALL_REALORDER_CATEGORY_IDS
     threshold = ""
     if volume_min is not None or amount_min is not None:
         parts = []
@@ -130,8 +203,12 @@ def build_datatype(
         if amount_min is not None:
             parts.append(f"17[{amount_min}~-]")
         threshold = "{" + "|".join(parts) + "}"
+    if category_ids is None:
+        category_ids = tuple(
+            build_category_id(value) for value in anomaly_bytes
+        )
     return ",".join(
-        f"{build_category_id(value)}{threshold}" for value in anomaly_bytes
+        f"{category_id}{threshold}" for category_id in category_ids
     ) + ","
 
 
@@ -264,7 +341,10 @@ def _parse_dxjl_record(
             "代码": code,
             "异动类型": ANOMALY_MAP_DXJL.get(
                 (anomaly_code, direction),
-                f"未知0x{anomaly_code:02x}",
+                ANOMALY_BYTE_MAP.get(
+                    anomaly_code,
+                    f"未知0x{anomaly_code:02x}",
+                ),
             ),
             "异动编码": anomaly_code,
             "金额": round(amount, 2),
@@ -398,13 +478,16 @@ def parse_pushrealorder_response(body: bytes) -> list[dict]:
 
 
 __all__ = [
+    "ALL_REALORDER_CATEGORY_IDS",
     "ANOMALY_BYTE_MAP",
     "ANOMALY_GROUP_PREFIX",
     "ANOMALY_MAP_DXJL",
     "DXJL_DATATYPE",
+    "LEVEL2_ONLY_REALORDER_CATEGORY_IDS",
     "REALORDER_HOST",
     "REALORDER_PORT",
     "SUBREALORDER_MARKETS",
+    "STANDARD_REALORDER_CATEGORY_IDS",
     "build_category_id",
     "build_datatype",
     "build_heartbeat_9601",

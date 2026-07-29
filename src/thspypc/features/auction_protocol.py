@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import logging
 import struct
+from datetime import date as date_type
 from datetime import datetime, time
 
 from ..codecs.compression import normalize_8901_response
+from ..codecs.compression import (
+    _decode_bitrle_0x13746d0,
+    _transpose_bitplane_0x1763410,
+)
 from ..codecs.framing import encode_frame
 from ..codecs.hd import _parse_hd_field_table
 from ..codecs.numeric import decode_ths_float
@@ -16,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 AUCTION_PERIOD = 7176
 AUCTION_DATATYPE = [10, 27, 33, 49]
+BASIC_AUCTION_PAGEID = 9354
+BASIC_HISTORY_AUCTION_PAGEID = 9355
+BASIC_HISTORY_AUCTION_PERIOD = 6144
+CLOSING_AUCTION_PERIOD = 7424
+CLOSING_AUCTION_DATATYPE = [10, 49, 287]
+L2_HISTORY_AUCTION_PAGEID = 4417
 
 _AUCTION_SENTINELS = frozenset({0x80000000, 0xFFFFFFFF})
 _AUCTION_SENTINEL_FIELDS = frozenset({27, 33})
@@ -74,6 +85,293 @@ def build_auction_query(
     header[18] = 0x1C
     struct.pack_into("<I", header, 19, len(text))
     return encode_frame(bytes(header) + text)
+
+
+def _coerce_trade_date(value) -> date_type:
+    if isinstance(value, str):
+        return date_type.fromisoformat(value)
+    if hasattr(value, "date") and callable(value.date):
+        return value.date()
+    return value
+
+
+def build_basic_auction_query(
+    code: str,
+    market: int = 33,
+    trade_date=None,
+    *,
+    closing: bool = False,
+    historical: bool = False,
+    seq: int = 0x015A,
+) -> bytes:
+    """Build normal-account opening or closing auction requests on MAIN."""
+    value = _coerce_trade_date(trade_date or datetime.now().date())
+    if closing:
+        start_time, end_time = time(14, 57), time(15, 0)
+        datatype = CLOSING_AUCTION_DATATYPE
+        period = CLOSING_AUCTION_PERIOD
+    else:
+        start_time, end_time = time(9, 15), time(9, 25)
+        datatype = AUCTION_DATATYPE
+        period = (
+            BASIC_HISTORY_AUCTION_PERIOD
+            if historical
+            else AUCTION_PERIOD
+        )
+    pageid = (
+        BASIC_HISTORY_AUCTION_PAGEID
+        if historical
+        else BASIC_AUCTION_PAGEID
+    )
+    start = datetime.combine(value, start_time)
+    end = datetime.combine(value, end_time)
+    datatype_text = ",".join(str(item) for item in datatype) + ","
+    text = (
+        f"CodeList={market}({code},);\r\n"
+        f"DataType={datatype_text}\r\n"
+        f"DateTime={period}({int(start.timestamp())}-{int(end.timestamp())})\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r"
+    ).encode("gbk")
+
+    header = bytearray(23)
+    header[0] = 0x09
+    header[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 5, seq & 0xFFFF)
+    header[7:11] = b"\x12\x00\x09\x00"
+    struct.pack_into("<H", header, 11, 0x0100)
+    header[18] = (period >> 8) & 0xFF
+    struct.pack_into("<I", header, 19, len(text) + 1)
+    return encode_frame(bytes(header) + text)
+
+
+def build_l2_closing_auction_query(
+    code: str,
+    market: int = 33,
+    trade_date=None,
+    *,
+    historical: bool = False,
+    seq: int = 0x0121,
+) -> bytes:
+    """Build current (4214) or historical (4417) Level2 closing auction."""
+    value = _coerce_trade_date(trade_date or datetime.now().date())
+    start = datetime.combine(value, time(14, 57))
+    end = datetime.combine(value, time(15, 0))
+    datatype_text = ",".join(
+        str(item) for item in CLOSING_AUCTION_DATATYPE
+    ) + ","
+    pageid = (
+        L2_HISTORY_AUCTION_PAGEID
+        if historical
+        else TIMELINE_L2_PAGEID
+    )
+    text = (
+        f"CodeList={market}({code},);\r\n"
+        f"DataType={datatype_text}\r\n"
+        f"DateTime={CLOSING_AUCTION_PERIOD}("
+        f"{int(start.timestamp())}-{int(end.timestamp())})\r\n"
+        "LackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r\n"
+    ).encode("gbk")
+
+    header = bytearray(23)
+    header[0] = 0x09
+    header[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 5, seq & 0xFFFF)
+    header[7:11] = b"\x12\x00\x09\x00"
+    struct.pack_into("<H", header, 11, 0x0100)
+    header[18] = (CLOSING_AUCTION_PERIOD >> 8) & 0xFF
+    struct.pack_into("<I", header, 19, len(text))
+    return encode_frame(bytes(header) + text)
+
+
+def build_l2_history_auction_query(
+    code: str,
+    market: int = 33,
+    trade_date=None,
+    *,
+    seq: int = 0x0123,
+) -> bytes:
+    """Build the captured pageid=4417 historical opening-auction request."""
+    value = _coerce_trade_date(trade_date or datetime.now().date())
+    start = datetime.combine(value, time(9, 15))
+    end = datetime.combine(value, time(9, 25))
+    datatype_text = ",".join(
+        str(item) for item in AUCTION_DATATYPE
+    ) + ","
+    text = (
+        f"CodeList={market}({code},);\r\n"
+        f"DataType={datatype_text}\r\n"
+        f"DateTime={BASIC_HISTORY_AUCTION_PERIOD}("
+        f"{int(start.timestamp())}-{int(end.timestamp())})\r\n"
+        "LackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={L2_HISTORY_AUCTION_PAGEID}\r\n"
+    ).encode("gbk")
+
+    header = bytearray(23)
+    header[0] = 0x09
+    header[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 5, seq & 0xFFFF)
+    header[7:11] = b"\x12\x00\x09\x00"
+    struct.pack_into("<H", header, 11, 0x0100)
+    header[18] = (BASIC_HISTORY_AUCTION_PERIOD >> 8) & 0xFF
+    struct.pack_into("<I", header, 19, len(text))
+    return encode_frame(bytes(header) + text)
+
+
+def _closing_ts_in_range(timestamp: int) -> bool:
+    try:
+        value = datetime.fromtimestamp(timestamp)
+    except (OSError, ValueError, OverflowError):
+        return False
+    seconds = value.hour * 3600 + value.minute * 60 + value.second
+    return 14 * 3600 + 57 * 60 <= seconds <= 15 * 3600
+
+
+def _decode_closing_rows(
+    rows: bytes,
+    fields: list[tuple[int, int, int]],
+    record_size: int,
+    record_count: int,
+) -> list[dict]:
+    records: list[dict] = []
+    for index in range(record_count):
+        row = rows[index * record_size : (index + 1) * record_size]
+        if len(row) < record_size:
+            # Level2 historical closing frames are persistently truncated by
+            # one byte at the tail (verified across 603118/600519/688981:
+            # every frame's declared record region overruns the frame end by
+            # exactly 1 byte on the final record's last field). Only the very
+            # last declared record is affected; its leading timestamp/price/
+            # amount fields are intact, so pad it and keep the closing tick
+            # rather than dropping the 15:00:00 point. A mid-stream shortfall
+            # would indicate real corruption, so stop there.
+            if index == record_count - 1 and len(row) >= 4:
+                row = row + b"\x00" * (record_size - len(row))
+            else:
+                break
+        if len(row) > record_size:
+            row = row[:record_size]
+        record: dict = {}
+        offset = 0
+        valid = True
+        for datatype, fmt, width in fields:
+            chunk = row[offset : offset + width]
+            offset += width
+            if width != 4 or len(chunk) != 4:
+                record[f"dt{datatype}_raw"] = chunk
+                continue
+            raw_value = struct.unpack("<I", chunk)[0]
+            if datatype == 1:
+                if not _closing_ts_in_range(raw_value):
+                    # The declared record_count may include a trailing
+                    # non-data row (e.g. 688981 declares 62 but only 61 carry
+                    # valid 14:57-15:00 timestamps). Stop at the first row
+                    # whose timestamp falls outside the window and return what
+                    # we have, instead of throwing everything away.
+                    valid = False
+                    break
+                record["time"] = datetime.fromtimestamp(raw_value)
+            elif fmt in (0x70, 0x64):
+                record[f"dt{datatype}"] = decode_ths_float(raw_value)
+            else:
+                record[f"dt{datatype}_raw"] = chunk
+        if not valid:
+            break
+        records.append(record)
+    return records
+
+
+def parse_closing_auction_response(body: bytes) -> list[dict]:
+    """Parse MAIN or Level2 14:57-15:00 companion tables."""
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError:
+            return []
+
+    for marker_name in (b"hd1.0", b"hd3.1"):
+        position = 0
+        while True:
+            marker = body.find(marker_name, position)
+            if marker < 0:
+                break
+            position = marker + 6
+            base = marker + 6
+            if len(body) < base + 10:
+                continue
+            raw_count, flag, record_size, field_count = struct.unpack_from(
+                "<IHHH", body, base
+            )
+            if (
+                flag != 0x0036
+                or record_size != 16
+                or field_count != 4
+            ):
+                continue
+            record_count = raw_count & 0xFFFF
+            fields = _parse_hd_field_table(
+                body, base + 10, field_count
+            )
+            if (
+                len(fields) != field_count
+                or sum(width for _, _, width in fields) != record_size
+                or [field[0] for field in fields]
+                != [1, 10, 49, 31]
+            ):
+                continue
+            shell_offset = base + 10 + field_count * 4
+
+            if marker_name == b"hd3.1":
+                bitrle_offset = shell_offset + 26
+                expected_size = record_count * record_size
+                if (
+                    len(body) < bitrle_offset + 4
+                    or struct.unpack_from(
+                        ">I", body, bitrle_offset
+                    )[0]
+                    != expected_size
+                ):
+                    continue
+                bitplane = _decode_bitrle_0x13746d0(
+                    body[bitrle_offset:], expected_size
+                )
+                rows = _transpose_bitplane_0x1763410(
+                    bitplane, record_size, record_count
+                )
+                records = _decode_closing_rows(
+                    rows, fields, record_size, record_count
+                )
+                if records:
+                    return records
+                continue
+
+            scan_end = min(
+                len(body) - record_size * 2,
+                shell_offset + 256,
+            )
+            for data_start in range(shell_offset, max(shell_offset, scan_end)):
+                if data_start + record_size * 2 > len(body):
+                    break
+                first = struct.unpack_from("<I", body, data_start)[0]
+                second = struct.unpack_from(
+                    "<I", body, data_start + record_size
+                )[0]
+                if (
+                    _closing_ts_in_range(first)
+                    and _closing_ts_in_range(second)
+                    and 0 < second - first <= 180
+                ):
+                    rows = body[
+                        data_start :
+                        data_start + record_count * record_size
+                    ]
+                    records = _decode_closing_rows(
+                        rows, fields, record_size, record_count
+                    )
+                    if records:
+                        return records
+    return []
 
 
 def _auction_ts_in_range(timestamp: int) -> bool:

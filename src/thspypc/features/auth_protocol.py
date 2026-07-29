@@ -26,6 +26,9 @@ class LoginProtocolProfile:
     qsid: str
     account_type: bytes
     supports_manual_identity: bool
+    standard_username: str | None = None
+    standard_password: str | None = None
+    login_header_suffix: bytes | None = None
 
 
 PC_LEVEL2_LOGIN_PROFILE = LoginProtocolProfile(
@@ -37,10 +40,24 @@ PC_LEVEL2_LOGIN_PROFILE = LoginProtocolProfile(
     qsid="6800",
     account_type=bytes((0xBE, 0x06, 0x06, 0x80, 0x00)),
     supports_manual_identity=True,
+    standard_username="thsuser",
+    standard_password="thsuser",
 )
 
-# Keep the current verified profile as the default until ordinary-account
-# captures establish whether any byte-affecting login parameter differs.
+PC_STANDARD_LOGIN_PROFILE = LoginProtocolProfile(
+    name="pc-standard-verified",
+    product="E02",
+    securities="同花顺统一版",
+    http_version="9.60.20.0031",
+    tcp_version="E029.60.20.0031",
+    qsid="6800",
+    account_type=bytes((0xE8, 0x04, 0x06, 0x80, 0x00)),
+    supports_manual_identity=False,
+    standard_username="thsuser",
+    standard_password="thsuser",
+    login_header_suffix=b"\x58\x07",
+)
+
 DEFAULT_LOGIN_PROTOCOL_PROFILE = PC_LEVEL2_LOGIN_PROFILE
 
 
@@ -89,6 +106,21 @@ def parse_passport_fields(passport_bytes: bytes | str) -> dict[str, str]:
             key, _, value = text.partition("=")
             result[key.strip()] = value.strip()
     return result
+
+
+def select_login_profile(
+    passport_fields: Mapping[str, str],
+    *,
+    fallback: LoginProtocolProfile = DEFAULT_LOGIN_PROTOCOL_PROFILE,
+) -> LoginProtocolProfile:
+    """Select a byte-verified profile from the paired account signature."""
+    userclass = passport_fields.get("userclass", "").strip()
+    level2 = passport_fields.get("level2", "").strip()
+    if userclass == "10000" and level2 == "255":
+        return PC_STANDARD_LOGIN_PROFILE
+    if userclass == "30002" and level2 == "16;32;48":
+        return PC_LEVEL2_LOGIN_PROFILE
+    return fallback
 
 
 def build_passport64(
@@ -148,23 +180,31 @@ def build_login_body(
         fields = [
             ("Ask", "login"),
             ("C-Version", profile.tcp_version),
+        ]
+        if profile.standard_username is not None:
+            fields.append(("UserName", profile.standard_username))
+        if profile.standard_password is not None:
+            fields.append(("Password", profile.standard_password))
+        fields.extend([
             ("VerifyType", "1"),
             ("Mac64", mac_b64),
             ("C-SupportPushVer", "1.0"),
             ("C-SupReqDataVer", "hq6.0"),
             ("C-SupPushDataVer", "hq6.0"),
-        ]
+        ])
         fixed = (
             "\n".join(f"{key}={value}" for key, value in fields)
             + "\nPassport64="
         ).encode("gbk")
 
-    check_byte = (len(fixed) + 1) & 0xFF
+    suffix = profile.login_header_suffix
+    if suffix is None:
+        check_byte = (len(fixed) + 1) & 0xFF
+        suffix = bytes([check_byte]) + b"\x09"
     prefix = (
         b"\x09\x41\x09\x00"
         + b"zh_CN.GBK"
-        + bytes([check_byte])
-        + b"\x09"
+        + suffix
     )
     return prefix + fixed + passport64.encode("ascii")
 

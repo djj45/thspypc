@@ -123,7 +123,8 @@ def main():
             print(f"  回退普通连接 {client._connected_ip}")
         else:
             print(f"  ✓ __manual 登录成功")
-            # __manual 连接不发 init（HANDOFF §2 确认 __manual 连接发 init 会被拒断连）
+            # __manual 连接不发 init（docs/handoffs/HANDOFF.md §2 确认
+            # __manual 连接发 init 会被拒断连）
     else:
         client = THSClient(username=username, password=password, imei=imei, enable_heartbeat=False)
         client.connect()

@@ -222,7 +222,8 @@ def test_live():
         print(f"\n⚠ 数量偏少（{len(stocks)} < 7000，可能服务器未响应全量）")
 
     if not stocks:
-        # 拉取失败（服务器实例未响应，HANDOFF 已知现象），无法验证缓存命中
+        # 拉取失败（服务器实例未响应，docs/handoffs/HANDOFF.md 已知现象），
+        # 无法验证缓存命中
         print("\n✗ 拉取为空（服务器实例未响应全量，可重试换 IP）")
         print("  离线测试已验证缓存逻辑正确，活网拉取是 stock_list 本身的稳定性问题")
         client.disconnect()

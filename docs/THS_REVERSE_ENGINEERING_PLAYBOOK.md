@@ -702,7 +702,7 @@ thsdk JSON、DMP、Unicorn 和加载映像只用于开发验证。生产库应�
 
 ### 当前状态与结论
 
-- `HANDOFF_SUPERORDER_20260726.md`
+- [`HANDOFF_SUPERORDER_20260726.md`](handoffs/HANDOFF_SUPERORDER_20260726.md)
 - `docs/SH_AUCTION_X86_HARNESS_PLAN.md`
 
 ### 外层正规化

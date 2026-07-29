@@ -32,11 +32,16 @@
   维持长连接。实测静置 10 秒后连接仍可用。
 - **短线精灵实时推送**（`subscribe_realtime` + `receive_pushes`）：9601 subrealorder
   订阅 + pushrealorder 推送接收。盘中 ~500-800 帧/分钟，异动代码/金额/涨幅/方向
-  全部解码（异动字节锚定 + THS float，30 种异动全覆盖，历史对照 100% 精确）。
+  普通账号支持 23 类基础异动；Level2 “全选”共 53 类（额外 30 类盘口/挂撤单
+  等高级异动）。通道可用、基础异动集和 Level2 高级异动集分别建模。
 - **K线查询**（`kline`）：日/周/月/5分/15分/30分/60分K线，hd3.1 flag=0x0042/0x0046
   响应解析，连接复用（一次 connect 查多只多周期）。
-- **沪深 L2 分时查询**（`timeline`）：当日逐点分时（现价/量/额/均价，241 根），
-  level2 账号走 pageid=4214 推送通道，hd3.1 flag=0x00b4 响应解析。
+- **沪深分时查询**（`timeline`）：当日逐点分时（现价/量/额/均价，241 根）。
+  普通账号走 MAIN `pageid=9354`，Level2 账号走 `pageid=4214`。
+- **历史分时**（`history_timeline`）：普通账号走 MAIN `pageid=9355` 的基础
+  七字段响应，Level2 保留 `pageid=4417` 大单字段路径。
+- **早盘/尾盘竞价**（`auction` / `closing_auction`）：分别覆盖 9:15-9:25 与
+  14:57-15:00；`intraday` 按显示顺序合并早盘竞价、盘中分时和尾盘竞价。
   ★ **沪深分服**：shlv2（沪）/szlv2（深）是两套独立 L2 服务器（IP 0 重叠），
   按股票市场选对应 IP + 配套 init MarketCode（沪 16;144 / 深 32）。
   ★ **后台预热**：首次建好某市连接后异步预热另一市，跨市切换 0.44s（复刻 hexin 秒加载）。
@@ -88,8 +93,8 @@ THSClient
 
 ### 普通账号兼容边界
 
-当前默认登录 profile 和已经验证的行情路径基于 **Level2 账号**。重构已为普通账号
-预留独立的 `LoginProtocolProfile`、账号证据收集、三态能力模型
+普通账号与 Level2 账号都使用独立证据选择请求路径。重构提供
+`LoginProtocolProfile`、账号证据收集、三态能力模型
 （`YES` / `NO` / `UNKNOWN`）以及按连接角色路由的扩展点：
 
 - 普通账号可以使用独立的 product、version、qsid、account type，并声明是否支持
@@ -101,9 +106,9 @@ THSClient
 - 只有明确为 `YES` 的能力才会进入对应专用通道；`NO` 和 `UNKNOWN` 会在创建连接
   前返回明确错误，避免普通账号误走 Level2 请求。
 
-普通账号的 HTTP 类型签名已经验证；但其 TCP `LoginProtocolProfile`、9354 行情
-parser 和 9601 行为仍需官方客户端抓包确认，目前不应视为已经实现。详细设计见
-`HANDOFF_REFACTOR_20260728.md`。
+2026-07-29 普通账号冷启动抓包已确认 MAIN 登录，以及日 K、9354 当日分时、
+9355 历史分时、早盘竞价和尾盘竞价的沪深请求/响应。普通账号只返回基础字段；
+代码不会伪造 Level2 大单字段。9601 的基础 23 类异动也已单独建模。
 
 ## 三种登录方式
 
@@ -404,7 +409,9 @@ with THSClient("账号", "密码") as client:
 ```
 
 每条记录：`时间`(微秒戳) / `市场`(32深 16沪) / `代码` / `异动类型`(中文) /
-`异动编码` / `金额` / `涨跌幅`。异动类型见 `ANOMALY_MAP_DXJL`（30 种，抓包确认）。
+`异动编码` / `金额` / `涨跌幅`。普通账号和 Level2 的可选异动集合不同；
+`STANDARD_REALORDER_CATEGORY_IDS` 是普通账号 23 类，
+`ALL_REALORDER_CATEGORY_IDS` 是 Level2 全选抓到的 53 类。
 
 ### 自定义异动过滤（`datatype`）
 
@@ -416,7 +423,9 @@ from thspypc import build_datatype, build_qurealorder_query
 
 # 只查特大主动买卖（0xbc/0xbe），手数≥2千 OR 金额≥50万
 dt = build_datatype([0xbc, 0xbe], volume_min=2000, amount_min=500000)
-# 查全部已知异动类型（匹配推送帧时推荐）
+# 普通账号 UI 支持的全部 23 类
+dt_standard = build_datatype("standard")
+# Level2 UI “全选”抓到的 53 类；普通账号不要发送这一组
 dt_all = build_datatype("all")
 
 # 通过底层 API 传入（dxjl_page/dxjl_latest 目前用固定 DXJL_DATATYPE，
@@ -424,7 +433,8 @@ dt_all = build_datatype("all")
 ```
 
 类别 ID 规则：`组前缀 | 异动字节`（见 `ANOMALY_GROUP_PREFIX`）。字段19=成交手数(手)，
-字段17=成交金额(元)，`|`=OR。完整规则见 `HANDOFF.md` §1.4。
+字段17=成交金额(元)，`|`=OR。完整规则见
+[`docs/handoffs/HANDOFF.md`](docs/handoffs/HANDOFF.md) §1.4。
 
 ### 实时推送（`subscribe_realtime` + `receive_pushes`）
 
@@ -468,6 +478,8 @@ with THSClient("账号", "密码") as client:
 ## 集合竞价（`auction`）
 
 查 9:15-9:25 集合竞价的逐 tick 撮合数据（虚拟开盘价/累计量/买卖未匹配量）。
+普通账号当天使用 MAIN `pageid=9354/period=7176`，历史日使用
+`pageid=9355/period=6144`；Level2 账号保留 4214 路径。
 
 ```python
 from datetime import date
@@ -514,15 +526,38 @@ records = client.auction("603118", trade_date=date(2026, 7, 27))
 **99% 的逆向难度在外层 LZ**：它自研无格式签名、控制位序非标准、用非标准哈希函数。
 早期会话曾把外层压缩的字典引用表象误判为"内层参数化变长编码"，走了大量弯路。
 外层算法移植自 hexin.exe RVA `0xf74260`（Unicorn 模拟逐字节对照纯 Python），
-详见 `HANDOFF_SUPERORDER_20260726.md` 第十七~二十章。
+详见
+[`docs/handoffs/HANDOFF_SUPERORDER_20260726.md`](docs/handoffs/HANDOFF_SUPERORDER_20260726.md)
+第十七~二十章。
 后续逆向建议先阅读[同花顺协议逆向方法论与实战复盘](docs/THS_REVERSE_ENGINEERING_PLAYBOOK.md)，
 其中总结了本次分层判定、语料设计、DMP 加载映像重建、Unicorn 原生 oracle 和
 回归验收方法。
 
-深市响应格式与沪市**完全一致**（`cmd=0x0a` 外层压缩 + hd1.0 定长内层），盘中
-请求五字段解析 100% 通过（000938/000001 经 thsdk oracle 验证）。仅**盘后查
-历史竞价**时服务器会返回含全天分时的特殊帧，需单独处理（边缘场景，详见
-`HANDOFF_SUPERORDER_20260726.md` §21）。
+深市响应格式与沪市**同构**。普通账号历史竞价返回 9355 伴随表，解析器会从
+组合响应中选择 9:15-9:25 段。
+
+尾盘集合竞价使用独立方法：
+
+```python
+closing = client.closing_auction("603118", trade_date=date(2026, 7, 29))
+whole_day = client.intraday("603118", trade_date=date(2026, 7, 29))
+# whole_day 每条记录有 phase:
+# opening_auction / continuous / closing_auction
+```
+
+尾盘协议为 `period=7424`，字段为时间、价格、累计量和伴随字段；它与早盘
+买卖未匹配量字段集不同，因此底层保持独立解析，高层由 `intraday()` 合并显示。
+普通账号使用 MAIN 9354/9355；Level2 账号严格使用对应市场连接，当天用 4214、
+历史日用 4417，并先完成该股票的订阅注册，不会回退或混用普通账号请求。
+2026-07-29 冷启动抓包已确认 Level2 市场连接使用 `thsuser` 标准行情登录壳
+承载 Level2 passport；这只是 TCP 登录形态，不会改变上述业务路由。PC 会话的
+4417 请求确实返回了 `603118 / 2026-07-24` 的 61 个历史尾盘点，响应序号也与
+请求一致；但独立客户端即使对齐同一节点、完整启动序列和页面停留时间，仍只收到
+空 ACK。全 TCP 抓包只发现页面并发加载了公开的异动解读 HTTP 接口，实发该接口
+不会激活尾盘响应。当前最强差异是官方 PC 通过 `verify3/gs → verify3/pwd_login`
+取得 SID，而库仍使用兼容的 `verify2 unified_login → mainverify`；两者 Passport
+权限字段相同，但 SID 代际不同。现代 PC HTTP 登录尚未复刻前，该组合暂不标记为
+已完成。
 
 ## 安装
 with THSClient("账号", "密码") as client:
@@ -570,8 +605,8 @@ thspypc/
 - hd3.1 变体（unk=0x36/0x42/0x4a 等非 BitRLE 编码）暂不支持，`parse_hd3_response`
   自动跳过。
 - hq1.0 字段表 TLV 格式未破解（字段表签名跨帧固定但 TLV 切分方式未对齐）。
-  当前推送帧的数值解码通过**异动字节锚定 + THS float 扫描**绕过，30 种异动
-  全覆盖（金额/涨幅 100% 精确）。解出 TLV 能实现通用 schema 驱动解析，但
+  当前推送帧的数值解码通过**异动字节锚定 + THS float 扫描**绕过，已知类别名
+  按抓包和官方客户端配置匹配（金额/涨幅 100% 精确）。解出 TLV 能实现通用 schema 驱动解析，但
   实际收益有限（需 Ghidra 逆向 hexin.exe）。
 - upstockname A 股名称的块状编码未解（纯文本段已解），默认走同花顺本地缓存
   填充名称（需安装同花顺 PC 客户端）。
@@ -589,12 +624,10 @@ thspypc/
     提前返回 `error="session_conflict"`。
   - 仍建议长连接复用（connect 一次反复查），但反复 connect 在 IP 分散时也安全。
   - 确保同花顺客户端已退出（同账号不能两个客户端同时在线）。
-- **`__manual` 登录的 Passport64 时效**（分时/推送通道专用）：主连接 login 已"消费"
-  Passport64（服务器记录会话），`__manual` 再用同一票据登录会被拒——PromptText
-  "我们发现您的登录通行证有被修改的痕迹"。**这不是过期**（signvalid 有效期一周），
-  是同一票据被重复用于新登录触发的保护。主连接已建立的不受影响，只有新的
-  `__manual` 登录会被拒。`_open_manual_push_connection` 检测到此类 PromptText 会
-  **立即重新 `full_http_auth`** 拿新鲜 Passport64 重试（16s→1s），用户无感。
+- **L2 连接的 Passport64 时效**：同一票据被重复用于新 TCP 登录时，服务端可能返回
+  “登录通行证有被修改的痕迹”。这不是 `signvalid` 到期，而是会话级重复登录保护。
+  `_open_manual_push_connection` 是保留的兼容方法名；生产路径已按抓包使用
+  `thsuser` 标准行情登录壳，并在检测到票据失效后立即重新 HTTP 鉴权。
 
 ## 连接治理（长连接复用 + 防 -1）
 
@@ -618,13 +651,13 @@ thspypc/
 ## 服务器 IP 动态获取 + 测速选最优
 
 thspypc 不硬编码服务器 IP——HTTP 鉴权返回的 passport 里有 `M_hqdns` 字段
-（域名列表）。A 股 MAIN 连接由 `resolve_market_hosts()` 只解析
-`ifindhq.123ths.com`；`fu4`、`hkus`、`euhq` 等条目属于其他市场组，虽然可以完成
-普通 login，但不会响应沪深 `list_quotes`。L2 连接则分别解析
+（域名列表）。A 股 MAIN 连接优先解析普通客户端实际使用的
+`main.123ths.com`；旧 passport 缺少该域名时回退到已验证的
+`ifindhq.123ths.com`。`fu4`、`hkus`、`euhq` 等条目不混入 MAIN。L2 连接分别解析
 `shlv2.123ths.com` / `szlv2.123ths.com`。硬编码的 `MARKET_HOSTS` 仅作 MAIN DNS
 解析失败时的回退。
 
-拿到当前约 12 个 ifindhq IP 后，`connect()` 会并发 TCP 握手测延迟，再从排序后的
+拿到当前 MAIN IP 后，`connect()` 会并发 TCP 握手测延迟，再从排序后的
 IP 池轮换选择最多 7 个 login。测速缓存只在缓存 IP 仍属于当前 DNS 候选时复用，
 避免旧域名分组或过期 DNS 结果重新混入 MAIN。纯 TCP 握手不发 login，不触发
 VerifyCode=-1。
@@ -632,10 +665,9 @@ VerifyCode=-1。
 ## L2 分服 init
 
 MAIN 普通登录连接在 `VerifyCode=0` 后发送标准 MAIN init，收到服务器配置帧后
-才进入 ready。此前 init 后断连来自连接到非 `ifindhq` 节点，不是 MAIN init
-本身；MAIN 不应发送的是 `__manual` L2 初始化流程。
+才进入 ready；MAIN 不发送 L2 市场初始化流程。
 
-带市场配置的 init 属于 `__manual` L2 通道：
+带市场配置的 init 属于 L2 市场通道：
 
 - 沪市：连接 `shlv2`，发送 `MarketCode=16;144;`
 - 深市：连接 `szlv2`，发送 `MarketCode=32;`

@@ -25,20 +25,23 @@
 | 个股列表行情 | `list_quotes` | ✅ 完整 | hd1.0/hd3.1 解码链 |
 | 个股五档盘口 | `depth_quote` | ✅ API 已完成 | 买卖各五档 + 涨跌停封单额；不是 Level2 十档 |
 | K线（日/周/月/5分/15分/30分/60分） | `kline` | ✅ 完整 | 连接复用 + 坏 IP 黑名单 |
-| 当日分时（L2） | `timeline` | ✅ 完整 | pageid=4214 推送通道 |
-| 集合竞价 | `auction` | ✅ 完整 | 9:15-9:25 逐 tick 撮合 |
+| 当日分时（普通/L2） | `timeline` | ✅ 完整 | 普通 9354；L2 4214 |
+| 历史分时（普通） | `history_timeline` | ✅ 完整 | MAIN 9355，基础价量额 241 点 |
+| 早盘集合竞价 | `auction` | ✅ 完整 | 普通 current/history + L2 |
+| 尾盘集合竞价 | `closing_auction` | ⚠️ 部分 | 普通 MAIN 9354/9355、L2 当日 4214 已验证；冷启动 PC 抓包已确认 L2 历史 4417 返回 `603118 / 2026-07-24` 的 61 点，同节点完整重放仍只回空 ACK；全端口抓包已排除页面附属 HTTP 预热，当前缺口收敛到 PC `verify3/pwd_login` SID 与库内旧 `verify2` SID 的差异 |
+| 完整日内序列 | `intraday` | ✅ 完整 | 早盘竞价 + 盘中 + 尾盘竞价 |
 | 全市场代码表 | `stock_list` / `stock_list_cached` | ✅ 完整 | ~7400 条，自然日缓存 |
 | 排行榜/涨跌幅榜 | `stock_list_hot` | ✅ 部分 | 按排序字段排，无成交量/成交额榜 |
 | 全市场快照 | `market_snapshot` / `market_snapshot_with_quotes` | ✅ 完整 | 沪市 hfd1.0 + 全市场混合方案 |
 | 自定义板块/自选股 CRUD | `list_groups`/`add_group`/`add_stock` 等 | ✅ 完整 | 门面委托 `BlockManager` |
 | 问财动态选股 | `query_dynamic_plate` | ✅ 完整 | 选股表达式成分股查询 |
-| 短线精灵（异动）历史 | `dxjl_latest` / `dxjl_history` | ✅ 完整 | 9601 qurealorder，30 种异动 |
+| 短线精灵（异动）历史 | `dxjl_latest` / `dxjl_history` | ✅ 完整 | 9601 qurealorder；普通账号基础 23 类，Level2 全选 53 类 |
 | 短线精灵实时推送 | `subscribe_realtime` / `receive_pushes` | ✅ 完整 | 盘中 ~500-800 帧/分钟 |
 | 个股逐 tick 推送 | `snapshot_subscribe` | ✅ 完整 | pageid=4214 实时快照 |
 | 心跳保活 | 自动（`_start_heartbeat`） | ✅ 完整 | 8901 每 3s / 9601 每 30s |
 
-> 上表登录完成度指当前已验证的 Level2 PC profile。普通账号的 HTTP passport
-> 已可识别，但 TCP profile 尚缺官方客户端对照抓包，暂不宣称普通账号 MAIN 完整。
+> 普通账号冷启动抓包已验证 MAIN 登录及上述基础行情；Level2 专属字段仍按独立
+> capability 路由，不因 MAIN 可用而开放。
 
 ### 分时附带的大单金额曲线（PC 版口径，已实现）
 
@@ -53,7 +56,7 @@
 
 | 模块 | 方法 | 现状 | 缺什么 |
 |------|------|------|--------|
-| 历史分时（回忆） | `history_timeline` | 已接入沪深分服的 `__manual + L2 init`；指数 241 点 + 个股完整锚点型核心字段可解 | 强状态省略型及 dt54 后 level2 字段仍待完成；公开方法暂属实验接口 |
+| 历史分时（Level2） | `history_timeline` | 已接入沪深分服的 Level2 passport + 标准行情登录壳 + L2 init；指数 241 点 + 个股完整锚点型核心字段可解 | 强状态省略型及 dt54 后 level2 字段仍待完成 |
 | 排行榜 | `stock_list_hot` | 涨幅/涨速/换手/量比/主力净流入/竞价等排序榜 | 不支持成交量/成交额榜（这两个走别的协议） |
 
 ---

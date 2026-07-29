@@ -140,7 +140,7 @@ class ConnectionFactory:
                 self._drop_main()
                 opened = self._open_manual(market)
                 if opened is None:
-                    raise OSError(f"__manual[{key}] 建连或 init 失败")
+                    raise OSError(f"L2[{key}] 建连或 init 失败")
                 with self._push_lock:
                     current = self._push_sockets.get(key)
                     if current is None:

@@ -481,7 +481,7 @@ class ConnectionPrimitives:
             logger.warning("9601 短线精灵服务连接失败: %s", e)
 
     def _preheat_other_market(self, current_key: str) -> None:
-        """后台异步预热另一市的 __manual 连接（复刻 hexin 启动即双连行为）。
+        """后台异步预热另一市的 L2 连接（复刻 hexin 启动即双连行为）。
 
         hexin 启动时同时连 sz+sh 两条 L2 服务器，所以切任何票都秒加载。thspypc
         原来是惰性的——遇到某市票才建该市连接，首次切另一市要等 init（4-5s）。
@@ -517,10 +517,11 @@ class ConnectionPrimitives:
 
     def _open_manual_push_connection(self, market: int, skip_init: bool = False,
                                       use_main_ip: bool = False):
-        """用 __manual 身份开一条独立 8901 连接（推送通道专用，按沪深分服）。
+        """打开一条独立的沪市或深市 L2 8901 连接。
 
         复用当前 HTTP AuthMaterial 的 Passport64/Mac64；不要求 MAIN 已连接。
-        login 帧使用 UserName=__manual。
+        兼容方法名沿用 ``manual``，但生产 login 帧按 2026-07-29 PC 抓包使用
+        ``UserName=thsuser`` 标准行情登录壳；Level2 权限来自 passport 和业务证据。
         登录后默认发 init 激活行情通道（``skip_init=False``）。
 
         ★ **按沪深选 L2 服务器**（2026-07-24 实测突破）：shlv2/szlv2 是两套独立
@@ -530,7 +531,8 @@ class ConnectionPrimitives:
             沪市（17/16/144）→ shlv2 IP + init(MarketCode="16;144;")
             深市（33/32）    → szlv2 IP + init(MarketCode="32;")
 
-        HANDOFF 旧结论"__manual 发 init(16) 被拒、改 32 正常"是误判——当时连的
+        docs/handoffs/HANDOFF.md 的旧结论"init(16) 被拒、改 32 正常"
+        是误判——当时连的
         是 szlv2 的深市 IP，发沪市 init(16) 当然被拒。真相是 IP 与 MarketCode
         必须配套，而非 16 vs 32 谁对谁错。
 
@@ -560,10 +562,10 @@ class ConnectionPrimitives:
             """用给定 passport64 尝试所有候选 IP；全失败时可选重新鉴权重试一轮。"""
             if use_main_ip:
                 if not self._connected_ip:
-                    logger.error("__manual: use_main_ip 但无主连接 IP")
+                    logger.error("L2: use_main_ip 但无主连接 IP")
                     return None
                 hosts = [self._connected_ip]
-                logger.info("__manual[%s] use_main_ip=True → 强制连主连接 IP %s",
+                logger.info("L2[%s] use_main_ip=True → 强制连主连接 IP %s",
                             key, self._connected_ip)
             else:
                 grouped = resolve_l2_hosts_grouped(self._auth.get("passport_bytes", b""))
@@ -572,10 +574,10 @@ class ConnectionPrimitives:
                     hosts.remove(self._connected_ip)
                     hosts.insert(0, self._connected_ip)
                 if not hosts:
-                    logger.error("__manual: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
+                    logger.error("L2: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
                     return None
 
-            logger.info("__manual[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
+            logger.info("L2[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
                         key, len(hosts), hosts[:3], init_market_code,
                         "（skip_init）" if skip_init else "")
             stale = False
@@ -587,28 +589,28 @@ class ConnectionPrimitives:
                 if result == "stale_passport":
                     # 票据失效，剩余 IP 必然也失败，立即跳出重新鉴权
                     stale = True
-                    logger.info("__manual[%s] 票据失效（%s），跳过剩余 IP 直接重新鉴权",
+                    logger.info("L2[%s] 票据失效（%s），跳过剩余 IP 直接重新鉴权",
                                 key, host)
                     break
-                logger.info("__manual[%s] IP %s 不可用，换下一个", key, host)
-            # ★ 票据失效或全失败：__manual 登录对 Passport64 新鲜度敏感——同一票据
+                logger.info("L2[%s] IP %s 不可用，换下一个", key, host)
+            # ★ 票据失效或全失败：L2 登录对 Passport64 新鲜度敏感——同一票据
             # 被多次使用后服务器会拒（PromptText="通行证有被修改的痕迹"）。主连接
-            # 已建立不受影响，但新 __manual 登录会被拒。检测到 stale 或全失败时，
+            # 已建立不受影响，但新的 L2 登录会被拒。检测到 stale 或全失败时，
             # 重新 full_http_auth 拿新鲜票据再试一轮。
             if stale or allow_refresh:
                 if stale:
-                    logger.warning("__manual[%s] 票据失效，重新 HTTP 鉴权拿新鲜 Passport64...",
+                    logger.warning("L2[%s] 票据失效，重新 HTTP 鉴权拿新鲜 Passport64...",
                                    key)
                 else:
-                    logger.warning("__manual[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
+                    logger.warning("L2[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
                                    key)
                 try:
                     fresh = self._refresh_auth_material().passport64
-                    logger.info("__manual[%s] 已拿到新鲜 Passport64，重试一轮", key)
+                    logger.info("L2[%s] 已拿到新鲜 Passport64，重试一轮", key)
                     return _try_round(fresh, allow_refresh=False)
                 except Exception as e:
-                    logger.error("__manual[%s] 重新鉴权失败: %s", key, e)
-            logger.error("__manual[%s] 全部候选 IP 都失败", key)
+                    logger.error("L2[%s] 重新鉴权失败: %s", key, e)
+            logger.error("L2[%s] 全部候选 IP 都失败", key)
             return None
 
         passport64 = self._current_passport64()
@@ -617,7 +619,7 @@ class ConnectionPrimitives:
         return _try_round(passport64, allow_refresh=True)
 
     def _try_open_manual_sock(self, host, passport64, key, init_market_code, skip_init=False):
-        """对单个 IP 执行 __manual 连接 → 登录 → init，成功返回 socket。
+        """对单个 L2 IP 执行连接 → 标准行情登录壳 → init。
 
         init 响应 <5000B 视为该 IP 不健康（连错市/未激活），返回 None 让调用方换 IP。
         ``skip_init=True`` 时跳过 init（复刻 ``_replay_exact.py`` 的成功路径）。
@@ -626,11 +628,11 @@ class ConnectionPrimitives:
         try:
             sock = _socket.create_connection((host, MARKET_PORT), timeout=15)
         except OSError as e:
-            logger.warning("__manual[%s] 连接失败 %s: %s", key, host, e)
+            logger.warning("L2[%s] 连接失败 %s: %s", key, host, e)
             return None
         login_body = self._auth_service.login_body_for_passport(
             passport64,
-            LoginIdentity.MANUAL,
+            LoginIdentity.STANDARD,
         )
         try:
             sock.sendall(encode_frame(login_body) + b"\n")
@@ -644,7 +646,7 @@ class ConnectionPrimitives:
                 elif line.startswith("PromptText="):
                     prompt = line.split("=", 1)[1]
             if vc != "0":
-                logger.error("__manual[%s] %s 登录失败 VerifyCode=%s PromptText=%s",
+                logger.error("L2[%s] %s 登录失败 VerifyCode=%s PromptText=%s",
                              key, host, vc, prompt or "(无)")
                 sock.close()
                 if self._is_explicit_l2_permission_rejection(prompt):
@@ -657,14 +659,14 @@ class ConnectionPrimitives:
                 if "通行证" in prompt or "身份" in prompt:
                     return "stale_passport"
                 return None
-            logger.info("__manual[%s] %s 登录成功", key, host)
+            logger.info("L2[%s] %s 登录成功", key, host)
             self._account_evidence.record_manual_login(Support.YES)
         except (OSError, ValueError) as e:
-            logger.error("__manual[%s] %s 登录异常: %s", key, host, e)
+            logger.error("L2[%s] %s 登录异常: %s", key, host, e)
             sock.close()
             return None
         if skip_init:
-            logger.info("__manual[%s] %s 跳过 init（skip_init）", key, host)
+            logger.info("L2[%s] %s 跳过 init（skip_init）", key, host)
             return sock
         # ★ 发 init 激活行情通道。MarketCode 必须匹配该 IP 所属市场
         # （shlv2→16;144 沪市，szlv2→32 深市），否则只回 210B 小帧。
@@ -691,16 +693,16 @@ class ConnectionPrimitives:
                     n_bytes += len(b)
                 except (socket.timeout, OSError, ValueError):
                     break
-            logger.info("__manual[%s] %s init 完成（MarketCode=%s，%d帧/%dB）",
+            logger.info("L2[%s] %s init 完成（MarketCode=%s，%d帧/%dB）",
                         key, host, init_market_code, n_frames, n_bytes)
             if n_bytes < 5000:
-                logger.warning("__manual[%s] %s init 响应过小（%dB），该 IP 未激活行情通道",
+                logger.warning("L2[%s] %s init 响应过小（%dB），该 IP 未激活行情通道",
                                key, host, n_bytes)
                 sock.close()
                 return None
             self._account_evidence.record_l2_init(Support.YES)
         except OSError as e:
-            logger.warning("__manual[%s] %s init 异常: %s", key, host, e)
+            logger.warning("L2[%s] %s init 异常: %s", key, host, e)
             sock.close()
             return None
         return sock

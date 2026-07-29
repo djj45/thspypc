@@ -231,7 +231,7 @@ def test_history_timeline_authenticates_without_main_login(monkeypatch):
     assert client._sock is None
 
 
-def test_verified_standard_passport_blocks_l2_before_socket_open(monkeypatch):
+def test_verified_standard_passport_routes_timeline_to_main(monkeypatch):
     client = _client()
     auth_calls = []
 
@@ -255,10 +255,24 @@ def test_verified_standard_passport_blocks_l2_before_socket_open(monkeypatch):
         "_open_manual_push_connection",
         lambda market: opened.append(market),
     )
+    routed_roles = []
 
-    with pytest.raises(UnsupportedAccountFeatureError):
-        client.timeline("600519", market=17)
+    class FakeTimelineService:
+        def __init__(self, connections, *, subscriptions, evidence=None):
+            routed_roles.append(connections.profile.kind)
 
+        def timeline(self, code, **kwargs):
+            return [{"code": code, "dt10": 10.0}]
+
+    monkeypatch.setattr(
+        "thspypc.services.TimelineService",
+        FakeTimelineService,
+    )
+
+    result = client.timeline("600519", market=17)
+
+    assert result == [{"code": "600519", "dt10": 10.0}]
     assert len(auth_calls) == 1
     assert client.observed_account_profile.kind is AccountKind.STANDARD
+    assert routed_roles == [AccountKind.STANDARD]
     assert opened == []

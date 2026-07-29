@@ -96,12 +96,29 @@ def build_account_profile(evidence: AccountEvidence) -> AccountProfile:
     else:
         kind = AccountKind.UNKNOWN
 
+    realorder_basic = evidence.realorder
+    if evidence.realorder is Support.NO:
+        realorder_level2 = Support.NO
+    elif evidence.l2_entitlement is Support.NO:
+        realorder_level2 = Support.NO
+    elif (
+        evidence.realorder is Support.YES
+        and evidence.l2_entitlement is Support.YES
+    ):
+        realorder_level2 = Support.YES
+    else:
+        realorder_level2 = Support.UNKNOWN
+
     capabilities = {
         Capability.BASIC_QUOTE: evidence.main_market_access,
         Capability.BASIC_TIMELINE: evidence.main_market_access,
+        Capability.BASIC_HISTORY_TIMELINE: evidence.main_market_access,
+        Capability.BASIC_AUCTION: evidence.main_market_access,
         Capability.L2_MARKET_ACCESS: market_support,
         **feature_values,
         Capability.REALORDER: evidence.realorder,
+        Capability.REALORDER_BASIC_ANOMALIES: realorder_basic,
+        Capability.REALORDER_LEVEL2_ANOMALIES: realorder_level2,
     }
     return AccountProfile(
         kind=kind,

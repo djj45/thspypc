@@ -18,6 +18,14 @@ def test_unknown_profile_does_not_guess_capabilities():
     assert profile.kind is AccountKind.UNKNOWN
     assert profile.support(Capability.BASIC_QUOTE) is Support.UNKNOWN
     assert not profile.supports(Capability.BASIC_QUOTE)
+    assert (
+        profile.support(Capability.REALORDER_BASIC_ANOMALIES)
+        is Support.UNKNOWN
+    )
+    assert (
+        profile.support(Capability.REALORDER_LEVEL2_ANOMALIES)
+        is Support.UNKNOWN
+    )
     assert profile.passport_fields["level2"] == ""
 
 

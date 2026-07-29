@@ -12,6 +12,7 @@ from ..features.auth_protocol import (
     build_login_body,
     build_passport64,
     parse_passport_fields,
+    select_login_profile,
 )
 
 HttpAuthenticator = Callable[[str, str, str | None], dict]
@@ -75,6 +76,9 @@ class AuthService:
         self._mac64 = mac64
         self._authenticator = authenticator
         self._profile = profile
+        self._auto_select_profile = (
+            profile is DEFAULT_LOGIN_PROTOCOL_PROFILE
+        )
         self._generation = 0
         self._current: AuthMaterial | None = None
 
@@ -84,6 +88,8 @@ class AuthService:
 
     @property
     def profile(self) -> LoginProtocolProfile:
+        if self._current is not None:
+            return self._current.profile
         return self._profile
 
     def authenticate(
@@ -99,12 +105,20 @@ class AuthService:
         passport_fields = parse_passport_fields(
             auth_info.get("passport_bytes", b"")
         )
+        profile = (
+            select_login_profile(
+                passport_fields,
+                fallback=self._profile,
+            )
+            if self._auto_select_profile
+            else self._profile
+        )
         self._generation += 1
         material = AuthMaterial(
             auth_info=MappingProxyType(dict(auth_info)),
             passport_fields=MappingProxyType(passport_fields),
-            passport64=build_passport64(auth_info, profile=self._profile),
-            profile=self._profile,
+            passport64=build_passport64(auth_info, profile=profile),
+            profile=profile,
             generation=self._generation,
         )
         self._current = material
@@ -130,5 +144,9 @@ class AuthService:
             passport64,
             self._mac64,
             identity=identity,
-            profile=self._profile,
+            profile=(
+                self._current.profile
+                if self._current is not None
+                else self._profile
+            ),
         )

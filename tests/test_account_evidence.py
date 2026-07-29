@@ -73,6 +73,31 @@ def test_explicit_ordinary_entitlement_disables_only_l2_capabilities():
     assert profile.support(Capability.REALORDER) is Support.UNKNOWN
 
 
+def test_realorder_channel_and_anomaly_tiers_are_independent():
+    standard = build_account_profile(
+        AccountEvidence(
+            l2_entitlement=Support.NO,
+            realorder=Support.YES,
+        )
+    )
+    level2 = build_account_profile(
+        AccountEvidence(
+            l2_entitlement=Support.YES,
+            realorder=Support.YES,
+        )
+    )
+
+    assert standard.supports(Capability.REALORDER)
+    assert standard.supports(Capability.REALORDER_BASIC_ANOMALIES)
+    assert (
+        standard.support(Capability.REALORDER_LEVEL2_ANOMALIES)
+        is Support.NO
+    )
+    assert level2.supports(Capability.REALORDER)
+    assert level2.supports(Capability.REALORDER_BASIC_ANOMALIES)
+    assert level2.supports(Capability.REALORDER_LEVEL2_ANOMALIES)
+
+
 def test_l2_init_and_feature_success_promote_only_observed_capabilities():
     profile = build_account_profile(
         AccountEvidence(

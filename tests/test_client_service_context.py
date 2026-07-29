@@ -728,11 +728,54 @@ def test_auction_opt_in_delegates_with_inferred_market(monkeypatch):
     ]
 
 
+def test_closing_auction_level2_delegates_with_l2_profile(monkeypatch):
+    client = _client()
+    client._push_socks["sh"] = FakeSocket()
+    client._push_initialized.add("sh")
+    calls = []
+
+    class FakeAuctionService:
+        def __init__(self, connections, *, subscriptions, evidence=None):
+            self.connections = connections
+
+        def closing_auction(self, code, **kwargs):
+            calls.append(
+                (self.connections.profile.kind, code, kwargs)
+            )
+            return [{"dt10": 15.01}]
+
+    monkeypatch.setattr(
+        "thspypc.services.AuctionService",
+        FakeAuctionService,
+    )
+    client.configure_service_context(LEVEL2_PROFILE)
+
+    result = client.closing_auction(
+        "603118",
+        trade_date="2026-07-24",
+        timeout=7.0,
+    )
+
+    assert result == [{"dt10": 15.01}]
+    assert calls == [
+        (
+            AccountKind.LEVEL2,
+            "603118",
+            {
+                "market": 17,
+                "trade_date": "2026-07-24",
+                "timeout": 7.0,
+            },
+        )
+    ]
+
+
 def test_auction_opt_in_standard_profile_fails_before_opening():
     client = _client()
     profile = AccountProfile(
         kind=AccountKind.STANDARD,
         capabilities={
+            Capability.BASIC_AUCTION: Support.NO,
             Capability.L2_MARKET_ACCESS: Support.NO,
             Capability.L2_AUCTION: Support.NO,
         },
@@ -811,8 +854,22 @@ def test_timeline_opt_in_delegates_with_inferred_market(monkeypatch):
     ]
 
 
-def test_timeline_opt_in_standard_stops_before_opening():
+def test_timeline_opt_in_standard_delegates_to_basic_service(monkeypatch):
     client = _client()
+    calls = []
+
+    class FakeTimelineService:
+        def __init__(self, connections, *, subscriptions, evidence=None):
+            self.connections = connections
+
+        def timeline(self, code, **kwargs):
+            calls.append((code, kwargs))
+            return [{"code": code, "dt10": 12.34}]
+
+    monkeypatch.setattr(
+        "thspypc.services.TimelineService",
+        FakeTimelineService,
+    )
     profile = AccountProfile(
         kind=AccountKind.STANDARD,
         capabilities={
@@ -823,10 +880,12 @@ def test_timeline_opt_in_standard_stops_before_opening():
     )
     client.configure_service_context(profile)
 
-    with pytest.raises(UnsupportedAccountFeatureError) as exc_info:
-        client.timeline("000938")
+    result = client.timeline("000938")
 
-    assert exc_info.value.feature == "timeline:basic_response"
+    assert result == [{"code": "000938", "dt10": 12.34}]
+    assert calls == [
+        ("000938", {"market": 33, "timeout": 12.0})
+    ]
 
 
 def test_timeline_opt_in_reports_missing_l2_socket():
@@ -863,6 +922,54 @@ def test_timeline_opt_in_rejects_competing_snapshot_reader():
 
     with pytest.raises(ChannelUnavailableError, match="后台快照线程"):
         client.timeline("000938")
+
+
+def test_intraday_combines_historical_phases_in_display_order(
+    monkeypatch,
+):
+    client = _client()
+    calls = []
+    monkeypatch.setattr(
+        client,
+        "auction",
+        lambda code, **kwargs: (
+            calls.append(("opening", code, kwargs))
+            or [{"time": "09:15"}]
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "history_timeline",
+        lambda code, value, **kwargs: (
+            calls.append(("continuous", code, value, kwargs))
+            or [{"bar_index": 1}]
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "closing_auction",
+        lambda code, **kwargs: (
+            calls.append(("closing", code, kwargs))
+            or [{"time": "14:57"}]
+        ),
+    )
+
+    result = client.intraday(
+        "603118",
+        market=17,
+        trade_date="2026-05-15",
+        timeout=6.0,
+        retries=1,
+    )
+
+    assert [row["phase"] for row in result] == [
+        "opening_auction",
+        "continuous",
+        "closing_auction",
+    ]
+    assert calls[0][0] == "opening"
+    assert calls[1][0] == "continuous"
+    assert calls[2][0] == "closing"
 
 
 def test_controlled_opener_builds_and_caches_borrowed_l2_socket(

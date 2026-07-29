@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""在线验证 client.auction("603118") 生产链路（HANDOFF_SUPERORDER 17.4 第 1 条）。
+"""在线验证 client.auction("603118") 生产链路
+（docs/handoffs/HANDOFF_SUPERORDER_20260726.md 17.4 第 1 条）。
 
 确认无需 DMP/Unicorn，仅凭 .env 的 lv2 账号 + 网络，即可在线拿到 603118
 7-27 集合竞价的 200 条五字段记录。顺带：

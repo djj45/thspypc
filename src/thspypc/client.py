@@ -150,11 +150,12 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._market_session = MarketSession(lambda: self._sock, self._sock_lock)
         self._realorder_lock = threading.Lock()         # 保护 9601 socket send
         # 实时分时推送（8901 pageid=4214 订阅后的逐 tick 快照）
-        # __manual 推送连接池，按沪深分服（shlv2=沪, szlv2=深）。
+        # L2 推送连接池，按沪深分服（shlv2=沪, szlv2=深）。
         # ★ 2026-07-24 实测：沪深 L2 是两套独立服务器，IP 0 重叠。沪市票必须连
         # shlv2 的 IP + init(16;144)，深市票必须连 szlv2 的 IP + init(32)，连错
         # 市会导致 init 只回 210B、4214 注册 CodeListSize=0。详见
-        # resolve_l2_hosts_grouped() 与 HANDOFF_PUSH_INVESTIGATION §沪深分服突破。
+        # resolve_l2_hosts_grouped() 与
+        # docs/handoffs/HANDOFF_PUSH_INVESTIGATION_20260724.md §沪深分服突破。
         self._push_socks: dict = {}               # {"sh": sock, "sz": sock}
         self._push_lock = threading.Lock()        # 保护 _push_socks 并发（预热线程 vs 主线程）
         self._push_request_locks = {
@@ -678,7 +679,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         而本方法还会探测 socket 是否已被对端/网络中断关闭。
 
         本方法**不自动重连**——重连=重新 login=新的 VerifyCode=-1 风险
-        （见 HANDOFF §7）。连接断开时返回 False，由调用方决定是否重连
+        （见 docs/handoffs/HANDOFF.md §7）。连接断开时返回 False，由调用方决定是否重连
         （通常应等 ≥20s 冷却后再 connect）。
 
         Returns:
@@ -1048,7 +1049,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
 
     def _snapshot_loop(self) -> None:
-        """后台读取沪深两条 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
+        """后台读取沪深两条 L2 推送连接的 71B 快照帧，更新现价/触发回调。
 
         用 ``select`` 同时等待 ``self._push_socks`` 里的连接（最多沪深两条），
         可读的就 ``read_frame``。遇到非快照帧（心跳响应、注册响应等）直接丢弃。
@@ -1088,7 +1089,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
         hexin 客户端从不主动断开（90s 抓包零 FIN），thspypc 遵循同样模式：
         长连接反复查询，避免反复 disconnect/connect 触发 VerifyCode=-1
-        （同账号同 IP 短时间重复 login 的会话冲突，见 HANDOFF §7）。
+        （同账号同 IP 短时间重复 login 的会话冲突，见 docs/handoffs/HANDOFF.md §7）。
         """
         self._connection_runtime.disconnect()
 

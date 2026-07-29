@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date as date_type, datetime
 
 from ..errors import ChannelUnavailableError, ProtocolError
-from ..models import Capability, DepthQuote
+from ..models import AccountKind, Capability, DepthQuote
 from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
 from ..transport import ConnectionRole
 from .stock_cache import (
@@ -89,7 +90,8 @@ class ServiceFacade:
         | :meth:`list_quotes` | 全市场准确行情（批量回填） | ~10-30s |
 
         旧实现额外调用 hfd1.0 空括号快照拿沪市 code+name，但 hfd1.0 路径
-        反复 connect/disconnect 触发 VerifyCode=-1（限流根因，见 HANDOFF §7），
+        反复 connect/disconnect 触发 VerifyCode=-1（限流根因，见
+        docs/handoffs/HANDOFF.md §7），
         且名称覆盖（1209 锚点）不如 hexin 本地缓存（~8000 条）全，故移除。
         code+name 现完全由 ``stock_list_cached(with_names=True)`` 提供。
 
@@ -169,7 +171,8 @@ class ServiceFacade:
         发送 ``method=upstockname`` 请求，解析响应中的 ``[name_<MARKET>]`` 段。
         纯文本段（外汇/期货/北交所/外盘等）直接解出；块状自定义编码段
         （沪深 A 股 ``name_16_16``）当前跳过（编码未逆向，简单模型已穷举证伪，见
-        :func:`thspypc.protocol.decode_name_frame` 与 HANDOFF §6a/§6b）。
+        :func:`thspypc.protocol.decode_name_frame` 与
+        docs/handoffs/HANDOFF.md §6a/§6b）。
 
         服务器按账号追踪名称版本，thspypc 账号通常只能拿到**增量**（~12 条），
         全量需 hexin 客户端冷启动触发。本方法适合补充 :meth:`load_hexin_names`
@@ -507,13 +510,8 @@ class ServiceFacade:
     ) -> list[dict]:
         """查当日分时图（逐点行情：现价/均价/量额，复刻 hexin 分时白线）。
 
-        L2 账号走 **pageid=4214 推送通道**（``__manual`` 连接），用 35 个 level2
-        字段查询 ``DateTime=8192``。2026-07-24 抓包确认 hexin 盘后也走此路径
-        拿当日完整 240 根分时。
-
-        ⚠️ 自动建立 ``__manual`` 推送连接（同 :meth:`snapshot_subscribe`）。
-        普通账号走 pageid=9354 请求-响应（本方法不支持，用 :func:`build_timeline_query`
-        在主连接上手动发）。
+        普通账号走 MAIN 上的 ``pageid=9354`` 请求-响应；Level2 账号走
+        ``pageid=4214`` 的市场专用通道。两种响应统一返回逐点行情记录。
 
         Args:
             code: 股票代码（纯数字，如 ``"000938"``）。
@@ -525,7 +523,7 @@ class ServiceFacade:
             按时间正序。非交易日/盘前当天无分时数据时返回空列表。
 
         Raises:
-            RuntimeError: 未登录或 ``__manual`` 连接建立失败。
+            RuntimeError: 未登录或 L2 市场连接建立失败。
         """
         from ..errors import ChannelUnavailableError
 
@@ -533,20 +531,31 @@ class ServiceFacade:
             raise ValueError(
                 "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
             )
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        capability = (
+            Capability.BASIC_TIMELINE
+            if profile.kind is AccountKind.STANDARD
+            else Capability.L2_TIMELINE
+        )
         if (
-            self._snapshot_thread is not None
+            capability is Capability.L2_TIMELINE
+            and self._snapshot_thread is not None
             and self._snapshot_thread.is_alive()
         ):
             raise ChannelUnavailableError(
                 "l2_snapshot",
                 "后台快照线程正在读取 4214 连接",
             )
-        if market == 0:
-            market = 17 if code.startswith("6") else 33
-        if self._auth is None and self._service_connections is None:
-            self.authenticate()
         return self._run_default_service(
-            (Capability.L2_TIMELINE,),
+            (capability,),
             lambda: self._timeline_service.timeline(
                 code,
                 market=market,
@@ -565,12 +574,8 @@ class ServiceFacade:
     ) -> list[dict]:
         """查集合竞价（9:15-9:25 每 9 秒一次虚拟撮合：撮合价/累计量/未匹配量）。
 
-        与 :meth:`timeline` 走**同一条** ``__manual`` 推送连接（同为 pageid=4214
-        通道），只是请求用周期码 7176 + unix 时间戳参数（2026-07-26 抓包确认）。
-        连接管理与 :meth:`timeline` 完全相同（沪深分服 + 后台预热另一市）。
-
-        ⚠️ 与 :meth:`timeline` 一样会断主连接（只留 ``__manual`` 推送连接），
-           推送期间 kline/list_quotes 不可用。
+        普通账号走 MAIN：当天请求用 ``pageid=9354/period=7176``，历史交易日
+        用 ``pageid=9355/period=6144``。Level2 账号保留 4214 通道路径。
 
         Args:
             code: 股票代码（纯数字，如 ``"000938"``）。
@@ -593,7 +598,7 @@ class ServiceFacade:
             注册制上市日。dt 号是协议槽位号，语义由字段表定义，勿跨接口混淆。
 
         Raises:
-            RuntimeError: 未登录或 ``__manual`` 连接建立失败。
+            RuntimeError: 未登录或 L2 市场连接建立失败。
         """
         from ..errors import ChannelUnavailableError
 
@@ -601,20 +606,31 @@ class ServiceFacade:
             raise ValueError(
                 "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
             )
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        capability = (
+            Capability.BASIC_AUCTION
+            if profile.kind is AccountKind.STANDARD
+            else Capability.L2_AUCTION
+        )
         if (
-            self._snapshot_thread is not None
+            capability is Capability.L2_AUCTION
+            and self._snapshot_thread is not None
             and self._snapshot_thread.is_alive()
         ):
             raise ChannelUnavailableError(
                 "l2_snapshot",
                 "后台快照线程正在读取 4214 连接",
             )
-        if market == 0:
-            market = 17 if code.startswith("6") else 33
-        if self._auth is None and self._service_connections is None:
-            self.authenticate()
         return self._run_default_service(
-            (Capability.L2_AUCTION,),
+            (capability,),
             lambda: self._auction_service.auction(
                 code,
                 market=market,
@@ -622,6 +638,115 @@ class ServiceFacade:
                 timeout=timeout,
             ),
         )
+
+    def closing_auction(
+        self,
+        code: str,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """查 14:57-15:00 尾盘集合竞价逐点行情。
+
+        普通账号走 MAIN：当天 ``pageid=9354``，历史日 ``pageid=9355``。
+        Level2 账号走对应市场连接：当天 ``pageid=4214``，历史日
+        ``pageid=4417``。两类账号都使用 ``period=7424``，但连接、页号和
+        请求头不混用。
+        """
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        capability = (
+            Capability.BASIC_AUCTION
+            if profile.kind is AccountKind.STANDARD
+            else Capability.L2_AUCTION
+        )
+        if (
+            capability is Capability.L2_AUCTION
+            and self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        return self._run_default_service(
+            (capability,),
+            lambda: self._auction_service.closing_auction(
+                code,
+                market=market,
+                trade_date=trade_date,
+                timeout=timeout,
+            ),
+        )
+
+    def intraday(
+        self,
+        code: str,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+        retries: int = 3,
+    ) -> list[dict]:
+        """返回同花顺式完整日内序列：早盘竞价、盘中、尾盘竞价。
+
+        每条记录增加 ``phase``，值依次为 ``opening_auction``、
+        ``continuous``、``closing_auction``。历史交易日自动选择账号对应的
+        历史分时与竞价协议；普通账号使用 9354/9355，Level2 使用 4214/4417。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        value = trade_date
+        if isinstance(value, str):
+            value = date_type.fromisoformat(value)
+        elif isinstance(value, datetime):
+            value = value.date()
+        historical = value is not None and value != date_type.today()
+
+        opening = self.auction(
+            code,
+            market=market,
+            trade_date=trade_date,
+            timeout=timeout,
+        )
+        if historical:
+            continuous = self.history_timeline(
+                code,
+                value,
+                market=market,
+                timeout=timeout,
+                retries=retries,
+            )
+        else:
+            continuous = self.timeline(
+                code,
+                market=market,
+                timeout=timeout,
+            )
+        closing = self.closing_auction(
+            code,
+            market=market,
+            trade_date=trade_date,
+            timeout=timeout,
+        )
+
+        result: list[dict] = []
+        for phase, records in (
+            ("opening_auction", opening),
+            ("continuous", continuous),
+            ("closing_auction", closing),
+        ):
+            result.extend(
+                {"phase": phase, **record}
+                for record in records
+            )
+        return result
 
     def history_timeline(
         self,
@@ -633,16 +758,15 @@ class ServiceFacade:
     ) -> list[dict]:
         """查**历史分时（回忆）**：某交易日的逐点分时行情（现价/量额/level2 大单）。
 
-        复刻 hexin 在分时图上按 ←/→ 切换历史日期时发的请求（pageid=4417，嵌套子帧，
-        DateTime=8192(bar_start-bar_start+355)）。bar_start 由 ``date`` 经
-        :func:`protocol.date_to_timeline_bar` 自动换算（编码已破解，4 锚点验证）。
+        普通账号走 MAIN 的 ``pageid=9355``；Level2 账号走市场专用连接上的
+        ``pageid=4417``。两种协议使用不同的日期游标编码，由服务自动选择。
 
-        **与当日分时的区别**：历史分时用独立的 pageid=4417 协议，DataType 含 level2
-        大单字段（201-230），对应 hexin 分时图的「大单金额」第二条曲线。
+        **与当日分时的区别**：Level2 历史响应包含 201-230 大单字段；普通账号
+        返回基础价量额字段，不虚构无权限字段。
 
         响应若为 ``cmd=0x0a`` 会先解开 8901 字典压缩；指数和个股块再按 241 点
         ``bar_index`` 序列锚定。请求固定走已实测成功的
-        ``__manual + 对应市场 L2 服务器 + init`` 通道，并与同一市场上的其他
+        ``Level2 passport + 对应市场 L2 服务器 + init`` 通道，并与同一市场上的其他
         请求/读取严格串行。服务器偶发返回连 bar 高位也省略的强状态变体，
         解析器只返回可安全验证的点；``retries`` 不能代替完整状态机解码。
 
@@ -671,6 +795,14 @@ class ServiceFacade:
         if (
             self._snapshot_thread is not None
             and self._snapshot_thread.is_alive()
+            and (
+                (
+                    self._service_connections.profile
+                    if self._service_connections is not None
+                    else self.observed_account_profile
+                ).kind
+                is AccountKind.LEVEL2
+            )
         ):
             raise ChannelUnavailableError(
                 "l2_snapshot",
@@ -695,8 +827,18 @@ class ServiceFacade:
                     last_err = f"HTTP 鉴权失败: {exc}"
                     continue
             try:
+                profile = (
+                    self._service_connections.profile
+                    if self._service_connections is not None
+                    else self.observed_account_profile
+                )
+                capability = (
+                    Capability.BASIC_HISTORY_TIMELINE
+                    if profile.kind is AccountKind.STANDARD
+                    else Capability.L2_HISTORY_TIMELINE
+                )
                 records = self._run_default_service(
-                    (Capability.L2_HISTORY_TIMELINE,),
+                    (capability,),
                     lambda: self._timeline_service.history_timeline(
                         code,
                         market=market,
@@ -715,8 +857,13 @@ class ServiceFacade:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
                                code, date, attempt + 1, last_err)
-                from ..protocol import pick_l2_market
-
+                if capability is Capability.BASIC_HISTORY_TIMELINE:
+                    if self._service_connections is not None:
+                        self._service_connections.close(
+                            ConnectionRole.MAIN
+                        )
+                    self._drop_connection()
+                    continue
                 key = pick_l2_market(market)
                 with self._push_lock:
                     failed = self._push_socks.pop(key, None)
@@ -756,7 +903,8 @@ class ServiceFacade:
         换成跌幅榜传 ``sort_by=199112, sort_dir="A"``（升序值 A 为推测，未实测）。
 
         ⚠ 成交量/成交额**不能**通过本方法拿——它们不走 SortBy 路径，而是客户端
-        订阅行情推送（dt13/dt19）后本地排序。详见 HANDOFF_STOCKLIST_PUSH.md。
+        订阅行情推送（dt13/dt19）后本地排序。详见
+        docs/handoffs/HANDOFF_STOCKLIST_PUSH.md。
 
         翻页机制（2026-07-23 抓包确认）：SortBegin 是游标（首次 0，翻页递增到
         已加载位置），每页 59 条（SortCount 恒 59）。``count`` 是想要的总条数，
@@ -861,7 +1009,7 @@ class ServiceFacade:
 
         ⚠️ 当前连接的服务器 host **可能不支持 hfd1.0**（集群中仅部分 host 支持）。
         不支持时本方法返回空列表——但**不重连**（重连会触发 VerifyCode=-1，
-        见 HANDOFF §7）。需要稳定拿沪市行情时优先用
+        见 docs/handoffs/HANDOFF.md §7）。需要稳定拿沪市行情时优先用
         :meth:`market_snapshot_with_quotes`。
 
         Args:
@@ -893,14 +1041,11 @@ class ServiceFacade:
     ) -> bool:
         """订阅个股实时逐 tick 快照推送（现价随每笔成交跳动）。
 
-        用 **``__manual`` 身份开一条独立的 8901 推送连接**，发 pageid=4214 订阅帧
+        在对应市场 L2 服务器上开一条独立的 8901 连接，发 pageid=4214 订阅帧
         （嵌套双子帧），服务端持续推送 71B 快照帧（约每 3 秒，盘中全程不断）。
 
-        ★ ``__manual`` 登录是推送通道的必要身份（2026-07-24 三份抓包 + 实测确认）：
-        hexin 收推送的那条连接就是 ``__manual`` 登录的。普通登录发 4214 订阅 →
-        ``CodeListSize=0``（注册失败）；``__manual`` 登录 → ``CodeListSize=1``
-        （注册成功）。两种 login 的响应字段完全一致，但只有 ``__manual`` 能注册
-        4214 推送通道——这是会话级权限差异。
+        2026-07-29 PC 抓包确认该 L2 连接使用 ``thsuser`` 标准行情登录壳，
+        Level2 passport + 正确的 shlv2/szlv2 路由和市场 init 才决定 4214 注册能力。
 
         ⚠️ 需要 **level2 账号**：普通账号打开分时走 pageid=9354（请求-响应，无推送）。
         ⚠️ 需在**盘中**（9:30-15:00）才有逐笔成交推送；收盘后注册成功但无推送数据。
@@ -967,7 +1112,7 @@ class ServiceFacade:
         return self._latest_price.get(code)
 
     def stop_snapshot(self) -> None:
-        """停止分时推送读取线程，关闭沪深两条 __manual 推送连接（disconnect 时自动调用）。"""
+        """停止分时推送读取线程，关闭沪深两条 L2 推送连接（disconnect 时自动调用）。"""
         self._connection_runtime.stop_snapshot()
 
     def dxjl_page(self, market: int, endtime_us: int) -> list[dict]:

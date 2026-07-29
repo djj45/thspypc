@@ -10,7 +10,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from thspypc.protocol import (
     build_history_timeline_query,
+    build_normal_history_timeline_query,
+    date_to_normal_timeline_bar,
     date_to_timeline_bar,
+    normal_timeline_bar_to_date,
     parse_history_timeline_response,
     timeline_bar_to_date,
 )
@@ -88,6 +91,14 @@ def test_history_timeline_date_encoding_matches_thsdk_business_date():
     assert timeline_bar_to_date(132_477_534).date().isoformat() == "2026-05-14"
 
 
+def test_normal_history_date_encoding_matches_captured_cursor():
+    assert date_to_normal_timeline_bar("2026-05-15") == 132_479_582
+    assert date_to_normal_timeline_bar("2026-04-22") == 132_428_382
+    assert normal_timeline_bar_to_date(
+        132_479_582
+    ).date().isoformat() == "2026-05-15"
+
+
 def test_protocol_reexports_history_timeline_implementations():
     assert (
         protocol.build_history_timeline_query
@@ -119,6 +130,74 @@ def test_stock_history_query_matches_captured_three_part_request():
     )
     assert b"CodeList=32(399002,);33(000938,);" in body
     assert body.count(b"pageid=4417") == 3
+
+
+def test_sh_stock_history_query_matches_captured_market_routes():
+    frame = build_history_timeline_query(
+        "603118",
+        date="2026-07-27",
+        market=17,
+        benchmark_market=16,
+        benchmark_code="1A0002",
+        seq=0x10EC,
+    )
+    body = frame[12:]
+
+    assert len(body) == 373
+    assert hashlib.sha256(body).hexdigest() == (
+        "aeffeb5063ff9e583b67f20f3b6624b3"
+        "395e048184bda1be69afb019d824898a"
+    )
+    assert body[11:13] == b"\x7c\x00"
+    assert b"\x7c\x01" in body
+    assert b"\x7c\x02" in body
+    assert b"DateTime=8192(132629086-132629441)" in body
+
+
+def test_normal_history_query_matches_captured_two_part_request():
+    frame = build_normal_history_timeline_query(
+        "603118",
+        date="2026-05-15",
+        market=17,
+    )
+
+    assert len(frame) == 283
+    assert hashlib.sha256(frame).hexdigest() == (
+        "df3e66be63fe07726ac1e9bf04fcb07e"
+        "d6113e6ac27194b2c8830c092adb2646"
+    )
+    assert b"DateTime=8192(132479582-132479937)" in frame
+    assert frame.count(b"pageid=9355") == 2
+
+
+def test_normal_history_response_uses_basic_seven_fields():
+    fields = [1, 10, 13, 19, 22, 23, 54]
+    table = b"".join(
+        bytes((datatype, 0x30 if datatype == 1 else 0x70, 0, 4))
+        for datatype in fields
+    )
+    shell = b"\x16\x00\x01\x00\x11" + b"603118" + b"\x00" * 15
+    bar_start = date_to_normal_timeline_bar("2026-05-15")
+    rows = bytearray()
+    for offset in BAR_OFFSETS:
+        raw = [bar_start + offset, 0xC0052B70, 0, 0, 0, 0, 0]
+        rows += struct.pack("<7I", *raw)
+    body = (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", 0x040000F2, 0x0042, 28, 7)
+        + table
+        + shell
+        + rows
+    )
+
+    records = parse_history_timeline_response(body, code="603118")
+
+    assert len(records) == 241
+    assert records[0]["bar_index"] == bar_start
+    assert records[0]["dt10"] == 33.88
+    assert set(records[0]) == {
+        "bar_index", "dt10", "dt13", "dt19", "dt22", "dt23", "dt54"
+    }
 
 
 def test_stock_history_query_groups_same_market_companion_codes():

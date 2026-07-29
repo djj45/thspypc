@@ -42,6 +42,11 @@ from .features.auth_protocol import DEFAULT_LOGIN_PROTOCOL_PROFILE
 from .features.auction_protocol import (
     AUCTION_DATATYPE,
     AUCTION_PERIOD,
+    BASIC_AUCTION_PAGEID,
+    BASIC_HISTORY_AUCTION_PAGEID,
+    BASIC_HISTORY_AUCTION_PERIOD,
+    CLOSING_AUCTION_DATATYPE,
+    CLOSING_AUCTION_PERIOD,
     _AUCTION_SENTINEL_FIELDS,
     _AUCTION_SENTINELS,
     _auction_ts_in_range,
@@ -50,12 +55,18 @@ from .features.auction_protocol import (
     _split_auction_history_segment,
     _split_auction_state_rows,
     build_auction_query,
+    build_basic_auction_query,
+    build_l2_closing_auction_query,
+    build_l2_history_auction_query,
     parse_auction_response,
+    parse_closing_auction_response,
 )
 from .features.history_timeline_protocol import (
     HISTORY_TIMELINE_BAR_SPAN,
     HISTORY_TIMELINE_DATATYPE,
     HISTORY_TIMELINE_PAGEID,
+    NORMAL_HISTORY_TIMELINE_DATATYPE,
+    NORMAL_HISTORY_TIMELINE_PAGEID,
     TIMELINE_BAR_DAYS_SCALE,
     TIMELINE_BAR_EPOCH_ORDINAL,
     TIMELINE_INTRADAY_BAR,
@@ -64,7 +75,10 @@ from .features.history_timeline_protocol import (
     _history_timeline_first_row,
     _history_timeline_row_anchors,
     build_history_timeline_query,
+    build_normal_history_timeline_query,
+    date_to_normal_timeline_bar,
     date_to_timeline_bar,
+    normal_timeline_bar_to_date,
     parse_history_timeline_response,
     timeline_bar_to_date,
 )
@@ -145,6 +159,7 @@ from .features.timeline_protocol import (
     build_timeline_l2_query,
     build_timeline_query,
     parse_timeline_l2_response,
+    parse_timeline_response,
 )
 from .models import DepthLevel, DepthQuote
 
@@ -165,7 +180,8 @@ AUTH_PORT = 80
 # 从 passport 的 M_hqdns 动态解析（拿到当前最新 IP）。
 #
 # MAIN 与 L2 都在各自 socket 上执行 login -> init。MAIN 使用普通身份和标准
-# build_init_query()；L2 使用 __manual 身份，并按 shlv2/szlv2 分别发送
+# build_init_query()；L2 使用 Level2 passport + thsuser 行情登录壳，并按
+# shlv2/szlv2 分别发送
 # MarketCode=16;144;/32。HTTP 鉴权生成的 Passport64 可被各角色按需复用，
 # 但 TCP 登录和 init 状态不能跨 socket 继承。
 MARKET_PORT = 8901
@@ -190,10 +206,10 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
     """从 passport 的 M_hqdns 字段解析域名，DNS 查询得到 8901 服务器 IP 列表。
 
     hexin 客户端不硬编码 IP——HTTP 鉴权返回的 passport 里有 M_hqdns 字段，
-    格式如 ``ifindhq.123ths.com:8901:232;120;104;56;:``，并同时包含
-    fu4/hkus/euhq/lv2 等其他市场组。2026-07-28 MAIN 路由活网矩阵确认：
-    ifindhq 节点连续返回沪深 list_quotes；其他市场组可以保持登录连接，但
-    沪市查询超时。因此 A 股 MAIN 连接只解析 ifindhq。
+    普通账号冷启动抓包确认 ``main.123ths.com`` 承载沪深基础行情；较早的
+    独立登录验证也确认 ``ifindhq.123ths.com`` 可承载同类请求。因此优先使用
+    passport 明示的 ``main`` 域名，仅在它缺失时回退到 ``ifindhq``，不把
+    fu4/hkus/euhq/lv2 等其他市场组混入 MAIN。
 
     Args:
         passport_bytes: HTTP 鉴权返回的原始 passport_bytes（含 M_hqdns 字段）。
@@ -217,16 +233,23 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
         m_hqdns = m.group(1)
 
     # M_hqdns 格式: domain:port:markets;:,domain:port:markets;:,...
-    # MAIN A 股查询只使用 ifindhq。其他域名属于不同市场组；shlv2/szlv2
-    # 则由 resolve_l2_hosts_grouped() 路由到 __manual L2 连接。
-    domains = []
+    # 官方普通账号客户端优先连接 main；旧 passport 没有 main 时兼容
+    # 已实测可用的 ifindhq。shlv2/szlv2 由独立解析器处理。
+    main_domains = []
+    fallback_domains = []
     for entry in m_hqdns.split(","):
         dm = re.match(r'([\w.]+):(\d+):', entry.strip())
         if dm and dm.group(2) == str(MARKET_PORT):
             domain = dm.group(1).lower()
-            if domain == "ifindhq.123ths.com" or domain.startswith("ifindhq."):
-                domains.append(dm.group(1))
+            if domain == "main.123ths.com" or domain.startswith("main."):
+                main_domains.append(dm.group(1))
+            elif (
+                domain == "ifindhq.123ths.com"
+                or domain.startswith("ifindhq.")
+            ):
+                fallback_domains.append(dm.group(1))
 
+    domains = main_domains or fallback_domains
     if not domains:
         return []
 
@@ -244,8 +267,13 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
             continue  # DNS 解析失败，跳过
 
     if ips:
-        logger.info("M_hqdns 动态解析 %d 个 MAIN A股域名（ifindhq）→ %d 个 IP: %s",
-                    len(domains), len(ips), ips[:5])
+        logger.info(
+            "M_hqdns 动态解析 %d 个 MAIN A股域名（%s）→ %d 个 IP: %s",
+            len(domains),
+            "main" if main_domains else "ifindhq fallback",
+            len(ips),
+            ips[:5],
+        )
     return ips
 
 
@@ -350,7 +378,8 @@ def resolve_l2_hosts_grouped(passport_bytes: bytes) -> dict[str, list[str]]:
     M_hqdns 域名后缀的市场码直接对应：``shlv2`` 服务沪市（16/144），
     ``szlv2`` 服务深市（32）。把两者合并成一个列表（旧
     :func:`resolve_l2_hosts` 的做法）会随机连错市，导致 init 只回 210B 小帧、
-    4214 注册 CodeListSize=0——这是 HANDOFF 里"支持 push 的 IP 比例约 30%"
+    4214 注册 CodeListSize=0——这是 docs/handoffs/HANDOFF.md 里
+    "支持 push 的 IP 比例约 30%"
     的真因。
 
     Args:
@@ -741,8 +770,8 @@ def _legacy_build_auction_query(
 
     沪深两市集合竞价时段相同（9:15-9:25），无需区分；仅 ``market`` 码不同。
 
-    ⚠ 必须在 ``__manual`` 登录的连接上发送（4214 通道需要 __manual 身份），
-       与 :func:`build_timeline_l2_query` 共用同一条推送连接。
+    ⚠ 必须在对应市场的 L2 连接上发送（Level2 passport + 市场 init），
+       与 :func:`build_timeline_l2_query` 共用同一条连接。
 
     Args:
         code: 股票代码（如 ``"000938"``）。
@@ -1125,7 +1154,7 @@ def _legacy_build_history_timeline_query(
       基准指数+目标股完整查询(0x0009/0x0158) + 基准壳(0x0002/0x0258)``。
 
     当前只对深市个股复刻抓包中的 ``32(399002,)`` 伴随序列。2026-07-28
-    已在正确的 ``__manual + szlv2 + init(32)`` 连接上证明该代码可替换为
+    已在正确的 ``Level2 passport + szlv2 + init(32)`` 连接上证明该代码可替换为
     ``33(000001,)``，因此它不是服务器硬编码依赖。三段是否为服务器接受请求的
     最小形态仍须做主动 A/B；此前在主行情连接上的断连不能作为“缺壳必断”的证据。
     沪市个股尚无对应历史分时请求抓包，不自动猜测伴随指数。
@@ -1496,13 +1525,16 @@ def build_subreal_query(
 # Keep the historical protocol surface bound to the extracted RealOrder
 # implementation.
 from .features.realorder_protocol import (  # noqa: E402,F811
+    ALL_REALORDER_CATEGORY_IDS,
     ANOMALY_BYTE_MAP,
     ANOMALY_GROUP_PREFIX,
     ANOMALY_MAP_DXJL,
     DXJL_DATATYPE,
+    LEVEL2_ONLY_REALORDER_CATEGORY_IDS,
     REALORDER_HOST,
     REALORDER_PORT,
     SUBREALORDER_MARKETS,
+    STANDARD_REALORDER_CATEGORY_IDS,
     build_category_id,
     build_datatype,
     build_heartbeat_9601,

@@ -139,7 +139,8 @@ dump 0x11223344
 
 1. attach 后，在命令栏输入 `mod hexin.exe` 看 imagebase（假设是 `0x00400000`）。
    真实 delta = imagebase - 0x400000（脱壳 exe 的默认基址）。
-   HANDOFF §10 记录的 delta 是 `-0x2a0000`，即运行时地址 = 静态 VA - 0x2a0000。
+   `handoffs/HANDOFF_SUPERORDER_20260726.md` §10 记录的 delta 是
+   `-0x2a0000`，即运行时地址 = 静态 VA - 0x2a0000。
 
 2. 在写文件处下断（静态 VA `0x167aecc`，运行时 `0x167aecc - 0x2a0000 = 0x13daecc`）：
    ```

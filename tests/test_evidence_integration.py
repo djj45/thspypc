@@ -112,6 +112,8 @@ def test_manual_login_and_large_init_record_l2_access(monkeypatch):
     profile = client.observed_account_profile
 
     assert result is sock
+    assert b"UserName=thsuser" in sock.sent[0]
+    assert b"UserName=__manual" not in sock.sent[0]
     assert profile.kind is AccountKind.LEVEL2
     assert profile.supports(Capability.L2_MARKET_ACCESS)
 

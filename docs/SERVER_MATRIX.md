@@ -11,7 +11,8 @@
 `stock_list()` 走 **MAIN A 股基础行情连接**：
 
 1. 通过 `auth.10jqka.com.cn:80` 完成 HTTP 鉴权并取得 passport；
-2. 从 passport 的 `M_hqdns` 中选择 `ifindhq.123ths.com:8901`；
+2. 从 passport 的 `M_hqdns` 中优先选择 `main.123ths.com:8901`，旧
+   passport 缺失时回退 `ifindhq.123ths.com:8901`；
 3. 使用普通登录身份建立 `ConnectionRole.MAIN`；
 4. 在这条已登录的 MAIN 连接上发送一个 `DataType=[5],[55]` 请求；
 5. 从服务器返回的 `hd3.1` 全量代码表中解码股票代码。
@@ -42,10 +43,10 @@ pageid=5716
 | 连接角色 | 地址 | 登录身份 / 初始化 | 权限要求 | 已验证用途 |
 |---|---|---|---|---|
 | HTTP 鉴权 | `auth.10jqka.com.cn:80` | HTTP 三步鉴权 | 有效账号、密码或扫码凭据 | 获取 passport、signature、`M_hqdns` |
-| MAIN | `ifindhq.123ths.com:8901` | 普通登录；`VerifyCode=0` 后发送标准 MAIN init，不发送 `__manual` L2 init | `BASIC_QUOTE`；不是 L2 专用 | `stock_list`、热门/排序列表、批量行情、基础分时、K 线、名称增量等 MAIN 请求 |
-| SH_L2 | `shlv2.123ths.com:8901` | `__manual` 登录；init `MarketCode=16;144;` | Level2 账号，且 `L2_MARKET_ACCESS` 已有成功证据；具体功能还分别受 `L2_TIMELINE`、`L2_AUCTION`、`L2_SNAPSHOT_PUSH`、`L2_HISTORY_TIMELINE` 控制 | 沪市主板/科创板 L2 分时、竞价、快照推送、历史分时 |
-| SZ_L2 | `szlv2.123ths.com:8901` | `__manual` 登录；init `MarketCode=32;` | 同 SH_L2 | 深市 L2 分时、竞价、快照推送、历史分时 |
-| REALORDER | 固定 seed/default `106.14.65.90:9601`；官方客户端可缓存动态首选物理节点 | 独立 9601 登录 | `REALORDER`；这是独立能力，不能仅由“是否 Level2 账号”推断 | `qurealorder` 历史异动、`subrealorder` 实时异动订阅、`pushrealorder` 接收 |
+| MAIN | `main.123ths.com:8901`（优先）/ `ifindhq.123ths.com:8901`（兼容回退） | 普通登录；`VerifyCode=0` 后发送标准 MAIN init，不发送 `__manual` L2 init | `BASIC_QUOTE` / `BASIC_TIMELINE` / `BASIC_HISTORY_TIMELINE` / `BASIC_AUCTION` | 日 K、9354 当日分时、9355 历史分时、早盘/尾盘竞价、股票列表与批量行情 |
+| SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + 标准行情登录壳（`thsuser`）；init `MarketCode=16;144;` | Level2 账号，且 `L2_MARKET_ACCESS` 已有成功证据；具体功能还分别受 `L2_TIMELINE`、`L2_AUCTION`、`L2_SNAPSHOT_PUSH`、`L2_HISTORY_TIMELINE` 控制 | 沪市主板/科创板 L2 分时、竞价、快照推送、历史分时 |
+| SZ_L2 | `szlv2.123ths.com:8901` | Level2 passport + 标准行情登录壳（`thsuser`）；init `MarketCode=32;` | 同 SH_L2 | 深市 L2 分时、竞价、快照推送、历史分时 |
+| REALORDER | 固定 seed/default `106.14.65.90:9601`；官方客户端可缓存动态首选物理节点 | 独立 9601 登录 | 通道权限 `REALORDER` 独立于 Level2；异动类别再细分为普通账号基础 23 类和 Level2 额外 30 类 | `qurealorder` 历史异动、`subrealorder` 实时异动订阅、`pushrealorder` 接收 |
 
 权限判断采用“业务成功证据优先”原则。域名出现在 `M_hqdns`、TCP 能连通或登录
 成功，都不等于某个具体业务已获授权；超时、RST 也不能单独证明账号无权限。
@@ -62,7 +63,8 @@ pageid=5716
 | `szlv2.123ths.com` | 8901 | `32` | 深市 L2，已验证 | 已实现，要求 L2 能力 |
 | `fu4.123ths.com` | 8901 | `96;128;88;URS;UCT;UNX;UCX;UME;216;48` | 多市场/板块/订阅路由；确切业务权限未完成验证 | 未作为 MAIN 或 L2 路由 |
 | `hkus.123ths.com` | 8901 | `176;112` 和 `168;184;200` | 域名指向港股组；具体品种和账号权限未验证 | 未实现 |
-| `ifindhq.123ths.com` | 8901 | `232;120;104;56` | 尽管公告字段不是沪深 16/32，活网已验证它承担本项目 A 股 MAIN 请求 | 已实现为唯一 MAIN DNS 域名 |
+| `ifindhq.123ths.com` | 8901 | `232;120;104;56` | 尽管公告字段不是沪深 16/32，活网已验证它可承担 A 股 MAIN 请求 | 已实现为 `main` 缺失时的兼容回退 |
+| `main.123ths.com` | 8901 | 普通客户端 MAIN 路由 | 普通账号冷启动实际连接；沪深基础请求同构 | 已实现为 MAIN 首选域名 |
 | `fu2.123ths.com` | 8901 | `64;80;UGF;UZC;UDE` | 多市场路由；确切用途和权限未验证 | 未实现 |
 | `euhq.123ths.com` | 8901 | `160` | 域名表明欧洲行情组；业务和权限未验证 | 未实现 |
 | `fu6.123ths.com` | 8601 | `UZX` | 独立 8601 通道；用途和权限未验证 | 未实现 |
@@ -74,13 +76,25 @@ pageid=5716
 
 ## 路由约束
 
-- MAIN 只从 `ifindhq` 解析 IP。把 `fu4`、`hkus`、`euhq` 等 IP 混入 MAIN，
+- MAIN 优先从 `main` 解析 IP，缺失时回退 `ifindhq`。把 `fu4`、`hkus`、`euhq` 等 IP 混入 MAIN，
   可能登录成功，但已观察到沪深基础行情请求超时。
 - 沪深 L2 必须分服。`shlv2` 与 `szlv2` 的 DNS IP 集合当前完全不重叠；
   沪票连 `shlv2` 并 init `16;144`，深票连 `szlv2` 并 init `32`。
-- MAIN 必须完成自己的标准 init；不要把 `__manual` L2 init 发到 MAIN。
+- MAIN 必须完成自己的标准 init；L2 市场 init 只发送到 `shlv2` / `szlv2`。
+- `thsuser` 只是 PC 行情 TCP 登录壳，不代表普通账号请求。账号能力仍由 passport
+  与业务成功证据决定；L2 业务继续使用 4214/4417，禁止回退到 MAIN 9354/9355。
 - REALORDER 是独立端口和独立能力，不复用 MAIN/L2 的功能权限判断。
   `106.14.65.90:9601` 是可直接连接的固定 seed/default，不保证永远是客户端
   缓存的首选物理节点；不能把 `otqs` 或 `wdcs/hxstats` 的 9601 节点混入该角色。
+- 普通账号也能以 `VerifyCode=0` 登录 REALORDER，并执行 `qurealorder` /
+  `subrealorder`。普通账号 UI 支持 23 类基础异动；Level2 的“全选”请求包含
+  53 类，即额外开放 30 类盘口/挂撤单等高级异动。代码分别用
+  `REALORDER_BASIC_ANOMALIES` 和 `REALORDER_LEVEL2_ANOMALIES` 表示，不能把
+  9601 登录成功直接等同于 53 类全部可用。
+- 2026-07-29 普通账号冷启动抓包中，`gateway_106.14.65.90` 被客户端缓存为
+  `116.63.67.140:9601`，该连接承载 `qurealorder` / `subrealorder`；
+  `gateway_116.205.182.140` 被缓存为 `8.132.233.78:9601`，但后者只承载
+  `statscalc`，属于统计计算服务，不能作为 REALORDER 备选地址。两条物理 IP
+  均未出现在抓包内的传统 DNS 响应中。
 - DNS 结果会轮换。文档中的 IP 只作为某次活网证据，运行时始终应解析 passport
   下发的域名。

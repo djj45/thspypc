@@ -9,8 +9,9 @@ def _passport(entries: str) -> bytes:
     return f'account=test|M_hqdns="{entries}"|userclass=0'.encode("ascii")
 
 
-def test_main_host_resolution_uses_only_ifindhq(monkeypatch):
+def test_main_host_resolution_prefers_main_over_ifindhq(monkeypatch):
     resolved = {
+        "main.123ths.com": ["10.0.9.1", "10.0.9.2"],
         "ifindhq.123ths.com": ["10.0.0.1", "10.0.0.2"],
         "fu4.123ths.com": ["10.0.1.1"],
         "hkus.123ths.com": ["10.0.2.1"],
@@ -27,13 +28,14 @@ def test_main_host_resolution_uses_only_ifindhq(monkeypatch):
     passport = _passport(
         "fu4.123ths.com:8901:96;128;,"
         "hkus.123ths.com:8901:176;112;,"
+        "main.123ths.com:8901:16;32;,"
         "ifindhq.123ths.com:8901:232;120;104;56;,"
         "euhq.123ths.com:8901:160;,"
         "shlv2.123ths.com:8901:16;144;"
     )
 
-    assert resolve_market_hosts(passport) == ["10.0.0.1", "10.0.0.2"]
-    assert queried == ["ifindhq.123ths.com"]
+    assert resolve_market_hosts(passport) == ["10.0.9.1", "10.0.9.2"]
+    assert queried == ["main.123ths.com"]
 
 
 def test_main_host_resolution_deduplicates_ifindhq_addresses(monkeypatch):
@@ -48,6 +50,25 @@ def test_main_host_resolution_deduplicates_ifindhq_addresses(monkeypatch):
     )
 
     assert resolve_market_hosts(passport) == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_main_host_resolution_uses_ifindhq_when_main_is_absent(
+    monkeypatch,
+):
+    queried = []
+
+    def lookup(domain):
+        queried.append(domain)
+        return domain, [], ["10.0.0.1"]
+
+    monkeypatch.setattr(socket, "gethostbyname_ex", lookup)
+    passport = _passport(
+        "ifindhq.123ths.com:8901:232;120;104;56;,"
+        "fu2.123ths.com:8901:64;80;"
+    )
+
+    assert resolve_market_hosts(passport) == ["10.0.0.1"]
+    assert queried == ["ifindhq.123ths.com"]
 
 
 def test_main_host_resolution_returns_empty_without_ifindhq(monkeypatch):

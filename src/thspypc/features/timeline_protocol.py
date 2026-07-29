@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import logging
 import struct
+from datetime import datetime
 
 from ..codecs.compression import (
     _decode_bitrle_0x13746d0,
     _transpose_bitplane_0x1763410,
+    normalize_8901_response,
 )
 from ..codecs.framing import encode_frame
 from ..codecs.hd import _parse_hd_field_table
@@ -19,7 +21,11 @@ TIMELINE_PERIOD = 0x2000
 TIMELINE_PAGEID = 9354
 TIMELINE_L2_PAGEID = 4214
 
-TIMELINE_DATATYPE = [10, 13, 14, 15, 19, 22, 23, 54, 6, 45]
+TIMELINE_DATATYPE = [14, 13, 19, 54, 10, 23, 15, 22, 6, 45]
+TIMELINE_COMPANION_DATATYPE = [
+    13, 18, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+    122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157,
+]
 TIMELINE_L2_DATATYPE = [
     1,
     16,
@@ -60,26 +66,61 @@ def build_timeline_query(
     market: int = 33,
     datatype: list[int] | None = None,
     pageid: int = TIMELINE_PAGEID,
-    seq: int = 0x0025,
+    seq: int = 0x1122,
+    companion_seq: int = 0x0125,
 ) -> bytes:
-    """Build the pageid=9354 timeline request used by normal accounts."""
+    """Build the two-part pageid=9354 request used by normal accounts."""
     if datatype is None:
         datatype = TIMELINE_DATATYPE
     datatype_text = ",".join(str(value) for value in datatype) + ","
-    text = (
+    timeline_text = (
         f"CodeList={market}({code},);\r\nDataType={datatype_text}\r\n"
         f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
-        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+        f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    companion_datatype = ",".join(
+        str(value) for value in TIMELINE_COMPANION_DATATYPE
+    ) + ","
+    companion_text = (
+        f"CodeList={market}({code},);\r\n"
+        f"DataType={companion_datatype}\r\n"
+        "DateTime=0(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r\n"
     ).encode("gbk")
 
-    header = bytearray(23)
-    header[0] = 0x09
-    header[1:5] = b"\x00\x16\x00\x00"
-    struct.pack_into("<H", header, 5, seq & 0xFFFF)
-    header[7:11] = b"\x12\x00\x02\x00"
-    struct.pack_into("<H", header, 11, 0x000A)
-    struct.pack_into("<H", header, 19, len(text) + 1)
-    return encode_frame(bytes(header) + text)
+    def subframe(
+        sequence: int,
+        route: int,
+        text: bytes,
+        *,
+        history_flag: bool,
+    ) -> bytes:
+        header = bytearray(22)
+        header[0:4] = b"\x00\x16\x00\x00"
+        struct.pack_into("<H", header, 4, sequence & 0xFFFF)
+        header[6:10] = b"\x12\x00\x09\x00"
+        struct.pack_into("<H", header, 10, route)
+        if history_flag:
+            header[17] = 0x20
+        struct.pack_into("<I", header, 18, len(text))
+        return bytes(header) + text
+
+    body = (
+        b"\x09"
+        + subframe(
+            seq,
+            0x010A,
+            timeline_text,
+            history_flag=True,
+        )
+        + subframe(
+            companion_seq,
+            0x0100,
+            companion_text,
+            history_flag=False,
+        )
+    )
+    return encode_frame(body)
 
 
 def build_timeline_l2_query(
@@ -115,6 +156,105 @@ def build_timeline_l2_query(
     header[18] = 0x20
     struct.pack_into("<I", header, 19, len(text))
     return encode_frame(bytes(header) + text)
+
+
+def parse_timeline_response(body: bytes) -> list[dict]:
+    """Parse the normal-account ``pageid=9354`` intraday table.
+
+    The MAIN servers return a single-instrument ``hd3.1`` BitRLE table.  The
+    instrument shell uses either ``0x11`` or ``0x21`` depending on market, but
+    both forms have the same 26-byte layout.
+    """
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("normal timeline normalization failed: %s", exc)
+            return []
+
+    position = 0
+    while True:
+        marker = body.find(b"hd3.1\x00", position)
+        if marker < 0:
+            return []
+        position = marker + 6
+        base = marker + 6
+        if len(body) < base + 10:
+            continue
+
+        record_count, flag, record_size, field_count = struct.unpack_from(
+            "<IHHH", body, base
+        )
+        if (
+            record_count != 241
+            or flag not in (0x0042, 0x0046)
+            or record_size == 0
+            or not 1 <= field_count <= 50
+        ):
+            continue
+
+        fields = _parse_hd_field_table(body, base + 10, field_count)
+        if (
+            len(fields) != field_count
+            or sum(width for _, _, width in fields) != record_size
+            or [field[0] for field in fields]
+            != TIMELINE_DATATYPE[:8]
+        ):
+            continue
+
+        shell_offset = base + 10 + field_count * 4
+        shell_size = 26
+        bitrle_offset = shell_offset + shell_size
+        if len(body) < bitrle_offset + 4:
+            continue
+        shell = body[shell_offset:bitrle_offset]
+        if (
+            len(shell) != shell_size
+            or shell[:4] != b"\x16\x00\x01\x00"
+            or shell[4] not in (0x11, 0x21)
+        ):
+            continue
+        code = shell[5:11].decode("ascii", errors="replace")
+
+        expected_size = record_count * record_size
+        if struct.unpack_from(">I", body, bitrle_offset)[0] != expected_size:
+            continue
+        bitplane = _decode_bitrle_0x13746d0(
+            body[bitrle_offset:], expected_size
+        )
+        if len(bitplane) < expected_size:
+            continue
+        rows = _transpose_bitplane_0x1763410(
+            bitplane, record_size, record_count
+        )
+
+        records: list[dict] = []
+        for index in range(record_count):
+            row = rows[
+                index * record_size : (index + 1) * record_size
+            ]
+            if len(row) != record_size:
+                return []
+            record: dict = {"code": code, "minute_index": index}
+            offset = 0
+            for datatype, fmt, width in fields:
+                chunk = row[offset : offset + width]
+                offset += width
+                if width != 4 or len(chunk) != 4:
+                    record[f"dt{datatype}_raw"] = chunk
+                    continue
+                raw_value = struct.unpack("<I", chunk)[0]
+                if datatype == 1:
+                    try:
+                        record["time"] = datetime.fromtimestamp(raw_value)
+                    except (OSError, ValueError, OverflowError):
+                        record["bar_index"] = raw_value
+                elif fmt in (0x70, 0x64):
+                    record[f"dt{datatype}"] = decode_ths_float(raw_value)
+                else:
+                    record[f"dt{datatype}_raw"] = chunk
+            records.append(record)
+        return records
 
 
 def parse_timeline_l2_response(body: bytes) -> list[dict]:

@@ -208,8 +208,12 @@ def _decode_response_frames(server_bytes):
     用 protocol.parse_timeline_l2_response / parse_kline_hd3_response 实解码。
     """
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-    from thspypc.protocol import (parse_timeline_l2_response,
-                                  parse_kline_hd3_response, decode_ths_float)
+    from thspypc.protocol import (
+        decode_ths_float,
+        parse_closing_auction_response,
+        parse_kline_hd3_response,
+        parse_timeline_l2_response,
+    )
     summaries = []
     # 按 MAGIC 拆响应帧
     for sub in server_bytes.split(MAGIC):
@@ -217,6 +221,22 @@ def _decode_response_frames(server_bytes):
             continue
         body = sub[8:]  # 去长度头后的帧体（hd 标记在内部）
         # 试 hd3.1（分时/K线变体）
+        closing = parse_closing_auction_response(body)
+        if closing:
+            summaries.append({
+                "tag": "closing",
+                "dc": len(closing),
+                "flag": "0x0036",
+                "hs": 16,
+                "fc": 4,
+                "first_bar": closing[0].get("time"),
+                "first_dt10": closing[0].get("dt10"),
+                "n_recs": len(closing),
+                "note": (
+                    f"closing auction "
+                    f"{closing[0].get('time')}..{closing[-1].get('time')}"
+                ),
+            })
         if b"hd3.1\x00" in body:
             # 先看原始头（不做完整解析，提取 dc/flag/hs/fc）
             pos = body.find(b"hd3.1\x00")
@@ -388,7 +408,8 @@ def _dump_responses(target_streams, pcap_path, target_code):
     for sid, _, server_bytes, _ in target_streams:
         if len(server_bytes) < 50:
             continue
-        out_path = pcap_path.replace('.pcap', f'_resp_stream{sid}.bin')
+        stem, _suffix = os.path.splitext(pcap_path)
+        out_path = f"{stem}_resp_stream{sid}.bin"
         with open(out_path, 'wb') as f:
             f.write(server_bytes)
         nframes = server_bytes.count(MAGIC)

@@ -17,9 +17,11 @@ from ..features.timeline_protocol import (
     build_timeline_l2_query,
     build_timeline_query,
     parse_timeline_l2_response,
+    parse_timeline_response,
 )
 from ..features.history_timeline_protocol import (
     build_history_timeline_query,
+    build_normal_history_timeline_query,
     history_timeline_request_codes,
     parse_history_timeline_response,
 )
@@ -184,34 +186,37 @@ class TimelineService:
             market,
             mode,
         )
-        if not plan.level2:
-            raise UnsupportedAccountFeatureError(
-                "timeline:basic_response",
-                self._connections.profile.kind,
-                "pageid=9354 响应协议缺少普通账号脱敏语料",
-            )
 
         frame = build_timeline_request(plan, code, market=market)
         connection = self._connections.acquire(
             plan.role,
             capability=plan.capability,
         )
-        self._subscriptions.ensure_registered(
-            connection,
-            code,
-            market=market,
-            timeout=min(timeout, 5.0),
-        )
+        if plan.level2:
+            self._subscriptions.ensure_registered(
+                connection,
+                code,
+                market=market,
+                timeout=min(timeout, 5.0),
+            )
         saw_timeline_frame = False
         with connection.request(frame, timeout=timeout) as sock:
             for _ in range(self._max_frames):
                 response = self._read_frame(sock)
-                if b"hd3.1\x00" not in response:
+                if (
+                    not response.startswith(b"\x0a")
+                    and b"hd3.1\x00" not in response
+                ):
                     continue
                 saw_timeline_frame = True
-                records = parse_timeline_l2_response(response)
+                parser = (
+                    parse_timeline_l2_response
+                    if plan.level2
+                    else parse_timeline_response
+                )
+                records = parser(response)
                 if records:
-                    if self._evidence is not None:
+                    if self._evidence is not None and plan.level2:
                         self._evidence.record_feature(
                             Capability.L2_TIMELINE,
                             Support.YES,
@@ -219,7 +224,8 @@ class TimelineService:
                     return records
 
         if saw_timeline_frame:
-            raise ProtocolError("收到 Level2 分时帧但无法解析")
+            label = "Level2" if plan.level2 else "普通账号"
+            raise ProtocolError(f"收到{label}分时帧但无法解析")
         return []
 
     def history_timeline(
@@ -234,37 +240,49 @@ class TimelineService:
         benchmark_code: str | None = None,
     ) -> list[dict]:
         profile = self._connections.profile
-        if profile.kind is not AccountKind.LEVEL2:
+        if profile.kind is AccountKind.STANDARD:
+            capability = Capability.BASIC_HISTORY_TIMELINE
+            role = ConnectionRole.MAIN
+            requested_codes = (code,)
+            frame = build_normal_history_timeline_query(
+                code,
+                bar_start=bar_start,
+                date=date,
+                market=market,
+            )
+        elif profile.kind is AccountKind.LEVEL2:
+            capability = Capability.L2_HISTORY_TIMELINE
+            role = _l2_role(market)
+            requested_codes, _, _ = history_timeline_request_codes(
+                code,
+                market=market,
+                benchmark_market=benchmark_market,
+                benchmark_code=benchmark_code,
+            )
+            frame = build_history_timeline_query(
+                code,
+                bar_start=bar_start,
+                date=date,
+                market=market,
+                benchmark_market=benchmark_market,
+                benchmark_code=benchmark_code,
+            )
+        else:
             raise UnsupportedAccountFeatureError(
                 "history_timeline",
                 profile.kind,
-                "普通账号 4417 协议尚未获得脱敏实测",
+                "账号类型未知，不能选择普通或 Level2 历史分时协议",
             )
         _require(
             profile,
-            Capability.L2_HISTORY_TIMELINE,
+            capability,
             feature="history_timeline",
-        )
-        role = _l2_role(market)
-        requested_codes, _, _ = history_timeline_request_codes(
-            code,
-            market=market,
-            benchmark_market=benchmark_market,
-            benchmark_code=benchmark_code,
-        )
-        frame = build_history_timeline_query(
-            code,
-            bar_start=bar_start,
-            date=date,
-            market=market,
-            benchmark_market=benchmark_market,
-            benchmark_code=benchmark_code,
         )
         connection = self._connections.acquire(
             role,
-            capability=Capability.L2_HISTORY_TIMELINE,
+            capability=capability,
         )
-        if not connection.init_complete:
+        if role is not ConnectionRole.MAIN and not connection.init_complete:
             raise ChannelUnavailableError(
                 role.value,
                 "L2 连接尚未完成 init",
@@ -286,7 +304,11 @@ class TimelineService:
                     requested_codes=requested_codes,
                 )
                 if records:
-                    if self._evidence is not None:
+                    if (
+                        self._evidence is not None
+                        and capability
+                        is Capability.L2_HISTORY_TIMELINE
+                    ):
                         self._evidence.record_feature(
                             Capability.L2_HISTORY_TIMELINE,
                             Support.YES,

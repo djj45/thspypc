@@ -6,6 +6,7 @@ from thspypc.features.auth_protocol import (
     DEFAULT_LOGIN_PROTOCOL_PROFILE,
     LoginIdentity,
     LoginProtocolProfile,
+    PC_STANDARD_LOGIN_PROFILE,
     build_manual_login_body,
     build_passport64,
     build_standard_login_body,
@@ -97,6 +98,36 @@ def test_refresh_atomically_replaces_the_current_generation():
     assert first.passport64 != second.passport64
     assert service.current is second
     assert first.auth_info["sessionid"] == "session-first"
+
+
+def test_verified_standard_signature_selects_captured_login_bytes():
+    payload = _auth_payload()
+    payload["passport_bytes"] = (
+        b"account=test|userclass=10000|level2=255|sk=normal"
+    )
+    service = AuthService(
+        "user",
+        "secret",
+        "device",
+        MAC64,
+        authenticator=lambda *_args: payload,
+    )
+
+    material = service.authenticate()
+    body = service.login_body()
+
+    assert material.profile is PC_STANDARD_LOGIN_PROFILE
+    assert service.profile is PC_STANDARD_LOGIN_PROFILE
+    assert material.passport64.startswith("6AQGgA")
+    assert (
+        b"UserName=thsuser\nPassword=thsuser\nVerifyType=1"
+        in body
+    )
+    assert body[:15] == (
+        b"\x09\x41\x09\x00zh_CN.GBK\x58\x07"
+    )
+    with pytest.raises(ValueError, match="does not support manual"):
+        service.login_body(LoginIdentity.MANUAL)
 
 
 def test_future_ordinary_profile_can_disable_manual_identity_explicitly():

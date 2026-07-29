@@ -19,16 +19,19 @@ def test_normal_account_timeline_builder_wire_contracts():
         "603118", market=17, seq=0x1234
     )
 
-    assert len(shenzhen) == 156
+    assert len(shenzhen) == 359
     assert _sha256(shenzhen) == (
-        "9a405822794de2093db888521aacb6c40"
-        "b787de061ace8272a5b6c4c0442e340"
+        "7c58ac0b8e6103924255f4aceda2782f"
+        "0efe271f2fe4867d46b4509ae9eb9f77"
     )
-    assert len(shanghai) == 156
+    assert len(shanghai) == 359
     assert _sha256(shanghai) == (
-        "ee9ed45db6313102afc14ab722e4e564"
-        "927efe8582f974cdf83238391e3d6e2f"
+        "20dad8b5fff206c0302e3489964beb6cc"
+        "f2a1d3fac55bea08bd3d7ba527af737"
     )
+    assert shanghai[12:] == timeline_protocol.build_timeline_query(
+        "603118", market=17
+    )[12:].replace(b"\x22\x11", b"\x34\x12", 1)
 
 
 def test_level2_timeline_builder_wire_contracts():
@@ -85,6 +88,43 @@ def test_level2_timeline_parser_selects_stock_half(monkeypatch):
     ]
 
 
+def test_normal_timeline_parser_accepts_shanghai_shell(monkeypatch):
+    fields = timeline_protocol.TIMELINE_DATATYPE[:8]
+    field_table = b"".join(
+        bytes((datatype, 0x70, 0, 4)) for datatype in fields
+    )
+    shell = (
+        b"\x16\x00\x01\x00\x11"
+        + b"603118"
+        + b"\x00" * 15
+    )
+    header = b"hd3.1\x00" + struct.pack(
+        "<IHHH", 241, 0x0046, 32, 8
+    )
+    body = header + field_table + shell + struct.pack(">I", 241 * 32)
+    row = [0] * 8
+    row[4] = 0xC0052B70
+    rows = b"".join(
+        struct.pack("<8I", *row) for _ in range(241)
+    )
+    monkeypatch.setattr(
+        timeline_protocol,
+        "_decode_bitrle_0x13746d0",
+        lambda _data, _size: b"\x00" * (241 * 32),
+    )
+    monkeypatch.setattr(
+        timeline_protocol,
+        "_transpose_bitplane_0x1763410",
+        lambda _data, _record_size, _record_count: rows,
+    )
+
+    records = timeline_protocol.parse_timeline_response(body)
+
+    assert len(records) == 241
+    assert records[0]["code"] == "603118"
+    assert records[0]["dt10"] == 33.88
+
+
 def test_protocol_reexports_timeline_implementations():
     assert protocol.build_timeline_query is timeline_protocol.build_timeline_query
     assert (
@@ -94,6 +134,10 @@ def test_protocol_reexports_timeline_implementations():
     assert (
         protocol.parse_timeline_l2_response
         is timeline_protocol.parse_timeline_l2_response
+    )
+    assert (
+        protocol.parse_timeline_response
+        is timeline_protocol.parse_timeline_response
     )
     assert protocol.TIMELINE_DATATYPE is timeline_protocol.TIMELINE_DATATYPE
     assert (

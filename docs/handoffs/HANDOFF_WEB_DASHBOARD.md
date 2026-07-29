@@ -1,5 +1,7 @@
 # 交接文档：Web 看板增强 + 字段逆向
 
+> 归档位置：`docs/handoffs/`。文中未特别说明的路径均相对仓库根目录。
+>
 > 会话日期：2026-07-23
 > 分支：`feat/stock-list-full`
 > 未提交改动：`src/thspypc/client.py`、`src/thspypc/protocol.py`、`tests/web_dashboard.py`（修改）+ `tests/capture_list_quote_fields.py`、`tests/dump_quote_raw.py`（新增）
@@ -224,4 +226,3 @@ thspypc 的 `list_quotes` 在非交易时段（盘后/周末）返回 26 字节�
 4. **【中】验证 SortBy=13/19/1968584/1771976**（成交量/成交额/换手率/量比榜单）：字段表确认但未抓到请求
 5. **【低】SortDir 升序值**：推测 "A"（做跌幅榜），未实测
 6. **【低】卖盘字段编号已确认**（2026-07-23 688799/002432 对照）：`dt30/31`=卖一 `dt32/33`=卖二 `dt34/35`=卖三 `dt152/153`=卖四 `dt156/157`=卖五。已写入 `SELL_LEVEL_FIELDS`，封单额逻辑完整支持涨跌停。
-

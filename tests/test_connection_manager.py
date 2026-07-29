@@ -100,7 +100,7 @@ def test_level2_connection_is_cached_and_owns_single_flight_session():
 
     assert first is second
     assert opened == [ConnectionRole.SZ_L2]
-    assert first.spec.identity is LoginIdentity.MANUAL
+    assert first.spec.identity is LoginIdentity.STANDARD
     assert first.spec.init_market_codes == (32,)
     assert first.init_complete
     with first.request(b"query", timeout=2.5):

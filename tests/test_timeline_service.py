@@ -30,6 +30,7 @@ STANDARD_PROFILE = _profile(
     AccountKind.STANDARD,
     {
         Capability.BASIC_TIMELINE: Support.YES,
+        Capability.BASIC_HISTORY_TIMELINE: Support.YES,
         Capability.L2_MARKET_ACCESS: Support.NO,
         Capability.L2_TIMELINE: Support.NO,
     },
@@ -138,19 +139,25 @@ class FakeSocket:
         self.closed = True
 
 
-def test_standard_workflow_stops_before_opening_without_basic_parser():
+def test_standard_workflow_uses_main_and_basic_parser(monkeypatch):
     opened = []
     manager = ConnectionManager(
         STANDARD_PROFILE,
         lambda spec: opened.append(spec.role) or FakeSocket(),
     )
-    service = TimelineService(manager, frame_reader=lambda _sock: b"")
+    service = TimelineService(
+        manager,
+        frame_reader=lambda _sock: b"hd3.1\x00normal",
+        max_frames=1,
+    )
+    expected = [{"code": "000938", "minute_index": 0, "dt10": 37.33}]
+    monkeypatch.setattr(
+        "thspypc.services.timeline.parse_timeline_response",
+        lambda _body: expected,
+    )
 
-    with pytest.raises(UnsupportedAccountFeatureError) as exc_info:
-        service.timeline("000938", market=33)
-
-    assert exc_info.value.feature == "timeline:basic_response"
-    assert opened == []
+    assert service.timeline("000938", market=33) == expected
+    assert opened == [ConnectionRole.MAIN]
 
 
 def test_level2_workflow_uses_selected_role_and_matches_response(monkeypatch):
@@ -201,23 +208,38 @@ def test_level2_workflow_distinguishes_parser_failure(monkeypatch):
         service.timeline("603118", market=17)
 
 
-def test_standard_history_stops_before_opening():
+def test_standard_history_uses_main_and_pageid_9355(monkeypatch):
     opened = []
     manager = ConnectionManager(
         STANDARD_PROFILE,
         lambda spec: opened.append(spec.role) or FakeSocket(),
     )
-    service = TimelineService(manager, frame_reader=lambda _sock: b"")
+    service = TimelineService(
+        manager,
+        frame_reader=lambda _sock: b"hd1.0\x00normal-history",
+        max_frames=1,
+    )
+    expected = [{"bar_index": 132_477_534, "dt10": 33.88}]
+    monkeypatch.setattr(
+        "thspypc.services.timeline.parse_history_timeline_response",
+        lambda _body, code, requested_codes: (
+            expected
+            if code == "000938" and requested_codes == ("000938",)
+            else []
+        ),
+    )
 
-    with pytest.raises(UnsupportedAccountFeatureError) as exc_info:
-        service.history_timeline(
-            "000938",
-            market=33,
-            date="2026-05-14",
-        )
+    result = service.history_timeline(
+        "000938",
+        market=33,
+        date="2026-05-14",
+    )
 
-    assert exc_info.value.feature == "history_timeline"
-    assert opened == []
+    assert result == expected
+    assert opened == [ConnectionRole.MAIN]
+    assert b"pageid=9355" in manager.peek(
+        ConnectionRole.MAIN
+    ).socket.sent[0]
 
 
 def test_level2_history_uses_market_role_and_matches_compressed_response(

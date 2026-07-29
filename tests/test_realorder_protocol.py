@@ -54,6 +54,31 @@ def test_datatype_category_contracts():
         "1074269398{19[10000~-]|17[5000000~-]},"
         "1074269399{19[10000~-]|17[5000000~-]},"
     )
+    standard = realorder_protocol.STANDARD_REALORDER_CATEGORY_IDS
+    level2_only = realorder_protocol.LEVEL2_ONLY_REALORDER_CATEGORY_IDS
+    all_categories = realorder_protocol.ALL_REALORDER_CATEGORY_IDS
+
+    assert len(standard) == 23
+    assert len(level2_only) == 30
+    assert len(all_categories) == 53
+    assert set(standard).isdisjoint(level2_only)
+    assert set(standard) | set(level2_only) == set(all_categories)
+    assert realorder_protocol.build_datatype("standard") == (
+        ",".join(map(str, standard)) + ","
+    )
+    assert realorder_protocol.build_datatype("all") == (
+        ",".join(map(str, all_categories)) + ","
+    )
+
+
+def test_standard_only_anomaly_names_fall_back_to_byte_map():
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0xD3] == "区间放量平"
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0xD4] == "单笔冲涨"
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0xD5] == "单笔冲跌"
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0xAB] == "笼子触涨停"
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0xAC] == "笼子触跌停"
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0x99] == "涨幅突破"
+    assert realorder_protocol.ANOMALY_BYTE_MAP[0x9A] == "跌幅突破"
 
 
 def test_qurealorder_parser_contract():
@@ -140,12 +165,15 @@ def test_protocol_reexports_realorder_contracts():
 
 def test_package_reexports_historical_realorder_contracts():
     names = (
+        "ALL_REALORDER_CATEGORY_IDS",
         "ANOMALY_GROUP_PREFIX",
         "ANOMALY_MAP_DXJL",
         "DXJL_DATATYPE",
+        "LEVEL2_ONLY_REALORDER_CATEGORY_IDS",
         "REALORDER_HOST",
         "REALORDER_PORT",
         "SUBREALORDER_MARKETS",
+        "STANDARD_REALORDER_CATEGORY_IDS",
         "build_category_id",
         "build_datatype",
         "build_heartbeat_9601",

@@ -1,11 +1,13 @@
 # thspypc 开发交接文档
 
+> 归档位置：`docs/handoffs/`。文中未特别说明的路径均相对仓库根目录。
+>
 > **2026-07-29 stock_list 纠正**：下文 §1.5 保留的是 2026-07-19
 > 逆向过程，不再代表当前实现。逐帧活网 A/B 已证明完整代码表只需要一个
 > `DataType=[5],[55]` 请求；旧 `stock_list_replay.bin` 的另外 153 帧均非必需。
 > 当前 `stock_list()` 复用 `ifindhq.123ths.com:8901` 的 MAIN 连接，不走
 > `shlv2/szlv2`，也不发送 L2 init。最新结论及服务器权限见
-> [`docs/SERVER_MATRIX.md`](docs/SERVER_MATRIX.md)。
+> [`docs/SERVER_MATRIX.md`](../SERVER_MATRIX.md)。
 >
 > 会话日期：2026-07-16 ~ 2026-07-17
 > 项目路径：`D:\code\ths_takehome\thspypc`
@@ -347,3 +349,86 @@ py tests/test_push.py --timeout 20  # 短线精灵实时推送（盘中）
 py tests/test_heartbeat.py          # 心跳保活
 py tests/collect_push_samples.py    # 采集推送+历史对照（盘中，用于逆向）
 ```
+
+---
+
+## 七、2026-07-29：Level2 历史尾盘问题已解决
+
+### 7.1 历史尾盘"空 ACK"是解析器假象，不是会话/鉴权问题
+
+**结论先行**：此前推导出的"需要复刻 verify3 SID 链路"方向作废。
+官方 PC 和 thspypc 在历史尾盘请求上**行为完全一致**——服务器都正常
+返回含 61 个点的数据帧。所谓的"空 ACK / 超时"是
+`parse_closing_auction_response` 对该帧返回 0 点、再被
+`probe_l2_history_closing_replay.py` 的 `report()`（只统计解析出点的帧）
+渲染成的假象。
+
+**诊断过程（抓包 + 活网重放双链验证）**：
+
+1. 逐帧核对官方抓包 stream 19（`192.168.1.4 → 8.134.115.123:8901`）：
+   - 请求 `seq=0x00eb`：`CodeList=17(603118,)` + `DataType=10,49,287` +
+     `DateTime=7424(1784876220-1784876400)` + `pageid=4417`，与
+     `build_l2_closing_auction_query` 字节级一致。
+   - `1784876220/1784876400` = `2026-07-24 14:57:00 / 15:00:00`。
+   - 服务器 `srv[88]` 在 **8.20 ms** 后返回 `seq=0x00eb`、1101 B 的
+     `hd1.0` 帧（`flag=0x0036`，`record_size=16`，`field_count=4`，
+     字段 `[1,10,49,31]`，`record_count=61`）。
+   - ⚠️ 注意区分：抓包里另一个 61 点帧 `srv[50]`（`seq=0x0097`）是
+     **current `pageid=4214`**（当日 2026-07-29）的尾盘，走 `hd3.1`
+     BitRLE；别当成历史响应的证据。
+
+2. **活网重放**（fresh login，`tests/diag_replay_socket_trace.py`）：
+   - current 4214 → 服务器返回 1101 B `hd1.0` 帧，socket=open。
+   - **history 4417 → 服务器同样返回 1101 B `hd1.0` 帧（`seq=0x00eb`），
+     socket=open，无 FIN、无超时、无空 ACK**。
+   - 该帧离线扫描确认含 **61 个 `2026-07-24 14:57:00–15:00:00` 的点**，
+     价格 15.79→15.77，与官方抓包完全一致。
+   - 中途某 IP 实例 login 返回 `VerifyCode=-1` 是该实例临时状态
+     （§6 已知），换 `122.9.202.190` 即 `VerifyCode=0`，与历史请求无关。
+
+**真正的根因（解析器 bug，非会话）**：
+`parse_closing_auction_response` 的 `hd1.0` 分支正确定位到
+`data_start=126`，但 `_decode_closing_rows` 在最后一条记录（index 60）
+发现 `len(row) != record_size`（15≠16）后**直接 `return []`，把前面
+解出的 60 条全丢弃**。原因是该帧 61×16=976 B 的记录区从 offset 126
+起，而帧长 1101，可用空间 975 B——**最后一条记录的 `dt31` 字段（4 B）
+在帧尾被截断 1 字节**（只有 3 B）。这是服务器编码如此，不是 drift。
+
+修复原则：`_decode_closing_rows` 对末尾不完整记录应容错（补零保留该条，
+或丢弃该条但保留前面的记录），而不是 `return []` 丢弃全部。修复后
+`diag_replay_socket_trace.py` 实测已从 `pts=0` 变为 `pts=61`。
+
+新增工具：
+- `tests/diag_replay_socket_trace.py`：socket 级诊断，逐帧记录 cmd/seq/
+  hd 标记/点数，区分"沉默 / FIN / 空 ACK / 有数据但解析失败"四种模式。
+- `tests/probe_l2_closing_variants.py`：沪深多股票历史尾盘变体探测，
+  抓取返回帧并报告 hd 结构与记录区 deficit（用于确认截断是否为普遍变体）。
+
+**修复结果（2026-07-29 夜，已落地）**：
+`_decode_closing_rows`（`src/thspypc/features/auction_protocol.py`）改为
+容错解码——末条记录被截断时补零保留该收盘点（而非 `return []` 丢弃全部），
+声明 `record_count` 多出 1 条、其时间戳落在 14:57–15:00 窗口外时停在越界行
+（保留已解记录）。新增两个离线回归测试
+（`test_closing_auction_parser_tolerates_hd1_trailing_truncation`、
+`test_closing_auction_parser_stops_at_timestamp_outside_window`），全套
+313 测试无回归。
+
+活网回归（`probe_l2_history_closing_replay.py` + `probe_l2_closing_variants.py`，
+fresh login → `122.9.202.190:8901`）：
+
+| 股票 | 市场 | 历史尾盘点数 | 说明 |
+|------|------|------------|------|
+| 603118 | 17(沪) | **61** | 14:57:00–15:00:00，价 15.79→15.77 |
+| 600519 | 17(沪) | 60 | 14:57:00 无成交，从 14:57:03 起（真实数据） |
+| 688981 | 17(沪STAR) | **61** | `record_count` 字段声明 62（多 1），容错后 61 |
+| 601318 | 17(沪) | **61** | 同上，count 声明 62 |
+| 600276 | 17(沪) | 60 | 首tick 无成交 |
+
+沪市历史尾盘端到端打通（probe 的 `report()` 从 0 点变为 61 点）。
+
+**深市变体（独立待查，与沪市解析 bug 无关）**：
+深市（`000001`/`000938`/`300033`）对 `pageid=4417` 历史尾盘请求返回
+极短拒绝帧，body 含 `ServerCost=257`（市场码 33）或 `ServerCost=514`
+（市场码 22），无 hd 数据表。`ServerCost` 是同花顺计费/权限码，表明深市
+历史尾盘需要不同的请求构造（pageid/period/市场码）或额外的 Level2 权限/
+订阅状态。这是单独的协议问题，不影响沪市已打通的路径。

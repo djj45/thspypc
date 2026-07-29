@@ -1,5 +1,7 @@
 # `client.py` / `protocol.py` 渐进重构交接（2026-07-28）
 
+> 归档位置：`docs/handoffs/`。文中未特别说明的路径均相对仓库根目录。
+>
 > 目标：在不破坏公开 API、不改变协议行为的前提下，把当前约 3064 行的
 > `client.py` 和约 4997 行的 `protocol.py` 逐步拆成可独立测试的连接层、codec、
 > 协议功能模块和业务 service。
