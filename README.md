@@ -76,7 +76,8 @@ THSClient
 - `features` 提供无网络副作用的请求构造和响应解析，适合使用抓包语料做离线回归。
 - `_transport` 以 `MAIN`、`SH_L2`、`SZ_L2`、`REALORDER` 等角色管理连接和读写所有权。
 - `services` 根据 `AccountProfile` 和 `Capability` 选择连接并组合完整工作流。
-- `THSClient` 保持现有公开调用方式；显式配置 service context 后可使用新的服务层路径。
+- `THSClient` 保持现有公开调用方式，行情、L2 与 REALORDER 默认委托 service；
+  `configure_service_context()` 仅保留给需要注入明确 profile/socket 的高级调用方。
 
 ### 普通账号兼容边界
 
@@ -86,13 +87,15 @@ THSClient
 
 - 普通账号可以使用独立的 product、version、qsid、account type，并声明是否支持
   `__manual` 登录身份，无需修改业务 service。
-- 账号类型和能力依据 MAIN/L2/9601 的明确响应证据生成，不根据 passport 中某个
-  文本字段或一次普通身份登录成功进行猜测。
+- HTTP passport 的成对实测签名提供账号类型基线：普通账号
+  `userclass=10000 + level2=255`，Level2 账号
+  `userclass=30002 + level2=16;32;48`。单字段或未知组合仍保持 `UNKNOWN`；
+  MAIN/L2/9601 的明确响应继续提供更细粒度的能力证据。
 - 只有明确为 `YES` 的能力才会进入对应专用通道；`NO` 和 `UNKNOWN` 会在创建连接
   前返回明确错误，避免普通账号误走 Level2 请求。
 
-普通账号的 9354 行情 parser、普通账号 profile 的真实字段以及普通账号 9601 行为
-仍需对应账号抓包和活网验证，目前不应视为已经实现。详细设计和重构进度见
+普通账号的 HTTP 类型签名已经验证；但其 TCP `LoginProtocolProfile`、9354 行情
+parser 和 9601 行为仍需官方客户端抓包确认，目前不应视为已经实现。详细设计见
 `HANDOFF_REFACTOR_20260728.md`。
 
 ## 三种登录方式
@@ -621,9 +624,9 @@ VerifyCode=-1。
 
 ## L2 分服 init
 
-MAIN 普通登录连接在 `VerifyCode=0` 后可直接发送 `list_quotes`，`connect()` 不向它
-发送带 `MarketCode` 的 init。2026-07-28 活网对照确认：把默认
-`MarketCode=16;144;` init 发到 MAIN，会让部分已登录服务器立即关闭连接。
+MAIN 普通登录连接在 `VerifyCode=0` 后发送标准 MAIN init，收到服务器配置帧后
+才进入 ready。此前 init 后断连来自连接到非 `ifindhq` 节点，不是 MAIN init
+本身；MAIN 不应发送的是 `__manual` L2 初始化流程。
 
 带市场配置的 init 属于 `__manual` L2 通道：
 

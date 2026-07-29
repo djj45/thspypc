@@ -1158,10 +1158,10 @@ codex/refactor-protocol-foundation
 - 普通账号登录差异的扩展点明确落在 `LoginProtocolProfile`：未来拿到普通账号
   抓包后，可单独提供 product/securities/HTTP version/TCP version/qsid/
   account_type 以及是否支持 `__manual`，并注入 `AuthService`，无需改业务
-  service 或连接角色。当前默认仍是唯一经过字节与活网验证的 Level2 profile；
-  不根据空 `level2`、`userclass` 文本或普通身份登录成功猜测普通账号协议。
-  `AuthService` 只暴露 passport 字段作为证据，账号种类和能力仍由
-  `AccountEvidenceRecorder` 在 MAIN/L2/9601 的明确行为之后判定；
+  service 或连接角色。2026-07-29 用 `.env.normal` 与 Level2 账号完成 HTTP-only
+  对照：普通账号为 `userclass=10000 + level2=255`，Level2 为
+  `userclass=30002 + level2=16;32;48`。只有这两组完整签名用于账号类型基线，
+  单字段或未知组合仍为 UNKNOWN；MAIN/L2/9601 行为继续提供细粒度能力证据；
 - `Capability.L2_MARKET_ACCESS` 单独表达 `__manual` L2 市场通道权限，避免把某个
   具体业务能力同时当作账号类型和 socket 健康状态；
 - 登录帧长度和 SHA 回归确认普通身份与 `__manual` 身份字节均未变化。
@@ -1170,23 +1170,13 @@ AuthService 接入、旧 RealOrder 源块清理、MAIN init 强制契约和按�
 完成后的扩大离线回归：
 
 ```text
-295 passed, 2 skipped, 1 deselected
+289 passed, 2 skipped
 ```
 
-其中两个 skip 是本机缺少部分历史分时可选语料；deselected 项是
-`tests/test_stock_cache.py::test_live`。单独运行时账号登录成功，
-随后服务端在股票列表回放段发送期间以 WinError 10053 中止连接。真实 K 线抓包
-`kline_20260724_000441_resp_stream1.bin` 也已离线回放成功：15 帧、18,846 根记录
-均能解析；诊断脚本中 373 根历史前复权记录因价格为负不满足其金融约束，因此脚本
-沿用旧逻辑返回非零，不属于 parser 迁移失败。
-
-全量 `pytest -q` 仍会收集旧活网/本机工具测试，已知非重构失败：
-
-```text
-tests/test_stock_list.py::test_offline  配置的 tshark.exe 路径不存在
-tests/test_stock_list.py::test_live     活网连接可能被服务器中止
-tests/test_stock_cache.py::test_live     登录成功后活网连接被服务器中止
-```
+两个 skip 是本机缺少部分历史分时可选语料。`test_market_snapshot.py`、
+`test_stock_cache.py`、`test_stock_list.py` 是可直接运行的活网/pcap 诊断脚本，
+已用 `__test__ = False` 排除出 pytest 默认收集；`pyproject.toml` 固定
+`pythonpath=["src"]`，默认 `pytest -q` 不再依赖外部 PYTHONPATH 或 tshark。
 
 本轮初步重构至此完成。旧认证 builder/parser 和旧 RealOrder 源块均已从
 `protocol.py` 物理删除，历史名称分别 compatibility re-export 到
@@ -1194,8 +1184,22 @@ tests/test_stock_cache.py::test_live     登录成功后活网连接被服务器
 RealOrder framing import 已清理，8901 心跳和 snapshot 前置 `subreal` 仍保留在
 原兼容层；公开协议导出与包级历史导出均已离线核对，不改变协议字节或 service
 行为。
-普通账号 9354 parser、普通账号专用 profile 的真实字段和普通账号 9601 行为仍
-明确属于下一阶段，必须等待对应账号抓包/活网证据后再实现。
+普通账号 HTTP 类型签名已经确认；9354 parser、普通账号 TCP
+`LoginProtocolProfile` 和普通账号 9601 行为仍明确属于下一阶段，必须等待官方
+客户端抓包/活网证据后再实现。当前 `.env.normal` 最小验证可完成 HTTP 分类，
+但沿用 Level2 TCP profile 时 MAIN 候选均关闭连接，因此不能猜测复用该 profile。
 `market_snapshot_with_quotes()` 暂不下沉或自动组合 `StockListService`，它仍是
 client 边界上的显式混合策略，避免名称目录、全市场 HFD1 和逐批行情在 service
 内部形成隐式网络瀑布。
+
+2026-07-29 默认 service 路径收口：
+
+- `list_quotes`、`depth_quote`、`kline`、分时/竞价/历史分时、股票列表/快照/
+  名称和 REALORDER 默认委托 service；
+- 删除对应 legacy 同步查询器及不可达分支，`THSClient` 从 3822 行降至约 3118 行；
+- `snapshot_subscribe` 注册也统一通过 `ConnectionManager` 和 subscription
+  coordinator，后台 reader 与 service 共用同一角色请求锁；
+- `web_dashboard.py` 删除跨角色 `_query_lock`，MAIN/L2/REALORDER 各自由
+  `ManagedConnection` single-flight 串行；
+- `configure_service_context()` 继续作为显式 profile/socket 注入入口，不再是启用
+  service 的必要步骤。

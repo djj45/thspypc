@@ -969,50 +969,6 @@ def test_service_context_open_mode_cannot_change():
         )
 
 
-def test_history_timeline_default_path_uses_initialized_l2_socket(
-    monkeypatch,
-):
-    client = _client()
-    client._auth = {}
-    sock = FakeSocket()
-    opened_markets = []
-    expected = [{"bar_index": 132_477_534, "dt10": 33.88}]
-
-    monkeypatch.setattr(client, "_drop_connection", lambda: None)
-    monkeypatch.setattr(
-        client,
-        "_open_manual_push_connection",
-        lambda market: opened_markets.append(market) or sock,
-    )
-    monkeypatch.setattr(
-        "thspypc.client.read_frame",
-        lambda _sock: b"history-response",
-    )
-    monkeypatch.setattr(
-        "thspypc.client.parse_history_timeline_response",
-        lambda _body, code, requested_codes: (
-            expected
-            if code == "000938"
-            and requested_codes == ("399002", "000938")
-            else []
-        ),
-    )
-
-    result = client.history_timeline(
-        "000938",
-        "2026-05-14",
-        retries=0,
-    )
-
-    assert result == expected
-    assert opened_markets == [33]
-    assert client._push_socks["sz"] is sock
-    assert "sz" in client._push_initialized
-    assert len(sock.sent) == 1
-    assert sock.sent[0].endswith(b"\n")
-    assert b"pageid=4417" in sock.sent[0]
-
-
 def test_history_timeline_opt_in_delegates_to_l2_service(monkeypatch):
     client = _client()
     client._push_socks["sh"] = FakeSocket()

@@ -22,14 +22,12 @@ import json
 import logging
 import os
 import sys
-import threading
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from thspypc.client import THSClient, market_from_code
-from thspypc.protocol import SORT_BY_VALUES
 
 logger = logging.getLogger(__name__)
 
@@ -265,8 +263,8 @@ async function refreshDxjl(){
       +'<div class="dxjl-raw">'+prettyJSON(r.raw||r)+'</div></details></li>';
   }).join('');
 }
-// 初始加载串行（后端 _query_lock 会串行化查询，前端顺序发避免三请求同时排队等待）
-async function refreshAll(){ await refreshQuotes(); await refreshHot(); await refreshDxjl(); }
+// 不同连接角色可并行；同一角色由 service 的 single-flight 锁串行。
+async function refreshAll(){ await Promise.all([refreshQuotes(),refreshHot(),refreshDxjl()]); }
 refreshAll();
 setInterval(refreshQuotes,5000);
 setInterval(refreshHot,30000);
@@ -282,12 +280,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
     client: THSClient | None = None
     codes_by_market: dict = DEFAULT_CODES
     _name_map: dict[str, str] = {}     # code → 中文名（启动时预加载）
-    # 串行化所有对 8901 主连接的查询。list_quotes 的 _sock_lock 只保护 send 不保护
-    # read（client.py 的已知缺陷），ThreadingHTTPServer 多线程并行轮询 /api/quotes
-    # /api/hot /api/dxjl 会并发 read_frame 同一 socket → 帧错位/互吞响应 → 超时。
-    # 本锁把所有查询排队执行，从源头杜绝并发读。
-    _query_lock = threading.Lock()
-
     def log_message(self, *args):
         pass  # 静默默认日志
 
@@ -335,46 +327,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
         quotes = []
         errors = []
         expected = sum(len(v) for v in self.codes_by_market.values())
-        # 串行化：list_quotes 的 read 不持 _sock_lock，并发读会帧错位（见类注释）
-        with self._query_lock:
-            for market, codes in self.codes_by_market.items():
-                try:
-                    # timeout 调短到 6s：非交易时段服务器对个股行情请求常不响应，
-                    # 用 client 默认 15s 会让前端干等到 abort。6s 足够交易时段拿数据。
-                    recs = c.list_quotes(codes, market=market,
-                                         datatype=QUOTE_DATATYPE_FULL, timeout=6)
-                except Exception as e:
-                    msg = f"market={market}: {type(e).__name__}: {e}"
-                    logger.warning("list_quotes(%s) 失败: %s", market, e)
-                    errors.append(msg)
-                    continue
-                for r in recs:
-                    price = r.get("dt10")
-                    prev = r.get("dt6")
-                    dt66 = r.get("dt66")
-                    # 涨跌幅：优先服务器 dt66；缺失时本地 (dt10-dt6)/dt6 回退
-                    chg_value = None
-                    chg_source = None
-                    if dt66 not in (None, "", 0):
-                        chg_value, chg_source = dt66, "dt66"
-                    elif price and prev:
-                        chg_value, chg_source = (price - prev) / prev * 100, "本地"
-                    quotes.append({
-                        "code": r.get("code", ""),
-                        "name": self._name_map.get(r.get("code", ""), ""),
-                        # 原始字段透传（前端按 dt 编号展示，便于对照抓包）
-                        "dt6": prev,
-                        "dt7": r.get("dt7"),
-                        "dt10": price,
-                        "dt13": r.get("dt13"),
-                        "dt17": r.get("dt17"),
-                        "dt48": r.get("dt48"),
-                        "dt49": r.get("dt49"),
-                        "dt66": dt66,
-                        "chg_value": round(chg_value, 2) if chg_value is not None else None,
-                        "chg_source": chg_source,
-                        "raw": r,   # 完整原始 dict（含所有 dt<N> 键）
-                    })
+        for market, codes in self.codes_by_market.items():
+            try:
+                # timeout 调短到 6s：非交易时段服务器对个股行情请求常不响应，
+                # 用 client 默认 15s 会让前端干等到 abort。6s 足够交易时段拿数据。
+                recs = c.list_quotes(codes, market=market,
+                                     datatype=QUOTE_DATATYPE_FULL, timeout=6)
+            except Exception as e:
+                msg = f"market={market}: {type(e).__name__}: {e}"
+                logger.warning("list_quotes(%s) 失败: %s", market, e)
+                errors.append(msg)
+                continue
+            for r in recs:
+                price = r.get("dt10")
+                prev = r.get("dt6")
+                dt66 = r.get("dt66")
+                # 涨跌幅：优先服务器 dt66；缺失时本地 (dt10-dt6)/dt6 回退
+                chg_value = None
+                chg_source = None
+                if dt66 not in (None, "", 0):
+                    chg_value, chg_source = dt66, "dt66"
+                elif price and prev:
+                    chg_value, chg_source = (price - prev) / prev * 100, "本地"
+                quotes.append({
+                    "code": r.get("code", ""),
+                    "name": self._name_map.get(r.get("code", ""), ""),
+                    # 原始字段透传（前端按 dt 编号展示，便于对照抓包）
+                    "dt6": prev,
+                    "dt7": r.get("dt7"),
+                    "dt10": price,
+                    "dt13": r.get("dt13"),
+                    "dt17": r.get("dt17"),
+                    "dt48": r.get("dt48"),
+                    "dt49": r.get("dt49"),
+                    "dt66": dt66,
+                    "chg_value": round(chg_value, 2) if chg_value is not None else None,
+                    "chg_source": chg_source,
+                    "raw": r,   # 完整原始 dict（含所有 dt<N> 键）
+                })
         self._json({
             "quotes": quotes,
             "count": len(quotes),
@@ -400,18 +390,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (ValueError, IndexError):
                 pass
         result = {"hot": [], "sort_total": 0, "sort_by": sort_by, "error": None}
-        # 串行化：与其他查询排队，避免并发读主连接 socket（见类注释）
-        with self._query_lock:
-            try:
-                stocks = c.stock_list_hot(count=50, sort_by=sort_by)
-                for s in stocks:
-                    # raw = 服务器原始字段快照（填 name 前的 dict 副本）
-                    s["raw"] = dict(s)
-                    s["name"] = self._name_map.get(s.get("code", ""), "")
-                result["hot"] = stocks
-            except Exception as e:
-                result["error"] = f"{type(e).__name__}: {e}"
-                logger.warning("stock_list_hot(sort_by=%d) 失败: %s", sort_by, e)
+        try:
+            stocks = c.stock_list_hot(count=50, sort_by=sort_by)
+            for s in stocks:
+                # raw = 服务器原始字段快照（填 name 前的 dict 副本）
+                s["raw"] = dict(s)
+                s["name"] = self._name_map.get(s.get("code", ""), "")
+            result["hot"] = stocks
+        except Exception as e:
+            result["error"] = f"{type(e).__name__}: {e}"
+            logger.warning("stock_list_hot(sort_by=%d) 失败: %s", sort_by, e)
         self._json(result)
 
     # ── 短线精灵异动（dxjl_latest，含名称 + 原始字段）──
@@ -420,19 +408,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not c or c._sock is None:
             self._json({"error": "未连接"}); return
         result = {"dxjl": [], "count": 0, "error": None}
-        # dxjl 走 9601 独立连接（_realorder_sock），与 8901 主连接的 _sock_lock 不同，
-        # 但仍串行化以避免与心跳线程/dxjl_history 的读竞争
-        with self._query_lock:
-            try:
-                recs = c.dxjl_latest()
-                for r in recs:
-                    r["name"] = self._name_map.get(r.get("代码", ""), "")
-                    r["raw"] = {k: v for k, v in r.items() if k != "raw"}
-                result["dxjl"] = recs
-                result["count"] = len(recs)
-            except Exception as e:
-                result["error"] = f"{type(e).__name__}: {e}"
-                logger.warning("dxjl_latest 失败: %s", e)
+        try:
+            recs = c.dxjl_latest()
+            for r in recs:
+                r["name"] = self._name_map.get(r.get("代码", ""), "")
+                r["raw"] = {k: v for k, v in r.items() if k != "raw"}
+            result["dxjl"] = recs
+            result["count"] = len(recs)
+        except Exception as e:
+            result["error"] = f"{type(e).__name__}: {e}"
+            logger.warning("dxjl_latest 失败: %s", e)
         self._json(result)
 
     @staticmethod

@@ -16,6 +16,9 @@ thspypc 全市场股票代码表本地缓存测试。
 """
 from __future__ import annotations
 
+# 可直接运行的缓存/活网诊断脚本；缓存单元契约由正式 pytest 模块覆盖。
+__test__ = False
+
 import json
 import os
 import sys

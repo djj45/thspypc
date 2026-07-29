@@ -14,8 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import protocol
-from .models import AccountProfile, Capability, DepthQuote, Support
+from .models import AccountKind, AccountProfile, Capability, DepthQuote, Support
 from .features.account_profile import AccountEvidenceRecorder
 from .features.auth_protocol import LoginIdentity
 from .services.auth import AuthMaterial, AuthService
@@ -31,44 +30,21 @@ from .protocol import (
     MARKET_PORT,
     REALORDER_HOST,
     REALORDER_PORT,
-    STOCK_LIST_DATATYPE,
     build_heartbeat_8901,
     build_heartbeat_9601,
     build_init_query,
-    build_kline_query,
-    build_list_quote_query,
-    build_depth_quote_query,
     build_passport64,
-    build_qurealorder_query,
-    build_full_stock_list_query,
-    build_stock_list_query,
-    build_upstockname_request,
-    build_history_timeline_query,
-    build_snapshot_subscribe,
-    build_timeline_query,
-    decode_name_frame,
     encode_frame,
     full_http_auth,
     generate_imei,
     generate_mac64,
     KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN,
     KLINE_PERIOD_60MIN, KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
-    parse_hd1_response,
-    parse_hd3_response,
-    parse_depth_quote_response,
-    parse_kline_hd3_response,
-    parse_history_timeline_response,
     parse_init_response,
     parse_snapshot_push,
     is_snapshot_push,
-    SNAPSHOT_PAGEID,
-    SNAPSHOT_PAGEID_SUB,
     parse_login_response,
-    parse_qurealorder_response,
-    parse_pushrealorder_response,
-    parse_stock_list_response,
     read_frame,
-    read_frame_realorder,
     resolve_market_hosts,
 )
 
@@ -170,6 +146,7 @@ class THSClient:
         self._preheat_threads: dict[str, threading.Thread] = {}  # 预热线程（主流程可 join 等待）
         self._service_connections: ConnectionManager | None = None
         self._service_allow_open = False
+        self._service_auto_profile = False
         self._account_evidence = AccountEvidenceRecorder()
         self._service_subscriptions = None
         self._kline_service = None
@@ -294,6 +271,109 @@ class THSClient:
         profile = self.observed_account_profile
         manager.update_profile(profile)
         return profile
+
+    def _ensure_default_service_context(
+        self,
+        *capabilities: Capability,
+    ) -> ConnectionManager:
+        """Return the single default service registry for an explicit call.
+
+        Unknown capabilities may be probed only because the caller explicitly
+        requested that feature.  The optimistic routing profile is temporary:
+        after the call it is replaced by the evidence actually observed.
+        Explicit contexts created through :meth:`configure_service_context`
+        retain their caller-supplied conservative profile.
+        """
+        if self._service_connections is None:
+            observed = self.observed_account_profile
+            support = dict(observed.capabilities)
+            l2_capabilities = {
+                Capability.L2_TIMELINE,
+                Capability.L2_AUCTION,
+                Capability.L2_SNAPSHOT_PUSH,
+                Capability.L2_HISTORY_TIMELINE,
+            }
+            requested_l2 = any(
+                capability in l2_capabilities
+                for capability in capabilities
+            )
+            for capability in capabilities:
+                if support.get(capability, Support.UNKNOWN) is Support.UNKNOWN:
+                    support[capability] = Support.YES
+            if (
+                requested_l2
+                and support.get(
+                    Capability.L2_MARKET_ACCESS,
+                    Support.UNKNOWN,
+                )
+                is Support.UNKNOWN
+            ):
+                support[Capability.L2_MARKET_ACCESS] = Support.YES
+            kind = observed.kind
+            if requested_l2 and kind is AccountKind.UNKNOWN:
+                kind = AccountKind.LEVEL2
+            profile = AccountProfile(
+                kind=kind,
+                capabilities=support,
+                passport_fields=observed.passport_fields,
+            )
+            manager = self.configure_service_context(
+                profile,
+                allow_open=True,
+            )
+            self._service_auto_profile = True
+            return manager
+
+        if self._service_auto_profile:
+            observed = self.observed_account_profile
+            support = dict(observed.capabilities)
+            l2_capabilities = {
+                Capability.L2_TIMELINE,
+                Capability.L2_AUCTION,
+                Capability.L2_SNAPSHOT_PUSH,
+                Capability.L2_HISTORY_TIMELINE,
+            }
+            requested_l2 = any(
+                capability in l2_capabilities
+                for capability in capabilities
+            )
+            for capability in capabilities:
+                if support.get(capability, Support.UNKNOWN) is Support.UNKNOWN:
+                    support[capability] = Support.YES
+            if (
+                requested_l2
+                and support.get(
+                    Capability.L2_MARKET_ACCESS,
+                    Support.UNKNOWN,
+                )
+                is Support.UNKNOWN
+            ):
+                support[Capability.L2_MARKET_ACCESS] = Support.YES
+            kind = observed.kind
+            if requested_l2 and kind is AccountKind.UNKNOWN:
+                kind = AccountKind.LEVEL2
+            self._service_connections.update_profile(
+                AccountProfile(
+                    kind=kind,
+                    capabilities=support,
+                    passport_fields=observed.passport_fields,
+                )
+            )
+        return self._service_connections
+
+    def _run_default_service(
+        self,
+        capabilities: tuple[Capability, ...],
+        operation,
+    ):
+        """Execute one explicit business call and commit observed evidence."""
+        manager = self._ensure_default_service_context(*capabilities)
+        self.sync_service_connections()
+        try:
+            return operation()
+        finally:
+            if self._service_auto_profile:
+                manager.update_profile(self.observed_account_profile)
 
     def _open_service_connection(self, spec) -> OpenedConnection:
         """Open through legacy login code while retaining legacy ownership."""
@@ -765,6 +845,9 @@ class THSClient:
         """Refresh one passport generation and mirror the legacy ``_auth``."""
         material = self._auth_service.authenticate(account, password)
         self._auth = material.legacy_auth_info()
+        self._account_evidence.record_passport_fields(
+            material.passport_fields
+        )
         return material
 
     def _current_passport64(self) -> str:
@@ -1223,52 +1306,22 @@ class THSClient:
         if datatype is None:
             datatype = LIST_QUOTE_DATATYPE_DEFAULT
         self._ensure_main_connection()
-        if self._service_connections is not None:
-            from .errors import ProtocolError
+        from .errors import ProtocolError
 
-            self.sync_service_connections()
-            try:
-                return self._quote_service.list_quotes(
+        try:
+            return self._run_default_service(
+                (Capability.BASIC_QUOTE,),
+                lambda: self._quote_service.list_quotes(
                     codes,
                     market=market,
                     datatype=datatype,
                     pageid=pageid,
                     timeout=timeout,
-                )
-            except ProtocolError as exc:
-                logger.warning("list_quotes: %s", exc)
-                return []
-
-        frame = build_list_quote_query(codes, market=market, datatype=datatype,
-                                       pageid=pageid)
-        # 每帧后跟 b"\n"（2026-07-17 实时抓包确认：hexin 每个帧 trailing 都是 0a，
-        # login/行情/心跳帧无一例外；不加 \n 服务器不响应）。
-        # MarketSession 持有完整请求锁，避免其他查询或心跳在响应读取期间插入帧。
-        with self._market_session.request(frame, timeout=timeout) as sock:
-            # 循环读帧，跳过 CodeListSize/MarketTime 等文本帧，取首个 hd 数据帧。
-            # 最多读 8 帧避免无限等待（8901 通常 1-3 帧内出数据）。
-            for _ in range(8):
-                resp = read_frame(sock)
-                if b"hd3.1\x00" in resp:
-                    recs = parse_hd3_response(resp)
-                    if recs:
-                        return recs
-                    # hd3.1 标记在但解析失败（非 BitRLE 变体）→ 继续读下一帧
-                    logger.warning("收到 hd3.1 帧但解析为空（可能非 BitRLE 变体），"
-                                   "原始头 24B: %s", resp[:24].hex(" "))
-                    continue
-                if b"hd1.0" in resp:
-                    recs = parse_hd1_response(resp)
-                    if recs:
-                        return recs
-                    logger.warning("收到 hd1.0 帧但解析为空，原始头 24B: %s",
-                                   resp[:24].hex(" "))
-                    continue
-                # 文本帧（CodeListSize= 等），跳过
-                logger.debug("跳过非数据帧: %s",
-                             resp[:40].decode("gbk", errors="replace")[:40])
-        logger.warning("list_quotes: 8 帧内未找到 hd 数据帧")
-        return []
+                ),
+            )
+        except ProtocolError as exc:
+            logger.warning("list_quotes: %s", exc)
+            return []
 
     def depth_quote(
         self,
@@ -1301,20 +1354,20 @@ class THSClient:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
-                if self._service_connections is not None:
-                    from .errors import ProtocolError
+                from .errors import ProtocolError
 
-                    self.sync_service_connections()
-                    try:
-                        return self._quote_service.depth_quote(
+                try:
+                    return self._run_default_service(
+                        (Capability.BASIC_QUOTE,),
+                        lambda: self._quote_service.depth_quote(
                             code,
                             market=market,
                             timeout=timeout,
-                        )
-                    except ProtocolError as exc:
-                        logger.warning("depth_quote: %s", exc)
-                        return {}
-                return self._depth_quote_once(code, market, timeout)
+                        ),
+                    )
+                except ProtocolError as exc:
+                    logger.warning("depth_quote: %s", exc)
+                    return {}
             except (ConnectionError, OSError, TimeoutError) as e:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("depth_quote %s 失败（attempt %d）: %s",
@@ -1322,28 +1375,6 @@ class THSClient:
                 self._drop_connection()
         raise RuntimeError(f"depth_quote {code} 重试 {retries} 次仍失败: {last_err}")
 
-    def _depth_quote_once(self, code: str, market: int, timeout: float) -> DepthQuote:
-        """在当前 8901 连接上完成一次五档盘口请求。"""
-        if self._sock is None:
-            raise RuntimeError("未登录")
-        frame = build_depth_quote_query(code, market=market)
-        with self._market_session.request(frame, timeout=timeout) as sock:
-            for _ in range(8):
-                try:
-                    resp = read_frame(sock)
-                except ValueError:
-                    logger.debug("depth_quote: read_frame magic 错位，丢弃一段重试")
-                    try:
-                        sock.recv(8192)
-                    except OSError:
-                        raise ConnectionError("连接已关闭")
-                    continue
-                result = parse_depth_quote_response(resp)
-                if result:
-                    return result
-                logger.debug("depth_quote: 跳过非盘口帧 %dB", len(resp))
-        logger.warning("depth_quote: 8 帧内未找到五档盘口数据帧")
-        return {}
 
     # K线周期名 → 周期码（kline/timeline 方法共用）
     _KLINE_PERIOD_CODES = {
@@ -1412,31 +1443,23 @@ class THSClient:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
-                if self._service_connections is not None:
-                    from .errors import ProtocolError
+                from .errors import ProtocolError
 
-                    self.sync_service_connections()
-                    try:
-                        recs = self._kline_service.kline(
+                try:
+                    recs = self._run_default_service(
+                        (Capability.BASIC_QUOTE,),
+                        lambda: self._kline_service.kline(
                             code,
                             market=market,
                             period=period_code,
                             count=count,
                             fuquan=fuquan,
                             timeout=timeout,
-                        )
-                    except ProtocolError as exc:
-                        logger.warning("kline: %s", exc)
-                        recs = []
-                else:
-                    recs = self._kline_query_once(
-                        code,
-                        market,
-                        period_code,
-                        count,
-                        fuquan,
-                        timeout,
+                        ),
                     )
+                except ProtocolError as exc:
+                    logger.warning("kline: %s", exc)
+                    recs = []
                 # ★ 数据完整性校验：部分坏 IP（116.63.x / 119.3.x 等）"成功"返回但
                 # 只给最近部分数据（day 121/336、week 26、month 7，§14j）。这种截断
                 # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）视为坏 IP。
@@ -1467,56 +1490,6 @@ class THSClient:
                 self._drop_connection()
         raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
 
-    def _kline_query_once(self, code: str, market: int, period: int, count: int,
-                          fuquan: str, timeout: float) -> list[dict]:
-        """在当前 8901 连接上发一次 K线请求并解析响应（单次，不重试）。"""
-        if self._sock is None:
-            raise RuntimeError("未登录")
-        frame = build_kline_query(code, market=market, period=period,
-                                  fuquan=fuquan, count=count)
-        with self._market_session.request(frame, timeout=timeout) as sock:
-            # 循环读帧，跳过文本/ACK 帧，累积所有 hd3.1 K线数据帧（响应可能分多帧）。
-            # 旧实现只取首个 hd3.1 帧，当服务器把大盘 K线分帧返回时会截断（实测 day
-            # 偶发只拿 121/336 根）。改为累积合并：读到首个数据帧后继续读，把同批
-            # hd3.1 帧的记录全部合并，直到读到非 hd3.1 帧（如下个请求的 ACK）或超时。
-            all_recs: list[dict] = []
-            got_data = False
-            for _ in range(16):
-                try:
-                    resp = read_frame(sock)
-                except socket.timeout:
-                    if got_data:
-                        break  # 已拿到数据，后续无更多帧，正常结束
-                    raise  # 没拿到任何数据，向上抛 timeout 触发重试
-                except ValueError:
-                    # read_frame magic 对齐失败（半帧/推送帧错位），丢一段继续找下个帧边界
-                    logger.debug("kline: read_frame magic 错位，丢弃一段重试")
-                    try:
-                        sock.recv(8192)
-                    except OSError:
-                        raise ConnectionError("连接已关闭")
-                    if got_data:
-                        # 已有数据，排空后停止（避免残留污染下次请求）
-                        break
-                    continue
-                if b"hd3.1\x00" in resp:
-                    recs = parse_kline_hd3_response(resp)
-                    if recs:
-                        all_recs.extend(recs)
-                        got_data = True
-                        # 已拿到首帧数据，缩短超时快速确认有无后续帧（避免等满 timeout）
-                        sock.settimeout(2.0)
-                        continue  # 继续读，可能还有后续帧
-                    logger.debug("kline: 收到 hd3.1 但解析为空，继续读")
-                    continue
-                if got_data:
-                    # 已拿到数据，这帧是下个请求的 ACK/文本帧，停止累积
-                    break
-                logger.debug("kline: 跳过非数据帧 %dB", len(resp))
-        if all_recs:
-            return all_recs
-        logger.warning("kline: 未找到 hd3.1 K线数据帧")
-        return []
 
     def timeline(
         self,
@@ -1548,145 +1521,33 @@ class THSClient:
         Raises:
             RuntimeError: 未登录或 ``__manual`` 连接建立失败。
         """
-        if self._service_connections is not None:
-            from .errors import ChannelUnavailableError
+        from .errors import ChannelUnavailableError
 
-            if (
-                self._snapshot_thread is not None
-                and self._snapshot_thread.is_alive()
-            ):
-                raise ChannelUnavailableError(
-                    "l2_snapshot",
-                    "后台快照线程正在读取 4214 连接",
-                )
-            if market == 0:
-                market = 17 if code.startswith("6") else 33
-            self.sync_service_connections()
-            return self._timeline_service.timeline(
+        if skip_init or use_main_ip:
+            raise ValueError(
+                "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
+            )
+        if (
+            self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._timeline_service.timeline(
                 code,
                 market=market,
                 timeout=timeout,
-            )
+            ),
+        )
 
-        if self._auth is None:
-            self.authenticate()
-        if market == 0:
-            market = 17 if code.startswith("6") else 33
-        # 确保 __manual 推送连接存在（按沪深分服）
-        from thspypc.protocol import pick_l2_market
-        key = pick_l2_market(market)
-        if key not in self._push_socks:
-            # ★ 如果该市正在后台预热，先 join 等它完成（避免主流程重复建连接）
-            with self._push_lock:
-                preheat_t = self._preheat_threads.get(key)
-            if preheat_t is not None and preheat_t.is_alive():
-                logger.info("timeline[%s]: 等待预热[%s]连接完成...", code, key)
-                preheat_t.join(timeout=20)
-            # 预热完成后再次检查（预热可能已填入 _push_socks）
-            if key not in self._push_socks:
-                # ★ 关闭主连接（实测：两条同 IP 同 Passport64 连接并存会导致
-                # __manual 的 4214 订阅 CodeListSize=0。关掉主连接只留 __manual
-                # 一条连接后 CodeListSize=1。kline/list_quotes 在推送期间不可用。）
-                self._drop_connection()
-                sock = self._open_manual_push_connection(market, skip_init=skip_init,
-                                                          use_main_ip=use_main_ip)
-                if sock is None:
-                    raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
-                self._push_socks[key] = sock
-                if not skip_init:
-                    self._push_initialized.add(key)
-            # ★ 后台预热另一市连接（复刻 hexin 启动即双连，避免首次切市等 init）
-            self._preheat_other_market(key)
-        return self._timeline_query_once(code, market, timeout)
-
-    def _timeline_query_once(self, code: str, market: int, timeout: float) -> list[dict]:
-        """在 __manual 推送连接上发 L2 当日分时请求并解析响应。
-
-        必须先发 4214 订阅注册帧（注册到推送通道），服务器回 CodeListSize=1 后，
-        才能发分时数据查询（DateTime=8192）。抓包确认 hexin 也是这个顺序。
-        """
-        from thspypc.protocol import build_timeline_l2_query, pick_l2_market
-        import re as _re
-        key = pick_l2_market(market)
-        sock = self._push_socks.get(key)
-        if sock is None:
-            raise RuntimeError(f"__manual[{key}] 推送连接不可用")
-
-        # 步骤1: 先发 4214 订阅注册帧（如果该 code 还没订阅过）
-        if code not in self._snapshot_codes:
-            sub_frame = build_snapshot_subscribe(code, market=market, seq=0)
-            sock.settimeout(5.0)
-            try:
-                sock.sendall(sub_frame + b"\n")
-            except OSError as e:
-                self._push_socks.pop(key, None)
-                self._push_initialized.discard(key)
-                raise ConnectionError(f"订阅帧发送失败: {e}")
-            logger.info("timeline[%s]: 已发 4214 订阅帧，等注册响应...", code)
-            # 读注册响应，等 CodeListSize≥1
-            registered = False
-            for _ in range(5):
-                try:
-                    resp = read_frame(sock)
-                except (socket.timeout, OSError, ValueError):
-                    break
-                m = _re.search(rb"CodeListSize=(\d+)", resp)
-                if m:
-                    sz = int(m.group(1))
-                    logger.info("timeline[%s]: 订阅响应 CodeListSize=%d（%dB）%s",
-                                code, sz, len(resp),
-                                "✓注册成功" if sz >= 1 else "✗注册失败")
-                    if sz >= 1:
-                        registered = True
-                        self._snapshot_codes.add(code)
-                        break
-            if not registered:
-                logger.warning("timeline[%s]: 4214 注册失败（CodeListSize=0 或无响应）", code)
-                # 继续尝试发查询（有些服务器注册和查询可合并响应）
-
-        # 步骤2: 发 L2 分时数据查询（pageid=4214, DateTime=8192）
-        extra = "32(399002,);" if market == 33 else "16(1A0002,);"
-        frame = build_timeline_l2_query(code, market=market, extra_codelist=extra)
-        sock.settimeout(timeout)
-        try:
-            sock.sendall(frame + b"\n")
-        except OSError as e:
-            self._push_socks.pop(key, None)
-            self._push_initialized.discard(key)
-            raise ConnectionError(f"查询帧发送失败: {e}")
-        logger.info("timeline[%s]: 已发 L2 分时查询（pageid=4214, DateTime=8192），等响应...", code)
-        # 分时响应是 hd3.1 flag=0x00b4 变体，用 parse_timeline_l2_response 解析
-        from thspypc.protocol import parse_timeline_l2_response
-        all_recs: list[dict] = []
-        got_data = False
-        for i in range(20):
-            try:
-                resp = read_frame(sock)
-            except socket.timeout:
-                if got_data:
-                    break
-                raise
-            except (OSError, ValueError) as e:
-                if got_data:
-                    break
-                raise ConnectionError(f"读取失败: {e}")
-            if b"hd3.1\x00" in resp or b"hd1.0\x00" in resp:
-                # ★ 分时用 parse_timeline_l2_response（flag=0x00b4），
-                #   K线用 parse_kline_hd3_response（flag=0x0042）。两者都试。
-                recs = parse_timeline_l2_response(resp)
-                if not recs:
-                    recs = parse_kline_hd3_response(resp)
-                if recs:
-                    all_recs.extend(recs)
-                    logger.info("timeline[%s]: 解出 %d 条分时记录", code, len(recs))
-                    # ★ 拿到数据直接返回，不再继续读（旧实现 settimeout(2.0)+continue
-                    #   会白等 2 秒 timeout 读下一帧，是"复用查询仍 2 秒"的元凶）
-                    return all_recs
-                continue
-        if all_recs:
-            return all_recs
-        logger.warning("timeline[%s]: 未找到分时数据帧（共读 %d 帧）", code, i + 1)
-        return []
 
     def auction(
         self,
@@ -1729,135 +1590,34 @@ class THSClient:
         Raises:
             RuntimeError: 未登录或 ``__manual`` 连接建立失败。
         """
-        if self._service_connections is not None:
-            from .errors import ChannelUnavailableError
+        from .errors import ChannelUnavailableError
 
-            if (
-                self._snapshot_thread is not None
-                and self._snapshot_thread.is_alive()
-            ):
-                raise ChannelUnavailableError(
-                    "l2_snapshot",
-                    "后台快照线程正在读取 4214 连接",
-                )
-            if market == 0:
-                market = 17 if code.startswith("6") else 33
-            self.sync_service_connections()
-            return self._auction_service.auction(
+        if skip_init or use_main_ip:
+            raise ValueError(
+                "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
+            )
+        if (
+            self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        return self._run_default_service(
+            (Capability.L2_AUCTION,),
+            lambda: self._auction_service.auction(
                 code,
                 market=market,
                 trade_date=trade_date,
                 timeout=timeout,
-            )
+            ),
+        )
 
-        if self._auth is None:
-            self.authenticate()
-        if market == 0:
-            market = 17 if code.startswith("6") else 33
-        # 复用 timeline 的连接管理（同为 pageid=4214 推送通道）
-        from thspypc.protocol import pick_l2_market
-        key = pick_l2_market(market)
-        if key not in self._push_socks:
-            with self._push_lock:
-                preheat_t = self._preheat_threads.get(key)
-            if preheat_t is not None and preheat_t.is_alive():
-                logger.info("auction[%s]: 等待预热[%s]连接完成...", code, key)
-                preheat_t.join(timeout=20)
-            if key not in self._push_socks:
-                self._drop_connection()
-                sock = self._open_manual_push_connection(market, skip_init=skip_init,
-                                                          use_main_ip=use_main_ip)
-                if sock is None:
-                    raise RuntimeError(f"__manual[{key}] 推送连接建立失败")
-                self._push_socks[key] = sock
-                if not skip_init:
-                    self._push_initialized.add(key)
-            self._preheat_other_market(key)
-        return self._auction_query_once(code, market, trade_date, timeout)
-
-    def _auction_query_once(
-        self, code: str, market: int, trade_date, timeout: float,
-    ) -> list[dict]:
-        """在 __manual 推送连接上发集合竞价请求（周期码 7176）并解析响应。
-
-        连接/订阅逻辑与 :meth:`_timeline_query_once` 完全相同（4214 通道共享），
-        仅请求帧和响应解析不同：
-          - 请求：:func:`build_auction_query`（周期码 7176 + unix 时间戳）
-          - 响应：hd1.0 flag=0x003a，用 :func:`parse_auction_response` 解析
-        """
-        from thspypc.protocol import build_auction_query, pick_l2_market
-        import re as _re
-        key = pick_l2_market(market)
-        sock = self._push_socks.get(key)
-        if sock is None:
-            raise RuntimeError(f"__manual[{key}] 推送连接不可用")
-
-        # 步骤1: 4214 订阅注册（与 timeline 共享 _snapshot_codes，同 code 不重复订阅）
-        if code not in self._snapshot_codes:
-            sub_frame = build_snapshot_subscribe(code, market=market, seq=0)
-            sock.settimeout(5.0)
-            try:
-                sock.sendall(sub_frame + b"\n")
-            except OSError as e:
-                self._push_socks.pop(key, None)
-                self._push_initialized.discard(key)
-                raise ConnectionError(f"订阅帧发送失败: {e}")
-            logger.info("auction[%s]: 已发 4214 订阅帧，等注册响应...", code)
-            registered = False
-            for _ in range(5):
-                try:
-                    resp = read_frame(sock)
-                except (socket.timeout, OSError, ValueError):
-                    break
-                m = _re.search(rb"CodeListSize=(\d+)", resp)
-                if m:
-                    sz = int(m.group(1))
-                    logger.info("auction[%s]: 订阅响应 CodeListSize=%d（%dB）%s",
-                                code, sz, len(resp),
-                                "✓" if sz >= 1 else "✗")
-                    if sz >= 1:
-                        registered = True
-                        self._snapshot_codes.add(code)
-                        break
-            if not registered:
-                logger.warning("auction[%s]: 4214 注册失败（CodeListSize=0 或无响应）", code)
-
-        # 步骤2: 发集合竞价查询（pageid=4214, 周期码 7176）
-        frame = build_auction_query(code, market=market, trade_date=trade_date)
-        # timeout 是本次竞价查询的总等待上限，而不是每个无关帧都重新计时。
-        # 沪市服务器可能先推送若干不能解析的控制帧；若每轮都使用完整
-        # timeout，原来的 20 轮最多会阻塞 20×timeout。
-        deadline = time.monotonic() + timeout
-        try:
-            sock.sendall(frame + b"\n")
-        except OSError as e:
-            self._push_socks.pop(key, None)
-            self._push_initialized.discard(key)
-            raise ConnectionError(f"查询帧发送失败: {e}")
-        dt_desc = "最近交易日" if trade_date is None else str(trade_date)
-        logger.info("auction[%s]: 已发竞价查询（pageid=4214, 周期7176, %s），等响应...",
-                    code, dt_desc)
-        # 竞价响应是 hd1.0 flag=0x003a 变体
-        from thspypc.protocol import parse_auction_response
-        for i in range(20):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            sock.settimeout(min(timeout, remaining))
-            try:
-                resp = read_frame(sock)
-            except socket.timeout:
-                raise
-            except (OSError, ValueError) as e:
-                raise ConnectionError(f"读取失败: {e}")
-            # 沪市通常返回 cmd=0x0a 外层压缩，协议层会先正规化为固定
-            # hd1.0 表体；不能在这里用字面量 hd1.0 提前门控。
-            recs = parse_auction_response(resp)
-            if recs:
-                logger.info("auction[%s]: 解出 %d 条竞价记录", code, len(recs))
-                return recs   # 拿到数据立即返回（与 timeline 一致）
-        logger.warning("auction[%s]: 未找到竞价数据帧（共读 %d 帧）", code, i + 1)
-        return []
 
     def history_timeline(
         self,
@@ -1902,28 +1662,23 @@ class THSClient:
         """
         if market == 0:
             market = self._market_for_code(code)
-        if self._service_connections is not None:
-            from .errors import ChannelUnavailableError
+        from .errors import ChannelUnavailableError
 
-            if (
-                self._snapshot_thread is not None
-                and self._snapshot_thread.is_alive()
-            ):
-                raise ChannelUnavailableError(
-                    "l2_snapshot",
-                    "后台快照线程正在读取 L2 连接",
-                )
-            self.sync_service_connections()
-            return self._timeline_service.history_timeline(
-                code,
-                market=market,
-                date=date,
-                timeout=timeout,
+        if (
+            self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 L2 连接",
             )
 
         last_err = ""
         for attempt in range(retries + 1):
-            if self._auth is None:
+            if (
+                self._auth is None
+                and self._service_connections is None
+            ):
                 logger.info(
                     "history_timeline: 尚未鉴权，仅获取 HTTP passport"
                     "（attempt %d/%d）",
@@ -1936,7 +1691,15 @@ class THSClient:
                     last_err = f"HTTP 鉴权失败: {exc}"
                     continue
             try:
-                records = self._history_timeline_once(code, date, market, timeout)
+                records = self._run_default_service(
+                    (Capability.L2_HISTORY_TIMELINE,),
+                    lambda: self._timeline_service.history_timeline(
+                        code,
+                        market=market,
+                        date=date,
+                        timeout=timeout,
+                    ),
+                )
                 if records:
                     return records
                 last_err = "收到强状态省略帧或未找到历史分时数据"
@@ -1948,12 +1711,19 @@ class THSClient:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
                                code, date, attempt + 1, last_err)
-                from thspypc.protocol import pick_l2_market
+                from .protocol import pick_l2_market
 
                 key = pick_l2_market(market)
                 with self._push_lock:
                     failed = self._push_socks.pop(key, None)
                     self._push_initialized.discard(key)
+                role = (
+                    ConnectionRole.SH_L2
+                    if key == "sh"
+                    else ConnectionRole.SZ_L2
+                )
+                if self._service_connections is not None:
+                    self._service_connections.close(role)
                 if failed is not None:
                     try:
                         failed.close()
@@ -1961,81 +1731,6 @@ class THSClient:
                         pass
         raise RuntimeError(f"history_timeline {code} {date} 重试 {retries} 次仍失败: {last_err}")
 
-    def _history_timeline_once(self, code: str, date, market: int,
-                               timeout: float) -> list[dict]:
-        """在对应市场的已初始化 L2 连接上执行一次历史分时请求。"""
-        from thspypc.features.history_timeline_protocol import (
-            history_timeline_request_codes,
-        )
-        from thspypc.protocol import pick_l2_market
-
-        if self._auth is None:
-            raise RuntimeError("未登录")
-        key = pick_l2_market(market)
-        with self._push_lock:
-            sock = self._push_socks.get(key)
-        if sock is None:
-            # __manual 与主连接共用同一票据/IP 时可能互斥；沿用已验证的
-            # L2 建连路径，但历史查询不发送 4214 当日分时订阅。
-            self._drop_connection()
-            opened = self._open_manual_push_connection(market)
-            if opened is None:
-                raise ConnectionError(f"__manual[{key}] L2 连接建立失败")
-            with self._push_lock:
-                sock = self._push_socks.get(key)
-                if sock is None:
-                    self._push_socks[key] = opened
-                    self._push_initialized.add(key)
-                    sock = opened
-                else:
-                    opened.close()
-        if key not in self._push_initialized:
-            raise ConnectionError(f"__manual[{key}] L2 连接尚未完成 init")
-
-        frame = build_history_timeline_query(code, date=date, market=market)
-        requested_codes, _, _ = history_timeline_request_codes(
-            code,
-            market=market,
-        )
-        with self._push_request_locks[key]:
-            sock.settimeout(timeout)
-            try:
-                sock.sendall(frame + b"\n")
-            except OSError as exc:
-                with self._push_lock:
-                    if self._push_socks.get(key) is sock:
-                        self._push_socks.pop(key, None)
-                        self._push_initialized.discard(key)
-                raise ConnectionError(f"历史分时请求发送失败: {exc}") from exc
-
-            # 循环读帧，跳过文本/ACK 帧。cmd=0x0a 压缩帧在原始字节中不保证
-            # 含字面量 hd1.0，必须先交给历史分时解析器正规化。
-            for _ in range(8):
-                try:
-                    resp = read_frame(sock)
-                except ValueError:
-                    logger.debug("history_timeline: read_frame magic 错位，丢弃一段重试")
-                    try:
-                        sock.recv(8192)
-                    except OSError:
-                        raise ConnectionError("连接已关闭")
-                    continue
-                recs = parse_history_timeline_response(
-                    resp,
-                    code=code,
-                    requested_codes=requested_codes,
-                )
-                if recs:
-                    return recs
-                if b"hd3.1\x00" in resp:
-                    # 部分响应走 hd3.1 变体，复用 kline 解码尝试
-                    recs = parse_kline_hd3_response(resp)
-                    if recs:
-                        return recs
-                    continue
-                logger.debug("history_timeline: 跳过非数据帧 %dB", len(resp))
-        logger.warning("history_timeline: 8 帧内未找到历史分时数据帧")
-        return []
 
     @staticmethod
     def _market_for_code(code: str) -> int:
@@ -2106,111 +1801,25 @@ class THSClient:
             RuntimeError: 未登录。
         """
         self._ensure_main_connection()
-        if self._service_connections is not None:
-            self.sync_service_connections()
-            stocks = self._stock_list_service.ranked(
+        stocks = self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._stock_list_service.ranked(
                 count=count,
                 timeout=timeout,
                 sort_by=sort_by,
                 sort_dir=sort_dir,
                 max_pages=max_pages,
-            )
-            if with_names and stocks:
-                stockname_dir = (
-                    with_names if isinstance(with_names, str) else None
-                )
-                name_map = THSClient.load_hexin_names(stockname_dir)
-                for stock in stocks:
-                    name = name_map.get(stock["code"], "")
-                    if name:
-                        stock["name"] = name
-            return stocks
-
-        # markets 对齐 hexin 抓包真值（stock_list.pcap）：17=沪 22=深A 151=北交所。
-        # 注意 33 是深市另一类（非深A 主板/创业板），抓包确认排序查询用的是 22 不是 33。
-        PAGE = 59  # hexin 每页恒 59 条（抓包确认）
-        stocks: list[dict] = []
-        seen_codes: set[str] = set()
-        sort_total = 0
-        sort_begin = 0
-        target = count  # 想要的总条数
-
-        with self._sock_lock:
-            sock = self._sock
-            for page in range(max_pages):
-                req = build_stock_list_query(
-                    markets=(17, 22, 151),
-                    sort_begin=sort_begin,
-                    sort_count=PAGE,
-                    datatype=[sort_by],
-                    sort_by=sort_by,
-                    sort_dir=sort_dir,
-                )
-                sock.sendall(req + b"\n")
-                sock.settimeout(timeout)
-                # 循环读帧，跳过 MarketTime 等文本帧，取首个含 SortTotal 的数据帧
-                # （同 list_quotes 的多帧模式：服务器可能先推 MarketTime 再推数据）
-                resp = None
-                for _ in range(8):
-                    try:
-                        frame = read_frame(sock)
-                    except (socket.timeout, OSError) as e:
-                        logger.error("stock_list_hot: 读取响应失败: %s", e)
-                        return stocks
-                    if not frame:
-                        continue
-                    if b"SortTotal" in frame:
-                        resp = frame
-                        break
-                    # 跳过非数据帧（MarketTime / CodeListSize 等）
-
-                if not resp:
-                    logger.warning("stock_list_hot: 第 %d 页无数据帧响应", page + 1)
-                    break
-
-                meta = parse_stock_list_response(resp)
-                if not sort_total:
-                    sort_total = meta.get("sort_total", 0)
-                page_stocks = meta.get("stocks", [])
-                # 按 code 去重合并（页边界可能重叠）
-                new_in_page = 0
-                for s in page_stocks:
-                    c = s.get("code", "")
-                    if c and c not in seen_codes:
-                        seen_codes.add(c)
-                        stocks.append(s)
-                        new_in_page += 1
-
-                data_count = meta.get("sort_data_count", len(page_stocks))
-                logger.debug("stock_list_hot: 第 %d 页 SortBegin=%d 拿 %d 条"
-                             "（新增 %d），累计 %d/%d",
-                             page + 1, sort_begin, data_count, new_in_page,
-                             len(stocks), sort_total)
-
-                # 终止条件：已拿够 / 已取完整个榜单 / 本页无数据
-                if len(stocks) >= target or len(stocks) >= sort_total \
-                        or data_count == 0:
-                    break
-                # 推进游标：用累计已收条数作为下一页起点（对齐抓包 Begin≈已加载位置）
-                sort_begin = len(stocks)
-
-        logger.info("stock_list_hot: 共 %d 页，获取 %d 条（共 %d 条，目标 %d）",
-                    page + 1, len(stocks), sort_total, target)
-
-        # 可选名称填充
+            ),
+        )
         if with_names and stocks:
-            stockname_dir = with_names if isinstance(with_names, str) else None
+            stockname_dir = (
+                with_names if isinstance(with_names, str) else None
+            )
             name_map = THSClient.load_hexin_names(stockname_dir)
-            if name_map:
-                filled = 0
-                for s in stocks:
-                    nm = name_map.get(s["code"], "")
-                    if nm:
-                        s["name"] = nm
-                        filled += 1
-                logger.info("stock_list_hot: 从 hexin 缓存填充 %d/%d 条名称",
-                            filled, len(stocks))
-
+            for stock in stocks:
+                name = name_map.get(stock["code"], "")
+                if name:
+                    stock["name"] = name
         return stocks
 
     def stock_list(
@@ -2240,86 +1849,20 @@ class THSClient:
             RuntimeError: 未登录。
         """
         self._ensure_main_connection()
-        if self._service_connections is not None:
-            self.sync_service_connections()
-            stocks = self._stock_list_service.full_list(timeout=timeout)
-            if with_names and stocks:
-                stockname_dir = (
-                    with_names if isinstance(with_names, str) else None
-                )
-                name_map = THSClient.load_hexin_names(stockname_dir)
-                for stock in stocks:
-                    name = name_map.get(stock["code"], "")
-                    if name:
-                        stock["name"] = name
-            return stocks
-
-        segments = [build_full_stock_list_query() + b"\n"]
-
-        best_stocks: list[dict] = []
-        full_dc = 0
-        # 请求及读取期间持锁，避免心跳或其他 MAIN 请求穿插。
-        with self._sock_lock:
-            sock = self._sock
-            for seg in segments:
-                if sock:
-                    sock.sendall(seg)
-            # 读响应：短超时轮询，直到 timeout 到或拿到全量帧后再读 3s 确认
-            sock.settimeout(2.0)
-            t0 = time.time()
-            got_full_at = None
-            while True:
-                if got_full_at and (time.time() - got_full_at > 3):
-                    break  # 拿到全量后再读 3s 确认无更大帧
-                if not got_full_at and (time.time() - t0 > timeout):
-                    break  # 总超时
-                try:
-                    resp = read_frame(sock)
-                    if not resp:
-                        continue
-                except (socket.timeout, OSError):
-                    continue
-                except ValueError:
-                    # read_frame 偶尔在推送帧中间解析失败（魔数碰撞），跳过
-                    try:
-                        sock.settimeout(1.0)
-                        sock.recv(8192)
-                        sock.settimeout(2.0)
-                    except Exception:
-                        pass
-                    continue
-                meta = parse_init_response(resp)
-                if len(meta["stocks"]) > len(best_stocks):
-                    best_stocks = meta["stocks"]
-                    # 检查这一帧是否有 dc>5000 的全量帧
-                    for f in meta.get("hd31_frames", []):
-                        if f["unk"] == 0x18 and f["dc"] > 5000:
-                            full_dc = f["dc"]
-                            got_full_at = time.time()
-                            break
-
-        if best_stocks:
-            logger.info("stock_list 获取 %d 条代码（全量帧 dc=%d）",
-                        len(best_stocks), full_dc)
-        else:
-            logger.warning("stock_list: 请求后未收到全量代码表帧 "
-                           "（可能服务器实例未响应，重连换 IP 重试）")
-
-        # 可选：从 hexin 本地缓存填充中文名称
-        if with_names:
-            stockname_dir = with_names if isinstance(with_names, str) else None
+        stocks = self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._stock_list_service.full_list(timeout=timeout),
+        )
+        if with_names and stocks:
+            stockname_dir = (
+                with_names if isinstance(with_names, str) else None
+            )
             name_map = THSClient.load_hexin_names(stockname_dir)
-            if name_map:
-                filled = 0
-                for s in best_stocks:
-                    nm = name_map.get(s["code"], "")
-                    if nm:
-                        s["name"] = nm
-                        filled += 1
-                logger.info("stock_list: 从 hexin 缓存填充 %d/%d 条名称",
-                            filled, len(best_stocks))
-
-        return best_stocks
+            for stock in stocks:
+                name = name_map.get(stock["code"], "")
+                if name:
+                    stock["name"] = name
+        return stocks
 
     def stock_list_cached(
         self,
@@ -2376,67 +1919,6 @@ class THSClient:
 
     # ── 全市场快照（hfd1.0 空括号协议）──
 
-    def _market_snapshot_on_main_sock(
-        self,
-        markets: list[int] | None = None,
-        timeout: float = 10.0,
-    ) -> list[dict]:
-        """在主连接 self._sock 上发一次全市场快照请求，解析 hfd1.0 响应。
-
-        ⚠ **不限流的根本前提**：本方法在 :meth:`connect` 建立的长连接上发请求，
-        绝不新建/断开连接。反复 connect/disconnect 会触发 VerifyCode=-1（同账号
-        同 IP 短时间重复 login 的会话冲突，见 HANDOFF §7），这是此前
-        ``market_snapshot`` 必然限流的根因——旧实现循环 ``connect()``/``disconnect()``
-        最多 5 次 × 每次并发 7 IP = 短时间 35 次 login 打同一批 IP。
-
-        host 不支持 hfd1.0（返回空/超时）时返回空列表，由调用方
-        （:meth:`market_snapshot_with_quotes`）决定是否走 :meth:`list_quotes`
-        兜底。本连接不被破坏，后续仍可做其他查询。
-
-        前置条件：已 connect() 成功（self._sock 存在）。
-
-        Args:
-            markets: 市场码列表，None 用 :data:`MARKET_SNAPSHOT_MARKETS`。
-            timeout: 单次 read_frame 超时（秒）。
-
-        Returns:
-            解析后的记录列表（约 1200 条，hfd1.0 数值字段为近似值）。
-            host 不支持或超时返回 []。
-        """
-        if self._sock is None:
-            logger.debug("market_snapshot: 未连接，跳过")
-            return []
-
-        req = protocol.build_market_snapshot_query(markets=markets)
-        try:
-            with self._sock_lock:
-                if not self._sock:
-                    return []
-                self._sock.sendall(req + b"\n")
-                self._sock.settimeout(timeout)
-                # 服务器可能先推文本帧再推 hfd1.0 数据帧，循环找首个含标记的
-                # （与 list_quotes 同模式）
-                for _ in range(8):
-                    try:
-                        raw = read_frame(self._sock)
-                    except (socket.timeout, OSError):
-                        return []
-                    except ValueError:
-                        # magic 对齐失败（推送帧中间魔数碰撞），跳过这一段继续
-                        continue
-                    if raw and b"hfd1.0" in raw:
-                        from thspypc.parse_hfd1 import parse_hfd1_response
-                        try:
-                            records = parse_hfd1_response(raw)
-                            logger.info("market_snapshot: 主连接 hfd1.0 成功, %d 条",
-                                        len(records))
-                            return records
-                        except Exception as e:
-                            logger.debug("market_snapshot: hfd1.0 解析失败: %s", e)
-                            return []
-        except (socket.timeout, OSError) as e:
-            logger.debug("market_snapshot: 主连接读取失败: %s", e)
-        return []
 
     def market_snapshot(
         self,
@@ -2472,13 +1954,13 @@ class THSClient:
             RuntimeError: 未登录（self._sock 为空）。
         """
         self._ensure_main_connection()
-        if self._service_connections is not None:
-            self.sync_service_connections()
-            return self._market_snapshot_service.snapshot(
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._market_snapshot_service.snapshot(
                 markets=markets,
                 timeout=timeout,
-            )
-        return self._market_snapshot_on_main_sock(markets=markets, timeout=timeout)
+            ),
+        )
 
     def market_snapshot_with_quotes(
         self,
@@ -2602,67 +2084,21 @@ class THSClient:
             RuntimeError: 未登录。
         """
         self._ensure_main_connection()
-        if self._service_connections is not None:
-            self.sync_service_connections()
-            result = self._stock_name_service.fetch(
+        result = self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._stock_name_service.fetch(
                 market=market,
                 stock_name_ver=stock_name_ver,
                 timeout=timeout,
-            )
-            logger.info(
-                "fetch_stock_names(market=%s): 解出 %d 条名称，跳过 %d 个块状段",
-                market,
-                len(result["names"]),
-                len(result["skipped"]),
-            )
-            return result
-
-        req = build_upstockname_request(market, stock_name_ver)
-        names_result: dict = {
-            "names": {}, "by_segment": {}, "skipped": [], "segments": [],
-        }
-        with self._sock_lock:
-            sock = self._sock
-            if not sock:
-                return names_result
-            sock.sendall(req)
-            sock.settimeout(2.0)
-            t0 = time.time()
-            # 名称帧通常 1~2 帧就到；读到含 [name_ 的帧后继续读 2s 收尾
-            got_name = False
-            while True:
-                if got_name and (time.time() - t0 > 4):
-                    break
-                if not got_name and (time.time() - t0 > timeout):
-                    break
-                try:
-                    resp = read_frame(sock)
-                    if not resp:
-                        continue
-                except (socket.timeout, OSError):
-                    continue
-                except ValueError:
-                    try:
-                        sock.settimeout(1.0)
-                        sock.recv(8192)
-                        sock.settimeout(2.0)
-                    except Exception:
-                        pass
-                    continue
-                # 名称帧特征：含 [name_ 或 MarketCode 或 upnametype
-                if b"[name_" in resp or b"upnametype" in resp or b"MarketCode" in resp:
-                    got_name = True
-                    r = decode_name_frame(resp)
-                    names_result["names"].update(r["names"])
-                    names_result["by_segment"].update(r["by_segment"])
-                    names_result["skipped"].extend(r["skipped"])
-                    names_result["segments"].extend(r["segments"])
-
-        logger.info("fetch_stock_names(market=%s): 解出 %d 条名称，跳过 %d 个块状段",
-                    market, len(names_result["names"]), len(names_result["skipped"]))
-        return names_result
-
-    # ── 股票名称加载 ──
+            ),
+        )
+        logger.info(
+            "fetch_stock_names(market=%s): 解出 %d 条名称，跳过 %d 个块状段",
+            market,
+            len(result["names"]),
+            len(result["skipped"]),
+        )
+        return result
 
     @staticmethod
     def load_hexin_names(
@@ -2823,6 +2259,10 @@ class THSClient:
             result = parse_login_response(resp)
             if result.get("VerifyCode") == "0":
                 self._realorder_sock = sock
+                self._account_evidence.record_feature(
+                    Capability.REALORDER,
+                    Support.YES,
+                )
                 logger.info("9601 短线精灵服务连接成功 (%s:%d)", REALORDER_HOST, REALORDER_PORT)
             else:
                 sock.close()
@@ -2893,91 +2333,46 @@ class THSClient:
         if market is None:
             market = 17 if code.startswith("6") else 33
 
-        # ★ 按沪深分服选推送连接（shlv2=沪, szlv2=深）
-        from thspypc.protocol import pick_l2_market
-        key = pick_l2_market(market)
-        if self._service_connections is not None:
-            from .errors import ProtocolError
+        from .errors import ProtocolError
+        from .protocol import pick_l2_market
 
+        key = pick_l2_market(market)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+
+        def register() -> bool:
             role = (
                 ConnectionRole.SH_L2
                 if key == "sh"
                 else ConnectionRole.SZ_L2
             )
-            self.sync_service_connections()
             connection = self._service_connections.acquire(
                 role,
                 capability=Capability.L2_SNAPSHOT_PUSH,
             )
-            try:
-                self._service_subscriptions.ensure_registered(
-                    connection,
-                    code,
-                    market=market,
-                    timeout=5.0,
-                )
-            except ProtocolError as exc:
-                logger.warning(
-                    "snapshot_subscribe: %s 注册失败: %s",
-                    code,
-                    exc,
-                )
-                return False
-            self._activate_snapshot_subscription(code, market, callback)
+            self._service_subscriptions.ensure_registered(
+                connection,
+                code,
+                market=market,
+                timeout=5.0,
+            )
             return True
 
-        if self._auth is None:
-            self.authenticate()
-        if key not in self._push_socks:
-            sock = self._open_manual_push_connection(market)
-            if sock is None:
-                logger.error("snapshot_subscribe: __manual[%s] 推送连接建立失败", key)
-                return False
-            self._push_socks[key] = sock
-            self._push_initialized.add(key)
-            logger.info("snapshot_subscribe: __manual[%s] 推送连接已建立", key)
-            # ★ 后台预热另一市连接
-            self._preheat_other_market(key)
-
-        # 发 pageid=4214 嵌套订阅帧
-        self._instance += 1
-        frame = build_snapshot_subscribe(code, market=market,
-                                          seq=self._instance & 0xFFFF)
-        with self._push_request_locks[key]:
-            try:
-                self._push_socks[key].sendall(frame + b"\n")
-            except OSError as e:
-                logger.error("snapshot_subscribe: 发送失败 %s，重连", e)
-                self._push_socks.pop(key, None)
-                self._push_initialized.discard(key)
-                return False
-
-            # 读注册响应（CodeListSize=1 才算成功）
-            import socket as _socket
-            self._push_socks[key].settimeout(5.0)
-            registered = False
-            try:
-                for _ in range(5):
-                    body = read_frame(self._push_socks[key])
-                    if b"CodeListSize=" in body:
-                        import re
-                        m = re.search(rb"CodeListSize=(\d+)", body)
-                        size = int(m.group(1)) if m else 0
-                        if size >= 1:
-                            registered = True
-                        logger.info("snapshot_subscribe: CodeListSize=%d（%s）",
-                                    size, "注册成功" if registered else "注册失败")
-                        break
-            except (_socket.timeout, OSError, ValueError):
-                pass
-
-        if not registered:
-            logger.warning("snapshot_subscribe: %s 注册失败（CodeListSize=0，"
-                           "检查账号是否有 L2 权限）", code)
+        try:
+            self._run_default_service(
+                (Capability.L2_SNAPSHOT_PUSH,),
+                register,
+            )
+        except ProtocolError as exc:
+            logger.warning(
+                "snapshot_subscribe: %s 注册失败: %s",
+                code,
+                exc,
+            )
             return False
-
-        self._activate_snapshot_subscription(code, market, callback)
-        return True
+        else:
+            self._activate_snapshot_subscription(code, market, callback)
+            return True
 
     def _activate_snapshot_subscription(
         self,
@@ -3366,16 +2761,6 @@ class THSClient:
                 except OSError as e:
                     logger.debug("9601 心跳发送失败（不影响查询）: %s", e)
 
-    def _realorder_query(self, body: bytes) -> bytes:
-        """在 9601 连接上发查询，返回原始响应。"""
-        if not self._realorder_sock:
-            self._connect_realorder_server()
-        if not self._realorder_sock:
-            raise RuntimeError("9601 短线精灵服务未连接")
-        with self._realorder_lock:
-            self._realorder_sock.sendall(encode_frame(body) + b"\n")
-            self._realorder_sock.settimeout(15)
-            return read_frame_realorder(self._realorder_sock)
 
     def dxjl_page(self, market: int, endtime_us: int) -> list[dict]:
         """获取短线精灵单页数据（9601，method=qurealorder）。
@@ -3387,17 +2772,13 @@ class THSClient:
         Returns:
             list[dict]，每项含 时间(微秒戳)/市场/代码/异动类型/异动编码/金额/涨跌幅。
         """
-        if self._realorder_service is not None:
-            self.sync_service_connections()
-            return self._realorder_service.dxjl_page(market, endtime_us)
-        try:
-            self._instance += 1
-            body = build_qurealorder_query(self._instance, market, endtime_us)
-            resp = self._realorder_query(body)
-            return parse_qurealorder_response(resp, str(market))
-        except Exception as e:
-            logger.error("dxjl_page 查询失败: %s", e)
-            return []
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.dxjl_page(
+                market,
+                endtime_us,
+            ),
+        )
 
     def dxjl_latest(self, markets: tuple = (32, 16)) -> list[dict]:
         """获取短线精灵最新一页（沪深）。
@@ -3408,15 +2789,10 @@ class THSClient:
         Returns:
             list[dict]，按时间倒序（最新在前）。非交易时段可能为空。
         """
-        if self._realorder_service is not None:
-            self.sync_service_connections()
-            return self._realorder_service.dxjl_latest(markets=markets)
-        now_us = int(time.time() * 1_000_000)
-        all_recs = []
-        for mk in markets:
-            all_recs.extend(self.dxjl_page(mk, now_us))
-        all_recs.sort(key=lambda r: r["时间"], reverse=True)
-        return all_recs
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.dxjl_latest(markets=markets),
+        )
 
     def dxjl_history(self, pages: int = 5, markets: tuple = (32, 16)) -> list[dict]:
         """翻页获取短线精灵历史数据（endtime 游标分页）。
@@ -3430,26 +2806,13 @@ class THSClient:
         Returns:
             list[dict]，按时间倒序。
         """
-        if self._realorder_service is not None:
-            self.sync_service_connections()
-            return self._realorder_service.dxjl_history(
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.dxjl_history(
                 pages=pages,
                 markets=markets,
-            )
-        now_us = int(time.time() * 1_000_000)
-        all_recs = []
-        cursor = now_us
-        for _ in range(pages):
-            page_recs = []
-            for mk in markets:
-                page_recs.extend(self.dxjl_page(mk, cursor))
-            if not page_recs:
-                break
-            page_recs.sort(key=lambda r: r["时间"])
-            all_recs.extend(page_recs)
-            cursor = page_recs[0]["时间"]
-        all_recs.sort(key=lambda r: r["时间"], reverse=True)
-        return all_recs
+            ),
+        )
 
     # ── 短线精灵实时推送（9601 subrealorder 订阅 + pushrealorder 接收）──
 
@@ -3465,24 +2828,10 @@ class THSClient:
         Args:
             markets: 市场代码列表，默认 [16,32,151,48]（沪/深/北交所/板块）。
         """
-        if self._realorder_service is not None:
-            self.sync_service_connections()
-            self._realorder_service.subscribe_realtime(markets)
-            return
-        from .protocol import SUBREALORDER_MARKETS, build_subrealorder_query
-        if markets is None:
-            markets = SUBREALORDER_MARKETS
-        if not self._realorder_sock:
-            self._connect_realorder_server()
-        if not self._realorder_sock:
-            raise RuntimeError("9601 短线精灵服务未连接")
-        for mk in markets:
-            self._instance += 1
-            body = build_subrealorder_query(self._instance, mk)
-            with self._realorder_lock:
-                if self._realorder_sock:
-                    self._realorder_sock.sendall(encode_frame(body) + b"\n")
-        logger.info("已订阅 %d 个市场的异动推送: %s", len(markets), markets)
+        self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.subscribe_realtime(markets),
+        )
 
     def receive_pushes(self, timeout: float = 10.0,
                        callback=None) -> list[dict]:
@@ -3503,37 +2852,14 @@ class THSClient:
             list[dict]，每项 ``{代码, 市场, raw_bytes}``。callback 模式下返回空列表。
             非交易时段返回空列表（无推送）。
         """
-        if self._realorder_service is not None:
-            self.sync_service_connections()
-            records, _ = self._realorder_service.receive_pushes(
+        records, _ = self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.receive_pushes(
                 timeout=timeout,
                 callback=callback,
-            )
-            return records
-        if not self._realorder_sock:
-            raise RuntimeError("9601 未连接，请先 subscribe_realtime()")
-        all_recs = []
-        import time as _time
-        deadline = _time.time() + timeout
-        while _time.time() < deadline:
-            remaining = deadline - _time.time()
-            if remaining <= 0:
-                break
-            self._realorder_sock.settimeout(min(remaining, 5.0))
-            try:
-                resp = read_frame_realorder(self._realorder_sock)
-            except (socket.timeout, OSError):
-                break
-            # 只处理 pushrealorder 帧（跳过心跳响应/其他帧）
-            if b"pushrealorder" not in resp:
-                continue
-            recs = parse_pushrealorder_response(resp)
-            if callback:
-                for r in recs:
-                    callback(r)
-            else:
-                all_recs.extend(recs)
-        return all_recs
+            ),
+        )
+        return records
 
     def receive_pushes_locked(self, timeout: float = 5.0,
                               callback=None, full_frame_callback=None) -> int:
@@ -3557,45 +2883,15 @@ class THSClient:
         Returns:
             本次收到的推送帧数（不含心跳/其他帧）。
         """
-        if self._realorder_service is not None:
-            self.sync_service_connections()
-            _, frame_count = self._realorder_service.receive_pushes(
+        _, frame_count = self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.receive_pushes(
                 timeout=timeout,
                 callback=callback,
                 full_frame_callback=full_frame_callback,
                 continue_on_timeout=True,
-            )
-            return frame_count
-        if not self._realorder_sock:
-            raise RuntimeError("9601 未连接，请先 subscribe_realtime()")
-        frame_count = 0
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            got_frame = False
-            # 持锁读单帧；读完释放锁给心跳/dxjl_history 机会
-            with self._realorder_lock:
-                if not self._realorder_sock:
-                    break
-                self._realorder_sock.settimeout(min(remaining, 2.0))
-                try:
-                    resp = read_frame_realorder(self._realorder_sock)
-                    got_frame = True
-                except (socket.timeout, OSError):
-                    resp = None
-            if not got_frame or resp is None:
-                continue
-            if b"pushrealorder" not in resp:
-                continue
-            frame_count += 1
-            if full_frame_callback:
-                full_frame_callback(resp)
-            recs = parse_pushrealorder_response(resp)
-            if callback:
-                for r in recs:
-                    callback(r)
+            ),
+        )
         return frame_count
 
     def disconnect(self) -> None:

@@ -9,6 +9,9 @@
 """
 from __future__ import annotations
 
+# 可直接运行的活网/语料诊断脚本，不属于默认 pytest 离线套件。
+__test__ = False
+
 import json
 import os
 import sys

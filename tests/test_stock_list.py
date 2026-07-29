@@ -18,6 +18,9 @@ thspypc 全市场股票列表（stock_list）测试。
 """
 from __future__ import annotations
 
+# 可直接运行的 pcap/活网诊断脚本，不由默认 pytest 自动收集。
+__test__ = False
+
 import os
 import sys
 import subprocess

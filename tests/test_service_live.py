@@ -1,17 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-重构活网验证：新 service 层路径 vs 旧协议路径行为对比。
+默认 service 路径的活网重复请求验证。
 
 目的
 ====
-codex/refactor-protocol-foundation 分支把单体 client.py/protocol.py 拆成
-codecs/features/services/_transport 分层。公开方法在显式配置 service context
-后 opt-in 委托新 service，否则走旧路径。
-
-本脚本在同一 client、同一主连接上，对 MAIN-only 业务先取旧路径基准，再 opt-in
-切新 service 路径取一份。动态报价/盘口比较代码、字段结构和类型；K 线对已完成
-区间逐字段比较，避免两次请求之间的正常行情变化造成误报。
+公开行情方法默认委托 codecs/features/services/_transport 分层。本脚本在同一
+client、同一 MAIN 生命周期内连续请求两轮，验证连接复用、single-flight 读写和
+动态响应结构稳定。
 
 ⚠ 前置条件
 ==========
@@ -178,7 +174,7 @@ def main() -> int:
     imei = os.environ.get("THS_IMEI", "").strip() or None
 
     print("=" * 70)
-    print("活网验证：新 service 路径 vs 旧协议路径（重构行为对比）")
+    print("活网验证：默认 service 路径的重复请求与连接复用")
     print("=" * 70)
     print(f"账号: {username or '(空)'}  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
@@ -205,66 +201,65 @@ def main() -> int:
     SH_CODES = ["600519", "600000", "600036"]   # ≤5 股走 hd1.0 明文，盘后最稳
     results = []
     try:
-        # ---- 2. 旧路径基准 ----
+        # ---- 2. 第一轮默认 service 请求 ----
         # 注意：kline() 内部有跨 IP 重连重试逻辑，失败时会破坏主连接，且当前
         # 凌晨时段服务器对 kline 查询无响应（非重构问题）。本次核心对比先聚焦
         # list_quotes / depth_quote（MAIN 复用主连接、无重连副作用），kline 留待
         # 盘中或白天单独验证。
-        print("── 旧路径基准（未配置 service context）──")
+        print("── 第一轮默认 service 请求 ──")
         t0 = time.time()
-        old_quotes = client.list_quotes(SH_CODES, market=17)
-        print(f"  list_quotes(沪): {len(old_quotes)} 条  ({time.time()-t0:.1f}s)")
+        first_quotes = client.list_quotes(SH_CODES, market=17)
+        print(f"  list_quotes(沪): {len(first_quotes)} 条  ({time.time()-t0:.1f}s)")
         t0 = time.time()
-        old_depth = client.depth_quote("600519")
-        print(f"  depth_quote(600519): 买{len(old_depth.get('buy',[]))}/卖{len(old_depth.get('sell',[]))}  ({time.time()-t0:.1f}s)")
-        old_kline = None
+        first_depth = client.depth_quote("600519")
+        print(f"  depth_quote(600519): 买{len(first_depth.get('buy',[]))}/卖{len(first_depth.get('sell',[]))}  ({time.time()-t0:.1f}s)")
+        first_kline = None
         try:
             t0 = time.time()
             # retries=0 避免内部重连破坏主连接；init 修复后单次即成功
-            old_kline = client.kline("600519", period="day", count=5, market=17, retries=0, timeout=15.0)
-            print(f"  kline(600519 日): {len(old_kline)} 根  ({time.time()-t0:.1f}s)")
+            first_kline = client.kline("600519", period="day", count=5, market=17, retries=0, timeout=15.0)
+            print(f"  kline(600519 日): {len(first_kline)} 根  ({time.time()-t0:.1f}s)")
         except Exception as ke:
             print(f"  kline(600519 日): 跳过: {type(ke).__name__}: {ke}")
         print()
 
         if not client.is_connected:
-            print("!! 旧路径查询后连接断开，无法继续 service 路径对比")
+            print("!! 第一轮查询后 MAIN 连接断开")
             return 1
 
-        # ---- 3. 配置 service context，opt-in 新路径 ----
-        print("── opt-in 新 service 路径 ──")
-        client.configure_service_context(allow_open=True)
-        profile = client.refresh_service_profile_from_evidence()
+        # ---- 3. 第二轮复用同一默认 service context ----
+        print("── 第二轮复用默认 service context ──")
+        profile = client.observed_account_profile
         print(f"  账号画像: kind={profile.kind.value}")
         caps = {c.value: s.value for c, s in profile.capabilities.items()}
         print(f"  能力: {caps}")
         client.sync_service_connections()
         print()
 
-        print("── 新 service 路径查询 ──")
+        print("── 第二轮查询 ──")
         t0 = time.time()
-        new_quotes = client.list_quotes(SH_CODES, market=17)
-        print(f"  list_quotes(沪): {len(new_quotes)} 条  ({time.time()-t0:.1f}s)")
+        second_quotes = client.list_quotes(SH_CODES, market=17)
+        print(f"  list_quotes(沪): {len(second_quotes)} 条  ({time.time()-t0:.1f}s)")
         t0 = time.time()
-        new_depth = client.depth_quote("600519")
-        print(f"  depth_quote(600519): 买{len(new_depth.get('buy',[]))}/卖{len(new_depth.get('sell',[]))}  ({time.time()-t0:.1f}s)")
-        new_kline = None
+        second_depth = client.depth_quote("600519")
+        print(f"  depth_quote(600519): 买{len(second_depth.get('buy',[]))}/卖{len(second_depth.get('sell',[]))}  ({time.time()-t0:.1f}s)")
+        second_kline = None
         try:
             t0 = time.time()
-            new_kline = client.kline("600519", period="day", count=5, market=17, retries=0, timeout=15.0)
-            print(f"  kline(600519 日): {len(new_kline)} 根  ({time.time()-t0:.1f}s)")
+            second_kline = client.kline("600519", period="day", count=5, market=17, retries=0, timeout=15.0)
+            print(f"  kline(600519 日): {len(second_kline)} 根  ({time.time()-t0:.1f}s)")
         except Exception as ke:
             print(f"  kline(600519 日): 跳过: {type(ke).__name__}: {ke}")
         print()
 
         # ---- 4. 行为对比 ----
-        print("── 行为对比（旧 vs 新 service）──")
-        results.append(compare_live_list("list_quotes(沪)", old_quotes, new_quotes))
-        results.append(compare_depth("depth_quote(600519)", old_depth, new_depth))
-        if old_kline is not None and new_kline is not None:
-            results.append(compare_kline("kline(600519 日)", old_kline, new_kline))
-        elif old_kline is None and new_kline is None:
-            print("  ⊙ kline(600519 日): 新旧路径均跳过，无法对比")
+        print("── 两轮行为对比 ──")
+        results.append(compare_live_list("list_quotes(沪)", first_quotes, second_quotes))
+        results.append(compare_depth("depth_quote(600519)", first_depth, second_depth))
+        if first_kline is not None and second_kline is not None:
+            results.append(compare_kline("kline(600519 日)", first_kline, second_kline))
+        elif first_kline is None and second_kline is None:
+            print("  ⊙ kline(600519 日): 两轮均跳过，无法对比")
 
     except Exception as e:
         print(f"\n!! 验证过程异常: {e}")
@@ -279,7 +274,7 @@ def main() -> int:
     passed = sum(1 for r in results if r)
     total = len(results)
     if passed == total:
-        print(f"✓ 全部对比一致 {passed}/{total}：重构未改变 MAIN 业务协议行为")
+        print(f"✓ 全部对比一致 {passed}/{total}：默认 service 路径复用稳定")
         return 0
     else:
         print(f"✗ 存在差异 {passed}/{total} 通过：需排查")

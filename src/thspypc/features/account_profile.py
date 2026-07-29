@@ -116,6 +116,24 @@ _FEATURE_FIELDS = {
 }
 
 
+def infer_l2_entitlement(
+    passport_fields: Mapping[str, str],
+) -> Support:
+    """Classify only the paired passport signatures verified in live accounts.
+
+    A single ``userclass`` or ``level2`` value is not sufficient evidence.
+    Unknown combinations remain UNKNOWN so new server-side account classes do
+    not get routed to a privileged channel by accident.
+    """
+    userclass = passport_fields.get("userclass", "").strip()
+    level2 = passport_fields.get("level2", "").strip()
+    if userclass == "30002" and level2 == "16;32;48":
+        return Support.YES
+    if userclass == "10000" and level2 == "255":
+        return Support.NO
+    return Support.UNKNOWN
+
+
 class AccountEvidenceRecorder:
     """Atomically evolve evidence while preserving conservative semantics."""
 
@@ -160,6 +178,23 @@ class AccountEvidenceRecorder:
         support: Support,
     ) -> AccountEvidence:
         return self._update(l2_entitlement=Support(support))
+
+    def record_passport_fields(
+        self,
+        passport_fields: Mapping[str, str],
+    ) -> AccountEvidence:
+        """Record passport metadata and any verified account-class signature."""
+        with self._lock:
+            fields = dict(self._evidence.passport_fields)
+            fields.update(passport_fields)
+            inferred = infer_l2_entitlement(fields)
+            entitlement = self._evidence.l2_entitlement
+            if inferred is not Support.UNKNOWN:
+                entitlement = inferred
+            return self._update(
+                passport_fields=fields,
+                l2_entitlement=entitlement,
+            )
 
     def record_manual_login(
         self,

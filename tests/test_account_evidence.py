@@ -22,6 +22,39 @@ def test_unknown_passport_fields_do_not_guess_account_type():
     assert profile.passport_fields["level2"] == ""
 
 
+def test_verified_passport_signatures_classify_standard_and_level2():
+    standard = AccountEvidenceRecorder()
+    standard.record_passport_fields(
+        {"userclass": "10000", "level2": "255"}
+    )
+    level2 = AccountEvidenceRecorder()
+    level2.record_passport_fields(
+        {"userclass": "30002", "level2": "16;32;48"}
+    )
+
+    assert standard.profile().kind is AccountKind.STANDARD
+    assert (
+        standard.profile().support(Capability.L2_MARKET_ACCESS)
+        is Support.NO
+    )
+    assert level2.profile().kind is AccountKind.LEVEL2
+    assert (
+        level2.profile().support(Capability.L2_MARKET_ACCESS)
+        is Support.UNKNOWN
+    )
+
+
+def test_partial_or_unrecognized_passport_signature_stays_unknown():
+    for fields in (
+        {"userclass": "30002"},
+        {"level2": "16;32;48"},
+        {"userclass": "new-class", "level2": "16;32;48"},
+    ):
+        recorder = AccountEvidenceRecorder()
+        recorder.record_passport_fields(fields)
+        assert recorder.profile().kind is AccountKind.UNKNOWN
+
+
 def test_explicit_ordinary_entitlement_disables_only_l2_capabilities():
     profile = build_account_profile(
         AccountEvidence(

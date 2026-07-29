@@ -1,5 +1,7 @@
 """Offline contracts for HTTP-only auth and role-lazy TCP connections."""
 
+import pytest
+
 from thspypc import (
     AccountKind,
     AccountProfile,
@@ -10,6 +12,7 @@ from thspypc import (
     THSClient,
 )
 from thspypc.transport import ConnectionRole
+from thspypc.errors import UnsupportedAccountFeatureError
 
 
 class FakeSocket:
@@ -103,6 +106,30 @@ def test_connect_main_reuses_existing_http_material(monkeypatch):
     assert tcp_logins == [dict(material.passport_fields)]
 
 
+def test_default_main_call_creates_service_context(monkeypatch):
+    client = _client()
+    client._sock = FakeSocket()
+    client._account_evidence.record_main_ready()
+    calls = []
+
+    class FakeQuoteService:
+        def __init__(self, connections, *, evidence=None):
+            self.connections = connections
+
+        def list_quotes(self, codes, **kwargs):
+            calls.append((codes, kwargs))
+            return [{"code": codes[0], "dt10": 1.0}]
+
+    monkeypatch.setattr("thspypc.services.QuoteService", FakeQuoteService)
+
+    records = client.list_quotes(["600519"], market=17)
+
+    assert records == [{"code": "600519", "dt10": 1.0}]
+    assert client._service_connections is not None
+    assert client._service_auto_profile
+    assert calls[0][0] == ["600519"]
+
+
 def test_l2_service_opener_authenticates_without_main_login(monkeypatch):
     client = _client()
     calls = []
@@ -178,12 +205,17 @@ def test_history_timeline_authenticates_without_main_login(monkeypatch):
         "connect_main",
         lambda: main_logins.append(True),
     )
+
+    class FakeTimelineService:
+        def __init__(self, connections, *, subscriptions, evidence=None):
+            self.connections = connections
+
+        def history_timeline(self, code, **_kwargs):
+            return [{"code": code, "bar_index": 1}]
+
     monkeypatch.setattr(
-        client,
-        "_history_timeline_once",
-        lambda code, date, market, timeout: [
-            {"code": code, "bar_index": 1}
-        ],
+        "thspypc.services.TimelineService",
+        FakeTimelineService,
     )
 
     records = client.history_timeline(
@@ -197,3 +229,36 @@ def test_history_timeline_authenticates_without_main_login(monkeypatch):
     assert len(calls) == 1
     assert main_logins == []
     assert client._sock is None
+
+
+def test_verified_standard_passport_blocks_l2_before_socket_open(monkeypatch):
+    client = _client()
+    auth_calls = []
+
+    def authenticate(username, password, imei):
+        auth_calls.append((username, password, imei))
+        return {
+            "userid": "user-id",
+            "sessionid": "session-id",
+            "signature": "AB" * 128,
+            "passport_bytes": (
+                b"account=test|userclass=10000|level2=255|"
+                b"M_hqdns=\"ifindhq.123ths.com:8901:232;\""
+            ),
+        }
+
+    client._auth_service._authenticator = authenticate
+    client._init_blocks = lambda: None
+    opened = []
+    monkeypatch.setattr(
+        client,
+        "_open_manual_push_connection",
+        lambda market: opened.append(market),
+    )
+
+    with pytest.raises(UnsupportedAccountFeatureError):
+        client.timeline("600519", market=17)
+
+    assert len(auth_calls) == 1
+    assert client.observed_account_profile.kind is AccountKind.STANDARD
+    assert opened == []

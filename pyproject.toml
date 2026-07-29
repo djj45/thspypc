@@ -29,3 +29,7 @@ build-backend = "uv_build"
 # Windows AppLocker/WDAC 应用控制策略拦截，WinError 4551）。
 # 测试脚本靠 sys.path.insert(0, "src") 找到源码，无需 editable 安装。
 package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

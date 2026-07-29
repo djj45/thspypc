@@ -17,8 +17,9 @@ parse_hfd1.py                     全市场快照解码
 qr_login.py                       二维码和凭证缓存
 ```
 
-`THSClient` 和 `protocol.py` 仍然偏大。后续按“修改到哪个功能，就迁移哪个功能”
-逐步拆分，旧模块保留兼容性 re-export。
+`THSClient` 保留登录、连接原语、推送线程和公开门面；同步业务工作流默认位于
+`services`。`protocol.py` 继续作为历史导入兼容层，新增实现直接进入
+`features` / `codecs`。
 
 ## 连接不变量
 
@@ -91,7 +92,7 @@ HTTP 接口时，应在 `THSClient` 之上增加一层 `api.py`（或独立服�
         ↓  HTTP / JSON / WebSocket
 api.py        路由 + 鉴权 + JSON 序列化 + 请求编排
         ↓
-THSClient（公开门面）/ services（opt-in）
+THSClient（公开门面）→ services（默认）
         ↓
 features → codecs
 ```
@@ -106,25 +107,22 @@ features → codecs
 | 请求编排（一次页面加载并发取 quotes+kline+depth） | 字段含义映射（features parser） |
 | 错误码统一（`CapabilityUnavailableError`→403、`ChannelUnavailableError`→503） | — |
 
-### 抽 api.py 之前的两个前置条件
+### api.py 的下层前置条件（已完成）
 
 `tests/web_dashboard.py` 已暴露核心矛盾：它在 HTTP 层加了一把全局 `_query_lock`
 来绕过 `list_quotes` 的「锁 send 不锁 read」缺陷（见该文件 §285-289 注释）。
-这说明 socket 读所有权问题没真正下沉，只是被 web 层打了补丁。因此抽 `api.py`
-之前必须先：
+该问题现已在下层完成收口：
 
-1. **MAIN 业务默认切到 service 路径**：`list_quotes`/`kline`/`depth_quote` 等目前
-   是 opt-in（显式 `configure_service_context` 才走 service），默认走旧路径直接
-   碰 `_sock`。只有全切到 service，`api.py` 才能依赖稳定的「请求锁覆盖 send+read」
-   语义，无需自己加全局锁。
+1. **MAIN 业务默认切到 service 路径**：`list_quotes`/`kline`/`depth_quote`、
+   股票列表、快照和名称等公开方法均默认委托 service。
 
 2. **socket 读所有权由 `_transport` 统一保障**：让 `ManagedConnection` /
    `ConnectionManager` 保证单连接串行读，使 `_query_lock` 这类 web 层补丁可以删除。
-   这是连接不变量 §5（不允许功能方法脱离 session 新增「只锁 send、锁外 read」）的
-   最终落地——目前 MAIN 旧路径仍是该不变量的违规点。
+   这是连接不变量 §5（不允许功能方法脱离 session 新增「只锁 send、锁外 read」）
+   的落地；旧同步业务查询器已经删除。
 
-前置条件达成后，`web_dashboard.py` 的 `_query_lock` 应能直接删除；届时 `api.py`
-就是一层薄薄的 HTTP 适配，没有连接治理负担。
+`web_dashboard.py` 不再需要用跨角色全局锁补偿底层读竞争；`api.py` 可以保持为
+一层薄 HTTP 适配，不承担连接治理。
 
 ### 不同前端规模的决策
 
