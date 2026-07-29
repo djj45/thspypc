@@ -6,7 +6,9 @@
 ## 当前分层
 
 ```text
-THSClient                         公开门面、登录与功能编排
+THSClient                         公开门面与兼容入口
+    ├── ConnectionFactory         角色建连与 MAIN 登录编排
+    ├── ConnectionRuntime         心跳、推送 reader 与关闭顺序
     ├── MarketSession             8901 同步请求生命周期
     ├── BlockManager              自定义板块/自选股 HTTP 能力
     ├── 4214 manual connections   沪深 L2 分时与竞价
@@ -17,9 +19,9 @@ parse_hfd1.py                     全市场快照解码
 qr_login.py                       二维码和凭证缓存
 ```
 
-`THSClient` 保留登录、连接原语、推送线程和公开门面；同步业务工作流默认位于
-`services`。`protocol.py` 继续作为历史导入兼容层，新增实现直接进入
-`features` / `codecs`。
+`THSClient` 保留公开门面及旧私有入口的薄兼容委托；角色建连、MAIN 登录编排和
+后台生命周期位于 `connection_runtime.py`，同步业务工作流默认位于 `services`。
+`protocol.py` 继续作为历史导入兼容层，新增实现直接进入 `features` / `codecs`。
 
 ## 连接不变量
 

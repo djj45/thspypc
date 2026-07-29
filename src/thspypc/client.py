@@ -18,6 +18,7 @@ from .models import AccountKind, AccountProfile, Capability, DepthQuote, Support
 from .features.account_profile import AccountEvidenceRecorder
 from .features.auth_protocol import LoginIdentity
 from .services.auth import AuthMaterial, AuthService
+from .connection_runtime import ConnectionFactory, ConnectionRuntime
 from .transport import (
     ConnectionManager,
     ConnectionRole,
@@ -171,6 +172,8 @@ class THSClient:
             self._probe_cache = (time.time(), _ips)
             logger.debug("从磁盘加载 IP 状态：%d 个 IP，offset=%d",
                          len(_ips), self._login_rr_offset)
+        self._connection_factory = ConnectionFactory(self, LoginResult)
+        self._connection_runtime = ConnectionRuntime(self)
 
     def configure_service_context(
         self,
@@ -376,69 +379,8 @@ class THSClient:
                 manager.update_profile(self.observed_account_profile)
 
     def _open_service_connection(self, spec) -> OpenedConnection:
-        """Open through legacy login code while retaining legacy ownership."""
-        if spec.role is ConnectionRole.MAIN:
-            if self._sock is None:
-                result = self.connect_main()
-                if not result.success or self._sock is None:
-                    raise OSError(
-                        f"MAIN 登录失败: {result.error or result.detail}"
-                    )
-            return OpenedConnection(
-                socket=self._sock,
-                owns_socket=False,
-                initialized=True,
-                request_lock=self._sock_lock,
-            )
-
-        l2_role = {
-            ConnectionRole.SH_L2: ("sh", 17),
-            ConnectionRole.SZ_L2: ("sz", 33),
-        }.get(spec.role)
-        if l2_role is not None:
-            key, market = l2_role
-            with self._push_lock:
-                current = self._push_socks.get(key)
-                initialized = key in self._push_initialized
-            if current is None:
-                if self._auth is None:
-                    try:
-                        self.authenticate()
-                    except Exception as exc:
-                        raise OSError(f"L2 HTTP 鉴权失败: {exc}") from exc
-                self._drop_connection()
-                opened = self._open_manual_push_connection(market)
-                if opened is None:
-                    raise OSError(f"__manual[{key}] 建连或 init 失败")
-                with self._push_lock:
-                    current = self._push_socks.get(key)
-                    if current is None:
-                        self._push_socks[key] = opened
-                        self._push_initialized.add(key)
-                        current = opened
-                    else:
-                        opened.close()
-                    initialized = key in self._push_initialized
-            return OpenedConnection(
-                socket=current,
-                owns_socket=False,
-                initialized=initialized,
-                request_lock=self._push_request_locks[key],
-            )
-
-        if spec.role is ConnectionRole.REALORDER:
-            if self._realorder_sock is None:
-                self._connect_realorder_server()
-            if self._realorder_sock is None:
-                raise OSError("realorder 建连失败")
-            return OpenedConnection(
-                socket=self._realorder_sock,
-                owns_socket=False,
-                initialized=True,
-                request_lock=self._realorder_lock,
-            )
-
-        raise OSError(f"不支持的连接角色: {spec.role.value}")
+        """Compatibility delegate to the role-aware connection factory."""
+        return self._connection_factory.open(spec)
 
     def sync_service_connections(self) -> ConnectionManager:
         """Synchronize borrowed wrappers with the sockets currently held here."""
@@ -581,32 +523,9 @@ class THSClient:
         **直接复用现有连接**返回成功，不重新 login——这是 hexin 客户端的策略
         （连接还活着就别重连）。连接已断时正常走登录流程。
         """
-        # ---- 连接治理：活着且未过冷却期 → 复用，避免重复 login 触发 -1 ----
-        if (self._last_connect_ts
-                and self.is_connected
-                and (time.time() - self._last_connect_ts < self._CONNECT_COOLDOWN)):
-            elapsed = time.time() - self._last_connect_ts
-            logger.info("connect(): 当前连接仍活着（%.1fs 前），复用避免重复 login 触发 -1",
-                        elapsed)
-            return LoginResult(
-                success=True, verify_code="0",
-                server=f"(reused)",
-                error="reused_existing_connection",
-            )
-
-        # ---- 第 1 步：按需 HTTP 鉴权，只在无票据或明确要求时刷新 ----
-        try:
-            material = self.authenticate(force=refresh_auth)
-            passport_fields = dict(material.passport_fields)
-            logger.debug("passport 关键字段: account=%s, userclass=%s, level2=%s",
-                         passport_fields.get("account", "?"),
-                         passport_fields.get("userclass", "?"),
-                         passport_fields.get("level2", "?"))
-        except Exception as e:
-            logger.error("HTTP 鉴权失败: %s", e)
-            return LoginResult(success=False, error="http_auth_failed", detail=str(e))
-
-        return self._do_tcp_login(passport_fields)
+        return self._connection_factory.connect_main(
+            refresh_auth=refresh_auth
+        )
 
     # ── 连接治理（避免反复 connect 触发 VerifyCode=-1）──
 
@@ -2278,22 +2197,11 @@ class THSClient:
         8901 每 3 秒、9601 每 30 秒（若已连接）。daemon 线程，主进程退出时自动结束。
         enable_heartbeat=False 时不启动（用于对比测试）。
         """
-        if not self.enable_heartbeat:
-            return
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            return  # 已在运行
-        self._heartbeat_stop.clear()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, name="ths-heartbeat", daemon=True)
-        self._heartbeat_thread.start()
-        logger.debug("心跳线程已启动")
+        self._connection_runtime.start_heartbeat()
 
     def stop_heartbeat(self) -> None:
         """停止心跳线程（disconnect 时自动调用）。"""
-        self._heartbeat_stop.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=5)
-        self._heartbeat_thread = None
+        self._connection_runtime.stop_heartbeat()
 
     # ── 实时分时推送（pageid=5716 多股订阅触发，2026-07-24 抓包破解）──
 
@@ -2381,17 +2289,11 @@ class THSClient:
         callback,
     ) -> None:
         """Record a registration and ensure the single push reader is running."""
-        self._snapshot_codes.add(code)
-        if callback is not None:
-            self._snapshot_cb = callback
-        # 启动推送读取线程
-        if self._snapshot_thread is None or not self._snapshot_thread.is_alive():
-            self._snapshot_stop.clear()
-            self._snapshot_thread = threading.Thread(
-                target=self._snapshot_loop, name="ths-snapshot", daemon=True)
-            self._snapshot_thread.start()
-            logger.debug("分时推送读取线程已启动")
-        logger.info("snapshot_subscribe: 已订阅 %s（market=%d）", code, market)
+        self._connection_runtime.activate_snapshot(
+            code,
+            market,
+            callback,
+        )
 
     def _preheat_other_market(self, current_key: str) -> None:
         """后台异步预热另一市的 __manual 连接（复刻 hexin 启动即双连行为）。
@@ -2637,22 +2539,7 @@ class THSClient:
 
     def stop_snapshot(self) -> None:
         """停止分时推送读取线程，关闭沪深两条 __manual 推送连接（disconnect 时自动调用）。"""
-        self._snapshot_stop.set()
-        if self._snapshot_thread and self._snapshot_thread.is_alive():
-            self._snapshot_thread.join(timeout=3)
-        self._snapshot_thread = None
-        for key, sock in list(self._push_socks.items()):
-            with self._push_request_locks[key]:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-        self._push_socks.clear()
-        self._push_initialized.clear()
-        self._preheat_threads.clear()
-        if self._service_connections is not None:
-            self._service_connections.close(ConnectionRole.SH_L2)
-            self._service_connections.close(ConnectionRole.SZ_L2)
+        self._connection_runtime.stop_snapshot()
 
     def _snapshot_loop(self) -> None:
         """后台读取沪深两条 __manual 推送连接的 71B 快照帧，更新现价/触发回调。
@@ -2661,105 +2548,21 @@ class THSClient:
         可读的就 ``read_frame``。遇到非快照帧（心跳响应、注册响应等）直接丢弃。
         select 超时 1 秒，期间反复检查 ``_snapshot_stop`` 以便及时退出。
         """
-        import select as _select
-        import socket as _socket
-        while not self._snapshot_stop.is_set():
-            with self._push_lock:
-                socket_items = [
-                    (key, sock)
-                    for key, sock in self._push_socks.items()
-                    if sock is not None
-                ]
-            socks = [sock for _, sock in socket_items]
-            if not socks:
-                if self._snapshot_stop.wait(1.0):
-                    break
-                continue
-            try:
-                r, _, _ = _select.select(socks, [], [], 1.0)
-            except (OSError, ValueError):
-                if self._snapshot_stop.wait(1.0):
-                    break
-                continue
-            for sock in r:
-                key = next(
-                    (
-                        candidate_key
-                        for candidate_key, candidate in socket_items
-                        if candidate is sock
-                    ),
-                    None,
-                )
-                if key is None:
-                    continue
-                with self._push_request_locks[key]:
-                    with self._push_lock:
-                        if self._push_socks.get(key) is not sock:
-                            continue
-                    try:
-                        sock.settimeout(2.0)
-                        body = read_frame(sock)
-                    except (_socket.timeout, OSError):
-                        continue
-                    except ValueError:
-                        # read_frame 偶尔在半帧处解析失败，跳过
-                        continue
-                if not is_snapshot_push(body):
-                    continue
-                rec = parse_snapshot_push(body)
-                if rec is None:
-                    continue
-                self._latest_price[rec["code"]] = rec["price"]
-                if self._snapshot_cb is not None:
-                    try:
-                        self._snapshot_cb(rec["code"], rec["market"],
-                                          rec["price"], rec["volume"])
-                    except Exception as e:
-                        logger.warning("snapshot 回调异常: %s", e)
+        self._connection_runtime.snapshot_loop(
+            read_frame,
+            is_snapshot_push,
+            parse_snapshot_push,
+        )
 
     def _heartbeat_loop(self) -> None:
         """心跳循环：8901 每 3 秒、9601 每 30 秒（10 个 3 秒周期）。
 
         用 _heartbeat_stop.wait(3) 阻塞，被 set 时立即退出。异常只 warning 不中断。
         """
-        tick = 0
-        while not self._heartbeat_stop.is_set():
-            # 等 3 秒（或被 stop 唤醒立即退出）
-            if self._heartbeat_stop.wait(3.0):
-                break
-            tick += 1
-            # 8901 心跳（每 3 秒）
-            if self._sock:
-                try:
-                    self._hb_seq_8901 += 1
-                    sent = self._market_session.try_send(
-                        build_heartbeat_8901(self._hb_seq_8901)
-                    )
-                    if not sent:
-                        logger.debug("8901 连接正在处理业务请求，跳过本轮心跳")
-                except OSError as e:
-                    logger.debug("8901 心跳发送失败（不影响查询）: %s", e)
-            # 9601 心跳（每 30 秒 = 每 10 个 tick）
-            if tick % 10 == 0 and self._realorder_sock:
-                try:
-                    self._hb_seq_9601 += 1
-                    if self._realorder_service is not None:
-                        sent = self._realorder_service.send_heartbeat(
-                            self._hb_seq_9601
-                        )
-                        if not sent:
-                            logger.debug(
-                                "9601 连接正在处理业务请求，跳过本轮心跳"
-                            )
-                    else:
-                        with self._realorder_lock:
-                            if self._realorder_sock:
-                                self._realorder_sock.sendall(
-                                    build_heartbeat_9601(self._hb_seq_9601)
-                                    + b"\n"
-                                )
-                except OSError as e:
-                    logger.debug("9601 心跳发送失败（不影响查询）: %s", e)
+        self._connection_runtime.heartbeat_loop(
+            build_heartbeat_8901,
+            build_heartbeat_9601,
+        )
 
 
     def dxjl_page(self, market: int, endtime_us: int) -> list[dict]:
@@ -2905,21 +2708,7 @@ class THSClient:
         长连接反复查询，避免反复 disconnect/connect 触发 VerifyCode=-1
         （同账号同 IP 短时间重复 login 的会话冲突，见 HANDOFF §7）。
         """
-        self.stop_heartbeat()
-        self.stop_snapshot()
-        if self._service_connections is not None:
-            self._service_connections.close_all()
-        for attr, lock in (("_sock", self._sock_lock),
-                           ("_realorder_sock", self._realorder_lock)):
-            with lock:
-                sock = getattr(self, attr, None)
-                if sock:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-                    setattr(self, attr, None)
-        logger.info("连接已关闭")
+        self._connection_runtime.disconnect()
 
     def __enter__(self):
         return self
