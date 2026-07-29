@@ -12,9 +12,9 @@ import threading
 import time
 from typing import Any
 
-from .features.auth_protocol import LoginIdentity
-from .models import Capability, Support
-from .protocol import (
+from ..features.auth_protocol import LoginIdentity
+from ..models import Capability, Support
+from ..protocol import (
     MARKET_PORT,
     REALORDER_HOST,
     REALORDER_PORT,
@@ -22,7 +22,7 @@ from .protocol import (
     encode_frame,
     parse_init_response,
 )
-from .transport import ConnectionRole
+from ..transport import ConnectionRole
 
 logger = logging.getLogger(__name__)
 

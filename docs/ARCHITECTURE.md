@@ -22,10 +22,10 @@ qr_login.py                       二维码和凭证缓存
 ```
 
 `THSClient` 保留对象构造、HTTP 鉴权、服务组合及旧入口兼容；底层登录建连位于
-`connection_primitives.py`，角色选择和后台生命周期位于
-`connection_runtime.py`，公开业务门面位于 `service_facade.py`，同步业务工作流
-默认位于 `services`，本地股票代码缓存位于 `stock_cache.py`。这些模块均不反向
-导入或保存 `THSClient`。
+`_client/connection_primitives.py`，角色选择和后台生命周期位于
+`_client/connection_runtime.py`，公开业务门面位于
+`_client/service_facade.py`，同步业务工作流默认位于 `services`，本地股票代码缓存
+位于 `_client/stock_cache.py`。这些模块均不反向导入或保存 `THSClient`。
 
 ## 连接不变量
 

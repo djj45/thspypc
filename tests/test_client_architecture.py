@@ -14,7 +14,12 @@ MODULES = (
 
 
 def test_extracted_modules_do_not_import_or_store_client() -> None:
-    package = Path(__file__).resolve().parents[1] / "src" / "thspypc"
+    package = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "thspypc"
+        / "_client"
+    )
 
     for name in MODULES:
         source = (package / name).read_text(encoding="utf-8")

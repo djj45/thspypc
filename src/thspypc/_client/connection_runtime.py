@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .transport import ConnectionRole, OpenedConnection
+from ..transport import ConnectionRole, OpenedConnection
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +277,7 @@ class ConnectionRuntime:
         parse_snapshot_push: Callable[[bytes], dict | None] | None = None,
     ) -> None:
         import select
-        from .protocol import (
+        from ..protocol import (
             is_snapshot_push as default_is_snapshot_push,
             parse_snapshot_push as default_parse_snapshot_push,
             read_frame as default_read_frame,
@@ -346,7 +346,7 @@ class ConnectionRuntime:
         build_main_heartbeat: Callable[[int], bytes] | None = None,
         build_realorder_heartbeat: Callable[[int], bytes] | None = None,
     ) -> None:
-        from .protocol import (
+        from ..protocol import (
             build_heartbeat_8901,
             build_heartbeat_9601,
         )

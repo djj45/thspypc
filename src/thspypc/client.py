@@ -16,10 +16,10 @@ from dataclasses import dataclass, field
 from .models import AccountKind, AccountProfile, Capability, Support
 from .features.account_profile import AccountEvidenceRecorder
 from .services.auth import AuthMaterial, AuthService
-from .connection_runtime import ConnectionFactory, ConnectionRuntime
-from .connection_primitives import ConnectionPrimitives
-from .service_facade import ServiceFacade
-from .stock_cache import (
+from ._client.connection_runtime import ConnectionFactory, ConnectionRuntime
+from ._client.connection_primitives import ConnectionPrimitives
+from ._client.service_facade import ServiceFacade
+from ._client.stock_cache import (
     default_stock_cache_path,
     is_stock_cache_expired,
     load_stock_codes,

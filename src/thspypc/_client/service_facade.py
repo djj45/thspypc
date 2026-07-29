@@ -4,10 +4,10 @@ from __future__ import annotations
 import logging
 import os
 
-from .errors import ChannelUnavailableError, ProtocolError
-from .models import Capability, DepthQuote
-from .protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
-from .transport import ConnectionRole
+from ..errors import ChannelUnavailableError, ProtocolError
+from ..models import Capability, DepthQuote
+from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
+from ..transport import ConnectionRole
 from .stock_cache import (
     default_stock_cache_path,
     load_stock_codes,
@@ -322,7 +322,7 @@ class ServiceFacade:
         if datatype is None:
             datatype = LIST_QUOTE_DATATYPE_DEFAULT
         self._ensure_main_connection()
-        from .errors import ProtocolError
+        from ..errors import ProtocolError
 
         try:
             return self._run_default_service(
@@ -370,7 +370,7 @@ class ServiceFacade:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
-                from .errors import ProtocolError
+                from ..errors import ProtocolError
 
                 try:
                     return self._run_default_service(
@@ -450,7 +450,7 @@ class ServiceFacade:
                     last_err = f"connect 失败: {lr.error}"
                     continue
             try:
-                from .errors import ProtocolError
+                from ..errors import ProtocolError
 
                 try:
                     recs = self._run_default_service(
@@ -527,7 +527,7 @@ class ServiceFacade:
         Raises:
             RuntimeError: 未登录或 ``__manual`` 连接建立失败。
         """
-        from .errors import ChannelUnavailableError
+        from ..errors import ChannelUnavailableError
 
         if skip_init or use_main_ip:
             raise ValueError(
@@ -595,7 +595,7 @@ class ServiceFacade:
         Raises:
             RuntimeError: 未登录或 ``__manual`` 连接建立失败。
         """
-        from .errors import ChannelUnavailableError
+        from ..errors import ChannelUnavailableError
 
         if skip_init or use_main_ip:
             raise ValueError(
@@ -666,7 +666,7 @@ class ServiceFacade:
         """
         if market == 0:
             market = self._market_for_code(code)
-        from .errors import ChannelUnavailableError
+        from ..errors import ChannelUnavailableError
 
         if (
             self._snapshot_thread is not None
@@ -715,7 +715,7 @@ class ServiceFacade:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
                                code, date, attempt + 1, last_err)
-                from .protocol import pick_l2_market
+                from ..protocol import pick_l2_market
 
                 key = pick_l2_market(market)
                 with self._push_lock:
@@ -921,8 +921,8 @@ class ServiceFacade:
         if market is None:
             market = 17 if code.startswith("6") else 33
 
-        from .errors import ProtocolError
-        from .protocol import pick_l2_market
+        from ..errors import ProtocolError
+        from ..protocol import pick_l2_market
 
         key = pick_l2_market(market)
         if self._auth is None and self._service_connections is None:
