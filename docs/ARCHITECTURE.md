@@ -7,6 +7,8 @@
 
 ```text
 THSClient                         公开门面与兼容入口
+    ├── ServiceFacade             service-backed 公开行情方法
+    ├── ConnectionPrimitives      MAIN/L2/REALORDER 登录与建连原语
     ├── ConnectionFactory         角色建连与 MAIN 登录编排
     ├── ConnectionRuntime         心跳、推送 reader 与关闭顺序
     ├── MarketSession             8901 同步请求生命周期
@@ -19,9 +21,11 @@ parse_hfd1.py                     全市场快照解码
 qr_login.py                       二维码和凭证缓存
 ```
 
-`THSClient` 保留公开门面及旧私有入口的薄兼容委托；角色建连、MAIN 登录编排和
-后台生命周期位于 `connection_runtime.py`，同步业务工作流默认位于 `services`。
-`protocol.py` 继续作为历史导入兼容层，新增实现直接进入 `features` / `codecs`。
+`THSClient` 保留对象构造、HTTP 鉴权、服务组合及旧入口兼容；底层登录建连位于
+`connection_primitives.py`，角色选择和后台生命周期位于
+`connection_runtime.py`，公开业务门面位于 `service_facade.py`，同步业务工作流
+默认位于 `services`，本地股票代码缓存位于 `stock_cache.py`。这些模块均不反向
+导入或保存 `THSClient`。
 
 ## 连接不变量
 

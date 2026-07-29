@@ -1,0 +1,1101 @@
+"""Public market-data facade methods backed by services."""
+from __future__ import annotations
+
+import logging
+import os
+
+from .errors import ChannelUnavailableError, ProtocolError
+from .models import Capability, DepthQuote
+from .protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
+from .transport import ConnectionRole
+from .stock_cache import (
+    default_stock_cache_path,
+    load_stock_codes,
+    market_from_code,
+    save_stock_codes,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ServiceFacade:
+    """Service-backed public methods shared by the compatibility client."""
+
+    def stock_list_cached(
+        self,
+        *,
+        cache_path: str | None = None,
+        refresh: bool = False,
+        with_names: bool = True,
+        timeout: float = 30.0,
+    ) -> list[dict]:
+        """获取全市场股票代码表（带本地缓存，有效期一天=自然日）。
+
+        :meth:`stock_list` 的缓存版：当天首次调用走网络拉取（~6s）并写盘，
+        之后当天再调用直接读缓存（~瞬时），不再发网络请求。跨自然日自动失效。
+
+        缓存文件 ``~/.ths_stock_codes.json``（见 :func:`default_stock_cache_path`），
+        含全量代码 + 名称 + 派生市场码（沪=17/深=33），可直接喂给
+        :meth:`list_quotes`。
+
+        Args:
+            cache_path: 缓存文件路径，None 用默认路径。
+            refresh: True 时强制刷新（忽略缓存，重新走网络拉取并覆盖写盘）。
+            with_names: 网络拉取时是否填充名称。默认 True（缓存场景几乎都要名称，
+                且只写盘一次）。缓存命中时此参数无效（名称已存盘）。
+            timeout: 网络拉取的总超时（秒），传给 :meth:`stock_list`。
+
+        Returns:
+            list[dict]，每项 ``{"code", "name", "market"}``，约 7400 条。
+            market 为派生值：17=沪市 A 股、33=深市 A 股、None=北交所/新三板/基金
+            （list_quotes 当前不支持的市场，仍保留 code+name 供其他用途）。
+
+        Raises:
+            RuntimeError: 未登录（缓存未命中需走网络时）。
+        """
+        path = cache_path or default_stock_cache_path()
+        if not refresh:
+            loaded = load_stock_codes(path)
+            if loaded is not None:
+                stocks, saved_date = loaded
+                logger.info("stock_list_cached: 命中缓存 (%s, %d 条)",
+                            saved_date, len(stocks))
+                return stocks
+        # 缓存不存在/过期/强制刷新 → 走网络
+        logger.info("stock_list_cached: 缓存未命中，走 stock_list() 拉取...")
+        stocks = self.stock_list(timeout=timeout, with_names=with_names)
+        # 覆盖 market 字段为派生值（stock_list 返回的 market 恒为 0）
+        for s in stocks:
+            s["market"] = market_from_code(s["code"])
+        # 仅在拿到有效结果时写盘，避免失败的拉取被缓存一整天
+        if stocks:
+            save_stock_codes(stocks, path)
+        else:
+            logger.warning("stock_list_cached: 拉取为空，不写缓存（可重试）")
+        return stocks
+
+    def market_snapshot_with_quotes(
+        self,
+        timeout: float = 60.0,
+        batch_size: int = 30,
+    ) -> list[dict]:
+        """全市场行情快照：沪深全市场 code+name+准确行情。
+
+        纯双数据源方案（**不依赖 hfd1.0**，彻底避免反复 connect 限流）：
+
+        | 数据源 | 覆盖 | 速度 |
+        |--------|------|------|
+        | :meth:`stock_list_cached` | 沪深全市场 code+name | ~瞬时(缓存) / ~6s(首次) |
+        | :meth:`list_quotes` | 全市场准确行情（批量回填） | ~10-30s |
+
+        旧实现额外调用 hfd1.0 空括号快照拿沪市 code+name，但 hfd1.0 路径
+        反复 connect/disconnect 触发 VerifyCode=-1（限流根因，见 HANDOFF §7），
+        且名称覆盖（1209 锚点）不如 hexin 本地缓存（~8000 条）全，故移除。
+        code+name 现完全由 ``stock_list_cached(with_names=True)`` 提供。
+
+        Args:
+            timeout: list_quotes 单批超时（秒）。
+            batch_size: 每批 list_quotes 数量。
+
+        Returns:
+            list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``。
+            code 和 name 来自 stock_list 缓存（hexin 本地名称），数值来自
+            list_quotes（盘中准确值，需在交易时段调用）。
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        self._ensure_main_connection()
+
+        # 1. stock_list 缓存取全量 code+name（含沪深，名称来自 hexin 本地缓存）
+        stock_codes = self.stock_list_cached(with_names=True)
+        all_by_code: dict[str, dict] = {}
+        for s in stock_codes:
+            code = s["code"]
+            all_by_code[code] = {"code": code, "name": s.get("name", "")}
+
+        # 2. list_quotes 批量回填行情（在主连接上，安全）
+        # DataType 字段集（2026-07-23 实测确认含义，见 tests/diag_field_mapping.py）：
+        #   dt5=代码 dt6=昨收 dt7=今开 dt8=最高 dt9=最低 dt10=最新价
+        #   dt13=成交股数(÷100=手) dt19=成交额(元) dt48=涨速 dt66=涨幅(盘中有效)
+        # ⚠ 必须含 dt6（昨收），否则涨跌幅无法本地计算（实测缺 dt6 时返回 None）。
+        # ⚠ 字段名必须用 r.get("dt10") 等原始键——list_quotes 返回 dt<N> 原始键，
+        #   不是 "price"/"change_pct" 等具名键（旧代码用具名键导致全部 None）。
+        datatype = [5, 6, 7, 8, 9, 10, 13, 18, 19, 48, 49]
+        codes_all = list(all_by_code.keys())
+        quote_count = 0
+
+        for i in range(0, len(codes_all), batch_size):
+            batch = codes_all[i:i + batch_size]
+            try:
+                mkt = market_from_code(batch[0]) if batch else 17
+                recs = self.list_quotes(batch, market=mkt,
+                                        datatype=datatype,
+                                        timeout=min(timeout, 15))
+                for r in recs:
+                    code = r.get("code", "")
+                    if code and code in all_by_code:
+                        # 用 list_quotes 实际返回的 dt<N> 原始键回填
+                        all_by_code[code].update({
+                            "price": r.get("dt10"),
+                            "prev_close": r.get("dt6"),
+                            "open": r.get("dt7"),
+                            "high": r.get("dt8"),
+                            "low": r.get("dt9"),
+                            "amount": r.get("dt19"),   # 成交额(元)，服务器直接返回
+                            "volume": r.get("dt13"),   # 成交股数(÷100=手)
+                        })
+                        quote_count += 1
+            except Exception as e:
+                logger.debug("market_snapshot batch %s 失败: %s", batch[:3], e)
+
+        result = list(all_by_code.values())
+        logger.info("market_snapshot_with_quotes: %d 条, 回填 %d 条行情",
+                    len(result), quote_count)
+        return result
+
+    def fetch_stock_names(
+        self,
+        market: str = "URS",
+        stock_name_ver: str = ";;",
+        timeout: float = 10.0,
+    ) -> dict:
+        """通过 upstockname 协议从服务器获取股票名称（探索性能力）。
+
+        ⚠ **默认名称源是** :meth:`load_hexin_names`（同花顺本地缓存，瞬时、稳定、
+        覆盖沪深北 A 股）。本方法仅作探索性补充——且对主用途（A 股名称）无增益：
+        thspypc 拿到的增量帧恰好是未解的 ``name_16_16`` 块状段。
+
+        发送 ``method=upstockname`` 请求，解析响应中的 ``[name_<MARKET>]`` 段。
+        纯文本段（外汇/期货/北交所/外盘等）直接解出；块状自定义编码段
+        （沪深 A 股 ``name_16_16``）当前跳过（编码未逆向，简单模型已穷举证伪，见
+        :func:`thspypc.protocol.decode_name_frame` 与 HANDOFF §6a/§6b）。
+
+        服务器按账号追踪名称版本，thspypc 账号通常只能拿到**增量**（~12 条），
+        全量需 hexin 客户端冷启动触发。本方法适合补充 :meth:`load_hexin_names`
+        覆盖不到的市场（外盘/期货）。
+
+        Args:
+            market: 市场通道码（``URS``/``UNX``/``UCX``/``UNS``/``UHI`` …）。
+            stock_name_ver: 本地版本号，``;;`` 请求全量（实际仍可能只回增量）。
+            timeout: 读响应总时长（秒）。
+
+        Returns:
+            :func:`decode_name_frame` 的结果 dict::
+
+                {
+                  "names": {code: name, ...},
+                  "by_segment": {...},
+                  "skipped": [...],   # 块状编码、未解的段名
+                  "segments": [(seg_name, data_len, kind), ...],
+                }
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        self._ensure_main_connection()
+        result = self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._stock_name_service.fetch(
+                market=market,
+                stock_name_ver=stock_name_ver,
+                timeout=timeout,
+            ),
+        )
+        logger.info(
+            "fetch_stock_names(market=%s): 解出 %d 条名称，跳过 %d 个块状段",
+            market,
+            len(result["names"]),
+            len(result["skipped"]),
+        )
+        return result
+
+    @staticmethod
+    def load_hexin_names(
+        stockname_dir: str | None = None,
+    ) -> dict[str, str]:
+        """从同花顺本地缓存加载股票代码→名称映射（**默认名称源**）。
+
+        这是获取 A 股名称的推荐方式——瞬时、稳定、零网络依赖，覆盖沪深北交易所。
+        相比网络协议 :meth:`fetch_stock_names`（块状段未解、只能拿增量），本方法
+        是主用途的首选。
+
+        读取 ``<hexin_dir>/stockname/stockname_*_0.txt`` 文件，
+        解析 ``CODE=NAME|ALIAS@FLAG`` 格式。仅保留 6 位数字代码。
+
+        Args:
+            stockname_dir: stockname 目录路径。为 None 时自动探测常见安装位置：
+                ``C:/同花顺软件/同花顺/stockname/``。
+
+        Returns:
+            dict[str, str]，键为 6 位数字代码（如 "600000"），值为中文名称（如 "浦发银行"）。
+            约 8000+ 条（覆盖沪深北交易所）。
+        """
+        if stockname_dir is None:
+            # 自动探测常见安装路径
+            candidates = [
+                r"C:\同花顺软件\同花顺\stockname",
+                r"D:\同花顺软件\同花顺\stockname",
+                os.path.expandvars(r"%LOCALAPPDATA%\同花顺\stockname"),
+                os.path.expandvars(r"%APPDATA%\同花顺\stockname"),
+            ]
+            for c in candidates:
+                if os.path.isdir(c):
+                    stockname_dir = c
+                    break
+        if not stockname_dir or not os.path.isdir(stockname_dir):
+            logger.warning("load_hexin_names: stockname 目录不存在，返回空映射。"
+                           "请安装同花顺 PC 客户端或手动指定 --stockname-dir")
+            return {}
+
+        names: dict[str, str] = {}
+        for fname in sorted(os.listdir(stockname_dir)):
+            # 只读 _0.txt 基础文件（_1.txt 是增量，.base 是备份）
+            if not (fname.endswith("_0.txt") and fname.startswith("stockname_")):
+                continue
+            fpath = os.path.join(stockname_dir, fname)
+            try:
+                with open(fpath, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            try:
+                text = raw.decode("gbk", errors="replace")
+            except UnicodeDecodeError:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("[") or line.startswith("ConfigVer"):
+                    continue
+                if "=" not in line:
+                    continue
+                code, _, rest = line.partition("=")
+                # 只取 6 位纯数字代码（A 股/北交所/新三板）
+                if not (code.isdigit() and len(code) == 6):
+                    continue
+                name = rest.split("|")[0].split("@")[0].strip()
+                if name:
+                    names[code] = name
+
+        logger.info("load_hexin_names: 从 %s 加载 %d 条名称",
+                    stockname_dir, len(names))
+        return names
+
+    def list_quotes(
+        self,
+        codes: list[str],
+        market: int = 17,
+        datatype: list[int] | None = None,
+        pageid: int = 1335,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """查个股列表行情（复用登录后的 8901 socket）。
+
+        发送 build_list_quote_query 构造的列表行情请求，解析 hd1.0（≤5 股）
+        或 hd3.1（≥6 股）响应，返回记录列表。
+
+        首次调用会按需执行 HTTP 鉴权并建立 MAIN；已有连接时直接复用。
+        8901 一条 TCP 响应可能含多个 fdfdfdfd 子帧（CodeListSize / MarketTime
+        文本帧 + hd 数据帧）。本方法循环 read_frame，跳过非数据帧，取首个含
+        ``hd1.0`` / ``hd3.1`` 标记的帧解析。
+
+        Args:
+            codes: 股票代码（纯数字，如 ["600056","600057"]）
+            market: 市场码（17=沪 33=深）
+            datatype: DataType 字段集（默认=精简7列 LIST_QUOTE_DATATYPE_DEFAULT）
+            pageid: 页面 id
+            timeout: 单次 read_frame 超时（秒）
+
+        Returns:
+            记录列表，每条 dict 含 ``code`` 及若干 ``dt<N>`` 字段，例如::
+
+                {"code": "600056", "dt7": 9.36, "dt10": 9.64, "dt6": 9.5,
+                 "dt17": 276800.0, "dt66": 0.0, ...}
+
+            字段语义见 README「DataType 字段含义」表。
+            竞价金额 = dt17(竞价量) × dt7(开盘价)，成交额 = dt13(成交量) × dt10(现价)，
+            均由调用方本地计算。
+
+        Raises:
+            RuntimeError: 未登录（self._sock 为空）
+        """
+        if datatype is None:
+            datatype = LIST_QUOTE_DATATYPE_DEFAULT
+        self._ensure_main_connection()
+        from .errors import ProtocolError
+
+        try:
+            return self._run_default_service(
+                (Capability.BASIC_QUOTE,),
+                lambda: self._quote_service.list_quotes(
+                    codes,
+                    market=market,
+                    datatype=datatype,
+                    pageid=pageid,
+                    timeout=timeout,
+                ),
+            )
+        except ProtocolError as exc:
+            logger.warning("list_quotes: %s", exc)
+            return []
+
+    def depth_quote(
+        self,
+        code: str,
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 2,
+    ) -> DepthQuote:
+        """查询个股五档买卖盘及涨跌停封单额。
+
+        当前协议字段覆盖买卖各五档，并非 Level2 十档。盘后服务器仍会返回最后
+        一份盘口快照。返回值包含 ``buy``、``sell``、``seal_amount``、
+        ``seal_type`` 和原始 ``fields``；无盘口数据时返回空字典。
+
+        Args:
+            code: 六位股票代码。
+            market: 0=按代码推断，17=沪市，33=深市。
+            timeout: 单次响应读取超时（秒）。
+            retries: 连接异常后的重试次数。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        last_err = ""
+        for attempt in range(retries + 1):
+            if not self.is_connected:
+                logger.info("depth_quote: 连接不可用，connect（attempt %d/%d）",
+                            attempt + 1, retries)
+                lr = self.connect()
+                if not lr.success:
+                    last_err = f"connect 失败: {lr.error}"
+                    continue
+            try:
+                from .errors import ProtocolError
+
+                try:
+                    return self._run_default_service(
+                        (Capability.BASIC_QUOTE,),
+                        lambda: self._quote_service.depth_quote(
+                            code,
+                            market=market,
+                            timeout=timeout,
+                        ),
+                    )
+                except ProtocolError as exc:
+                    logger.warning("depth_quote: %s", exc)
+                    return {}
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("depth_quote %s 失败（attempt %d）: %s",
+                               code, attempt + 1, last_err)
+                self._drop_connection()
+        raise RuntimeError(f"depth_quote {code} 重试 {retries} 次仍失败: {last_err}")
+
+    def kline(
+        self,
+        code: str,
+        period: str = "day",
+        count: int = 2146,
+        fuquan: str = "Q",
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 3,
+    ) -> list[dict]:
+        """查 K线（复用登录后的 8901 长连接，复刻 hexin 单连接连发模式）。
+
+        发送 ``build_kline_query`` 构造的 K线请求，解析 ``parse_kline_hd3_response``
+        返回的 hd3.1 变体响应（flag=0x0042/0x0046），返回 OHLCV 记录列表。
+
+        **连接复用**（关键）：抓包确认 hexin 在**同一条 TCP 长连接**上连发日/周/
+        月/5分K 请求（不轮换 IP）。本方法复用 ``self._sock``，首次调用触发 connect()，
+        后续调用复用同一条连接——这避免了每次重连新建短连接时的会话不稳定
+        （周/月K route=0x014e 在新连接上易被 RST，长连接复用则稳定）。
+
+        **重试**：连接断开或读超时时自动 ensure_connected + 重试（最多 ``retries`` 次）。
+        每次重试用 IP 轮换取新连接（测速缓存 + 轮换偏移），命中稳定 IP 即成功。
+
+        Args:
+            code: 股票代码（纯数字，如 "000089"）
+            period: 周期名（"5min"/"15min"/"30min"/"60min"/"day"/"week"/"month"）
+            count: 取的根数（服务器按实际数据返回，可能少于 count）
+            fuquan: 复权（"Q"=前复权 "H"=后复权 ""=不复权）
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）
+            timeout: 单次 read_frame 超时（秒）
+            retries: 连接失败时的重试次数（每次重连轮换 IP）
+
+        Returns:
+            记录列表，每条 ``{code, time, open, high, low, close, volume,
+            amount, bar_index?, dt<N>...}``，按时间正序。日内K（5分等）的
+            ``time`` 为 None、原 dt1 值存 ``bar_index``。
+
+        Raises:
+            ValueError: period 不在支持列表内。
+            RuntimeError: 重试 ``retries`` 次后仍失败。
+        """
+        if period not in self._KLINE_PERIOD_CODES:
+            raise ValueError(f"period 不支持: {period}，可选: {list(self._KLINE_PERIOD_CODES)}")
+        period_code = self._KLINE_PERIOD_CODES[period]
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+
+        last_err = ""
+        for attempt in range(retries + 1):
+            # ensure_connected 对从未登录会 raise；这里统一用 is_connected 判断，
+            # 连接不在则 connect()（首次登录 + 断线重连都走这里，IP 轮换取新连接）
+            if not self.is_connected:
+                logger.info("kline: 连接不可用，connect（attempt %d/%d，IP 轮换）",
+                            attempt + 1, retries)
+                lr = self.connect()
+                if not lr.success:
+                    last_err = f"connect 失败: {lr.error}"
+                    continue
+            try:
+                from .errors import ProtocolError
+
+                try:
+                    recs = self._run_default_service(
+                        (Capability.BASIC_QUOTE,),
+                        lambda: self._kline_service.kline(
+                            code,
+                            market=market,
+                            period=period_code,
+                            count=count,
+                            fuquan=fuquan,
+                            timeout=timeout,
+                        ),
+                    )
+                except ProtocolError as exc:
+                    logger.warning("kline: %s", exc)
+                    recs = []
+                # ★ 数据完整性校验：部分坏 IP（116.63.x / 119.3.x 等）"成功"返回但
+                # 只给最近部分数据（day 121/336、week 26、month 7，§14j）。这种截断
+                # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）视为坏 IP。
+                # 新股天然根数少，但新股 day/week/month 都少，不会触发（阈值是相对 count）。
+                if recs and count > 20 and len(recs) < count * 0.5:
+                    logger.warning("kline %s %s 数据不全：%d/%d 根（IP=%s，疑似坏 IP 只返回部分数据）",
+                                   code, period, len(recs), count, self._connected_ip or "?")
+                    if attempt < retries:
+                        if self._connected_ip:
+                            self._bad_kline_ips.add(self._connected_ip)
+                            logger.info("将 %s 加入 K线坏 IP 黑名单（共 %d 个），换 IP 重试",
+                                        self._connected_ip, len(self._bad_kline_ips))
+                        self._drop_connection()
+                        last_err = f"数据不全 {len(recs)}/{count}"
+                        continue
+                return recs
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("kline %s %s 失败（attempt %d, IP=%s）: %s",
+                               code, period, attempt + 1, self._connected_ip or "?", last_err)
+                # ★ 记录坏 IP：部分 IP（116.63.x 等）不支持大 K线查询，重连时跳过。
+                # 日志确认：成功 IP 都是 8.x/122.9.x，失败 IP 都是 116.63.x（§14j）。
+                if self._connected_ip:
+                    self._bad_kline_ips.add(self._connected_ip)
+                    logger.info("将 %s 加入 K线坏 IP 黑名单（共 %d 个），下次 connect 跳过",
+                                self._connected_ip, len(self._bad_kline_ips))
+                # 连接已坏，强制下次重连
+                self._drop_connection()
+        raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
+
+    def timeline(
+        self,
+        code: str,
+        market: int = 0,
+        timeout: float = 12.0,
+        skip_init: bool = False,
+        use_main_ip: bool = False,
+    ) -> list[dict]:
+        """查当日分时图（逐点行情：现价/均价/量额，复刻 hexin 分时白线）。
+
+        L2 账号走 **pageid=4214 推送通道**（``__manual`` 连接），用 35 个 level2
+        字段查询 ``DateTime=8192``。2026-07-24 抓包确认 hexin 盘后也走此路径
+        拿当日完整 240 根分时。
+
+        ⚠️ 自动建立 ``__manual`` 推送连接（同 :meth:`snapshot_subscribe`）。
+        普通账号走 pageid=9354 请求-响应（本方法不支持，用 :func:`build_timeline_query`
+        在主连接上手动发）。
+
+        Args:
+            code: 股票代码（纯数字，如 ``"000938"``）。
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
+            timeout: 单次 read_frame 超时（秒）。
+
+        Returns:
+            记录列表，每条 ``{time, dt10(现价), dt13(量), dt19(额), dt14(均价), ...}``，
+            按时间正序。非交易日/盘前当天无分时数据时返回空列表。
+
+        Raises:
+            RuntimeError: 未登录或 ``__manual`` 连接建立失败。
+        """
+        from .errors import ChannelUnavailableError
+
+        if skip_init or use_main_ip:
+            raise ValueError(
+                "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
+            )
+        if (
+            self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._timeline_service.timeline(
+                code,
+                market=market,
+                timeout=timeout,
+            ),
+        )
+
+    def auction(
+        self,
+        code: str,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+        skip_init: bool = False,
+        use_main_ip: bool = False,
+    ) -> list[dict]:
+        """查集合竞价（9:15-9:25 每 9 秒一次虚拟撮合：撮合价/累计量/未匹配量）。
+
+        与 :meth:`timeline` 走**同一条** ``__manual`` 推送连接（同为 pageid=4214
+        通道），只是请求用周期码 7176 + unix 时间戳参数（2026-07-26 抓包确认）。
+        连接管理与 :meth:`timeline` 完全相同（沪深分服 + 后台预热另一市）。
+
+        ⚠️ 与 :meth:`timeline` 一样会断主连接（只留 ``__manual`` 推送连接），
+           推送期间 kline/list_quotes 不可用。
+
+        Args:
+            code: 股票代码（纯数字，如 ``"000938"``）。
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
+            trade_date: 交易日。``None``（默认）= 最近交易日；传 ``date``/``datetime``
+                = 指定交易日（算该日 9:15/9:25 unix 时间戳）。沪深竞价时段相同。
+                ★ 历史日期的 DateTime 格式基于当日抓包推断，若实测不符需调整。
+            timeout: 单次 read_frame 超时（秒）。
+
+        Returns:
+            集合竞价记录列表，每条 ``{time, dt10(撮合价), dt49(累计量·股),
+            dt27(买方未匹配·股), dt33(卖方未匹配·股)}``，按时间正序
+            （9:15:00-9:24:57）。非交易日/无竞价数据时返回空列表。
+
+            ``dt27`` / ``dt33`` 的「无值」哨兵归一化为 ``None``（如该方向无未匹配
+            委托），与真实 ``0.0`` 区分。每条 tick 因撮合被动方被吃光，dt27/dt33
+            恰好一侧为 None。
+
+            ⚠ ``dt33`` 在竞价接口=卖方未匹配量，但在分时接口=成交额、在 list_quotes=
+            注册制上市日。dt 号是协议槽位号，语义由字段表定义，勿跨接口混淆。
+
+        Raises:
+            RuntimeError: 未登录或 ``__manual`` 连接建立失败。
+        """
+        from .errors import ChannelUnavailableError
+
+        if skip_init or use_main_ip:
+            raise ValueError(
+                "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
+            )
+        if (
+            self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        if market == 0:
+            market = 17 if code.startswith("6") else 33
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        return self._run_default_service(
+            (Capability.L2_AUCTION,),
+            lambda: self._auction_service.auction(
+                code,
+                market=market,
+                trade_date=trade_date,
+                timeout=timeout,
+            ),
+        )
+
+    def history_timeline(
+        self,
+        code: str,
+        date,
+        market: int = 0,
+        timeout: float = 12.0,
+        retries: int = 3,
+    ) -> list[dict]:
+        """查**历史分时（回忆）**：某交易日的逐点分时行情（现价/量额/level2 大单）。
+
+        复刻 hexin 在分时图上按 ←/→ 切换历史日期时发的请求（pageid=4417，嵌套子帧，
+        DateTime=8192(bar_start-bar_start+355)）。bar_start 由 ``date`` 经
+        :func:`protocol.date_to_timeline_bar` 自动换算（编码已破解，4 锚点验证）。
+
+        **与当日分时的区别**：历史分时用独立的 pageid=4417 协议，DataType 含 level2
+        大单字段（201-230），对应 hexin 分时图的「大单金额」第二条曲线。
+
+        响应若为 ``cmd=0x0a`` 会先解开 8901 字典压缩；指数和个股块再按 241 点
+        ``bar_index`` 序列锚定。请求固定走已实测成功的
+        ``__manual + 对应市场 L2 服务器 + init`` 通道，并与同一市场上的其他
+        请求/读取严格串行。服务器偶发返回连 bar 高位也省略的强状态变体，
+        解析器只返回可安全验证的点；``retries`` 不能代替完整状态机解码。
+
+        Args:
+            code: 股票代码（如 ``"000938"``；指数用 ``"1A0002"``）。
+            date: 目标交易日（``date``/``datetime``/``"YYYY-MM-DD"`` 字符串）。
+                必须是历史交易日（非当天，当天用 :meth:`timeline`）。
+            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33；
+                指数 1A0002 等需手动传 16）。
+            timeout: 单次 read_frame 超时（秒）。
+            retries: 连接失败时的重试次数（每次重连轮换 IP）。
+
+        Returns:
+            记录列表，每条 ``{bar_index, dt10, dt13, dt19, dt22, dt23, ...}``。
+            dt10=现价、dt13=成交量、dt19=成交额、dt201-230=level2 大单金额。
+            指数和完整锚点型个股帧均可解；服务器确实缺少某个 bar 时保留其余有效点，
+            不凭空补值。
+
+        Raises:
+            RuntimeError: 重试 ``retries`` 次后仍失败。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        from .errors import ChannelUnavailableError
+
+        if (
+            self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 L2 连接",
+            )
+
+        last_err = ""
+        for attempt in range(retries + 1):
+            if (
+                self._auth is None
+                and self._service_connections is None
+            ):
+                logger.info(
+                    "history_timeline: 尚未鉴权，仅获取 HTTP passport"
+                    "（attempt %d/%d）",
+                    attempt + 1,
+                    retries + 1,
+                )
+                try:
+                    self.authenticate()
+                except Exception as exc:
+                    last_err = f"HTTP 鉴权失败: {exc}"
+                    continue
+            try:
+                records = self._run_default_service(
+                    (Capability.L2_HISTORY_TIMELINE,),
+                    lambda: self._timeline_service.history_timeline(
+                        code,
+                        market=market,
+                        date=date,
+                        timeout=timeout,
+                    ),
+                )
+                if records:
+                    return records
+                last_err = "收到强状态省略帧或未找到历史分时数据"
+                logger.info(
+                    "history_timeline %s %s 未获得可验证变体，重请求（attempt %d/%d）",
+                    code, date, attempt + 1, retries + 1,
+                )
+            except (ConnectionError, OSError, TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
+                               code, date, attempt + 1, last_err)
+                from .protocol import pick_l2_market
+
+                key = pick_l2_market(market)
+                with self._push_lock:
+                    failed = self._push_socks.pop(key, None)
+                    self._push_initialized.discard(key)
+                role = (
+                    ConnectionRole.SH_L2
+                    if key == "sh"
+                    else ConnectionRole.SZ_L2
+                )
+                if self._service_connections is not None:
+                    self._service_connections.close(role)
+                if failed is not None:
+                    try:
+                        failed.close()
+                    except OSError:
+                        pass
+        raise RuntimeError(f"history_timeline {code} {date} 重试 {retries} 次仍失败: {last_err}")
+
+    def stock_list_hot(
+        self,
+        count: int = 29,
+        timeout: float = 10.0,
+        with_names: bool | str = False,
+        sort_by: int = 199112,
+        sort_dir: str = "D",
+        max_pages: int = 120,
+    ) -> list[dict]:
+        """获取排序榜单（自动翻页，可拿完整榜单）。
+
+        发送排序代码表查询（同花顺打开 A 股列表、切换排序列时发的请求），
+        服务器按 ``sort_by`` 指定的字段排序后返回。本方法自动用 SortBegin 游标
+        翻页，直到拿满 ``count`` 条或取完整个榜单。
+
+        ``sort_by`` 是排序键编号（见 :data:`protocol.SORT_BY_VALUES`，均为活网验证）：
+        涨幅=199112、涨速=48、换手率=1968584、量比=1771976、主力净流入=592890、
+        竞价金额=68758、竞价涨幅=68762。默认按涨幅降序（涨幅榜）。
+        换成跌幅榜传 ``sort_by=199112, sort_dir="A"``（升序值 A 为推测，未实测）。
+
+        ⚠ 成交量/成交额**不能**通过本方法拿——它们不走 SortBy 路径，而是客户端
+        订阅行情推送（dt13/dt19）后本地排序。详见 HANDOFF_STOCKLIST_PUSH.md。
+
+        翻页机制（2026-07-23 抓包确认）：SortBegin 是游标（首次 0，翻页递增到
+        已加载位置），每页 59 条（SortCount 恒 59）。``count`` 是想要的总条数，
+        本方法内部循环请求直到拿满。
+
+        Args:
+            count: 想要的总条数，默认 29（对齐 hexin 第一页，向后兼容）。
+                想要完整榜单（约 5200 条）传一个大数如 5300 即可。
+            timeout: 单次请求的超时时间（秒）。
+            with_names: 是否填充中文名称（同 stock_list 的 with_names 参数）。
+            sort_by: 排序键编号，默认 199112（涨幅）。见
+                :data:`protocol.SORT_BY_VALUES`。
+            sort_dir: 排序方向，``"D"``=降序（默认）、``"A"``=升序（推测，未实测）。
+            max_pages: 翻页安全阀（默认 120，≈5300/59），防止死循环。
+
+        Returns:
+            list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``。
+            按 code 去重（页边界可能重叠）。
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        self._ensure_main_connection()
+        stocks = self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._stock_list_service.ranked(
+                count=count,
+                timeout=timeout,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+                max_pages=max_pages,
+            ),
+        )
+        if with_names and stocks:
+            stockname_dir = (
+                with_names if isinstance(with_names, str) else None
+            )
+            name_map = self.load_hexin_names(stockname_dir)
+            for stock in stocks:
+                name = name_map.get(stock["code"], "")
+                if name:
+                    stock["name"] = name
+        return stocks
+
+    def stock_list(
+        self,
+        timeout: float = 30.0,
+        with_names: bool | str = False,
+    ) -> list[dict]:
+        """获取全市场股票代码列表（沪深+北交所+新三板+基金，~7400 条）。
+
+        登录/init 后发送一个 ``DataType=[5],[55]`` 空市场组查询，触发服务器
+        下发全量代码/名称表。主动 A/B 已确认旧抓包里的 153 个 subreal、1B0987、
+        重复 init 和其他查询均非必需。
+
+        Args:
+            timeout: 收尾读取的总时长（秒）。请求后服务器陆续推送，需等全量帧到达。
+            with_names: 是否填充中文名称。
+                - False: 不填名称（默认，快）
+                - True: 自动从同花顺本地缓存加载名称（需安装同花顺 PC 客户端）
+                - str: 指定 stockname 目录路径
+
+        Returns:
+            list[dict]，每项 ``{"code": "600000", "name": "浦发银行"}``。
+            约 7400 条，按 dt5 代码字段顺序（通常代码升序）。
+            with_names=False 时 name 恒为 ""。
+
+        Raises:
+            RuntimeError: 未登录。
+        """
+        self._ensure_main_connection()
+        stocks = self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._stock_list_service.full_list(timeout=timeout),
+        )
+        if with_names and stocks:
+            stockname_dir = (
+                with_names if isinstance(with_names, str) else None
+            )
+            name_map = self.load_hexin_names(stockname_dir)
+            for stock in stocks:
+                name = name_map.get(stock["code"], "")
+                if name:
+                    stock["name"] = name
+        return stocks
+
+    def market_snapshot(
+        self,
+        markets: list[int] | None = None,
+        timeout: float = 10.0,
+    ) -> list[dict]:
+        """全市场行情快照：一个请求拿沪市全市场 code+name（~0.13s）。
+
+        在 :meth:`connect` 建立的**主连接**上发 hfd1.0 空括号请求
+        （``CodeList=16();17();...``），服务器一次性返回整个市场的股票代码和
+        名称。相比 :meth:`list_quotes` 逐批查询（~250 请求），本方法只需 1 个请求，
+        速度提升 2~3 个数量级。
+
+        ⚠️ **数值字段（price/change_pct 等）当前为近似值**，通过 THS float 扫描
+        推断，准确度有限。对于准确行情请用 :meth:`list_quotes`（或
+        :meth:`market_snapshot_with_quotes` 的混合方案）。
+
+        ⚠️ 当前连接的服务器 host **可能不支持 hfd1.0**（集群中仅部分 host 支持）。
+        不支持时本方法返回空列表——但**不重连**（重连会触发 VerifyCode=-1，
+        见 HANDOFF §7）。需要稳定拿沪市行情时优先用
+        :meth:`market_snapshot_with_quotes`。
+
+        Args:
+            markets: 市场码列表，None 用 :data:`MARKET_SNAPSHOT_MARKETS`
+                （16-22/144-151 沪市全）。
+            timeout: 单次 read_frame 超时（秒）。
+
+        Returns:
+            list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``，
+            约 1200+ 条（当前锚点覆盖率）。host 不支持或超时返回 []。
+
+        Raises:
+            RuntimeError: 未登录（self._sock 为空）。
+        """
+        self._ensure_main_connection()
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._market_snapshot_service.snapshot(
+                markets=markets,
+                timeout=timeout,
+            ),
+        )
+
+    def snapshot_subscribe(
+        self,
+        code: str,
+        market: int | None = None,
+        callback=None,
+    ) -> bool:
+        """订阅个股实时逐 tick 快照推送（现价随每笔成交跳动）。
+
+        用 **``__manual`` 身份开一条独立的 8901 推送连接**，发 pageid=4214 订阅帧
+        （嵌套双子帧），服务端持续推送 71B 快照帧（约每 3 秒，盘中全程不断）。
+
+        ★ ``__manual`` 登录是推送通道的必要身份（2026-07-24 三份抓包 + 实测确认）：
+        hexin 收推送的那条连接就是 ``__manual`` 登录的。普通登录发 4214 订阅 →
+        ``CodeListSize=0``（注册失败）；``__manual`` 登录 → ``CodeListSize=1``
+        （注册成功）。两种 login 的响应字段完全一致，但只有 ``__manual`` 能注册
+        4214 推送通道——这是会话级权限差异。
+
+        ⚠️ 需要 **level2 账号**：普通账号打开分时走 pageid=9354（请求-响应，无推送）。
+        ⚠️ 需在**盘中**（9:30-15:00）才有逐笔成交推送；收盘后注册成功但无推送数据。
+
+        推送连接独立于主连接（``self._sock``），不影响 kline/list_quotes 等
+        请求-响应方法。推送数据由后台线程读取并解析，两种消费方式：
+          - ``callback``：每收到一帧调用 ``callback(code, market, price, volume)``
+          - 无 callback 时存入 ``self._latest_price[code]``，用 ``latest_price()`` 取
+
+        Args:
+            code: 股票代码（纯数字，如 ``"000938"``）。
+            market: 市场码（17=沪 33=深）。None 时按代码推导（6开头=沪17，其余=深33）。
+            callback: 可选回调 ``fn(code:str, market:str, price:float, volume:int)``。
+
+        Returns:
+            True=订阅请求已发送（CodeListSize≥1）；False=注册失败或未登录。
+        """
+        if market is None:
+            market = 17 if code.startswith("6") else 33
+
+        from .errors import ProtocolError
+        from .protocol import pick_l2_market
+
+        key = pick_l2_market(market)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+
+        def register() -> bool:
+            role = (
+                ConnectionRole.SH_L2
+                if key == "sh"
+                else ConnectionRole.SZ_L2
+            )
+            connection = self._service_connections.acquire(
+                role,
+                capability=Capability.L2_SNAPSHOT_PUSH,
+            )
+            self._service_subscriptions.ensure_registered(
+                connection,
+                code,
+                market=market,
+                timeout=5.0,
+            )
+            return True
+
+        try:
+            self._run_default_service(
+                (Capability.L2_SNAPSHOT_PUSH,),
+                register,
+            )
+        except ProtocolError as exc:
+            logger.warning(
+                "snapshot_subscribe: %s 注册失败: %s",
+                code,
+                exc,
+            )
+            return False
+        else:
+            self._activate_snapshot_subscription(code, market, callback)
+            return True
+
+    def latest_price(self, code: str) -> float | None:
+        """取某代码的最新现价（snapshot_subscribe 后由推送线程更新）。"""
+        return self._latest_price.get(code)
+
+    def stop_snapshot(self) -> None:
+        """停止分时推送读取线程，关闭沪深两条 __manual 推送连接（disconnect 时自动调用）。"""
+        self._connection_runtime.stop_snapshot()
+
+    def dxjl_page(self, market: int, endtime_us: int) -> list[dict]:
+        """获取短线精灵单页数据（9601，method=qurealorder）。
+
+        Args:
+            market: 市场代码，32=深 16=沪。
+            endtime_us: 微秒时间戳游标（取此时间之前的记录）。
+
+        Returns:
+            list[dict]，每项含 时间(微秒戳)/市场/代码/异动类型/异动编码/金额/涨跌幅。
+        """
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.dxjl_page(
+                market,
+                endtime_us,
+            ),
+        )
+
+    def dxjl_latest(self, markets: tuple = (32, 16)) -> list[dict]:
+        """获取短线精灵最新一页（沪深）。
+
+        Args:
+            markets: 市场元组，默认 (32, 16) = 深沪。
+
+        Returns:
+            list[dict]，按时间倒序（最新在前）。非交易时段可能为空。
+        """
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.dxjl_latest(markets=markets),
+        )
+
+    def dxjl_history(self, pages: int = 5, markets: tuple = (32, 16)) -> list[dict]:
+        """翻页获取短线精灵历史数据（endtime 游标分页）。
+
+        翻页机制：第 N+1 页的 endtime = 第 N 页最早记录的时间戳。
+
+        Args:
+            pages: 翻页数。
+            markets: 市场元组，默认 (32, 16) = 深沪。
+
+        Returns:
+            list[dict]，按时间倒序。
+        """
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.dxjl_history(
+                pages=pages,
+                markets=markets,
+            ),
+        )
+
+    def subscribe_realtime(self, markets: list[int] | None = None) -> None:
+        """在 9601 上订阅异动推送（method=subrealorder）。
+
+        订阅后服务器在盘中主动推送 pushrealorder 帧（实测约 1500 条异动/分钟）。
+        用 receive_pushes() 接收推送数据。
+
+        抓包确认（2026-07-17 hexin stream 9）：在 9601 发 subrealorder，
+        market=16/32/151/48，服务器 90s 内推 1125 个 pushrealorder 帧。
+
+        Args:
+            markets: 市场代码列表，默认 [16,32,151,48]（沪/深/北交所/板块）。
+        """
+        self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.subscribe_realtime(markets),
+        )
+
+    def receive_pushes(self, timeout: float = 10.0,
+                       callback=None) -> list[dict]:
+        """接收 9601 实时推送（阻塞循环，直到 timeout）。
+
+        需先 subscribe_realtime() 订阅。盘中会持续收到 pushrealorder 帧，
+        每帧含 1~8 条异动记录（代码 + 原始字节）。
+
+        推送从 9601 短线精灵连接接收。注意：9601 用 read_frame_realorder
+        （len-1 编码，不同于 8901 的 read_frame）。
+
+        Args:
+            timeout: 接收时长（秒）。到时间后返回。
+            callback: 若给定，每收到一条记录回调 ``callback(record_dict)``（实时处理）。
+                      若为 None，收集所有记录到列表返回（批量模式）。
+
+        Returns:
+            list[dict]，每项 ``{代码, 市场, raw_bytes}``。callback 模式下返回空列表。
+            非交易时段返回空列表（无推送）。
+        """
+        records, _ = self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.receive_pushes(
+                timeout=timeout,
+                callback=callback,
+            ),
+        )
+        return records
+
+    def receive_pushes_locked(self, timeout: float = 5.0,
+                              callback=None, full_frame_callback=None) -> int:
+        """带锁接收 9601 推送，可安全穿插历史查询（与 receive_pushes 的区别）。
+
+        receive_pushes 直接读 socket 不持锁，若同时另一线程调 dxjl_page
+        （持 _realorder_lock 读同一 socket）或心跳线程写 socket，会产生
+        帧错位/数据竞争。本方法全程持 _realorder_lock，每收到一帧后**短暂
+        释放再重获锁**，给心跳线程写入的机会（心跳 30s 周期，不会饿死）。
+
+        配合 dxjl_history 在调用方交替使用（见 tests/collect_push_samples.py）：
+        推送 N 秒（本方法）→ 释放锁后 dxjl_history 翻页 → 再推送 → …
+        两者串行，不并发读同一 socket。
+
+        Args:
+            timeout: 本次接收时长（秒）。建议 ≤ 5s，避免长时间独占锁。
+            callback: 每条解析记录回调 ``callback(rec_dict)``。
+            full_frame_callback: 每个完整推送帧回调 ``cb(frame_bytes)``，
+                用于离线逆向（保留 hq1.0 字段表头）。
+
+        Returns:
+            本次收到的推送帧数（不含心跳/其他帧）。
+        """
+        _, frame_count = self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._realorder_service.receive_pushes(
+                timeout=timeout,
+                callback=callback,
+                full_frame_callback=full_frame_callback,
+                continue_on_timeout=True,
+            ),
+        )
+        return frame_count

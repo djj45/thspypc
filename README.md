@@ -51,6 +51,9 @@
 src/thspypc/
 |-- client.py               # THSClient 公开门面和旧调用兼容
 |-- connection_runtime.py   # 角色建连、MAIN 登录编排、心跳/推送生命周期
+|-- connection_primitives.py# MAIN/L2/REALORDER 底层登录与建连原语
+|-- service_facade.py       # service-backed 公开行情方法
+|-- stock_cache.py          # 股票代码表自然日缓存
 |-- models.py               # 账号证据、账号画像、能力和行情数据模型
 |-- codecs/                 # 帧、压缩、数值及 hd1/hd3 基础编解码
 |-- features/               # 各业务的纯协议 builder/parser
@@ -64,6 +67,7 @@ src/thspypc/
 
 ```text
 THSClient
+  -> ServiceFacade / ConnectionPrimitives
   -> AuthService / AccountEvidenceRecorder
   -> ConnectionFactory / ConnectionRuntime
   -> ConnectionManager
