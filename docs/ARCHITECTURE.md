@@ -141,3 +141,20 @@ features → codecs
 名（`price`/`prevClose`/...）。注意同一 dt 号跨接口语义不同（见 README「dt 号跨
 接口语义不同」表），翻译必须按接口绑定，不能全局映射。L2 多出的 `dt201-230` 等
 字段作为可选扩展存在，不能为了统一结果而伪造普通账号没有的数据。
+
+### 鉴权与连接生命周期
+
+`AuthService` 只负责通过 HTTP 生成不可变的 `AuthMaterial`。一次材料包含
+`Passport64`、登录 profile 和 generation，可供多个连接角色复用，但不代表任一
+TCP socket 已登录。
+
+- `THSClient.authenticate()`：只获取或刷新 `AuthMaterial`，不连接行情服务器。
+- `THSClient.connect_main()`：按需连接 `ifindhq`，在 MAIN socket 上执行
+  `login -> 标准 init`；`connect()` 是其兼容入口。
+- `SH_L2` / `SZ_L2`：首次 Level2 请求时分别连接 `shlv2` / `szlv2`，在各自
+  socket 上执行 `__manual login -> 市场 init`。
+- `REALORDER`：首次 9601 请求时建立并登录独立连接。
+
+每个角色都独立拥有 TCP 登录态、init 状态、读写锁和重连策略。普通账号支持应通过
+`AccountProfile` / `Capability` 决定允许建立哪些角色连接，而不是改变上述生命周期
+或让一个 socket 的登录状态被另一个 socket 继承。

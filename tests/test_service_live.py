@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-重构活网验证：新 service 层路径 vs 旧协议路径逐字段对比。
+重构活网验证：新 service 层路径 vs 旧协议路径行为对比。
 
 目的
 ====
@@ -10,15 +10,13 @@ codecs/features/services/_transport 分层。公开方法在显式配置 service
 后 opt-in 委托新 service，否则走旧路径。
 
 本脚本在同一 client、同一主连接上，对 MAIN-only 业务先取旧路径基准，再 opt-in
-切新 service 路径取一份，逐字段对比，确认重构未改变协议字节和解析结果。
+切新 service 路径取一份。动态报价/盘口比较代码、字段结构和类型；K 线对已完成
+区间逐字段比较，避免两次请求之间的正常行情变化造成误报。
 
 ⚠ 前置条件
 ==========
-- level2 账号频繁 connect 会触发服务器会话保护，连接在登录后被立即关闭。
-  跑本脚本前请确保：
-  1. 同花顺客户端已退出（同账号不能两个客户端同时在线）
-  2. 距上次 connect 间隔 > 60 秒（让 level2 会话冷却）
-- 全程在单次 connect 生命周期内完成，避免反复登录。
+- 确保同花顺客户端已退出，避免同账号并发占用会话。
+- 脚本只执行一次 connect，并在同一 MAIN 生命周期内完成全部查询。
 
 用法
 ====
@@ -65,49 +63,110 @@ def _round_floats(obj):
     return obj
 
 
-def compare_list(name: str, old, new) -> bool:
+def _value_shape(obj):
+    """保留容器结构、字段名和标量类型，忽略实时值。"""
+    if isinstance(obj, dict):
+        return {key: _value_shape(value) for key, value in sorted(obj.items())}
+    if isinstance(obj, list):
+        return [_value_shape(value) for value in obj]
+    return type(obj).__name__
+
+
+def _records_by_code(records):
+    return {
+        record.get("code", f"row-{index}"): _value_shape(record)
+        for index, record in enumerate(records)
+    }
+
+
+def compare_live_list(name: str, old, new) -> bool:
+    """比较动态记录的代码集合、字段结构和类型，不比较瞬时行情值。"""
     if not isinstance(old, list) or not isinstance(new, list):
         print(f"  ✗ {name}: 返回类型不是 list old={type(old).__name__} new={type(new).__name__}")
         return False
     if len(old) != len(new):
         print(f"  ✗ {name}: 条数不一致 old={len(old)} new={len(new)}")
         return False
-    ro, rn = _round_floats(old), _round_floats(new)
-    ok = ro == rn
+    old_shape = _records_by_code(old)
+    new_shape = _records_by_code(new)
+    ok = old_shape == new_shape
     if ok:
-        print(f"  ✓ {name}: {len(old)} 条逐字段一致")
+        print(f"  ✓ {name}: {len(old)} 条代码/字段结构/类型一致（动态值已忽略）")
     else:
-        diffs = 0
-        for i, (o, n) in enumerate(zip(ro, rn)):
-            if o != n:
-                diffs += 1
-                if diffs <= 3:
-                    ident = o.get("code", i) if isinstance(o, dict) else i
-                    print(f"  ✗ {name}[{ident}]: {o} → {n}")
-        if diffs > 3:
-            print(f"  （共 {diffs} 处差异，仅显示前 3 处）")
+        print(f"  ✗ {name}: 动态记录结构不一致")
+        print(f"    old={old_shape}")
+        print(f"    new={new_shape}")
     return ok
 
 
 def compare_depth(name: str, old: dict, new: dict) -> bool:
+    """盘口是动态数据，只比较档位数量、字段结构和标量类型。"""
     if not isinstance(old, dict) or not isinstance(new, dict):
         print(f"  ✗ {name}: 返回类型异常 old={type(old).__name__} new={type(new).__name__}")
         return False
-    ro, rn = _round_floats(old), _round_floats(new)
-    ok = ro == rn
+    old_shape = _value_shape(old)
+    new_shape = _value_shape(new)
+    ok = old_shape == new_shape
     if ok:
         b = len(old.get("buy", []))
         s = len(old.get("sell", []))
-        print(f"  ✓ {name}: 买{b}/卖{s}档逐字段一致，seal={old.get('seal_amount')}")
+        print(f"  ✓ {name}: 买{b}/卖{s}档结构和类型一致（动态值已忽略）")
     else:
-        for side in ("buy", "sell"):
-            ob, nb = ro.get(side, []), rn.get(side, [])
-            for i, (ol, nl) in enumerate(zip(ob, nb)):
-                if ol != nl:
-                    print(f"  ✗ {name}.{side}[{i}]: {ol} → {nl}")
-        if ro.get("seal_amount") != rn.get("seal_amount"):
-            print(f"  ✗ {name}.seal_amount: {ro.get('seal_amount')} → {rn.get('seal_amount')}")
+        print(f"  ✗ {name}: 盘口结构不一致")
+        print(f"    old={old_shape}")
+        print(f"    new={new_shape}")
     return ok
+
+
+def compare_kline(name: str, old, new) -> bool:
+    """已完成 bar 精确比较；最后一根可能仍在变化，只比较结构。"""
+    if not isinstance(old, list) or not isinstance(new, list):
+        print(f"  ✗ {name}: 返回类型不是 list")
+        return False
+    if len(old) != len(new) or not old:
+        print(f"  ✗ {name}: 条数异常 old={len(old)} new={len(new)}")
+        return False
+    completed_ok = _round_floats(old[:-1]) == _round_floats(new[:-1])
+    latest_shape_ok = _value_shape(old[-1]) == _value_shape(new[-1])
+    ok = completed_ok and latest_shape_ok
+    if ok:
+        print(
+            f"  ✓ {name}: {len(old) - 1} 根已完成 bar 逐字段一致，"
+            "最新 bar 结构一致"
+        )
+    else:
+        print(
+            f"  ✗ {name}: completed_ok={completed_ok} "
+            f"latest_shape_ok={latest_shape_ok}"
+        )
+    return ok
+
+
+def test_live_comparison_ignores_values_but_checks_schema():
+    old = [{"code": "600519", "price": 100.0, "volume": 10}]
+    changed = [{"code": "600519", "price": 101.5, "volume": 12}]
+    wrong_schema = [{"code": "600519", "price": "101.5", "volume": 12}]
+
+    assert compare_live_list("quotes", old, changed)
+    assert not compare_live_list("quotes", old, wrong_schema)
+
+
+def test_kline_comparison_allows_latest_bar_to_change():
+    old = [
+        {"date": "20260728", "close": 100.0},
+        {"date": "20260729", "close": 101.0},
+    ]
+    changed_latest = [
+        {"date": "20260728", "close": 100.0},
+        {"date": "20260729", "close": 102.0},
+    ]
+    changed_completed = [
+        {"date": "20260728", "close": 99.0},
+        {"date": "20260729", "close": 102.0},
+    ]
+
+    assert compare_kline("kline", old, changed_latest)
+    assert not compare_kline("kline", old, changed_completed)
 
 
 # ---------- 主流程 ----------
@@ -128,33 +187,19 @@ def main() -> int:
         print("!! .env 缺 THS_USERNAME/THS_PASSWORD，无法跑活网验证")
         return 2
 
-    # ---- 1. 登录主连接（带重试：部分 IP 登录后会被服务器立即 FIN）----
-    MAX_LOGIN_ATTEMPTS = 4
-    result = None
-    for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-        client = THSClient(username, password, imei)
-        try:
-            result = client.connect()
-        except Exception as e:
-            print(f"!! 第 {attempt} 次登录异常: {e}")
-            client.disconnect()
-            result = None
-            continue
-        if not result.success:
-            print(f"✗ 第 {attempt} 次登录失败 (error={result.error}): {result.detail}")
-            client.disconnect()
-            continue
-        print(f"✓ 第 {attempt} 次登录成功: {result.server} (VerifyCode={result.verify_code})")
-        if client.is_connected:
-            break
-        # 登录成功但连接被立即关闭（level2 会话保护 / 该 IP 不稳）→ 换 IP 重试
-        print(f"  连接被服务器立即关闭，换 IP 重试（冷却 25s）...")
+    # ---- 1. 登录主连接：client 内部筛选节点；init 失败会结束本次 connect ----
+    client = THSClient(username, password, imei)
+    try:
+        result = client.connect()
+    except Exception as e:
+        print(f"!! 登录异常: {e}")
         client.disconnect()
-        time.sleep(25)
-    else:
-        print("✗ 多次登录后连接均被服务器立即关闭。")
-        print("  请确保：1) 同花顺客户端已退出  2) 距上次 connect > 60s  3) 换网络环境。")
         return 1
+    if not result.success:
+        print(f"✗ 登录失败 (error={result.error}): {result.detail}")
+        client.disconnect()
+        return 1
+    print(f"✓ 登录成功: {result.server} (VerifyCode={result.verify_code})")
     print()
 
     SH_CODES = ["600519", "600000", "600036"]   # ≤5 股走 hd1.0 明文，盘后最稳
@@ -184,7 +229,6 @@ def main() -> int:
 
         if not client.is_connected:
             print("!! 旧路径查询后连接断开，无法继续 service 路径对比")
-            print("   （level2 会话保护间歇发作；冷却 60s 后重试通常可恢复）")
             return 1
 
         # ---- 3. 配置 service context，opt-in 新路径 ----
@@ -213,12 +257,12 @@ def main() -> int:
             print(f"  kline(600519 日): 跳过: {type(ke).__name__}: {ke}")
         print()
 
-        # ---- 4. 逐字段对比 ----
-        print("── 逐字段对比（旧 vs 新 service）──")
-        results.append(compare_list("list_quotes(沪)", old_quotes, new_quotes))
+        # ---- 4. 行为对比 ----
+        print("── 行为对比（旧 vs 新 service）──")
+        results.append(compare_live_list("list_quotes(沪)", old_quotes, new_quotes))
         results.append(compare_depth("depth_quote(600519)", old_depth, new_depth))
         if old_kline is not None and new_kline is not None:
-            results.append(compare_list("kline(600519 日)", old_kline, new_kline))
+            results.append(compare_kline("kline(600519 日)", old_kline, new_kline))
         elif old_kline is None and new_kline is None:
             print("  ⊙ kline(600519 日): 新旧路径均跳过，无法对比")
 

@@ -164,9 +164,10 @@ AUTH_PORT = 80
 # ⚠ 这是 DNS 解析失败时的回退 IP 列表。正常运行走 :func:`resolve_market_hosts`
 # 从 passport 的 M_hqdns 动态解析（拿到当前最新 IP）。
 #
-# 2026-07-28 活网修正：MAIN 普通登录在 VerifyCode=0 后可直接 list_quotes，
-# 不发送带 MarketCode 的 init。该 init 属于 __manual + shlv2/szlv2 分服；
-# 把默认 MarketCode=16;144; 发到 MAIN 会让部分服务器立即关闭连接。
+# MAIN 与 L2 都在各自 socket 上执行 login -> init。MAIN 使用普通身份和标准
+# build_init_query()；L2 使用 __manual 身份，并按 shlv2/szlv2 分别发送
+# MarketCode=16;144;/32。HTTP 鉴权生成的 Passport64 可被各角色按需复用，
+# 但 TCP 登录和 init 状态不能跨 socket 继承。
 MARKET_PORT = 8901
 MARKET_HOSTS = [
     # ifindhq.123ths.com 解析快照（2026-07-28）。
@@ -190,7 +191,7 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
 
     hexin 客户端不硬编码 IP——HTTP 鉴权返回的 passport 里有 M_hqdns 字段，
     格式如 ``ifindhq.123ths.com:8901:232;120;104;56;:``，并同时包含
-    fu4/hkus/euhq/lv2 等其他市场组。2026-07-28 无 MAIN init 活网矩阵确认：
+    fu4/hkus/euhq/lv2 等其他市场组。2026-07-28 MAIN 路由活网矩阵确认：
     ifindhq 节点连续返回沪深 list_quotes；其他市场组可以保持登录连接，但
     沪市查询超时。因此 A 股 MAIN 连接只解析 ifindhq。
 

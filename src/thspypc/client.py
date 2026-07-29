@@ -18,7 +18,7 @@ from . import protocol
 from .models import AccountProfile, Capability, DepthQuote, Support
 from .features.account_profile import AccountEvidenceRecorder
 from .features.auth_protocol import LoginIdentity
-from .services.auth import AuthService
+from .services.auth import AuthMaterial, AuthService
 from .transport import (
     ConnectionManager,
     ConnectionRole,
@@ -129,6 +129,7 @@ class THSClient:
                 imei_value,
             ),
         )
+        self._auth_lock = threading.RLock()
         # 板块/自选股管理（HTTPS，登录后初始化）
         self._blocks = None              # BlockManager 实例
         self._http_cookies: dict | None = None
@@ -298,7 +299,7 @@ class THSClient:
         """Open through legacy login code while retaining legacy ownership."""
         if spec.role is ConnectionRole.MAIN:
             if self._sock is None:
-                result = self.connect()
+                result = self.connect_main()
                 if not result.success or self._sock is None:
                     raise OSError(
                         f"MAIN 登录失败: {result.error or result.detail}"
@@ -321,12 +322,10 @@ class THSClient:
                 initialized = key in self._push_initialized
             if current is None:
                 if self._auth is None:
-                    result = self.connect()
-                    if not result.success:
-                        raise OSError(
-                            f"L2 前置登录失败: "
-                            f"{result.error or result.detail}"
-                        )
+                    try:
+                        self.authenticate()
+                    except Exception as exc:
+                        raise OSError(f"L2 HTTP 鉴权失败: {exc}") from exc
                 self._drop_connection()
                 opened = self._open_manual_push_connection(market)
                 if opened is None:
@@ -437,13 +436,61 @@ class THSClient:
             initialized=initialized,
         )
 
+    @property
+    def auth_material(self) -> AuthMaterial | None:
+        """Return the current HTTP-authenticated passport generation."""
+        return self._auth_service.current
+
+    def authenticate(
+        self,
+        *,
+        force: bool = False,
+        account: str | None = None,
+        password: str | None = None,
+    ) -> AuthMaterial:
+        """只执行 HTTP 鉴权并缓存 Passport64，不建立任何行情 TCP 连接。
+
+        同一代 :class:`AuthMaterial` 可被 MAIN、SH_L2、SZ_L2 和 REALORDER
+        连接按需复用。默认已有材料时直接返回；``force=True`` 或显式传入账号
+        凭据时重新鉴权并原子替换当前 generation。
+        """
+        with self._auth_lock:
+            current = self._auth_service.current
+            current_matches_legacy = (
+                current is not None
+                and self._auth is not None
+                and dict(current.auth_info) == self._auth
+            )
+            if (
+                not force
+                and account is None
+                and password is None
+                and current_matches_legacy
+            ):
+                return current
+
+            logger.info("开始 HTTP 三步鉴权 (account=%s)...", account or self.username)
+            material = self._refresh_auth_material(account, password)
+            self._init_blocks()
+            logger.info(
+                "HTTP 鉴权成功，passport generation=%d，含 %d 个字段",
+                material.generation,
+                len(material.passport_fields),
+            )
+            return material
+
     def connect(self) -> LoginResult:
-        """账号密码登录：HTTP 鉴权 → 构造 PC login 帧 → 连 8901 → 验证。
+        """兼容入口：按需 HTTP 鉴权，然后建立 MAIN 行情连接。"""
+        return self.connect_main()
+
+    def connect_main(self, *, refresh_auth: bool = False) -> LoginResult:
+        """按需建立 ``ifindhq`` MAIN：STANDARD login → init → ready。
 
         返回 LoginResult，含成功/失败诊断。失败时 error 字段区分：
           - "http_auth_failed"   HTTP 三步鉴权失败（账号/密码/网络问题）
           - "all_hosts_failed"   所有 8901 IP 都连不上（网络/防火墙）
           - "login_rejected"     连上了但 VerifyCode != 0（passport 被拒）
+          - "init_failed"        VerifyCode=0，但 MAIN 行情通道初始化失败
 
         VerifyCode=-1 有两种：A. login 帧内容错误（check 字节/sk/sv，已修复）；
         B. 同 IP 短时间重复 login 的会话冲突（level2 单点登录；**非账号封禁**——
@@ -467,12 +514,10 @@ class THSClient:
                 error="reused_existing_connection",
             )
 
-        # ---- 第 1 步：HTTP 三步鉴权 ----
+        # ---- 第 1 步：按需 HTTP 鉴权，只在无票据或明确要求时刷新 ----
         try:
-            logger.info("开始 HTTP 三步鉴权 (account=%s)...", self.username)
-            material = self._refresh_auth_material()
+            material = self.authenticate(force=refresh_auth)
             passport_fields = dict(material.passport_fields)
-            logger.info("HTTP 鉴权成功，passport 含 %d 个字段", len(passport_fields))
             logger.debug("passport 关键字段: account=%s, userclass=%s, level2=%s",
                          passport_fields.get("account", "?"),
                          passport_fields.get("userclass", "?"),
@@ -480,9 +525,6 @@ class THSClient:
         except Exception as e:
             logger.error("HTTP 鉴权失败: %s", e)
             return LoginResult(success=False, error="http_auth_failed", detail=str(e))
-
-        # 板块/自选股功能初始化（HTTP 鉴权后、TCP 登录前；失败不影响登录）
-        self._init_blocks()
 
         return self._do_tcp_login(passport_fields)
 
@@ -539,6 +581,16 @@ class THSClient:
             logger.warning("连接已断开，需重新 connect()（注意 ≥20s 冷却避免 -1）")
             return False
         return True
+
+    def _ensure_main_connection(self) -> None:
+        """按需建立 MAIN，不要求调用方预先调用 :meth:`connect`。"""
+        if self._sock is not None:
+            return
+        result = self.connect_main()
+        if not result.success or self._sock is None:
+            raise RuntimeError(
+                f"MAIN 连接失败: {result.error or result.detail}"
+            )
 
     def _init_blocks(self) -> None:
         """初始化板块/自选股管理（HTTPS cookie 鉴权）。
@@ -691,7 +743,11 @@ class THSClient:
         connect_with_qrcode / connect_cached 共用此方法。
         """
         try:
-            material = self._refresh_auth_material(account, password)
+            material = self.authenticate(
+                force=True,
+                account=account,
+                password=password,
+            )
             passport_fields = dict(material.passport_fields)
             logger.info("HTTP 鉴权成功（account=%s），passport 含 %d 个字段",
                         account[:6] + "***", len(passport_fields))
@@ -699,7 +755,6 @@ class THSClient:
             logger.error("HTTP 鉴权失败（account=%s）: %s", account[:6] + "***", e)
             return LoginResult(success=False, error="http_auth_failed", detail=str(e))
 
-        self._init_blocks()
         return self._do_tcp_login(passport_fields)
 
     def _refresh_auth_material(
@@ -786,6 +841,9 @@ class THSClient:
             save_ip_state(sorted_ips, self._login_rr_offset)
         if winner:
             host, sock, result = winner
+            # VerifyCode=0 后若 init 失败，不得在同一次 connect 中继续串行
+            # login 其他服务器。短时间跨节点重复登录会触发会话保护；本次直接
+            # 返回 init_failed，下次独立 connect 再按持久化 offset 换一批节点。
             return self._finalize_main_login(
                 host,
                 sock,
@@ -819,13 +877,14 @@ class THSClient:
                 logger.info("%s:%d 响应 VerifyCode=%s", host, MARKET_PORT, verify_code)
 
                 if verify_code == "0":
-                    finalized = self._finalize_main_login(
+                    # 与并发 winner 相同：认证成功后 init 失败即结束本次 connect，
+                    # 不在同一会话窗口继续尝试其他服务器。
+                    return self._finalize_main_login(
                         host,
                         sock,
                         result,
                         passport_fields,
                     )
-                    return finalized
                 else:
                     sock.close()
                     if verify_code == "-1":
@@ -871,7 +930,10 @@ class THSClient:
         reply_fields: dict,
         passport_fields: dict,
     ) -> LoginResult:
-        """Expose a verified ordinary-login socket as the MAIN connection."""
+        """Initialize and expose a verified ordinary-login socket as MAIN."""
+        # 旧连接的心跳线程可能仍存活；先停掉，避免替换 _sock 后抢在 init
+        # 之前向新连接发心跳。init 成功后再重新启动。
+        self.stop_heartbeat()
         previous = self._sock
         if previous is not None and previous is not sock:
             try:
@@ -880,10 +942,36 @@ class THSClient:
                 pass
         self._sock = sock
         self._connected_ip = host
+        try:
+            self._send_init_handshake()
+        except (OSError, ValueError) as exc:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if self._sock is sock:
+                self._sock = None
+            self._connected_ip = None
+            self._last_connect_ts = 0.0
+            logger.warning(
+                "%s:%d 登录验证通过，但 MAIN init 失败: %s",
+                host,
+                MARKET_PORT,
+                exc,
+            )
+            return LoginResult(
+                success=False,
+                verify_code="0",
+                server=f"{host}:{MARKET_PORT}",
+                reply_fields=reply_fields,
+                passport_fields=passport_fields,
+                error="init_failed",
+                detail=str(exc),
+            )
+
         self._last_connect_ts = time.time()
         self._account_evidence.record_main_ready(passport_fields)
         self._start_heartbeat()
-        self._send_init_handshake()
         logger.info("✓ 登录成功 (%s:%d)", host, MARKET_PORT)
         return LoginResult(
             success=True,
@@ -906,47 +994,53 @@ class THSClient:
         不是全量代码表（代码表由 stock_list() 的独立单请求触发）。实测稳定返回
         1 帧（多次验证），0.1s 即到达。读完这 1 帧配置即激活行情通道。
         """
-        try:
-            req = build_init_query()
-            with self._sock_lock:
-                self._sock.sendall(req + b"\n")
-                # 读配置帧并彻底排空缓冲区：先 timeout 秒等第 1 帧（配置帧），
-                # 再用 0.3s 短超时循环读，直到无数据（排空残留帧/半帧）。
-                # 残留半帧会让首个 K线请求的 read_frame 从错位位置扫 magic → 解析失败
-                # 或误判连接关闭。循环排空能避免首请求偶发 ConnectionError。
-                self._sock.settimeout(timeout)
-                n = 0
-                # 第 1 帧：配置帧（~49KB），等它到达
+        req = build_init_query()
+        with self._sock_lock:
+            sock = self._sock
+            if sock is None:
+                raise ConnectionError("MAIN 连接已关闭，无法发送 init")
+            sock.sendall(req + b"\n")
+            # 第一帧是激活成功的必要证据；超时、FIN 或非法帧均不能把 MAIN
+            # 标记为 ready。后续短读仅用于排空 ACK/通知帧。
+            sock.settimeout(timeout)
+            try:
+                first_frame = read_frame(sock)
+            except socket.timeout as exc:
+                raise TimeoutError("等待 MAIN init 响应超时") from exc
+            except ConnectionError:
+                raise
+            except OSError as exc:
+                raise ConnectionError(f"读取 MAIN init 响应失败: {exc}") from exc
+            except ValueError as exc:
+                raise ValueError(f"MAIN init 响应帧无效: {exc}") from exc
+
+            frames = [first_frame]
+            sock.settimeout(0.3)
+            for _ in range(8):
                 try:
-                    read_frame(self._sock)
-                    n += 1
-                except (socket.timeout, OSError):
-                    pass
-                except ValueError:
-                    # magic 对齐失败（偶发），丢一段继续
-                    try:
-                        self._sock.settimeout(0.5)
-                        self._sock.recv(8192)
-                    except Exception:
-                        pass
-                # 循环排空后续帧（配置帧后可能跟推送帧/ACK），每帧 0.3s 超时
-                # 最多读 8 帧（防异常情况死循环），正常 1-2 帧即超时退出
-                self._sock.settimeout(0.3)
-                for _ in range(8):
-                    try:
-                        read_frame(self._sock)
-                        n += 1
-                    except (socket.timeout, OSError):
-                        break  # 无更多数据，排空完成
-                    except ValueError:
-                        # 半帧/magic 错位，丢一段继续排空
-                        try:
-                            self._sock.recv(8192)
-                        except Exception:
-                            break
-                logger.debug("init 握手完成（读 %d 帧，行情通道已激活，缓冲区已排空）", n)
-        except Exception as e:
-            logger.warning("init 握手失败（行情查询可能超时）: %s", e)
+                    frames.append(read_frame(sock))
+                except socket.timeout:
+                    break
+                except ConnectionError:
+                    raise
+                except OSError as exc:
+                    raise ConnectionError(
+                        f"排空 MAIN init 响应时连接异常: {exc}"
+                    ) from exc
+                except ValueError as exc:
+                    raise ValueError(
+                        f"排空 MAIN init 响应时遇到非法帧: {exc}"
+                    ) from exc
+
+            if not any(
+                parse_init_response(frame).get("server_info")
+                for frame in frames
+            ):
+                raise ValueError("MAIN init 响应未包含服务器配置")
+            logger.debug(
+                "init 握手完成（读 %d 帧，行情通道已激活，缓冲区已排空）",
+                len(frames),
+            )
 
     def _probe_fastest_hosts(self, hosts: list[str], timeout: float = 1.0,
                              use_cache: bool = True) -> list[str]:
@@ -1101,7 +1195,7 @@ class THSClient:
         发送 build_list_quote_query 构造的列表行情请求，解析 hd1.0（≤5 股）
         或 hd3.1（≥6 股）响应，返回记录列表。
 
-        前置条件：已 connect() 成功（self._sock 存在）。
+        首次调用会按需执行 HTTP 鉴权并建立 MAIN；已有连接时直接复用。
         8901 一条 TCP 响应可能含多个 fdfdfdfd 子帧（CodeListSize / MarketTime
         文本帧 + hd 数据帧）。本方法循环 read_frame，跳过非数据帧，取首个含
         ``hd1.0`` / ``hd3.1`` 标记的帧解析。
@@ -1128,8 +1222,7 @@ class THSClient:
         """
         if datatype is None:
             datatype = LIST_QUOTE_DATATYPE_DEFAULT
-        if self._sock is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        self._ensure_main_connection()
         if self._service_connections is not None:
             from .errors import ProtocolError
 
@@ -1476,10 +1569,7 @@ class THSClient:
             )
 
         if self._auth is None:
-            # 未登录则自动 connect（拿 Passport64 用于 __manual 登录）
-            lr = self.connect()
-            if not lr.success:
-                raise RuntimeError(f"connect 失败: {lr.error}")
+            self.authenticate()
         if market == 0:
             market = 17 if code.startswith("6") else 33
         # 确保 __manual 推送连接存在（按沪深分服）
@@ -1661,9 +1751,7 @@ class THSClient:
             )
 
         if self._auth is None:
-            lr = self.connect()
-            if not lr.success:
-                raise RuntimeError(f"connect 失败: {lr.error}")
+            self.authenticate()
         if market == 0:
             market = 17 if code.startswith("6") else 33
         # 复用 timeline 的连接管理（同为 pageid=4214 推送通道）
@@ -1836,11 +1924,16 @@ class THSClient:
         last_err = ""
         for attempt in range(retries + 1):
             if self._auth is None:
-                logger.info("history_timeline: 尚未鉴权，connect（attempt %d/%d）",
-                            attempt + 1, retries)
-                lr = self.connect()
-                if not lr.success:
-                    last_err = f"connect 失败: {lr.error}"
+                logger.info(
+                    "history_timeline: 尚未鉴权，仅获取 HTTP passport"
+                    "（attempt %d/%d）",
+                    attempt + 1,
+                    retries + 1,
+                )
+                try:
+                    self.authenticate()
+                except Exception as exc:
+                    last_err = f"HTTP 鉴权失败: {exc}"
                     continue
             try:
                 records = self._history_timeline_once(code, date, market, timeout)
@@ -2012,8 +2105,7 @@ class THSClient:
         Raises:
             RuntimeError: 未登录。
         """
-        if self._sock is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        self._ensure_main_connection()
         if self._service_connections is not None:
             self.sync_service_connections()
             stocks = self._stock_list_service.ranked(
@@ -2147,8 +2239,7 @@ class THSClient:
         Raises:
             RuntimeError: 未登录。
         """
-        if self._sock is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        self._ensure_main_connection()
         if self._service_connections is not None:
             self.sync_service_connections()
             stocks = self._stock_list_service.full_list(timeout=timeout)
@@ -2380,8 +2471,7 @@ class THSClient:
         Raises:
             RuntimeError: 未登录（self._sock 为空）。
         """
-        if self._sock is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        self._ensure_main_connection()
         if self._service_connections is not None:
             self.sync_service_connections()
             return self._market_snapshot_service.snapshot(
@@ -2421,8 +2511,7 @@ class THSClient:
         Raises:
             RuntimeError: 未登录。
         """
-        if self._sock is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        self._ensure_main_connection()
 
         # 1. stock_list 缓存取全量 code+name（含沪深，名称来自 hexin 本地缓存）
         stock_codes = self.stock_list_cached(with_names=True)
@@ -2512,8 +2601,7 @@ class THSClient:
         Raises:
             RuntimeError: 未登录。
         """
-        if self._sock is None:
-            raise RuntimeError("未登录，请先 connect() / connect_cached()")
+        self._ensure_main_connection()
         if self._service_connections is not None:
             self.sync_service_connections()
             result = self._stock_name_service.fetch(
@@ -2651,7 +2739,9 @@ class THSClient:
 
     def _ensure_blocks(self):
         if self._blocks is None:
-            raise RuntimeError("板块功能未初始化，请先 connect()")
+            self.authenticate()
+        if self._blocks is None:
+            raise RuntimeError("板块功能初始化失败")
 
     @property
     def blocks(self):
@@ -2715,11 +2805,13 @@ class THSClient:
         """懒连接 9601 短线精灵服务（passport64 登录）。
 
         用 PC 版 login 帧（build_login_body_pc）登录，VerifyCode=0 则存 socket。
-        前置条件：self._auth 已设置。
+        缺少 Passport64 时只执行 HTTP 鉴权，不建立 MAIN。
         """
-        if self._realorder_sock or self._auth is None:
+        if self._realorder_sock:
             return
         try:
+            if self._auth is None:
+                self.authenticate()
             passport64 = self._current_passport64()
             login_body = self._auth_service.login_body_for_passport(
                 passport64,
@@ -2798,9 +2890,6 @@ class THSClient:
         Returns:
             True=订阅请求已发送（CodeListSize≥1）；False=注册失败或未登录。
         """
-        if self._auth is None:
-            if self._service_connections is None:
-                raise RuntimeError("未登录，请先 connect() / connect_cached()")
         if market is None:
             market = 17 if code.startswith("6") else 33
 
@@ -2837,6 +2926,8 @@ class THSClient:
             self._activate_snapshot_subscription(code, market, callback)
             return True
 
+        if self._auth is None:
+            self.authenticate()
         if key not in self._push_socks:
             sock = self._open_manual_push_connection(market)
             if sock is None:
@@ -2946,7 +3037,8 @@ class THSClient:
                                       use_main_ip: bool = False):
         """用 __manual 身份开一条独立 8901 连接（推送通道专用，按沪深分服）。
 
-        复用主连接的 Passport64/Mac64/IP，但 login 帧用 UserName=__manual。
+        复用当前 HTTP AuthMaterial 的 Passport64/Mac64；不要求 MAIN 已连接。
+        login 帧使用 UserName=__manual。
         登录后默认发 init 激活行情通道（``skip_init=False``）。
 
         ★ **按沪深选 L2 服务器**（2026-07-24 实测突破）：shlv2/szlv2 是两套独立
@@ -2978,6 +3070,9 @@ class THSClient:
         """
         import socket as _socket
         from thspypc.protocol import resolve_l2_hosts_grouped, pick_l2_market
+
+        if self._auth is None:
+            self.authenticate()
 
         def _try_round(passport64, allow_refresh):
             """用给定 passport64 尝试所有候选 IP；全失败时可选重新鉴权重试一轮。"""

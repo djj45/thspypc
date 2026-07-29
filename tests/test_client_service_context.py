@@ -913,12 +913,12 @@ def test_controlled_opener_can_bridge_main_login(monkeypatch):
     sock = FakeSocket()
     login_calls = []
 
-    def connect():
+    def connect_main():
         login_calls.append(True)
         client._sock = sock
         return LoginResult(success=True)
 
-    monkeypatch.setattr(client, "connect", connect)
+    monkeypatch.setattr(client, "connect_main", connect_main)
     profile = AccountProfile(
         kind=AccountKind.STANDARD,
         capabilities={Capability.BASIC_QUOTE: Support.YES},

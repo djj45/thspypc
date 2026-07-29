@@ -27,6 +27,7 @@ from .features.account_profile import (
     AccountEvidenceRecorder,
     build_account_profile,
 )
+from .services.auth import AuthMaterial
 from .client import (
     market_from_code,
     default_stock_cache_path,
@@ -83,7 +84,7 @@ from .parse_hfd1 import parse_hfd1_response
 
 __version__ = "0.1.0"
 __all__ = [
-    "THSClient", "LoginResult",
+    "THSClient", "LoginResult", "AuthMaterial",
     "AccountEvidence", "AccountKind", "AccountProfile", "Capability", "Support",
     "AccountEvidenceRecorder", "build_account_profile",
     "DepthLevel", "DepthQuote",

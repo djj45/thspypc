@@ -1,0 +1,199 @@
+"""Offline contracts for HTTP-only auth and role-lazy TCP connections."""
+
+from thspypc import (
+    AccountKind,
+    AccountProfile,
+    AuthMaterial,
+    Capability,
+    LoginResult,
+    Support,
+    THSClient,
+)
+from thspypc.transport import ConnectionRole
+
+
+class FakeSocket:
+    def __init__(self):
+        self.closed = False
+        self.sent = []
+
+    def close(self):
+        self.closed = True
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+
+def _client():
+    return THSClient(
+        "offline-user",
+        "offline-password",
+        enable_heartbeat=False,
+    )
+
+
+def _install_http_auth(client, calls):
+    def authenticate(username, password, imei):
+        calls.append((username, password, imei))
+        return {
+            "userid": "user-id",
+            "sessionid": "session-id",
+            "signature": "AB" * 128,
+            "passport_bytes": (
+                b"account=test|userclass=level2|"
+                b"M_hqdns=\"ifindhq.123ths.com:8901:232;\""
+            ),
+        }
+
+    client._auth_service._authenticator = authenticate
+    client._init_blocks = lambda: None
+
+
+def _level2_profile():
+    return AccountProfile(
+        kind=AccountKind.LEVEL2,
+        capabilities={
+            Capability.L2_MARKET_ACCESS: Support.YES,
+            Capability.L2_TIMELINE: Support.YES,
+        },
+    )
+
+
+def test_authenticate_is_http_only_and_reuses_one_generation():
+    client = _client()
+    calls = []
+    _install_http_auth(client, calls)
+
+    first = client.authenticate()
+    second = client.authenticate()
+
+    assert isinstance(first, AuthMaterial)
+    assert second is first
+    assert client.auth_material is first
+    assert first.generation == 1
+    assert client._sock is None
+    assert client._push_socks == {}
+    assert client._realorder_sock is None
+    assert len(calls) == 1
+    assert (
+        client.observed_account_profile.support(Capability.BASIC_QUOTE)
+        is Support.UNKNOWN
+    )
+
+
+def test_connect_main_reuses_existing_http_material(monkeypatch):
+    client = _client()
+    calls = []
+    _install_http_auth(client, calls)
+    material = client.authenticate()
+    tcp_logins = []
+    monkeypatch.setattr(
+        client,
+        "_do_tcp_login",
+        lambda fields: (
+            tcp_logins.append(dict(fields))
+            or LoginResult(success=False, error="offline-stop")
+        ),
+    )
+
+    result = client.connect_main()
+
+    assert result.error == "offline-stop"
+    assert len(calls) == 1
+    assert tcp_logins == [dict(material.passport_fields)]
+
+
+def test_l2_service_opener_authenticates_without_main_login(monkeypatch):
+    client = _client()
+    calls = []
+    _install_http_auth(client, calls)
+    l2_sock = FakeSocket()
+    main_logins = []
+    monkeypatch.setattr(
+        client,
+        "connect_main",
+        lambda: main_logins.append(True),
+    )
+    monkeypatch.setattr(
+        client,
+        "_open_manual_push_connection",
+        lambda market: l2_sock,
+    )
+
+    manager = client.configure_service_context(
+        _level2_profile(),
+        allow_open=True,
+    )
+    connection = manager.acquire(
+        ConnectionRole.SH_L2,
+        capability=Capability.L2_TIMELINE,
+    )
+
+    assert connection.socket is l2_sock
+    assert len(calls) == 1
+    assert main_logins == []
+    assert client._sock is None
+
+
+def test_realorder_authenticates_without_main_login(monkeypatch):
+    import thspypc.client as client_module
+
+    client = _client()
+    calls = []
+    _install_http_auth(client, calls)
+    realorder_sock = FakeSocket()
+    main_logins = []
+    monkeypatch.setattr(
+        client,
+        "connect_main",
+        lambda: main_logins.append(True),
+    )
+    monkeypatch.setattr(
+        client_module.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: realorder_sock,
+    )
+    monkeypatch.setattr(client_module, "read_frame", lambda _sock: b"login")
+    monkeypatch.setattr(
+        client_module,
+        "parse_login_response",
+        lambda _body: {"VerifyCode": "0"},
+    )
+
+    client._connect_realorder_server()
+
+    assert client._realorder_sock is realorder_sock
+    assert len(calls) == 1
+    assert main_logins == []
+    assert client._sock is None
+
+
+def test_history_timeline_authenticates_without_main_login(monkeypatch):
+    client = _client()
+    calls = []
+    _install_http_auth(client, calls)
+    main_logins = []
+    monkeypatch.setattr(
+        client,
+        "connect_main",
+        lambda: main_logins.append(True),
+    )
+    monkeypatch.setattr(
+        client,
+        "_history_timeline_once",
+        lambda code, date, market, timeout: [
+            {"code": code, "bar_index": 1}
+        ],
+    )
+
+    records = client.history_timeline(
+        "600519",
+        "2026-07-28",
+        market=17,
+        retries=0,
+    )
+
+    assert records == [{"code": "600519", "bar_index": 1}]
+    assert len(calls) == 1
+    assert main_logins == []
+    assert client._sock is None

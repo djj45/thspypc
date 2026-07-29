@@ -1110,43 +1110,51 @@ codex/refactor-protocol-foundation
   鉴权生成同代 `auth_info/passport_fields/passport64/profile/generation` 快照，
   MAIN、沪深 L2 `__manual` 和 REALORDER 均消费同一份 Passport64；重新鉴权会
   原子替换 current generation，已经交给在途连接的旧快照不被修改；
+- `THSClient.authenticate()` 是公开的 HTTP-only 鉴权边界，不建立行情 socket；
+  `connect_main()` 复用当前 `AuthMaterial` 后按需建立 MAIN，原有 `connect()` 作为
+  兼容别名保留。沪深 L2 和 9601 opener 在首次请求各自能力时直接消费当前
+  Passport64，并在自己的 socket 上执行 login/init，不再以预先登录 MAIN 为前置条件；
 - `THSClient.connect()`、二维码/缓存凭证路径、外部 Passport64 登录、
   `__manual` 票据刷新和 9601 登录均已改为通过 `AuthService` 构造登录身份。
   `_auth` 继续镜像当前认证 dict，兼容已有板块代码、诊断脚本和测试注入；原有
   主连接 IP 测速/轮换、20 秒复用窗口、并发登录、心跳和错误分类没有下沉。
-  2026-07-28 活网修正 MAIN 普通登录不再发送 L2 init；带 MarketCode 的 init
-  只保留在 `__manual + shlv2/szlv2` 分服和显式 stock-list 重放流程。扫码/缓存
-  路径原先向 `_do_tcp_login()` 传入不存在的 `max_retries` 参数也已修正；
+  MAIN 在 `VerifyCode=0` 后发送标准 `build_init_query()` 配置帧，成功读取至少
+  一帧响应后才记录 MAIN ready 并启动心跳；超时、FIN 或非法帧返回
+  `error="init_failed"` 并关闭候选 socket。此时本次 `connect()` 立即结束，
+  不再串行 login 其他服务器，避免短时间跨节点重复登录触发会话保护；下一次独立
+  `connect()` 再按持久化 offset 轮换节点。`__manual` L2 则在独立的
+  `shlv2/szlv2` 连接上分别发送 init(16;144)/(32)。扫码/缓存路径原先向
+  `_do_tcp_login()` 传入不存在的 `max_retries` 参数也已修正；
 - 同次活网排查进一步确认 MAIN 的 A 股请求只应路由到 `ifindhq.123ths.com`。
   `fu4/hkus/euhq` 节点可以返回 VerifyCode=0，但不响应沪深 `list_quotes`；
-  旧实现又向 MAIN 发送默认 `MarketCode=16;144;` 的 L2 init，导致部分节点立即
-  FIN。修正后 MAIN 不发 init，DNS 只取 ifindhq；测速缓存若含当前候选集以外的
-  IP 会失效重测，避免旧的跨域名缓存绕过筛选；
+  此前观察到这些节点在 init 前后 FIN 是节点路由错误，不是 MAIN init 本身。
+  DNS 只取 ifindhq；测速缓存若含当前候选集以外的 IP 会失效重测，避免旧的
+  跨域名缓存绕过筛选；
 - 修正后的活网矩阵 4/4 通过：`enable_heartbeat=False` 两轮和 `True` 两轮均完成
   登录、立即行情查询和等待后二次查询；有心跳两轮各发送 2 次心跳后连接仍存活，
   排除首秒断连由心跳触发；
-- ★ 2026-07-29 活网验证推翻「MAIN 不发 init」结论：上述修正把 MAIN 登录收尾
-  重构为 `_finalize_main_login`，但**误删了 `_send_init_handshake()` 调用和整个
-  方法**，导致 kline 回归。跨分支对照实验定位根因：旧分支 `feat/stock-list-full`
+- ★ 2026-07-29 活网验证确认 MAIN init 是必要登录步骤：此前把 MAIN 登录收尾
+  重构为 `_finalize_main_login` 时误删了 `_send_init_handshake()` 调用和整个方法，
+  导致 kline 回归。跨分支对照实验定位根因：旧分支 `feat/stock-list-full`
   登录后调 init（`client.py:490`），kline 能收到响应（仅 parser 有 NameError）；
   新分支 `1cf409d` 删了 init，kline 跨 4 个 IP 全超时，而 `list_quotes`/`depth_quote`
   仍正常（hd1.0/hd3.1 不强依赖 init，掩盖了回归）。`build_kline_query` 字节两分支
   完全一致（sha8 `897f7634`），故回归不在 builder，而在登录后没发 init 激活通道。
   K线走 hd3.1 flag=0x0042/0x0046，服务器要求 init（subtype 0x0001）激活通道才响应；
   补回 `_send_init_handshake` 后 kline 立即恢复（实测返回 6 根日K，7/21–7/28）。
-  「不发 L2 MarketCode init」的正确含义是：MAIN 不走 `__manual` L2 manual 路径
-  （那是 shlv2/szlv2 专用 init(16;144)/(32)）；但 MAIN 自己的 `build_init_query()`
-  配置帧是激活 A 股行情通道的必要步骤。之前观察到的「带 MarketCode init 在 fu4/hkus/euhq
-  节点 FIN」是**节点选错**（非 ifindhq），不是 init 本身的问题——DNS 收窄到 ifindhq 后，
-  带 `MarketCode=16;144;` 的 MAIN init 稳定激活通道且不触发 FIN；
+  MAIN 不走 `__manual` L2 manual 路径（那是 shlv2/szlv2 专用
+  init(16;144)/(32)）；MAIN 自己的 `build_init_query()` 配置帧则负责激活 A 股
+  MAIN 行情通道。之前观察到的 init 后 FIN 是**节点选错**（非 ifindhq），不是
+  init 本身的问题——DNS 收窄到 ifindhq 后，MAIN init 稳定激活通道且不触发 FIN；
 - 同次活网验证还顺带修复了 `test_stock_cache::test_live` 和 `test_stock_list::test_live`：
   这两个之前因 init 缺失导致 stock-list 重放通道未激活而失败，补回 init 后均通过；
 - `tests/test_main_login_finalization.py` 的两个契约已修正：原断言
   `sock.sent == []`（MAIN 登录后什么都不发）违背 hexin 协议，改为断言
   `_send_init_handshake` 被调用（激活行情通道）+ 旧 socket 正确关闭替换；
-- 活网新旧路径逐字段对比（`tests/test_service_live.py`，opt-in service context）
-  3/3 一致：`list_quotes`/`depth_quote`/`kline` 在同一次连接、同一服务器数据上，
-  旧协议路径与新 service 路径解析结果逐字段相同，确认重构未改变 MAIN 业务协议行为；
+- 活网新旧路径对比（`tests/test_service_live.py`，opt-in service context）在同一次
+  MAIN 连接上完成：动态 `list_quotes`/`depth_quote` 比较代码、字段结构和类型，
+  避免盘中连续两次请求因价格变化误报；K 线对已完成区间逐字段比较，并单独校验
+  最新动态 bar 的结构；
 - 普通账号登录差异的扩展点明确落在 `LoginProtocolProfile`：未来拿到普通账号
   抓包后，可单独提供 product/securities/HTTP version/TCP version/qsid/
   account_type 以及是否支持 `__manual`，并注入 `AuthService`，无需改业务
@@ -1158,10 +1166,11 @@ codex/refactor-protocol-foundation
   具体业务能力同时当作账号类型和 socket 健康状态；
 - 登录帧长度和 SHA 回归确认普通身份与 `__manual` 身份字节均未变化。
 
-AuthService 接入并完成旧 RealOrder 源块清理后的扩大离线回归：
+AuthService 接入、旧 RealOrder 源块清理、MAIN init 强制契约和按需连接生命周期
+完成后的扩大离线回归：
 
 ```text
-274 passed, 2 skipped, 1 deselected
+295 passed, 2 skipped, 1 deselected
 ```
 
 其中两个 skip 是本机缺少部分历史分时可选语料；deselected 项是
