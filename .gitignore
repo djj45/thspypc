@@ -23,10 +23,6 @@ captures_live/
 *.pcapng
 baratol*.log
 
-# 例外：stock_list 重放模板（公开的请求帧，不含账号/行情数据，需随代码提交）
-!src/thspypc/data/
-!src/thspypc/data/stock_list_replay.bin
-
 # 扫码登录返回的设备凭据（含明文 account/password/imei）
 tests/remember_*.json
 tests/credentials*.json
