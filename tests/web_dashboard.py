@@ -467,10 +467,9 @@ def preload_names() -> dict[str, str]:
     **只用 load_hexin_names**（读同花顺本地 stockname 文件，全品种 ~5.8万条：
     含 A 股/新三板/北交所/可转债/ETF/国债期货等，覆盖最全）。
 
-    ⚠ **不调 stock_list_cached**：它首次缓存未命中时会走 stock_list() 重放
-    subreal 订阅序列，重放后订阅无法取消，服务器持续往主连接推送帧，
-    会淹没后续 list_quotes / stock_list_hot 导致超时。load_hexin_names 纯读
-    本地文件、零网络、零副作用，且覆盖更全（58527 vs stock_list 的 ~7400）。
+    **不调 stock_list_cached**：仪表盘只需要名称，直接读取本地 stockname
+    无需占用 MAIN 连接，且覆盖品种更全。stock_list 已改为无订阅副作用的单请求；
+    这里保留本地方案只是为了名称覆盖和启动速度。
     """
     name_map: dict[str, str] = {}
     try:

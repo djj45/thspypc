@@ -20,6 +20,7 @@ from ..features.timeline_protocol import (
 )
 from ..features.history_timeline_protocol import (
     build_history_timeline_query,
+    history_timeline_request_codes,
     parse_history_timeline_response,
 )
 from ..features.account_profile import AccountEvidenceRecorder
@@ -63,9 +64,9 @@ def _require(
 
 
 def _l2_role(market: int) -> ConnectionRole:
-    if market == 17:
+    if market in (16, 17, 144):
         return ConnectionRole.SH_L2
-    if market == 33:
+    if market in (32, 33):
         return ConnectionRole.SZ_L2
     raise ValueError(f"分时暂不支持市场码: {market}")
 
@@ -245,6 +246,12 @@ class TimelineService:
             feature="history_timeline",
         )
         role = _l2_role(market)
+        requested_codes, _, _ = history_timeline_request_codes(
+            code,
+            market=market,
+            benchmark_market=benchmark_market,
+            benchmark_code=benchmark_code,
+        )
         frame = build_history_timeline_query(
             code,
             bar_start=bar_start,
@@ -276,6 +283,7 @@ class TimelineService:
                 records = parse_history_timeline_response(
                     response,
                     code=code,
+                    requested_codes=requested_codes,
                 )
                 if records:
                     if self._evidence is not None:

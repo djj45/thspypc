@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 
 STOCK_LIST_MARKETS = [(17, "沪"), (22, "深"), (151, "北交所")]
 STOCK_LIST_DATATYPE = [199112]
+FULL_STOCK_LIST_MARKETS = (
+    16,
+    17,
+    19,
+    20,
+    144,
+    145,
+    146,
+    147,
+    150,
+    151,
+)
 
 SORT_BY_VALUES = {
     "涨幅": {"sort_by": 199112, "verified": True},
@@ -101,6 +113,33 @@ def build_stock_list_query(
     header[11:13] = b"\x56\x01"
     struct.pack_into("<H", header, 19, len(text) + 1)
     return encode_frame(bytes(header) + text)
+
+
+def build_full_stock_list_query(
+    markets: tuple[int, ...] = FULL_STOCK_LIST_MARKETS,
+    *,
+    seq: int = 1,
+    route: int = 0x0100,
+    pageid: int = 5716,
+) -> bytes:
+    """Build the minimum verified full code/name table query."""
+    if not markets:
+        raise ValueError("full stock list requires at least one market")
+    codelist = "".join(f"{market}();" for market in markets)
+    text = (
+        "DataType=[5],[55]\r\n"
+        f"CodeList={codelist}\r\n"
+        "DateTime=0\r\n"
+        f"pageid={pageid}\r\n"
+    ).encode("gbk")
+
+    header = bytearray(22)
+    header[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 4, seq & 0xFFFF)
+    header[6:10] = b"\x12\x00\x09\x00"
+    struct.pack_into("<H", header, 10, route & 0xFFFF)
+    struct.pack_into("<I", header, 18, len(text))
+    return encode_frame(b"\x09" + bytes(header) + text)
 
 
 def parse_stock_list_response(body: bytes) -> dict:
@@ -397,6 +436,7 @@ def _parse_stock_list_hd10_variant(body: bytes) -> list[dict]:
 
 
 __all__ = [
+    "FULL_STOCK_LIST_MARKETS",
     "INIT_C_MODULES",
     "INIT_MARKET_CODE",
     "INIT_STOCK_LINKS",
@@ -404,6 +444,7 @@ __all__ = [
     "STOCK_LIST_DATATYPE",
     "STOCK_LIST_MARKETS",
     "build_init_query",
+    "build_full_stock_list_query",
     "build_stock_list_query",
     "parse_init_response",
     "parse_stock_list_replay",

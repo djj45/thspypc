@@ -4,16 +4,15 @@ from __future__ import annotations
 import socket
 import time
 from collections.abc import Callable
-from importlib import resources
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
 from ..errors import ProtocolError
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.stock_list_protocol import (
+    build_full_stock_list_query,
     build_stock_list_query,
     parse_init_response,
-    parse_stock_list_replay,
     parse_stock_list_response,
 )
 from ..models import Capability
@@ -48,16 +47,10 @@ class StockListService:
         self._clock = clock
         self._sleep = sleep
 
-    def _get_replay_segments(self) -> tuple[bytes, ...]:
+    def _get_request_segments(self) -> tuple[bytes, ...]:
         if self._replay_segments is not None:
             return self._replay_segments
-        data = (
-            resources.files("thspypc")
-            .joinpath("data", "stock_list_replay.bin")
-            .read_bytes()
-        )
-        self._replay_segments = parse_stock_list_replay(data)
-        return self._replay_segments
+        return (build_full_stock_list_query(),)
 
     def ranked(
         self,
@@ -141,19 +134,20 @@ class StockListService:
         replay_delay: float = 0.3,
         settle_timeout: float = 3.0,
     ) -> list[dict]:
-        """Replay the captured startup sequence and select the largest table."""
+        """Request all configured markets and select the largest table."""
         connection = self._connections.acquire(
             ConnectionRole.MAIN,
             capability=Capability.BASIC_QUOTE,
         )
+        generated_request = self._replay_segments is None
         try:
-            segments = self._get_replay_segments()
+            segments = self._get_request_segments()
         except (OSError, ValueError) as exc:
             raise ProtocolError(
-                f"stock-list replay resource is invalid: {exc}"
+                f"stock-list request sequence is invalid: {exc}"
             ) from exc
         if not segments:
-            raise ProtocolError("stock-list replay resource is empty")
+            raise ProtocolError("stock-list request sequence is empty")
 
         best_stocks: list[dict] = []
         started_at = self._clock()
@@ -162,10 +156,11 @@ class StockListService:
         with connection.request(
             segments[0],
             timeout=request_timeout,
-            trailing_newline=False,
+            trailing_newline=generated_request,
         ) as sock:
-            self._sleep(replay_delay)
-            for segment in segments[1:]:
+            for index, segment in enumerate(segments[1:]):
+                if index == 0:
+                    self._sleep(replay_delay)
                 sock.sendall(segment)
                 self._sleep(replay_delay)
 

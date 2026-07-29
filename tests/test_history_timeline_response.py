@@ -16,6 +16,9 @@ from thspypc.protocol import (
 )
 import thspypc.protocol as protocol
 from thspypc.features import history_timeline_protocol
+from thspypc.features.history_timeline_protocol import (
+    history_timeline_request_codes,
+)
 
 
 FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
@@ -133,6 +136,16 @@ def test_stock_history_query_groups_same_market_companion_codes():
     assert b"DateTime=8192(132477534-132477889)" in body
 
 
+def test_history_request_codes_preserve_mixed_table_order():
+    codes, benchmark_market, benchmark_code = (
+        history_timeline_request_codes("000938", market=33)
+    )
+
+    assert codes == ("399002", "000938")
+    assert benchmark_market == 32
+    assert benchmark_code == "399002"
+
+
 def test_stock_history_selects_requested_code():
     body = _stock_history_frame()
 
@@ -208,3 +221,31 @@ def test_companion_replacement_capture_identifies_000001():
         "dt22": 6_402_300,
         "dt23": 12_620_888,
     }
+
+
+def test_companion_response_binds_unlabelled_target_table_by_request_order():
+    capture = (
+        Path(__file__).resolve().parents[1]
+        / "captures_live"
+        / "history_companion_000001_000938_20260514_20260728_174530.bin"
+    )
+    if not capture.exists():
+        pytest.skip("本机没有 000001 伴随代码替换实发语料")
+
+    records = parse_history_timeline_response(
+        capture.read_bytes(),
+        code="000938",
+        requested_codes=("000001", "000938"),
+    )
+
+    assert len(records) == 235
+    assert (
+        records[0]["dt10"],
+        records[0]["dt13"],
+        records[0]["dt19"],
+    ) == (33.88, 5_494_600, 186_157_050)
+    assert (
+        records[-1]["dt10"],
+        records[-1]["dt13"],
+        records[-1]["dt19"],
+    ) == (32.14, 233_491_610, 7_610_279_300)

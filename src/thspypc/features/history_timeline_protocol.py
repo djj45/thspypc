@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import struct
+from collections.abc import Sequence
 from datetime import date as date_type
 from datetime import datetime
 
@@ -142,16 +144,14 @@ def build_history_timeline_query(
     datatype_text = ",".join(str(value) for value in datatype) + ","
     bar_end = bar_start + HISTORY_TIMELINE_BAR_SPAN
 
-    is_stock = code.isdigit() and not code.startswith("399")
-    if (
-        benchmark_market is None
-        and benchmark_code is None
-        and is_stock
-        and market == 33
-    ):
-        benchmark_market, benchmark_code = 32, "399002"
-    if (benchmark_market is None) != (benchmark_code is None):
-        raise ValueError("benchmark_market 和 benchmark_code 必须同时提供")
+    request_codes, benchmark_market, benchmark_code = (
+        history_timeline_request_codes(
+            code,
+            market=market,
+            benchmark_market=benchmark_market,
+            benchmark_code=benchmark_code,
+        )
+    )
 
     target_list = f"{market}({code},);"
     benchmark_list = (
@@ -160,7 +160,9 @@ def build_history_timeline_query(
         else ""
     )
     if benchmark_list and benchmark_market == market:
-        query_list = f"{market}({benchmark_code},{code},);"
+        query_list = (
+            f"{market}({','.join(request_codes)},);"
+        )
     else:
         query_list = benchmark_list + target_list
 
@@ -205,6 +207,51 @@ def build_history_timeline_query(
     else:
         body = b"\x09" + full_frame + tail_frame
     return encode_frame(body)
+
+
+def history_timeline_request_codes(
+    code: str,
+    *,
+    market: int,
+    benchmark_market: int | None = None,
+    benchmark_code: str | None = None,
+) -> tuple[tuple[str, ...], int | None, str | None]:
+    """Resolve the exact CodeList order used by a historical request.
+
+    The response can omit the ASCII code from later tables.  Keeping this
+    ordering in one pure helper lets the response parser bind such tables
+    without assuming that the first table is always the requested security.
+    """
+    is_stock = code.isdigit() and not code.startswith("399")
+    if (
+        benchmark_market is None
+        and benchmark_code is None
+        and is_stock
+        and market == 33
+    ):
+        benchmark_market, benchmark_code = 32, "399002"
+    if (benchmark_market is None) != (benchmark_code is None):
+        raise ValueError("benchmark_market 和 benchmark_code 必须同时提供")
+    if benchmark_code is None:
+        return (code,), None, None
+    return (
+        (benchmark_code, code),
+        benchmark_market,
+        benchmark_code,
+    )
+
+
+def _history_timeline_table_code(
+    body: bytes,
+    search_start: int,
+    search_end: int,
+) -> str | None:
+    """Return an explicit six-digit instrument label from a table shell."""
+    match = re.search(
+        rb"(?<![0-9])([0-9]{6})(?![0-9])",
+        body[search_start:min(search_end, search_start + 160)],
+    )
+    return match.group(1).decode("ascii") if match is not None else None
 
 
 def _history_timeline_first_row(
@@ -299,8 +346,14 @@ def _decode_history_timeline_rows(
 def parse_history_timeline_response(
     body: bytes,
     code: str | None = None,
+    requested_codes: Sequence[str] | None = None,
 ) -> list[dict]:
-    """Parse safely anchored records from a historical timeline response."""
+    """Parse safely anchored records from a historical timeline response.
+
+    ``requested_codes`` must follow the request ``CodeList`` order.  It is
+    used only when a mixed response omits a later table's ASCII code label;
+    an explicit on-wire label always takes precedence.
+    """
     if body.startswith(b"\x0a"):
         try:
             body = normalize_8901_response(body)
@@ -310,6 +363,8 @@ def parse_history_timeline_response(
             )
             return []
 
+    requested = tuple(requested_codes or ())
+    table_index = 0
     pos = 0
     while True:
         marker = body.find(b"hd1.0", pos)
@@ -361,12 +416,26 @@ def parse_history_timeline_response(
             fields = _HISTORY_TIMELINE_STOCK_CORE_FIELDS
             search_start = base + 10
 
+        explicit_code = _history_timeline_table_code(
+            body,
+            search_start,
+            block_end,
+        )
+        assigned_code = (
+            requested[table_index]
+            if table_index < len(requested)
+            else explicit_code
+        )
+        table_index += 1
+        if code is not None and code not in (explicit_code, assigned_code):
+            continue
+
         first_row = _history_timeline_first_row(
             body,
             search_start,
             block_end,
             record_size,
-            code,
+            explicit_code,
         )
         if first_row < 0:
             continue

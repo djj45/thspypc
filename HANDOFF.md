@@ -1,5 +1,12 @@
 # thspypc 开发交接文档
 
+> **2026-07-29 stock_list 纠正**：下文 §1.5 保留的是 2026-07-19
+> 逆向过程，不再代表当前实现。逐帧活网 A/B 已证明完整代码表只需要一个
+> `DataType=[5],[55]` 请求；旧 `stock_list_replay.bin` 的另外 153 帧均非必需。
+> 当前 `stock_list()` 复用 `ifindhq.123ths.com:8901` 的 MAIN 连接，不走
+> `shlv2/szlv2`，也不发送 L2 init。最新结论及服务器权限见
+> [`docs/SERVER_MATRIX.md`](docs/SERVER_MATRIX.md)。
+>
 > 会话日期：2026-07-16 ~ 2026-07-17
 > 项目路径：`D:\code\ths_takehome\thspypc`
 > 参考项目：`D:\code\thspy`（Mac 版逆向，本地）、`D:\code\ths_takehome\ths`（PC 版协议文档）

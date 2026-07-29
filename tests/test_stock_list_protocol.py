@@ -9,6 +9,8 @@ import pytest
 import thspypc.protocol as protocol
 from thspypc.features import stock_list_protocol
 from thspypc.features.stock_list_protocol import (
+    FULL_STOCK_LIST_MARKETS,
+    build_full_stock_list_query,
     build_init_query,
     build_stock_list_query,
     parse_init_response,
@@ -172,28 +174,21 @@ def test_captured_init_table_decodes_full_stock_list():
     ]
 
 
-def test_replay_resource_has_four_complete_segments():
-    path = (
-        Path(__file__).parents[1]
-        / "src"
-        / "thspypc"
-        / "data"
-        / "stock_list_replay.bin"
-    )
-    data = path.read_bytes()
+def test_full_stock_list_builder_is_the_verified_minimum_query():
+    request = build_full_stock_list_query()
 
-    segments = parse_stock_list_replay(data)
-
-    assert hashlib.sha256(data).hexdigest() == (
-        "b3ee3dd166a1d8aad86ddd076c9e45a5c4ec35ef6283736f3f04f057e0714b5f"
-    )
-    assert [len(segment) for segment in segments] == [
-        10690,
-        5468,
-        8223,
-        2839,
-    ]
-    assert all(segment.startswith(b"\xfd\xfd\xfd\xfd") for segment in segments)
+    assert len(request) == 146
+    assert request.startswith(b"\xfd\xfd\xfd\xfd00000086\x09")
+    assert b"DataType=[5],[55]\r\n" in request
+    assert (
+        b"CodeList="
+        + b"".join(
+            f"{market}();".encode("ascii")
+            for market in FULL_STOCK_LIST_MARKETS
+        )
+        + b"\r\n"
+    ) in request
+    assert b"DateTime=0\r\npageid=5716\r\n" in request
 
 
 @pytest.mark.parametrize(
@@ -212,6 +207,10 @@ def test_replay_parser_rejects_invalid_container(data):
 
 
 def test_protocol_facade_reexports_single_implementation():
+    assert (
+        protocol.build_full_stock_list_query
+        is stock_list_protocol.build_full_stock_list_query
+    )
     assert (
         protocol.build_stock_list_query
         is stock_list_protocol.build_stock_list_query

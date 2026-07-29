@@ -20,7 +20,7 @@
   600056 等股票的 现价/昨收/开盘/涨幅/竞价金额
 - **个股五档盘口**（`depth_quote`）：买卖各五档价格/挂单量、档位金额以及
   涨跌停封单额。注意当前是五档快照，不是 Level2 十档。
-- **全市场股票列表**（`stock_list`）：重放 hexin 启动序列，~6 秒拿全市场 7400+ 代码
+- **全市场股票列表**（`stock_list`）：MAIN 单请求拉取全市场代码表，无需抓包重放
   全部代码（约7500+条），hd3.1 BitRLE 解码，自动翻页
 - **热门股排序查询**（`stock_list_hot`）：DataType=199112 排序查询（同花顺打开 A 股
   列表时发的请求），服务器返回按 SortBy 排序的前 N 条代码
@@ -254,7 +254,7 @@ with THSClient("账号", "密码") as client:
 ```python
 with THSClient("账号", "密码") as client:
     client.connect()
-    # 拉取全市场代码表（重放 hexin 启动序列，~6 秒）
+    # 拉取全市场代码表（MAIN 单请求）
     stocks = client.stock_list()  # [{code:"600000", name:""}, ...]
     print(f"共 {len(stocks)} 只")
 
@@ -263,9 +263,11 @@ with THSClient("账号", "密码") as client:
     recs = client.list_quotes(codes, market=17)
 ```
 
-**机制**：重放 hexin 启动序列的关键请求段（subreal×8 + 特殊 CodeList 订阅 + init），
-触发服务器在登录连接上推送 dc≈7422 的全量 hd3.1 帧（unk=0x18 BitRLE 编码）。
-重放模板固化在 `src/thspypc/data/stock_list_replay.bin`（提取自 cold_start.pcap）。
+**机制**：在 `ifindhq.123ths.com:8901` 的已登录 MAIN 连接上发送一个
+`DataType=[5],[55]` 空代码组请求，触发服务器返回全量 hd3.1 代码表。
+线上报文共 147 字节；逐帧 A/B 已确认旧抓包序列的其余 153 帧均不需要。
+服务器角色、权限和完整最小请求见
+[行情服务器矩阵](docs/SERVER_MATRIX.md)。
 
 ⚠️ **限制**：
 - 默认 `with_names=False` 时 `name` 恒为 `""`；`stock_list(with_names=True)` 会自动
@@ -275,7 +277,7 @@ with THSClient("账号", "密码") as client:
 
 ### 带本地缓存的代码表（`stock_list_cached`）
 
-`stock_list()` 每次都要重放启动序列拉取（~6 秒）。如果一天内要多次用全量代码表，
+`stock_list()` 每次都要从 MAIN 拉取代码表。如果一天内要多次用全量代码表，
 用缓存版：当天首次走网络拉取并写盘，之后直接读缓存（~瞬时），跨自然日自动失效。
 
 ```python
@@ -628,8 +630,9 @@ MAIN 普通登录连接在 `VerifyCode=0` 后可直接发送 `list_quotes`，`co
 - 沪市：连接 `shlv2`，发送 `MarketCode=16;144;`
 - 深市：连接 `szlv2`，发送 `MarketCode=32;`
 
-`stock_list()` 仍会显式重放抓包确认的完整启动序列，其中包含 init 请求；这是获取
-全量代码表的独立业务流程，不属于 MAIN 登录握手。
+`stock_list()` 复用 MAIN，并且不发送 L2 init。它只发送一个最小
+`DataType=[5],[55]` 请求；详细路由见
+[行情服务器矩阵](docs/SERVER_MATRIX.md)。
 
 修正后的活网 A/B 验证共 4 轮：关闭心跳 2 轮、开启心跳 2 轮，四轮均完成登录、
 立即查询和等待后二次查询；开启心跳的两轮各发送 2 次心跳后连接仍正常。

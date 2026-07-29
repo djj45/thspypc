@@ -477,9 +477,9 @@ def main():
 
     print("加载沪深 A 股代码表（读同花顺本地名称缓存，瞬时零网络）...")
     # 用 hexin 本地名称缓存作 code+name 数据源（5556 条沪深 A 股，稳定可靠）。
-    # 不用 stock_list_cached()——它的重放机制不稳定（实测本次拿 0 条，上次 489 条，
-    # 交接文档 §1 记录的全量帧 dc≈7422 服务器实例可能不响应）。
-    # 本地缓存覆盖更全（59755 条含沪深北+基金+指数，过滤后正好 5500+ 沪深 A 股）。
+    # 这里需要稳定的 code+name A 股集合；本地缓存无需占用 MAIN 连接，
+    # 且名称覆盖更全。stock_list 已改为无订阅副作用的单请求。
+    # 本地缓存含沪深北+基金+指数，过滤后得到 5500+ 沪深 A 股。
     names = THSClient.load_hexin_names()
     a_codes = []
     for code, name in names.items():

@@ -1,5 +1,11 @@
 # thspypc 开发交接文档（stock_list + 推送采集）
 
+> **2026-07-29 stock_list 纠正**：本文关于“必须重放启动序列”的内容属于历史
+> 调查记录。逐帧活网消减后，最小完整序列为 MAIN 上的一个
+> `DataType=[5],[55]` 请求（FDF 146 字节，线上加换行共 147 字节）。
+> 生产路由是 `ifindhq.123ths.com:8901`，不是 `shlv2/szlv2`。详见
+> [`docs/SERVER_MATRIX.md`](docs/SERVER_MATRIX.md)。
+>
 > 会话日期：2026-07-19 ~ 2026-07-23
 > 项目路径：`D:\code\ths_takehome\thspypc`（GitHub: `djj45/thspypc`，分支 `feat/stock-list-full`）
 > 参考抓包：`D:\code\thspy\captures\cold_start.pcap`（Windows 冷启动，含 dc=7526 全量帧）

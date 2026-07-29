@@ -110,6 +110,7 @@ from .features.snapshot_protocol import (
     parse_snapshot_push,
 )
 from .features.stock_list_protocol import (
+    FULL_STOCK_LIST_MARKETS,
     INIT_C_MODULES,
     INIT_MARKET_CODE,
     INIT_STOCK_LINKS,
@@ -120,6 +121,7 @@ from .features.stock_list_protocol import (
     _parse_stock_list_hd10_variant,
     _parse_stock_list_hd31_variant,
     build_init_query,
+    build_full_stock_list_query,
     build_stock_list_query,
     parse_init_response,
     parse_stock_list_replay,

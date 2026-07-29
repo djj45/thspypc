@@ -9,10 +9,10 @@ thspypc 全市场股票列表（stock_list）测试。
        uv run python tests/test_stock_list.py --offline
    验证 parse_init_response 把 dc=7526 全量帧解出 7524+ 条代码。
 
-2. 活网端到端（需账号）—— 登录后重放请求序列拿全量代码表：
+2. 活网端到端（需账号）—— 登录后用一个 MAIN 请求拿全量代码表：
        uv run python tests/test_stock_list.py
-   默认读 .env 的 THS_USERNAME/THS_PASSWORD。重放 4 个请求段后服务器推送
-   dc≈7422 全量 hd3.1 帧，解码出 ~7400 条代码（600000/600009/...920992）。
+   默认读 .env 的 THS_USERNAME/THS_PASSWORD。发送 DataType=[5],[55] 请求后，
+   解码服务器返回的全量 hd3.1 代码表。
 
 输出：获取的代码总数 + 前/后若干样本 + 前缀分布。
 """
@@ -122,7 +122,7 @@ def load_dotenv():
 
 
 def test_live():
-    """活网端到端：登录 + 重放请求序列 + 解码全量代码表。"""
+    """活网端到端：登录 + 单个 MAIN 请求 + 解码全量代码表。"""
     load_dotenv()
     user = os.environ.get("THS_USERNAME", "").strip()
     pwd = os.environ.get("THS_PASSWORD", "").strip()
@@ -138,7 +138,7 @@ def test_live():
         return 1
     print(f"✓ 登录成功: {r.server}")
 
-    print(f"\n调用 stock_list()（重放请求序列，~30s）...")
+    print("\n调用 stock_list()（MAIN 单请求）...")
     import time
     t0 = time.time()
     with_names = "--with-names" in sys.argv
@@ -162,7 +162,7 @@ def test_live():
             print(f"\n⚠ 数量偏少（{len(stocks)} < 7000，可能服务器未响应全量）")
             rc = 1
     else:
-        print("\n✗ 未获取到代码（重放失败，可能需要换 IP 重试）")
+        print("\n✗ 未获取到代码（服务器未返回全量表，可换 IP 重试）")
         rc = 1
 
     client.disconnect()

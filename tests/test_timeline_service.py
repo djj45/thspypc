@@ -73,6 +73,21 @@ def test_level2_auto_uses_market_specific_role_and_pageid_4214():
     )
 
 
+def test_level2_index_market_codes_use_their_market_l2_roles():
+    assert select_timeline_plan(
+        LEVEL2_PROFILE,
+        16,
+    ).role is ConnectionRole.SH_L2
+    assert select_timeline_plan(
+        LEVEL2_PROFILE,
+        32,
+    ).role is ConnectionRole.SZ_L2
+    assert select_timeline_plan(
+        LEVEL2_PROFILE,
+        144,
+    ).role is ConnectionRole.SH_L2
+
+
 def test_level2_account_can_force_basic_for_protocol_comparison():
     plan = select_timeline_plan(LEVEL2_PROFILE, 33, mode="basic")
 
@@ -222,7 +237,12 @@ def test_level2_history_uses_market_role_and_matches_compressed_response(
     expected = [{"bar_index": 132_477_534, "dt10": 33.88}]
     monkeypatch.setattr(
         "thspypc.services.timeline.parse_history_timeline_response",
-        lambda _body, code: expected if code == "000938" else [],
+        lambda _body, code, requested_codes: (
+            expected
+            if code == "000938"
+            and requested_codes == ("399002", "000938")
+            else []
+        ),
     )
 
     result = service.history_timeline(
@@ -299,7 +319,7 @@ def test_level2_history_distinguishes_unsafe_state_variant(monkeypatch):
     )
     monkeypatch.setattr(
         "thspypc.services.timeline.parse_history_timeline_response",
-        lambda _body, code: [],
+        lambda _body, code, requested_codes: [],
     )
 
     with pytest.raises(ProtocolError):

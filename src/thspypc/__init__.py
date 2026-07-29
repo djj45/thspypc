@@ -63,7 +63,8 @@ from .protocol import (
     build_market_snapshot_query, MARKET_SNAPSHOT_MARKETS, MARKET_SNAPSHOT_DATATYPE,
 
     # 股票列表（全市场代码表）
-    build_stock_list_query, parse_stock_list_response, STOCK_LIST_DATATYPE,
+    build_full_stock_list_query, build_stock_list_query,
+    parse_stock_list_response, STOCK_LIST_DATATYPE,
     build_init_query, parse_init_response,
     # 短线精灵（异动）
     build_qurealorder_query, parse_qurealorder_response, read_frame_realorder,
@@ -107,7 +108,8 @@ __all__ = [
     "date_to_timeline_bar", "timeline_bar_to_date",
     "build_market_snapshot_query", "MARKET_SNAPSHOT_MARKETS", "MARKET_SNAPSHOT_DATATYPE",
     "parse_hfd1_response",
-    "build_stock_list_query", "parse_stock_list_response", "STOCK_LIST_DATATYPE",
+    "build_full_stock_list_query", "build_stock_list_query",
+    "parse_stock_list_response", "STOCK_LIST_DATATYPE",
     "build_init_query", "parse_init_response",
     "build_qurealorder_query", "parse_qurealorder_response", "read_frame_realorder",
     "build_subreal_query", "build_subrealorder_query", "parse_pushrealorder_response",

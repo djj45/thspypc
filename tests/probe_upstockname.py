@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-探针脚本：在 stock_list 重放序列末尾追加 upstockname 请求，捕获名称响应帧。
+探针脚本：在 stock_list 最小请求后追加 upstockname 请求，捕获名称响应帧。
 
-关键发现：upstockname 请求必须在 stock_list 重放后、读取响应前发送。
+关键发现：upstockname 请求必须在 stock_list 请求后、读取响应前发送。
 若单独发送或在 stock_list 之后发送，服务器不响应或断连。
 
 用法：
@@ -14,13 +14,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from thspypc.client import THSClient
-from thspypc.protocol import read_frame, parse_init_response
+from thspypc.protocol import (
+    build_full_stock_list_query,
+    parse_init_response,
+    read_frame,
+)
 
 CAPTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "captures_live")
 os.makedirs(CAPTURE_DIR, exist_ok=True)
@@ -76,36 +81,17 @@ def main():
     client.connect()
     print(f"已登录 (instance={client._instance})")
 
-    # ── 加载重放段 ──
-    replay_path = os.path.join(os.path.dirname(__file__), "..",
-                               "src", "thspypc", "data", "stock_list_replay.bin")
-    if not os.path.exists(replay_path):
-        print(f"重放文件不存在: {replay_path}")
-        client._sock.close()
-        return 1
-    with open(replay_path, "rb") as f:
-        data = f.read()
-    n = int.from_bytes(data[:4], "little")
-    off = 4
-    segments = []
-    for _ in range(n):
-        ln = int.from_bytes(data[off:off + 4], "little")
-        off += 4
-        segments.append(data[off:off + ln])
-        off += ln
-    print(f"加载 {n} 个重放段")
+    stock_list_request = build_full_stock_list_query() + b"\n"
 
     # ── 构造 upstockname 请求 ──
     up_req = build_upstockname_request(args.market, args.ver)
     print(f"upstockname 请求 ({len(up_req)}B): {up_req[:120]}...")
 
-    # ── 发送：重放段 + upstockname（都在读取响应之前）──
+    # ── 发送：最小代码表请求 + upstockname（都在读取响应之前）──
     with client._sock_lock:
         sock = client._sock
-        print("发送重放段...")
-        for i, seg in enumerate(segments):
-            sock.sendall(seg)
-            time.sleep(0.3)
+        print(f"发送 stock_list 最小请求（{len(stock_list_request)}B）...")
+        sock.sendall(stock_list_request)
         print("发送 upstockname 请求...")
         sock.sendall(up_req)
 

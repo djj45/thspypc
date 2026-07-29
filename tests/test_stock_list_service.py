@@ -313,7 +313,7 @@ def test_full_list_rejects_invalid_replay_before_sending():
     assert sock.sent == []
 
 
-def test_full_list_loads_packaged_replay_resource(monkeypatch):
+def test_full_list_builds_one_minimum_query(monkeypatch):
     sock = FakeSocket()
     manager = ConnectionManager(
         _profile(AccountKind.STANDARD),
@@ -337,9 +337,41 @@ def test_full_list_loads_packaged_replay_resource(monkeypatch):
     )
 
     assert service.full_list(settle_timeout=0) == expected
-    assert [len(segment) for segment in sock.sent] == [
-        10690,
-        5468,
-        8223,
-        2839,
-    ]
+    assert len(sock.sent) == 1
+    assert len(sock.sent[0]) == 147
+    assert b"DataType=[5],[55]" in sock.sent[0]
+    assert manager.peek(ConnectionRole.MAIN) is not None
+    assert manager.peek(ConnectionRole.SH_L2) is None
+    assert manager.peek(ConnectionRole.SZ_L2) is None
+
+
+def test_full_list_rebuilds_minimum_query_with_newline_on_every_call(
+    monkeypatch,
+):
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        _profile(AccountKind.STANDARD),
+        lambda _spec: sock,
+    )
+    expected = [{"code": "600000", "name": "", "market": 0}]
+    monkeypatch.setattr(
+        "thspypc.services.stock_list.parse_init_response",
+        lambda _body: {
+            "stocks": expected,
+            "server_info": {},
+            "hd31_frames": [
+                {"pos": 0, "dc": 7479, "unk": 0x18, "hs": 71, "fc": 2}
+            ],
+        },
+    )
+    service = StockListService(
+        manager,
+        frame_reader=lambda _sock: b"full-table",
+        sleep=lambda _delay: None,
+    )
+
+    assert service.full_list(settle_timeout=0) == expected
+    assert service.full_list(settle_timeout=0) == expected
+    assert len(sock.sent) == 2
+    assert all(len(request) == 147 for request in sock.sent)
+    assert all(request.endswith(b"\n") for request in sock.sent)

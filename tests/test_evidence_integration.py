@@ -225,7 +225,13 @@ def test_successful_l2_services_promote_only_observed_features(
     )
     monkeypatch.setattr(
         "thspypc.services.timeline.parse_history_timeline_response",
-        lambda _body, code: [{"code": code, "dt10": 12.2}],
+        lambda _body, code, requested_codes: [
+            {
+                "code": code,
+                "requested_codes": requested_codes,
+                "dt10": 12.2,
+            }
+        ],
     )
 
     timeline.timeline("000938", market=33)

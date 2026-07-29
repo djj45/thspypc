@@ -40,6 +40,7 @@ from .protocol import (
     build_depth_quote_query,
     build_passport64,
     build_qurealorder_query,
+    build_full_stock_list_query,
     build_stock_list_query,
     build_upstockname_request,
     build_history_timeline_query,
@@ -902,7 +903,7 @@ class THSClient:
         list_quotes 仍正常，故 init 缺失会被 list_quotes 的成功掩盖）。
 
         init 响应是**服务器配置帧**（~49KB，含 S-OS/S-Version/SName 等元数据），
-        不是全量代码表（代码表是 stock_list() 重放序列才触发）。实测稳定返回
+        不是全量代码表（代码表由 stock_list() 的独立单请求触发）。实测稳定返回
         1 帧（多次验证），0.1s 即到达。读完这 1 帧配置即激活行情通道。
         """
         try:
@@ -1788,10 +1789,10 @@ class THSClient:
         大单字段（201-230），对应 hexin 分时图的「大单金额」第二条曲线。
 
         响应若为 ``cmd=0x0a`` 会先解开 8901 字典压缩；指数和个股块再按 241 点
-        ``bar_index`` 序列锚定。服务器偶发返回连 bar 高位也省略的强状态变体，
-        解析器会拒绝错位数据。本方法当前仍是实验接口：请求发送沿用主行情连接，
-        尚未迁移到已实测成功的 ``__manual + 对应市场 L2 服务器 + init`` 通道。
-        ``retries`` 只方便收集不同响应变体，不能代替完整状态机解码。
+        ``bar_index`` 序列锚定。请求固定走已实测成功的
+        ``__manual + 对应市场 L2 服务器 + init`` 通道，并与同一市场上的其他
+        请求/读取严格串行。服务器偶发返回连 bar 高位也省略的强状态变体，
+        解析器只返回可安全验证的点；``retries`` 不能代替完整状态机解码。
 
         Args:
             code: 股票代码（如 ``"000938"``；指数用 ``"1A0002"``）。
@@ -1834,8 +1835,8 @@ class THSClient:
 
         last_err = ""
         for attempt in range(retries + 1):
-            if not self.is_connected:
-                logger.info("history_timeline: 连接不可用，connect（attempt %d/%d）",
+            if self._auth is None:
+                logger.info("history_timeline: 尚未鉴权，connect（attempt %d/%d）",
                             attempt + 1, retries)
                 lr = self.connect()
                 if not lr.success:
@@ -1854,16 +1855,66 @@ class THSClient:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("history_timeline %s %s 失败（attempt %d）: %s",
                                code, date, attempt + 1, last_err)
-                self._drop_connection()
+                from thspypc.protocol import pick_l2_market
+
+                key = pick_l2_market(market)
+                with self._push_lock:
+                    failed = self._push_socks.pop(key, None)
+                    self._push_initialized.discard(key)
+                if failed is not None:
+                    try:
+                        failed.close()
+                    except OSError:
+                        pass
         raise RuntimeError(f"history_timeline {code} {date} 重试 {retries} 次仍失败: {last_err}")
 
     def _history_timeline_once(self, code: str, date, market: int,
                                timeout: float) -> list[dict]:
-        """在当前 8901 连接上发一次历史分时请求并解析响应（单次，不重试）。"""
-        if self._sock is None:
+        """在对应市场的已初始化 L2 连接上执行一次历史分时请求。"""
+        from thspypc.features.history_timeline_protocol import (
+            history_timeline_request_codes,
+        )
+        from thspypc.protocol import pick_l2_market
+
+        if self._auth is None:
             raise RuntimeError("未登录")
+        key = pick_l2_market(market)
+        with self._push_lock:
+            sock = self._push_socks.get(key)
+        if sock is None:
+            # __manual 与主连接共用同一票据/IP 时可能互斥；沿用已验证的
+            # L2 建连路径，但历史查询不发送 4214 当日分时订阅。
+            self._drop_connection()
+            opened = self._open_manual_push_connection(market)
+            if opened is None:
+                raise ConnectionError(f"__manual[{key}] L2 连接建立失败")
+            with self._push_lock:
+                sock = self._push_socks.get(key)
+                if sock is None:
+                    self._push_socks[key] = opened
+                    self._push_initialized.add(key)
+                    sock = opened
+                else:
+                    opened.close()
+        if key not in self._push_initialized:
+            raise ConnectionError(f"__manual[{key}] L2 连接尚未完成 init")
+
         frame = build_history_timeline_query(code, date=date, market=market)
-        with self._market_session.request(frame, timeout=timeout) as sock:
+        requested_codes, _, _ = history_timeline_request_codes(
+            code,
+            market=market,
+        )
+        with self._push_request_locks[key]:
+            sock.settimeout(timeout)
+            try:
+                sock.sendall(frame + b"\n")
+            except OSError as exc:
+                with self._push_lock:
+                    if self._push_socks.get(key) is sock:
+                        self._push_socks.pop(key, None)
+                        self._push_initialized.discard(key)
+                raise ConnectionError(f"历史分时请求发送失败: {exc}") from exc
+
             # 循环读帧，跳过文本/ACK 帧。cmd=0x0a 压缩帧在原始字节中不保证
             # 含字面量 hd1.0，必须先交给历史分时解析器正规化。
             for _ in range(8):
@@ -1876,7 +1927,11 @@ class THSClient:
                     except OSError:
                         raise ConnectionError("连接已关闭")
                     continue
-                recs = parse_history_timeline_response(resp, code=code)
+                recs = parse_history_timeline_response(
+                    resp,
+                    code=code,
+                    requested_codes=requested_codes,
+                )
                 if recs:
                     return recs
                 if b"hd3.1\x00" in resp:
@@ -2073,17 +2128,12 @@ class THSClient:
     ) -> list[dict]:
         """获取全市场股票代码列表（沪深+北交所+新三板+基金，~7400 条）。
 
-        通过重放 hexin 启动序列的关键请求段（subreal×8 + CodeList 1B0987 + init），
-        触发服务器下发全量代码表（dc≈7422, unk=0x18, hs=71 的 hd3.1 帧）。
-        这是 hexin 启动时加载全量代码表的同一机制（冷启动抓包 stream 44 确认）。
-
-        ⚠ 单独发 init 请求**不会**触发全量下发（服务器只返回配置帧）。
-        必须重放完整的 subreal + 特殊 CodeList 订阅序列，服务器才会在登录连接上
-        推送 dc≈7422 的全量 hd3.1 帧。本方法用 ``data/stock_list_replay.bin``
-        里固化的 4 个请求段（提取自 cold_start.pcap stream 44 帧1619/1965/2308/2481）。
+        登录/init 后发送一个 ``DataType=[5],[55]`` 空市场组查询，触发服务器
+        下发全量代码/名称表。主动 A/B 已确认旧抓包里的 153 个 subreal、1B0987、
+        重复 init 和其他查询均非必需。
 
         Args:
-            timeout: 收尾读取的总时长（秒）。重放后服务器陆续推送，需等全量帧到达。
+            timeout: 收尾读取的总时长（秒）。请求后服务器陆续推送，需等全量帧到达。
             with_names: 是否填充中文名称。
                 - False: 不填名称（默认，快）
                 - True: 自动从同花顺本地缓存加载名称（需安装同花顺 PC 客户端）
@@ -2113,33 +2163,16 @@ class THSClient:
                         stock["name"] = name
             return stocks
 
-        # 加载重放段（4 个请求 segment，提取自 cold_start.pcap stream 44）
-        replay_path = os.path.join(os.path.dirname(__file__), "data",
-                                   "stock_list_replay.bin")
-        if not os.path.exists(replay_path):
-            logger.error("stock_list: 重放数据文件不存在 %s", replay_path)
-            return []
-        with open(replay_path, "rb") as f:
-            data = f.read()
-        n = int.from_bytes(data[:4], "little")
-        off = 4
-        segments = []
-        for _ in range(n):
-            ln = int.from_bytes(data[off:off+4], "little")
-            off += 4
-            segments.append(data[off:off+ln])
-            off += ln
+        segments = [build_full_stock_list_query() + b"\n"]
 
         best_stocks: list[dict] = []
         full_dc = 0
-        # 重放期间持锁，并临时禁用心跳避免干扰（如果心跳开着）
+        # 请求及读取期间持锁，避免心跳或其他 MAIN 请求穿插。
         with self._sock_lock:
             sock = self._sock
-            # 发送 4 个请求段（间隔 0.3s 模拟 hexin 节奏）
-            for i, seg in enumerate(segments):
+            for seg in segments:
                 if sock:
                     sock.sendall(seg)
-                time.sleep(0.3)
             # 读响应：短超时轮询，直到 timeout 到或拿到全量帧后再读 3s 确认
             sock.settimeout(2.0)
             t0 = time.time()
@@ -2178,7 +2211,7 @@ class THSClient:
             logger.info("stock_list 获取 %d 条代码（全量帧 dc=%d）",
                         len(best_stocks), full_dc)
         else:
-            logger.warning("stock_list: 重放后未收到全量代码表帧 "
+            logger.warning("stock_list: 请求后未收到全量代码表帧 "
                            "（可能服务器实例未响应，重连换 IP 重试）")
 
         # 可选：从 hexin 本地缓存填充中文名称
