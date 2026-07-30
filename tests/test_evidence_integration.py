@@ -52,7 +52,7 @@ def test_main_login_success_records_basic_access(monkeypatch):
     monkeypatch.setattr(
         client,
         "_probe_fastest_hosts",
-        lambda _hosts, timeout: ["127.0.0.1"],
+        lambda _hosts, timeout=1.0, **_kw: ["127.0.0.1"],
     )
     monkeypatch.setattr(
         client,
@@ -65,7 +65,7 @@ def test_main_login_success_records_basic_access(monkeypatch):
     )
     monkeypatch.setattr(client, "_start_heartbeat", lambda: None)
     monkeypatch.setattr(client, "_send_init_handshake", lambda timeout=2.0: None)
-    monkeypatch.setattr("thspypc.client.save_ip_state", lambda *_args: None)
+    monkeypatch.setattr("thspypc.client.save_ip_state", lambda *_args, **_kw: None)
 
     result = client._do_tcp_login_raw(
         b"login",

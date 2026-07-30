@@ -222,11 +222,11 @@ def test_winner_init_failure_does_not_fallback_to_more_logins(monkeypatch):
     serial_attempts = []
 
     monkeypatch.setattr(client_module, "MARKET_HOSTS", hosts)
-    monkeypatch.setattr(client_module, "save_ip_state", lambda *_args: None)
+    monkeypatch.setattr(client_module, "save_ip_state", lambda *_args, **_kw: None)
     monkeypatch.setattr(
         client,
         "_probe_fastest_hosts",
-        lambda candidates, timeout=1.0: list(candidates),
+        lambda candidates, timeout=1.0, **_kw: list(candidates),
     )
     monkeypatch.setattr(
         client,

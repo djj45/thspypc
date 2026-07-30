@@ -82,9 +82,10 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
     _login_result_type = LoginResult
 
     @staticmethod
-    def _persist_ip_state(sorted_ips: list[str], rr_offset: int) -> None:
+    def _persist_ip_state(sorted_ips: list[str], rr_offset: int,
+                          role: str = "main") -> None:
         """Compatibility hook for persisted host-probe state."""
-        save_ip_state(sorted_ips, rr_offset)
+        save_ip_state(sorted_ips, rr_offset, role=role)
 
     @staticmethod
     def _connection_read_frame(sock) -> bytes:
@@ -180,17 +181,20 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
-        # 测速缓存 + IP 轮换（减少反复 connect 的 login 次数，降低单点登录会话冲突）
-        self._probe_cache: tuple[float, list[str]] | None = None  # (ts, 按延迟排序的IP全表)
+        # 测速缓存 + IP 轮换（减少反复 connect 的 login 次数，降低单点登录会话冲突）。
+        # 按「连接角色」分桶：main/sh/sz 各自独立——shlv2 与 szlv2 是两套 IP 零重叠
+        # 的服务器，测速结果和轮换偏移不能混用。
+        self._probe_cache: dict[str, tuple[float, list[str]]] = {}
         self._PROBE_CACHE_TTL = 300.0        # 测速缓存有效期（秒），5 分钟
-        self._login_rr_offset = 0            # login 轮换偏移（每次 connect 后推进）
+        self._login_rr_offset: dict[str, int] = {"main": 0, "sh": 0, "sz": 0}
         # 从磁盘加载跨进程共享的测速状态 + 轮换偏移（避免每个进程都 offset=0）
         _disk = load_ip_state()
         if _disk is not None:
-            _ips, self._login_rr_offset = _disk
-            self._probe_cache = (time.time(), _ips)
-            logger.debug("从磁盘加载 IP 状态：%d 个 IP，offset=%d",
-                         len(_ips), self._login_rr_offset)
+            for _role, (_ips, _off) in _disk.items():
+                self._login_rr_offset[_role] = _off
+                self._probe_cache[_role] = (time.time(), _ips)
+            logger.debug("从磁盘加载 IP 状态：%s",
+                         {r: len(ips) for r, (ips, _) in _disk.items()})
         self._connection_factory = ConnectionFactory(
             result_type=LoginResult,
             is_connected=lambda: self.is_connected,
@@ -1128,38 +1132,66 @@ def default_ip_state_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".ths_ip_state.json")
 
 
+# 连接治理按角色分桶的角色键。MAIN / 沪市 L2 / 深市 L2 各自独立，
+# 因为 shlv2 与 szlv2 是两套 IP 零重叠的服务器，测速结果和轮换偏移不能混用。
+IP_STATE_ROLES = ("main", "sh", "sz")
+
+
 def save_ip_state(sorted_ips: list[str], rr_offset: int,
-                  path: str | None = None) -> None:
-    """把测速排序结果 + 轮换偏移写盘（跨进程共享）。
+                  role: str = "main", path: str | None = None) -> None:
+    """把测速排序结果 + 轮换偏移写盘（跨进程共享，按角色分桶）。
+
+    磁盘结构（v2，按角色分桶）::
+
+        {"version": 2, "roles": {"main": {"saved_at", "sorted_ips", "rr_offset"},
+                                 "sh": {...}, "sz": {...}}}
+
+    单次调用只更新 ``role`` 对应的那一桶，其它角色的桶原样保留。
 
     Args:
         sorted_ips: 按延迟升序排列的可达 IP 列表。
         rr_offset: 当前轮换偏移。
+        role: 角色键（``main``/``sh``/``sz``）。
         path: 缓存路径，None 用 :func:`default_ip_state_path`。
     """
     path = path or default_ip_state_path()
-    data = {
+    existing: dict = {"version": 2, "roles": {}}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict) and raw.get("version") == 2:
+                roles = raw.get("roles", {})
+                if isinstance(roles, dict):
+                    existing["roles"] = roles
+        except (json.JSONDecodeError, OSError, TypeError):
+            pass
+    existing["roles"][role] = {
         "saved_at": int(time.time()),
         "sorted_ips": sorted_ips,
         "rr_offset": rr_offset,
     }
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+            json.dump(existing, f)
     except OSError as e:
         logger.debug("IP 状态写盘失败（不影响运行）: %s", e)
 
 
 def load_ip_state(path: str | None = None,
-                  max_age: float = 300.0) -> tuple[list[str], int] | None:
-    """读取磁盘缓存的 IP 测速状态（未过期返回，否则 None）。
+                  max_age: float = 300.0) -> dict[str, tuple[list[str], int]] | None:
+    """读取磁盘缓存的 IP 测速状态（按角色分桶，未过期的角色才返回）。
+
+    向后兼容：旧 v1 扁平结构 ``{saved_at, sorted_ips, rr_offset}`` 自动迁移
+    到 ``main`` 桶，其余角色留空（首次测速时填充）。
 
     Args:
         path: 缓存路径，None 用 :func:`default_ip_state_path`。
         max_age: 缓存最大有效期（秒），默认 300（5 分钟，与 _PROBE_CACHE_TTL 一致）。
 
     Returns:
-        ``(sorted_ips, rr_offset)``，文件不存在/过期/损坏返回 None。
+        ``{role: (sorted_ips, rr_offset)}``，仅含未过期的角色；文件不存在/损坏
+        返回 None。返回的 dict 可能只含部分角色（其余已过期或从未测速）。
     """
     path = path or default_ip_state_path()
     if not os.path.exists(path):
@@ -1167,10 +1199,33 @@ def load_ip_state(path: str | None = None,
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        saved_at = data["saved_at"]
-        if time.time() - saved_at > max_age:
-            return None
-        return data["sorted_ips"], data["rr_offset"]
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+    except (json.JSONDecodeError, OSError) as e:
         logger.debug("IP 状态缓存读取失败（将忽略）: %s", e)
         return None
+    now = time.time()
+    roles: dict[str, tuple[list[str], int]] = {}
+
+    # v2 分桶结构
+    if isinstance(data, dict) and data.get("version") == 2:
+        for role, bucket in (data.get("roles") or {}).items():
+            if not isinstance(bucket, dict):
+                continue
+            try:
+                if now - bucket["saved_at"] > max_age:
+                    continue
+                roles[role] = (list(bucket["sorted_ips"]), int(bucket["rr_offset"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return roles or None
+
+    # v1 扁平结构（向后兼容）→ 迁移到 main 桶
+    try:
+        saved_at = data["saved_at"]
+        if now - saved_at > max_age:
+            return None
+        roles["main"] = (list(data["sorted_ips"]), int(data["rr_offset"]))
+        return roles
+    except (KeyError, TypeError, ValueError) as e:
+        logger.debug("IP 状态缓存（v1）读取失败（将忽略）: %s", e)
+        return None
+

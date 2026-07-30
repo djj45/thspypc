@@ -66,7 +66,7 @@ class ConnectionPrimitives:
         # 测速选最快的 IP（复刻同花顺「测试 IP」功能）。
         # 并发 TCP 握手测延迟，选最快的 login，避免盲选到慢 IP（曾 46s 超时）。
         # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
-        sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0)
+        sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0, role="main")
         if sorted_ips:
             # ★ K线坏 IP 黑名单过滤：部分 IP（如 116.63.x.x）不支持大 K线查询，
             # 只返回部分数据或 timeout（实测 §14j）。重连时跳过这些 IP，优先选
@@ -74,7 +74,7 @@ class ConnectionPrimitives:
             good_ips = [ip for ip in sorted_ips if ip not in self._bad_kline_ips]
             pool = good_ips if good_ips else sorted_ips
             n_concurrent = min(7, len(pool))
-            offset = self._login_rr_offset % max(1, len(pool))
+            offset = self._login_rr_offset.get("main", 0) % max(1, len(pool))
             # 环形取 n_concurrent 个（offset 起，绕回）
             batch = (pool[offset:] + pool[:offset])[:n_concurrent]
             skip_note = f"（跳过 {len(self._bad_kline_ips)} 个坏IP）" if self._bad_kline_ips else ""
@@ -88,9 +88,9 @@ class ConnectionPrimitives:
 
         winner = self._concurrent_login(batch, login_body)
         # 推进轮换偏移：下次 connect 用不同的 IP 子集。写盘持久化（跨进程共享）。
-        self._login_rr_offset = (self._login_rr_offset + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
+        self._login_rr_offset["main"] = (self._login_rr_offset.get("main", 0) + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
         if sorted_ips:
-            self._persist_ip_state(sorted_ips, self._login_rr_offset)
+            self._persist_ip_state(sorted_ips, self._login_rr_offset["main"], role="main")
         if winner:
             host, sock, result = winner
             # VerifyCode=0 后若 init 失败，不得在同一次 connect 中继续串行
@@ -295,7 +295,8 @@ class ConnectionPrimitives:
             )
 
     def _probe_fastest_hosts(self, hosts: list[str], timeout: float = 1.0,
-                             use_cache: bool = True) -> list[str]:
+                             use_cache: bool = True,
+                             role: str = "main") -> list[str]:
         """并发 TCP 握手测每个 IP 的延迟，返回**按延迟升序排列的全部可达 IP**。
 
         复刻同花顺客户端「测试 IP」功能的机制（2026-07-23 抓包确认）：并发对多个
@@ -309,27 +310,32 @@ class ConnectionPrimitives:
         connect 时重复测速。缓存命中时秒回。缓存只存按延迟排序的全表，调用方用
         ``_login_rr_offset`` 轮换取 batch（见 :meth:`_do_tcp_login_raw`）。
 
+        **按角色分桶**：``role`` 为 ``main``/``sh``/``sz``，各自独立缓存与持久化
+        ——shlv2 与 szlv2 是两套 IP 零重叠的服务器，测速结果不能混用。
+
         Args:
             hosts: 待测 IP 列表。
             timeout: 单个 TCP 连接超时（秒）。1s 足够区分（最快 28ms，1s 内必回）。
             use_cache: 是否使用缓存（缓存未命中时测速并写入）。
+            role: 连接角色键（``main``/``sh``/``sz``），用于隔离缓存与持久化。
 
         Returns:
             按延迟升序排列的可达 IP 列表（全部，不截断）。全部超时返回空列表。
         """
         # 缓存命中检查（避免反复 connect 重复测速）
-        if use_cache and self._probe_cache:
-            ts, cached = self._probe_cache
+        cached_entry = self._probe_cache.get(role) if use_cache else None
+        if cached_entry is not None:
+            ts, cached = cached_entry
             cache_matches_hosts = set(cached).issubset(set(hosts))
             if (
                 time.time() - ts < self._PROBE_CACHE_TTL
                 and cached
                 and cache_matches_hosts
             ):
-                logger.debug("IP 测速缓存命中（%d 个可达 IP）", len(cached))
+                logger.debug("IP 测速缓存[%s]命中（%d 个可达 IP）", role, len(cached))
                 return cached
             if cached and not cache_matches_hosts:
-                logger.debug("IP 测速缓存与当前 DNS 候选不一致，重新测速")
+                logger.debug("IP 测速缓存[%s]与当前 DNS 候选不一致，重新测速", role)
         results: list[tuple[str, float]] = []  # (ip, rtt_seconds)
         lock = threading.Lock()
 
@@ -356,15 +362,51 @@ class ConnectionPrimitives:
         sorted_ips = [ip for ip, _ in results]  # 全部可达 IP，按延迟升序
         if sorted_ips:
             # 写内存缓存 + 磁盘持久化（跨进程共享，避免每个进程都 offset=0）
-            self._probe_cache = (time.time(), sorted_ips)
-            self._persist_ip_state(sorted_ips, self._login_rr_offset)
-            logger.info("IP 测速完成（%.1fs）：最快 %s=%.0fms，共 %d/%d 个可达",
-                        time.time() - t0,
+            self._probe_cache[role] = (time.time(), sorted_ips)
+            self._persist_ip_state(
+                sorted_ips, self._login_rr_offset.get(role, 0), role=role,
+            )
+            logger.info("IP 测速[%s]完成（%.1fs）：最快 %s=%.0fms，共 %d/%d 个可达",
+                        role, time.time() - t0,
                         sorted_ips[0], results[0][1] * 1000,
                         len(results), len(hosts))
-            logger.debug("测速详情: %s",
+            logger.debug("测速[%s]详情: %s", role,
                          ", ".join(f"{ip}={rtt*1000:.0f}ms" for ip, rtt in results[:7]))
         return sorted_ips
+
+
+    def _rotated_l2_batch(self, sorted_ips: list[str], key: str) -> list[str]:
+        """按角色轮换偏移重排 L2 候选 IP，返回从 offset 起绕回的全表。
+
+        与 MAIN 的 batch 取子集不同，L2 是串行逐个尝试（每个 IP 要 login+init），
+        所以这里返回**完整轮换后的列表**（调用方按序遍历），而非只取前 N 个。
+        偏移按 ``sh``/``sz`` 独立分桶推进（IP 零重叠，不能混用）。
+        """
+        if not sorted_ips:
+            return []
+        offset = self._login_rr_offset.get(key, 0) % len(sorted_ips)
+        return (sorted_ips[offset:] + sorted_ips[:offset])
+
+    def _advance_l2_offset(self, key: str, tried: int, total: int,
+                           *, force_advance: bool = False) -> None:
+        """推进 L2 轮换偏移并持久化（跨进程共享，避免集中撞同一 IP 触发 -1）。
+
+        当遍历完整个 IP 表（``tried == total``）时，``(offset + total) % total``
+        会回到原点——这正是「全失败重连反复打同一批 IP」触发 -1 的根因。此时
+        ``force_advance`` 至少推进 1 位，保证下次连接从不同的起点开始。
+        """
+        if total <= 0:
+            return
+        step = max(1, tried)
+        new_offset = (self._login_rr_offset.get(key, 0) + step) % total
+        if force_advance and new_offset == self._login_rr_offset.get(key, 0) % total:
+            new_offset = (new_offset + 1) % total
+        self._login_rr_offset[key] = new_offset
+        # 持久化当前测速缓存里该角色的全表 + 新偏移（测速缓存可能尚未填充，
+        # 此时只推进内存偏移，下次测速成功后会一并写盘）。
+        cached = self._probe_cache.get(key)
+        if cached is not None:
+            self._persist_ip_state(cached[1], new_offset, role=key)
 
     def _concurrent_login(self, hosts: list[str],
                           login_body: bytes, timeout: float = 12.0):
@@ -569,22 +611,35 @@ class ConnectionPrimitives:
                             key, self._connected_ip)
             else:
                 grouped = resolve_l2_hosts_grouped(self._auth.get("passport_bytes", b""))
-                hosts = list(grouped.get(key, []))
+                candidates = list(grouped.get(key, []))
+                if not candidates:
+                    logger.error("L2: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
+                    return None
+                # 测速排序 + 轮换偏移：与 MAIN 同一套治理逻辑，避免反复建 L2 连接
+                # 时总从同一个最快的 IP 开始打，触发同 IP 重复 login 的 -1 会话冲突。
+                # SH/SZ 各自独立分桶（IP 零重叠）。测速纯 TCP 握手不发 login。
+                probed = self._probe_fastest_hosts(candidates, timeout=1.0, role=key)
+                if probed:
+                    hosts = self._rotated_l2_batch(probed, key)
+                else:
+                    # 测速全超时（网络异常），回退到原始候选 + 轮换偏移
+                    hosts = self._rotated_l2_batch(candidates, key)
                 if self._connected_ip and self._connected_ip in hosts:
                     hosts.remove(self._connected_ip)
                     hosts.insert(0, self._connected_ip)
-                if not hosts:
-                    logger.error("L2: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
-                    return None
 
             logger.info("L2[%s] 推送连接: 候选 %d IP %s，init MarketCode=%s%s",
                         key, len(hosts), hosts[:3], init_market_code,
                         "（skip_init）" if skip_init else "")
             stale = False
+            tried = 0
             for host in hosts:
+                tried += 1
                 result = self._try_open_manual_sock(host, passport64, key,
                                                      init_market_code, skip_init)
                 if result is not None and result != "stale_passport":
+                    # 成功：推进轮换偏移到已尝试的位置，下次从更靠后的 IP 开始。
+                    self._advance_l2_offset(key, tried, len(hosts))
                     return result
                 if result == "stale_passport":
                     # 票据失效，剩余 IP 必然也失败，立即跳出重新鉴权
@@ -593,6 +648,10 @@ class ConnectionPrimitives:
                                 key, host)
                     break
                 logger.info("L2[%s] IP %s 不可用，换下一个", key, host)
+            # 全部尝试过：推进偏移，下次 connect 换一批起点。遍历完整个表时
+            # (offset+total)%total 会回到原点，用 force_advance 至少挪 1 位，
+            # 否则反复全失败重连会一直打同一批 IP 触发 -1 会话冲突。
+            self._advance_l2_offset(key, tried, len(hosts), force_advance=True)
             # ★ 票据失效或全失败：L2 登录对 Passport64 新鲜度敏感——同一票据
             # 被多次使用后服务器会拒（PromptText="通行证有被修改的痕迹"）。主连接
             # 已建立不受影响，但新的 L2 登录会被拒。检测到 stale 或全失败时，
