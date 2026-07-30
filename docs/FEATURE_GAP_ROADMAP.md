@@ -28,7 +28,7 @@
 | 当日分时（普通/L2） | `timeline` | ✅ 完整 | 普通 9354；L2 4214 |
 | 历史分时（普通） | `history_timeline` | ✅ 完整 | MAIN 9355，基础价量额 241 点 |
 | 早盘集合竞价 | `auction` | ✅ 完整 | 普通 current/history + L2 |
-| 尾盘集合竞价 | `closing_auction` | ⚠️ 部分 | 普通 MAIN 9354/9355、L2 当日 4214 已验证；冷启动 PC 抓包已确认 L2 历史 4417 返回 `603118 / 2026-07-24` 的 61 点，同节点完整重放仍只回空 ACK；全端口抓包已排除页面附属 HTTP 预热，当前缺口收敛到 PC `verify3/pwd_login` SID 与库内旧 `verify2` SID 的差异 |
+| 尾盘集合竞价 | `closing_auction` | ✅ 完整 | 普通 MAIN 9354/9355、L2 当日 4214 已验证；L2 历史 4417 沪深两市均端到端打通。沪市 3 秒/tick（≈61 点）、深市 9 秒/tick（≈20-21 点），同一 `build_l2_closing_auction_query` + 解析器无市场分支。深市需连 szlv2 节点（DNS `szlv2.123ths.com`）。早期"深市 ServerCost 拒绝"是探测脚本收帧 bug（误把短确认帧当结果），非协议差异。详见 HANDOFF §7.6。 |
 | 完整日内序列 | `intraday` | ✅ 完整 | 早盘竞价 + 盘中 + 尾盘竞价 |
 | 全市场代码表 | `stock_list` / `stock_list_cached` | ✅ 完整 | ~7400 条，自然日缓存 |
 | 排行榜/涨跌幅榜 | `stock_list_hot` | ✅ 部分 | 按排序字段排，无成交量/成交额榜 |

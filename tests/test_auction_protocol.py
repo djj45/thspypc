@@ -223,6 +223,55 @@ def test_closing_auction_parser_stops_at_timestamp_outside_window():
     assert len(records) == 5
 
 
+def test_closing_auction_parser_handles_sz_9s_stride():
+    """Shenzhen (深市) Level2 historical closing frames use the same hd1.0
+    wire shape as Shanghai (verified on live captures for 000001/000938/300033)
+    but tick at a 9-second cadence (≈20-21 points over 14:57-15:00) instead of
+    Shanghai's 3-second cadence (≈61 points). The parser must decode them with
+    no market-specific branch. Captured frames also carry the 1-byte trailing
+    truncation seen on Shanghai.
+    """
+    from datetime import datetime, timedelta
+
+    field_table = b"".join(
+        bytes((datatype, fmt, 0, 4))
+        for datatype, fmt in (
+            (1, 0x30),
+            (10, 0x70),
+            (49, 0x70),
+            (31, 0x71),
+        )
+    )
+    shell = b"\x16\x00\x01\x00\x11" + b"000001" + b"\x00" * 15
+
+    # 9-second stride: 14:57:00, 14:57:09, ... through 15:00:00.
+    base_dt = datetime(2026, 3, 11, 14, 57, 0)
+    offsets = tuple(range(0, 181, 9))
+    rows = b"".join(
+        struct.pack(
+            "<4I",
+            int((base_dt + timedelta(seconds=s)).timestamp()),
+            0xC0052B70, 0, 0,
+        )
+        for s in offsets
+    )
+    # Mirror the live wire: final record truncated by one byte.
+    truncated_rows = rows[:-1]
+    body = (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", len(offsets), 0x0036, 16, 4)
+        + field_table
+        + shell
+        + truncated_rows
+    )
+
+    records = auction_protocol.parse_closing_auction_response(body)
+
+    assert len(records) == len(offsets)
+    assert records[0]["time"] == base_dt
+    assert records[-1]["time"] == datetime(2026, 3, 11, 15, 0, 0)
+
+
 def test_level2_closing_builders_match_captured_sh_sz_requests():
     cases = [
         (

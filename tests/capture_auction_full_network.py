@@ -5,6 +5,10 @@ delivered on 8901, but an additional session trigger is missing from an
 independent replay.  This capture intentionally includes all TCP ports so the
 trigger can be found.
 
+Use ``--market sz`` to capture a Shenzhen (深市) closing-auction flow instead
+of the default Shanghai (沪市) one; the on-screen guidance and output filename
+adjust accordingly.
+
 Privacy note: close browsers, mail clients, chat clients, and other networked
 applications first.  This pcap can contain plaintext application data.
 """
@@ -48,6 +52,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration", type=int, default=60)
     parser.add_argument("--interface")
+    parser.add_argument(
+        "--market", choices=["sh", "sz"], default="sh",
+        help="which market to capture: sh=Shanghai (603118), sz=Shenzhen (000001)",
+    )
     args = parser.parse_args()
     if not DUMPCAP.exists():
         raise FileNotFoundError(DUMPCAP)
@@ -71,14 +79,16 @@ def main() -> int:
 
     CAPTURE_DIR.mkdir(exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = CAPTURE_DIR / f"auction_full_{stamp}.pcapng"
+    output = CAPTURE_DIR / f"auction_full_{args.market}_{stamp}.pcapng"
+    sample_code = "000001" if args.market == "sz" else "603118"
+    market_name = "Shenzhen (深市)" if args.market == "sz" else "Shanghai (沪市)"
     print()
     print("Before continuing, fully exit Hexin and other networked apps.")
     print("During capture:")
-    print("  1. Start Hexin and log in with the Level2 account.")
-    print("  2. Open 603118 current timeline and wait 3 seconds.")
-    print("  3. Select 2026-07-24 and wait 5 seconds.")
-    print("  4. Move the cursor over 14:57-15:00, then leave it open.")
+    print(f"  1. Start Hexin and log in with the Level2 account.")
+    print(f"  2. Open {sample_code} ({market_name}) current timeline and wait 3 seconds.")
+    print(f"  3. Select a past trading day (e.g. 2026-07-24) and wait 5 seconds.")
+    print(f"  4. Move the cursor over 14:57-15:00 (closing auction), then leave it open.")
     print()
     input("Press Enter to begin the full TCP capture...")
     subprocess.run(

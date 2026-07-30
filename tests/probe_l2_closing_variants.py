@@ -128,24 +128,37 @@ def main() -> int:
             sock.settimeout(3.0)
             frames = []
             try:
-                while len(frames) < 4:
+                while len(frames) < 6:
                     frames.append(read_frame(sock))
             except socket.timeout:
                 pass
             except (ConnectionError, OSError) as exc:
                 print(f"{code} (mkt {market}): socket {type(exc).__name__}: {exc}")
                 continue
+            # Prefer the first frame that actually parses into closing points;
+            # fall back to the first frame carrying an hd table. A bare hd1.0
+            # ack (short ServerCost/subscription frame, common on SZ) must not
+            # shadow the real data frame that follows it.
             info = None
+            chosen_index = -1
             for i, fr in enumerate(frames):
                 inf = analyze(fr)
-                if inf.get("marker"):
+                if inf.get("parsed_pts", 0) and inf.get("marker"):
                     info = inf
-                    (dump / f"{code}_f{i}.bin").write_bytes(fr)
+                    chosen_index = i
                     break
             if info is None:
+                for i, fr in enumerate(frames):
+                    inf = analyze(fr)
+                    if inf.get("marker"):
+                        info = inf
+                        chosen_index = i
+                        break
+            if info is None:
                 info = analyze(frames[0]) if frames else {"size": 0}
-                if frames:
-                    (dump / f"{code}_f0.bin").write_bytes(frames[0])
+                chosen_index = 0
+            if frames:
+                (dump / f"{code}_f{chosen_index}.bin").write_bytes(frames[chosen_index])
             pts = info.get("parsed_pts", 0)
             print(f"{code} (mkt {market}): {len(frames)} reply frame(s); "
                   f"size={info['size']} pts={pts}")
