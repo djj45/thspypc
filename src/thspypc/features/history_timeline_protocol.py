@@ -81,14 +81,6 @@ _HISTORY_TIMELINE_BAR_OFFSETS = tuple(
     + [354]
 )
 _HISTORY_TIMELINE_MIN_ANCHORED_ROWS = 200
-_HISTORY_TIMELINE_STOCK_CORE_FIELDS = [
-    (1, 0x30, 0, 4),
-    (10, 0x70, 0, 4),
-    (13, 0x70, 0, 4),
-    (19, 0x70, 0, 4),
-    (22, 0x70, 0, 4),
-    (23, 0x70, 0, 4),
-]
 
 
 def _date_to_ordinal(value) -> int:
@@ -524,7 +516,7 @@ def parse_history_timeline_response(
 
         next_marker = body.find(b"hd1.0", pos)
         block_end = next_marker if next_marker >= 0 else len(body)
-        if flag in (0x0042, 0x007E):
+        if flag in (0x0042, 0x007E, 0x0082):
             field_table = base + 10
             raw_table = body[
                 field_table : field_table + field_count * 4
@@ -547,8 +539,9 @@ def parse_history_timeline_response(
                 continue
             search_start = field_table + field_count * 4
         else:
-            fields = _HISTORY_TIMELINE_STOCK_CORE_FIELDS
-            search_start = base + 10
+            # Only the table shapes above are supported; a different flag is
+            # not a historical timeline stock/index table.
+            continue
 
         explicit_code = _history_timeline_table_code(
             body,

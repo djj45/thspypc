@@ -22,6 +22,7 @@ from thspypc.features import history_timeline_protocol
 from thspypc.features.history_timeline_protocol import (
     history_timeline_request_codes,
 )
+from thspypc.codecs.compression import normalize_8901_response
 
 
 FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
@@ -81,7 +82,11 @@ def test_stock_history_uses_bar_anchors_instead_of_fixed_physical_rows():
     assert records[0]["dt13"] == 5_494_600
     assert records[0]["dt19"] == 186_157_050
     assert set(records[0]) == {
-        "bar_index", "dt10", "dt13", "dt19", "dt22", "dt23",
+        "bar_index", "dt10", "dt13", "dt19", "dt22", "dt23", "dt54",
+        "dt201", "dt202", "dt203", "dt204",
+        "dt207", "dt208", "dt209", "dt210",
+        "dt223", "dt224", "dt225", "dt226", "dt227", "dt228", "dt229",
+        "dt230",
     }
 
 
@@ -244,7 +249,7 @@ def test_captured_stock_history_matches_thsdk_core_oracle():
     frames = _split_frames(capture.read_bytes())
 
     may13 = parse_history_timeline_response(frames[2], code="000938")
-    assert len(may13) == 240
+    assert len(may13) == 241
     assert (may13[0]["dt10"], may13[0]["dt13"], may13[0]["dt19"]) == (
         30.60, 1_115_400, 34_131_240,
     )
@@ -291,7 +296,7 @@ def test_companion_replacement_capture_identifies_000001():
     )
 
     # 这是强状态省略变体，只对可安全锚定的 225 点作断言。
-    assert len(records) == 225
+    assert len(records) == 241
     assert records[0] == {
         "bar_index": 132_477_534,
         "dt10": 11.14,
@@ -299,6 +304,23 @@ def test_companion_replacement_capture_identifies_000001():
         "dt19": 4_246_568,
         "dt22": 6_402_300,
         "dt23": 12_620_888,
+        "dt54": 0.0,
+        "dt201": 0.0,
+        "dt202": 0.0,
+        "dt203": 109_700.0,
+        "dt204": 65_200.0,
+        "dt207": 0.0,
+        "dt208": 0.0,
+        "dt209": 0.0,
+        "dt210": 31_000.0,
+        "dt223": 0.0,
+        "dt224": 0.0,
+        "dt225": 1_222_058.0,
+        "dt226": 726_328.0,
+        "dt227": 0.0,
+        "dt228": 0.0,
+        "dt229": 0.0,
+        "dt230": 345_340.0,
     }
 
 
@@ -317,7 +339,7 @@ def test_companion_response_binds_unlabelled_target_table_by_request_order():
         requested_codes=("000001", "000938"),
     )
 
-    assert len(records) == 235
+    assert len(records) == 241
     assert (
         records[0]["dt10"],
         records[0]["dt13"],
@@ -328,3 +350,34 @@ def test_companion_response_binds_unlabelled_target_table_by_request_order():
         records[-1]["dt13"],
         records[-1]["dt19"],
     ) == (32.14, 233_491_610, 7_610_279_300)
+
+
+def test_companion_capture_normalizes_to_native_oracle_bytes():
+    """Pinned against hexin.exe's own outer normalizer (DMP emulation).
+
+    The Python port historically copied ``count - 1`` bytes per long match;
+    the native loop copies ``count`` bytes.  That off-by-one lost bytes from
+    record streams containing long matches, which misaligned the 0x0082 rows
+    and was previously misdiagnosed as a "strong-state omission codec".
+    """
+    capture = (
+        Path(__file__).resolve().parents[1]
+        / "captures_live"
+        / "history_companion_000001_000938_20260514_20260728_174530.bin"
+    )
+    if not capture.exists():
+        pytest.skip("missing 000001 companion replacement capture")
+
+    normalized = normalize_8901_response(capture.read_bytes())
+
+    assert len(normalized) == 45_201
+    assert hashlib.sha256(normalized).hexdigest() == (
+        "7847044c900d52704465ec9dffc4f0d5"
+        "8c12d1729d35b93e4b47e6c38a2c1c76"
+    )
+    offsets = [
+        index
+        for index in range(len(normalized))
+        if normalized[index : index + 6] == b"hd1.0\x00"
+    ]
+    assert offsets == [0x8D, 0x5821, 0xAFB5, 0xB025]

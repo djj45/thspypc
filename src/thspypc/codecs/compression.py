@@ -152,7 +152,12 @@ def normalize_8901_response(body: bytes) -> bytes:
         reference_pos = reference + 12
         while True:
             count = read_source_byte()
-            for _ in range(max(0, count - 1)):
+            # Native loop (hexin.exe RVA 0xf74260) copies `count` bytes: the
+            # x86 body is `dec edx; cmp/jae; copy; test edx; jne`, which lets
+            # the edx==0 iteration copy once more.  A `count-1` port loses one
+            # byte per long match and silently misaligns record streams that
+            # contain long matches (e.g. 4417 historical timelines).
+            for _ in range(max(0, count)):
                 if output_pos >= expected_size:
                     break
                 append_reference(reference_pos)
