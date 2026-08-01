@@ -51,6 +51,7 @@ except (AttributeError, ValueError):
 from thspypc.protocol import (  # noqa: E402
     date_to_normal_timeline_bar,
     date_to_timeline_bar,
+    normalize_8901_response,
     normal_timeline_bar_to_date,
     parse_history_timeline_response,
     timeline_bar_to_date,
@@ -183,14 +184,17 @@ def _parse_request(frame_body):
     return info
 
 
-def _date_of_bar_start(bar_start: int) -> str:
+def _date_of_bar_start(bar_start: int, pageid: str | None) -> str:
+    """按 pageid 选解码器还原日期。
+
+    2026-08-01 抓包修正：4417（L2）与 9354/9355 全部使用 packed-date 游标
+    （normal_timeline_bar_to_date）。旧 ordinal 解码会把 07-23 误标成
+    07-26、06-30 误标成 07-01（两者在 05-13/14 等日期巧合一致）。
+    """
     try:
-        return timeline_bar_to_date(bar_start).date().isoformat()
+        return normal_timeline_bar_to_date(bar_start).date().isoformat()
     except Exception:
-        try:
-            return normal_timeline_bar_to_date(bar_start).date().isoformat()
-        except Exception:
-            return f"bar#{bar_start}"
+        return f"bar#{bar_start}"
 
 
 def _dt54_raw_scan(frame_body, records):
@@ -199,26 +203,53 @@ def _dt54_raw_scan(frame_body, records):
     前提：parse_history_timeline_response 已成功；行首 = dt1(bar_index) u32，
     字段表按 4 字节/项排列，dt54 的列序号 = 其在字段表中的位置。
     """
-    if not records or b"hd1.0\x00" not in frame_body:
+    if not records:
         return None
-    idx = frame_body.find(b"hd1.0\x00")
-    header = struct.unpack("<IHHH", frame_body[idx + 6: idx + 16])
-    field_count = header[3]
-    table_start = idx + 16
-    fields = []
-    for i in range(field_count):
-        off = table_start + i * 4
-        fields.append(frame_body[off])
-    if 54 not in fields:
+    if frame_body.startswith(b"\x0a"):
+        try:
+            frame_body = normalize_8901_response(frame_body)
+        except ValueError:
+            return None
+    # L2 混合响应里 0x007E（基准，无 dt54）在前、0x0082（目标股，含 dt54）在后，
+    # 必须逐表找含 dt54 的那张，并把 bar 搜索限定在该表区间内。
+    col = None
+    table_region = None
+    pos = 0
+    while True:
+        idx = frame_body.find(b"hd1.0", pos)
+        if idx < 0:
+            return None
+        pos = idx + 6
+        if pos + 10 > len(frame_body):
+            continue
+        header = struct.unpack("<IHHH", frame_body[pos: pos + 10])
+        field_count = header[3]
+        if not 0 < field_count <= 50:
+            continue
+        table_start = pos + 10
+        fields = [
+            frame_body[table_start + i * 4]
+            for i in range(field_count)
+        ]
+        if 54 not in fields:
+            continue
+        next_marker = frame_body.find(b"hd1.0", pos)
+        col = fields.index(54)
+        table_region = (idx, next_marker if next_marker >= 0 else len(frame_body))
+        break
+    if col is None or table_region is None:
         return None
-    col = fields.index(54)
-    row_size = header[2]
+    region_start, region_end = table_region
     samples = []
     for rec in records[:3] + records[-2:]:
         bar = rec.get("bar_index")
         if bar is None:
             continue
-        pos = frame_body.find(struct.pack("<I", bar & 0xFFFFFFFF))
+        pos = frame_body.find(
+            struct.pack("<I", bar & 0xFFFFFFFF),
+            region_start,
+            region_end,
+        )
         if pos < 0:
             continue
         raw = struct.unpack("<I", frame_body[pos + col * 4: pos + col * 4 + 4])[0]
@@ -252,7 +283,7 @@ def analyze(pcap_path):
                 continue
             if arg1 == 0:
                 continue  # 当日分时 DateTime=8192(0-0)，不是历史
-            date_str = _date_of_bar_start(arg1)
+            date_str = _date_of_bar_start(arg1, parsed.get("pageid"))
             for code in parsed.get("codes", []):
                 found.setdefault((code, date_str), []).append((parsed, sframes))
 
@@ -270,16 +301,24 @@ def analyze(pcap_path):
     for (code, date_str), pairs in found.items():
         if date_str not in TARGET_DATES:
             continue
+        expected_bar = date_to_normal_timeline_bar(date_str)
         for req, sframes in pairs[:1]:
             for sf in sframes:
-                if b"hd1.0\x00" not in sf:
+                is_candidate = (
+                    sf.startswith(b"\x0a")
+                    or b"hd1.0\x00" in sf
+                    or b"hd3.1\x00" in sf
+                )
+                if not is_candidate:
                     continue
                 try:
                     recs = parse_history_timeline_response(sf, code=code)
                 except Exception as exc:
                     print(f"  ✗ {code} {date_str}: 解析失败 {exc}")
                     continue
-                if not recs:
+                # 内容寻址配对：只认首行 bar 等于该日期 packed 游标的响应，
+                # 避免同流多日期响应互相串绑。
+                if not recs or recs[0]["bar_index"] != expected_bar:
                     continue
                 dumped.setdefault((code, date_str), []).append(sf)
                 first, last = recs[0], recs[-1]

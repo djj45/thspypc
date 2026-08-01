@@ -138,9 +138,11 @@ def test_stock_history_query_matches_captured_three_part_request():
 
 
 def test_sh_stock_history_query_matches_captured_market_routes():
+    # 抓包实测值 132629086 = packed-date(2026-07-24)。
+    # 旧标签“07-27”是导航当天，实际请求的是按 ← 后的上一交易日 07-24。
     frame = build_history_timeline_query(
         "603118",
-        date="2026-07-27",
+        date="2026-07-24",
         market=17,
         benchmark_market=16,
         benchmark_code="1A0002",
@@ -299,7 +301,11 @@ def test_captured_history_dump_dates_four_day_regression(code, date_part, path):
     if not path.exists():
         pytest.skip("本机缺少该历史分时抓包样本")
 
-    frames = _split_frames(path.read_bytes())
+    data = path.read_bytes()
+    if data.startswith(b"\x0a"):
+        frames = [data]  # 裸压缩帧（单帧样本文件）
+    else:
+        frames = _split_frames(data)
     records = None
     for frame in frames:
         try:

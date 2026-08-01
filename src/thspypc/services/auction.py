@@ -53,7 +53,7 @@ def _build_l2_history_auction_bundle(
         raise ValueError(f"历史集合竞价暂不支持市场码: {market}")
     history = build_history_timeline_query(
         code,
-        date=_next_l2_auction_context_date(trade_date),
+        date=trade_date,
         market=market,
         benchmark_market=benchmark[0],
         benchmark_code=benchmark[1],
@@ -76,22 +76,6 @@ def _build_l2_history_auction_bundle(
     # the final LF; retain the two inter-frame delimiters that separate the
     # three pipelined requests in the PC capture.
     return b"\n".join((history, closing, opening))
-
-
-def _next_l2_auction_context_date(value) -> date:
-    """Return the page-4417 context cursor used before auction companions.
-
-    The PC client anchors the context to the next weekday while the two
-    companion auction requests retain the requested trading date.
-    """
-    if isinstance(value, str):
-        value = date.fromisoformat(value)
-    elif isinstance(value, datetime):
-        value = value.date()
-    candidate = value + timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
 
 
 class AuctionService:

@@ -81,6 +81,12 @@ _HISTORY_TIMELINE_BAR_OFFSETS = tuple(
     + [354]
 )
 _HISTORY_TIMELINE_MIN_ANCHORED_ROWS = 200
+# 普通账号（0x0042）稀疏历史分时响应实测只有 185-202 行/日
+# （2026-06-30/07-23 抓包），合并多张表后按 120 行判定。
+_HISTORY_TIMELINE_NORMAL_MIN_ROWS = 120
+# 稀疏响应单张表可能只含几十行（普通账号 9355 会把一天拆成多张 0x42 表），
+# 先按 ≥10 行收集，合并后再用 _HISTORY_TIMELINE_MIN_ANCHORED_ROWS 判定。
+_HISTORY_TIMELINE_MIN_TABLE_ROWS = 10
 
 
 def _date_to_ordinal(value) -> int:
@@ -96,7 +102,16 @@ def _date_to_ordinal(value) -> int:
 
 
 def date_to_timeline_bar(value) -> int:
-    """Convert a trading date to the historical timeline's first bar index."""
+    """Convert a trading date to the historical timeline's first bar index.
+
+    本函数保留 ordinal 游标（竞价 4417 上下文预热用，测试钉死
+    ordinal(下一交易日) 语义）。**历史分时请求本身用 packed-date 游标**，
+    :func:`build_history_timeline_query` 内部显式调用
+    :func:`date_to_normal_timeline_bar`。
+
+    2026-08-01 抓包证据：07-23 的 4417/9355 请求都是 ``132627038``
+    （= packed(07-23)；ordinal 会解成 07-26），响应行 241 点与该日期逐值一致。
+    """
     ordinal = (
         value.toordinal()
         if hasattr(value, "toordinal") and not isinstance(value, int)
@@ -119,9 +134,10 @@ def timeline_bar_to_date(bar_start: int) -> datetime:
 def date_to_normal_timeline_bar(value) -> int:
     """Encode a date using the normal-account packed-date cursor.
 
-    ``pageid=9355`` stores ``year-1900`` in the high bits, month in five
-    bits, and day in the low five bits before applying the common intraday
-    scale.  This differs from the ordinal cursor used by ``pageid=4417``.
+    2026-08-01 抓包确认 L2（4417）与普通（9355）**历史分时**都用本
+    packed-date 游标（``build_history_timeline_query`` 内部调用本函数）；
+    旧文档“4417 历史分时用 ordinal 游标”作废。ordinal 仅保留给竞价 4417
+    上下文预热（见 :func:`date_to_timeline_bar`）。
     """
     if isinstance(value, str):
         compact = value.replace("-", "").replace("/", "")
@@ -192,7 +208,7 @@ def build_history_timeline_query(
 ) -> bytes:
     """Build the nested pageid=4417 historical timeline request."""
     if date is not None:
-        bar_start = date_to_timeline_bar(date)
+        bar_start = date_to_normal_timeline_bar(date)
     if bar_start is None:
         raise ValueError("必须传 bar_start 或 date 之一")
     if datatype is None:
@@ -415,21 +431,26 @@ def _history_timeline_row_anchors(
     block_end: int,
     record_size: int,
 ) -> list[tuple[int, int]]:
-    """Recover physical rows using their on-wire bar-index anchors."""
+    """Recover physical rows using their on-wire bar-index anchors.
+
+    The normal-account (0x0042) sparse responses store row segments out of
+    chronological order inside one decompressed body, so each expected bar
+    is searched across the whole table block rather than only forward from
+    the previously anchored row.
+    """
     first_bar = struct.unpack_from("<I", body, first_row)[0]
     rows = [(first_row, first_bar)]
-    previous_offset = first_row
+    search_start = first_row + max(4, record_size - 4)
     for delta in _HISTORY_TIMELINE_BAR_OFFSETS[1:]:
         expected_bar = first_bar + delta
         offset = body.find(
             struct.pack("<I", expected_bar),
-            previous_offset + max(4, record_size - 4),
+            search_start,
             block_end,
         )
         if offset < 0 or offset + record_size > block_end:
             continue
         rows.append((offset, expected_bar))
-        previous_offset = offset
     return rows
 
 
@@ -484,10 +505,17 @@ def parse_history_timeline_response(
     requested = tuple(requested_codes or ())
     table_index = 0
     pos = 0
+    candidates: list[
+        tuple[
+            tuple[tuple[int, int, int, int], ...],
+            list[tuple[int, int]],
+            bool,
+        ]
+    ] = []
     while True:
         marker = body.find(b"hd1.0", pos)
         if marker < 0:
-            return []
+            break
         pos = marker + 6
         base = marker + 6
         if base + 10 > len(body):
@@ -569,8 +597,30 @@ def parse_history_timeline_response(
         rows = _history_timeline_row_anchors(
             body, first_row, block_end, record_size
         )
-        if len(rows) < _HISTORY_TIMELINE_MIN_ANCHORED_ROWS:
+        if len(rows) < _HISTORY_TIMELINE_MIN_TABLE_ROWS:
             continue
-        return _decode_history_timeline_rows(
-            body, rows, fields, record_size
-        )
+        candidates.append((tuple(fields), rows, level2_table))
+
+    if not candidates:
+        return []
+
+    # 稀疏响应会把同一代码/同一日期的行拆到多张 0x42 表里（行段乱序），
+    # 合并后再统一解码；不同形状（普通 vs Level2）的表不合并。
+    merged: dict[int, tuple[int, tuple]] = {}
+    any_level2 = False
+    for fields, rows, is_level2 in candidates:
+        any_level2 = any_level2 or is_level2
+        for row_offset, bar_index in rows:
+            merged.setdefault(bar_index, (row_offset, fields))
+    min_rows = (
+        _HISTORY_TIMELINE_MIN_ANCHORED_ROWS
+        if any_level2
+        else _HISTORY_TIMELINE_NORMAL_MIN_ROWS
+    )
+    if len(merged) < min_rows:
+        return []
+
+    ordered = sorted(merged.items())
+    fields, first_offset = ordered[0][1][1], ordered[0][1][0]
+    rows_out = [(offset, bar_index) for bar_index, (offset, _f) in ordered]
+    return _decode_history_timeline_rows(body, rows_out, fields, record_size)
