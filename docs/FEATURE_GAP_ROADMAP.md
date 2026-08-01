@@ -118,15 +118,24 @@ PC 版左侧导航的核心功能，当前 `blocks.py` 只覆盖**自定义**板
   `board_constituents`。
 - 活网验证脚本：`tests/verify_board_online.py`（四接口，`--env normal` 换账号）。
 
-**活网验证待解（2026-08-01 15:xx 会话保护窗口）**：双账号 fu4 login 均
-VerifyCode=0，但发送引导帧后服务器**主动 FIN**（个别网关单帧存活、第二帧即
-断；多帧突发必断）。同日 13:23 抓包时同一批 IP/网关正常响应，差异非帧内容
-（已逐字节核对）。当前判定为**账号会话保护**（今天已对该账号做大量 login
-探测；`PromptText=-300`/`-1` 间歇出现，符合 HANDOFF 记录的「同一 Passport64
-短时重复登录触发服务器保护」），需冷却后重跑 `verify_board_online.py`。若
-冷却后仍断连，下一步排查「会话捆绑」：抓包中 hexin 客户端在 10ms 内并开
-7 条连接（main/shlv2/szlv2/fu4…），fu4 可能要求账号其他通道先建（probe:
-`tests/_probe_board_bundle.py`）。
+**活网验证待解（2026-08-01 晚间复核）**：冷却数小时、各种身份/时序/捆绑组合
+均失败，fu4 侧会话拒绝已确认（帧内容逐字节核对无差异）：
+
+- 双账号 MAIN 行情正常（如 `timeline("000938")` 仍 241 点）——账号未全局受限。
+- fu4 login 各种身份均可 VerifyCode=0（L2 账号三种壳全 0；普通账号
+  `__manual`/无用户名间歇 `PromptText=-6`、`thsuser` 通过——已为
+  `_open_board_channel` 加 **BOARD→STANDARD→MANUAL 登录壳降级链**）。
+- 但 login 后发送任意引导帧（subreal/pageid/MKT_INIT/qureal/[5],[55]/
+  StockNameVer），服务器要么零响应、要么多帧突发时先回孤立 `\n` 再 FIN；
+  抓包旧票据 + 原样帧 + 原时序的「完美重放」同样失败。
+- 并发捆绑（main/shlv2/szlv2/fu4 四通道独立新票据同时登录，四者全
+  VerifyCode=0）后 fu4 引导仍被 FIN（probe: `tests/_probe_board_bundle_fresh.py`）。
+
+判定：fu4 侧对该账号/设备存在**会话级拒绝**（今日大量 fu4 login 探测触发，
+与 HANDOFF 记载的 Passport64 复用保护同族；MAIN 通道不受影响）。需等待更
+长冷却（建议隔天），或先在真实 hexin 客户端里重新打开板块页刷新会话状态
+后重跑 `tests/verify_board_online.py`。协议侧已无未覆盖变量（登录壳、引导
+帧、时序、会话捆绑均已逐项复刻）。
 
 ### 2. Level2 深度行情与逐笔数据
 

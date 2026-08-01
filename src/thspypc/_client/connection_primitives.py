@@ -808,16 +808,21 @@ class ConnectionPrimitives:
         if self._auth is None:
             self.authenticate()
 
-        def _try_round(material, allow_refresh: bool):
-            """用给定票据登录 fu4 + 引导；全失败/引导无响应时可选重新鉴权。"""
+        def _try_round(material, allow_refresh: bool, identities=None):
+            """用给定票据登录 fu4 + 引导；全失败/引导无响应时可选重新鉴权。
+
+            ``identities`` 按序尝试登录壳：2026-08-01 实测 fu4 服务器对普通
+            账号的 __manual 壳偶发 PromptText=-6 拒绝、thsuser 壳通过，
+            因此保留降级链（BOARD → STANDARD → MANUAL）。
+            """
             profile = material.profile
             passport64 = material.passport64
-            login_body = build_login_body(
-                passport64,
-                self.mac64,
-                identity=LoginIdentity.BOARD,
-                profile=profile,
-            )
+            if identities is None:
+                identities = (
+                    LoginIdentity.BOARD,
+                    LoginIdentity.STANDARD,
+                    LoginIdentity.MANUAL,
+                )
             level2 = profile.supports_manual_identity
             hosts = resolve_fu4_hosts(material.passport_bytes)
             if not hosts:
@@ -833,31 +838,63 @@ class ConnectionPrimitives:
             logger.info("板块通道：并发登录 %d 个 fu4 IP（offset=%d）: %s",
                         len(batch), offset, batch[:3])
 
-            winner = self._concurrent_login(
-                batch, login_body, timeout=min(timeout, 12.0)
-            )
-            tried = len(batch)
+            winner = None
+            tried = 0
+            for identity in identities:
+                login_body = build_login_body(
+                    passport64,
+                    self.mac64,
+                    identity=identity,
+                    profile=profile,
+                )
+                winner = self._concurrent_login(
+                    batch, login_body, timeout=min(timeout, 12.0)
+                )
+                tried = len(batch)
+                if winner is not None:
+                    break
+                logger.info("板块通道：登录壳 %s 全 IP 失败，降级下一壳",
+                            identity.value)
             if winner is None:
                 # 串行 fallback：补齐测速外的 IP（与 MAIN 同策略）
                 fallback = [h for h in candidates if h not in set(batch)]
                 for host in fallback:
-                    tried += 1
-                    try:
-                        sock = socket.create_connection(
-                            (host, MARKET_PORT), timeout=min(timeout, 15.0)
-                        )
-                        sock.sendall(encode_frame(login_body) + b"\n")
-                        sock.settimeout(min(timeout, 8.0))
-                        resp_body = self._connection_read_frame(sock)
-                        result = self._parse_connection_login_response(resp_body)
-                        if result.get("VerifyCode") == "0":
-                            winner = (host, sock, result)
+                    for identity in identities:
+                        tried += 1
+                        try:
+                            sock = socket.create_connection(
+                                (host, MARKET_PORT), timeout=min(timeout, 15.0)
+                            )
+                        except (socket.timeout, ConnectionError, OSError):
+                            continue
+                        try:
+                            login_body = build_login_body(
+                                passport64,
+                                self.mac64,
+                                identity=identity,
+                                profile=profile,
+                            )
+                            try:
+                                sock.sendall(encode_frame(login_body) + b"\n")
+                                sock.settimeout(min(timeout, 8.0))
+                                resp_body = self._connection_read_frame(sock)
+                                result = self._parse_connection_login_response(
+                                    resp_body
+                                )
+                                if result.get("VerifyCode") == "0":
+                                    winner = (host, sock, result)
+                                    break
+                            except (socket.timeout, OSError, ValueError):
+                                try:
+                                    sock.close()
+                                except OSError:
+                                    pass
+                        except (socket.timeout, ConnectionError, OSError):
+                            continue
+                        if winner is not None:
                             break
-                        sock.close()
-                    except (socket.timeout, ConnectionError, OSError):
-                        continue
-                    except ValueError:
-                        continue
+                    if winner is not None:
+                        break
             self._login_rr_offset["board"] = (
                 self._login_rr_offset.get("board", 0) + max(1, tried)
             ) % max(1, len(candidates))
