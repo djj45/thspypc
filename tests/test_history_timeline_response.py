@@ -267,6 +267,57 @@ def test_captured_stock_history_matches_thsdk_core_oracle():
     )
 
 
+def _history_date_dump_cases():
+    """扫描 captures_live 下 history_<code>_<yyyymmdd>_*.bin 样本。"""
+    captures = (
+        Path(__file__).resolve().parents[1]
+        / "captures_live"
+    )
+    if not captures.is_dir():
+        return []
+    cases = []
+    for path in sorted(captures.glob("history_*_20??????_*.bin")):
+        name = path.stem  # history_000938_20260630_20260801_...
+        parts = name.split("_")
+        if len(parts) < 3:
+            continue
+        code = parts[1]
+        date_part = parts[2]
+        if not (code.isdigit() and len(code) == 6 and date_part.isdigit()):
+            continue
+        cases.append((code, date_part, path))
+    return cases
+
+
+@pytest.mark.parametrize(
+    "code,date_part,path",
+    _history_date_dump_cases(),
+    ids=[f"{c}-{d}" for c, d, _ in _history_date_dump_cases()],
+)
+def test_captured_history_dump_dates_four_day_regression(code, date_part, path):
+    """四日期离线回归：新抓的 06-30/07-23 样本放入 captures_live 即自动生效。"""
+    if not path.exists():
+        pytest.skip("本机缺少该历史分时抓包样本")
+
+    frames = _split_frames(path.read_bytes())
+    records = None
+    for frame in frames:
+        try:
+            candidate = parse_history_timeline_response(frame, code=code)
+        except Exception:
+            continue
+        if len(candidate) == 241:
+            records = candidate
+            break
+
+    assert records is not None, f"{path.name}: 未从样本解出 241 点"
+    assert records[0]["dt10"] is not None
+    assert records[0]["dt13"] is not None
+    assert records[0]["dt19"] is not None
+    assert "dt54" in records[0]
+    assert records[0]["bar_index"] is not None
+
+
 def test_strong_state_omission_variant_is_rejected_not_misparsed():
     capture = (
         Path(__file__).resolve().parents[1]
