@@ -15,8 +15,10 @@ from thspypc.features.system_blocks_protocol import (  # noqa: E402
     BOARD_CONSTITUENT_DATATYPE_L2,
     BOARD_HISTORY_DATATYPE,
     BOARD_QUOTE_DATATYPE,
+    BOARD_QUOTE_DATATYPE_L2,
     PAGEID_BOARD_HISTORY,
     PAGEID_BOARD_LIST,
+    PAGEID_BOARD_LIST_L2,
     PAGEID_BOARD_TL,
     build_board_auction_query,
     build_board_constituents_query,
@@ -33,11 +35,16 @@ from thspypc.features.history_timeline_protocol import (
     date_to_normal_timeline_bar,
     normal_timeline_bar_to_date,
 )
+from thspypc.protocol import parse_kline_hd3_response
 import thspypc.features.system_blocks_protocol as board_protocol
 
 
 def _sample(name: str) -> Path:
     return Path(__file__).resolve().parents[1] / "captures_live" / name
+
+
+def _fixture(name: str) -> Path:
+    return Path(__file__).resolve().parent / "fixtures" / "board" / name
 
 
 def test_board_history_date_cursor_matches_captured_sample():
@@ -67,6 +74,34 @@ def test_build_board_list_query_shape():
     assert "CodeList=48(881101,885480,);" in text
     assert f"pageid={PAGEID_BOARD_LIST}" in text
     assert "DataType=48,592890,10,6,66," in text
+    # 2026-08-02 抓包：前缀 route=0x006C、查询 route=0x016C、seq=0x01C4、
+    # 查询子帧无 history flag（字节 17=0x00）、LackTime 全 0。
+    # 旧形态（0x0039/0x0139 + history flag + LackTime=0,3,…）服务端不回复。
+    assert body[11:13] == b"\x6c\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 10: query_offset + 12] == b"\x6c\x01"
+    assert body[query_offset + 17] == 0x00
+    assert body[query_offset + 4: query_offset + 6] == b"\xc4\x01"
+    assert "LackTime=0,0,0,0,0,0,0,0" in text
+    assert body.endswith(b"\r")
+
+
+def test_build_board_list_query_l2_shape():
+    frame = build_board_list_query(["881101", "885480"], level2=True)
+    body = frame[12:]
+    text = body.decode("gbk", errors="replace")
+    assert "CodeList=48(881101,885480,);" in text
+    assert f"pageid={PAGEID_BOARD_LIST_L2}" in text
+    assert "DataType=" + ",".join(map(str, BOARD_QUOTE_DATATYPE_L2)) in text
+    # 2026-08-02 抓包：L2 前缀 route=0x0052、查询 route=0x0152、seq=0x0068。
+    assert body[11:13] == b"\x52\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 10: query_offset + 12] == b"\x52\x01"
+    assert body[query_offset + 17] == 0x00
+    assert body[query_offset + 4: query_offset + 6] == b"\x68\x00"
+    assert "LackTime=0,0,0,0,0,0,0,0" in text
 
 
 def test_build_board_constituents_query_groups_markets():
@@ -228,6 +263,38 @@ def test_parse_board_timeline_sample():
     assert records[0]["minute_index"] == 0
     assert "date" not in records[0]  # 首行是基准价哨兵，不是 packed-date 游标
     assert records[1]["date"].isoformat() == "2026-02-03"
+
+
+def test_parse_board_auction_0x32_fixture():
+    """2026-08-02 抓包 0x32 竞价表（881101，2026-07-31 早盘集合竞价）。"""
+    records = parse_board_auction_response(
+        _fixture("auction_resp_0x32.bin").read_bytes()
+    )
+    assert len(records) == 21
+    first, last = records[0], records[-1]
+    assert first["time"].date().isoformat() == "2026-07-31"
+    assert first["time"].time().isoformat() == "09:15:15"
+    assert last["time"].time().isoformat() == "09:25:00"
+    assert first["dt10"] > 0
+    assert first["dt49"] > 0
+
+
+def test_parse_board_daily_k_0x42_fixture():
+    """2026-08-02 抓包 0x42 日K 表（881101，596 根）走 K 线解析器。
+
+    服务端对 DateTime=16384 日K 查询也回 0x42 表（字段 [1,7,8,9,11,19,13]，
+    dt1=YYYYMMDD），与分时字段集 [1,10,13,19,22,23,40] 不同；分时解析器
+    应按字段集拒收，避免把日K 误当分时。
+    """
+    body = _fixture("daily_k_resp_0x42.bin").read_bytes()
+    bars = parse_kline_hd3_response(body)
+    assert len(bars) == 596
+    assert bars[0]["time"].date().isoformat() == "2024-02-19"
+    assert bars[0]["open"] == pytest.approx(1156.573, abs=0.001)
+    assert bars[0]["close"] == pytest.approx(1161.679, abs=0.001)
+    assert bars[-1]["time"].date().isoformat() == "2026-07-31"
+    assert bars[-1]["close"] == pytest.approx(1984.555, abs=0.001)
+    assert parse_board_timeline_response(body) == []
 
 
 def test_parse_board_auction_sample():

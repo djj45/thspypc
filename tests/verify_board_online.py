@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""在线验证板块专用通道四接口：行情 / 分时 / 竞价 / 成分股。
+"""在线验证板块专用通道：全量行情（527527）+ 四接口（行情 / 分时 / 竞价 / 成分股）。
 
 板块查询走 fu4.123ths.com 独立 8901 连接（专用板块通道），首次调用自动完成
 login + subreal 注册 + MarketCode 初始化 + 分类表 + StockNameVer 引导。
@@ -68,7 +68,47 @@ def main() -> int:
 
     failures = 0
 
-    # 1. 板块行情列表（0x130：代码 + GBK 名称 + OHLC）
+    # 0. 板块指数全量行情（DataType=527527：0x20/0x1c/0x22 三表合并，513 条）
+    t0 = time.monotonic()
+    try:
+        full = client.board_quotes(None, timeout=40.0)
+        dt = (time.monotonic() - t0) * 1000
+        by_code = {q.get("code"): q for q in full}
+        if len(by_code) != 513:
+            print(f"✗ 全量行情 {dt:.0f}ms: {len(by_code)} 条（期望 513）")
+            failures += 1
+        else:
+            sample = by_code.get("885998", {})
+            new = by_code.get("886112", {})
+
+            def _fmt(value: float | None) -> str:
+                return "-" if value is None else f"{value:.2f}"
+
+            print(f"✓ 全量行情 {dt:.0f}ms: {len(by_code)} 条")
+            print(
+                f"    885998: 涨幅={_fmt(sample.get('chg_pct'))}% "
+                f"1分={sample.get('speed_1m')} "
+                f"4分={sample.get('speed_4m')} "
+                f"主力={sample.get('main_inflow')}"
+            )
+            print(
+                f"    886112(新): 涨幅={_fmt(new.get('chg_pct'))}% "
+                f"1分={new.get('speed_1m')} "
+                f"4分={new.get('speed_4m')} "
+                f"主力={new.get('main_inflow')}"
+            )
+            if any(
+                sample.get(key) is None
+                for key in ("chg_pct", "speed_1m", "speed_4m", "main_inflow")
+            ):
+                print("  ✗ 885998 字段缺失（正常板块应有完整四列）")
+                failures += 1
+    except Exception as exc:
+        print(f"✗ 全量行情异常: {type(exc).__name__}: {exc}")
+        failures += 1
+
+    # 1. 板块行情列表（08-02 起服务端对该请求回 0x20/0x1c/0x22 紧凑表，
+    #    无名称列；旧 0x130 名称表与旧路由 0x0039/0x0139 已不再回复）
     t0 = time.monotonic()
     try:
         quotes = client.board_quotes(["881101", "881121", "885480"], timeout=20.0)
@@ -152,7 +192,7 @@ def main() -> int:
     if failures:
         print(f"\n✗ {failures} 个接口失败")
         return 1
-    print("\n✓✓ 板块通道四接口全部通过")
+    print("\n✓✓ 板块通道全量行情 + 四接口全部通过")
     return 0
 
 

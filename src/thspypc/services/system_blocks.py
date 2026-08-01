@@ -47,12 +47,14 @@ from ..features.system_blocks_protocol import (
     build_board_constituents_page_transition,
     build_board_constituents_selection_query,
     build_board_constituents_sort_query,
+    build_board_full_list_query,
     build_board_list_query,
     build_board_timeline_query,
+    load_board_full_codes,
     parse_board_auction_response,
     parse_board_constituents_response,
     parse_board_constituents_selection_response,
-    parse_board_quote_response,
+    parse_board_full_quote_response,
     parse_board_timeline_response,
 )
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
@@ -508,21 +510,124 @@ class BoardService:
 
     def board_quotes(
         self,
-        codes: list[str],
+        codes: list[str] | None = None,
         *,
         timeout: float = 15.0,
     ) -> list[dict]:
-        """板块指数行情列表（含名称/最新价/量额，0x130 表）。"""
-        request = build_board_list_query(codes, level2=self._is_level2())
+        """板块指数行情列表。
+
+        ``codes=None`` 时发送**全量请求**：一次携带抓包确认的 513 个板块
+        指数代码（DataType=527527；响应为 0x20/0x1c/0x22 紧凑表，跨帧
+        到达），返回按代码合并后的全部板块行情，可直接用于本地表头排序
+        与分页。显式传 codes 时走列表查询（0x130 名称行情表请求；08-02 起
+        服务端对同一请求回 0x20/0x1c/0x22 紧凑表，无名称列），查询子帧携带
+        完整 universe（对齐抓包），返回时按请求的 codes 过滤。
+        """
+        if codes is None:
+            codes = list(load_board_full_codes())
+            level2 = self._is_level2()
+            requests = (
+                # 列表订阅：0x20（昨收/最新/4分钟涨速）+ 0x1c（主力金额）
+                build_board_list_query(codes, level2=level2),
+                # 527527 全量：0x22（1分钟涨速，513×3 行）
+                build_board_full_list_query(codes, level2=level2),
+            )
+            return self._request_full_quotes(
+                requests, codes, timeout=timeout
+            )
+        request = build_board_list_query(
+            codes,
+            level2=self._is_level2(),
+            universe_codes=list(load_board_full_codes()),
+        )
         wanted_codes = set(codes)
-        return self._request(
+        records = self._request(
             request,
-            parsers=(parse_board_quote_response,),
+            parsers=(parse_board_full_quote_response,),
             timeout=timeout,
             accept=lambda records: any(
                 record.get("code") in wanted_codes for record in records
             ),
         )
+        return [
+            record for record in records
+            if str(record.get("code", "")) in wanted_codes
+        ]
+
+    def _request_full_quotes(
+        self,
+        requests: tuple[bytes, ...],
+        wanted_codes: list[str],
+        *,
+        timeout: float,
+    ) -> list[dict]:
+        """发送全量行情请求序列并跨帧合并三类响应表。
+
+        2026-08-02 抓包：客户端先发**列表订阅**请求（DataType=48,592890,
+        10,6,66，返回 0x20 昨收/最新/4分钟涨速 + 0x1c 主力金额），再发
+        **527527** 全量请求（返回 0x22 1分钟涨速，513×3 行）。两类请求
+        在同一 BOARD socket 上连续发送，响应按帧累积合并；超时/帧数耗尽
+        时返回已合并的部分记录。哨兵字段由解析器映射为 None（UI 显示“-”）。
+        """
+        if not requests:
+            return []
+        connection = self._connections.acquire(
+            ConnectionRole.BOARD,
+            capability=Capability.BASIC_QUOTE,
+        )
+        wanted = set(wanted_codes)
+        try:
+            with connection.request(
+                requests[0],
+                timeout=timeout,
+                trailing_newline=True,
+            ) as sock:
+                for request in requests[1:]:
+                    time.sleep(0.04)
+                    sock.sendall(request + b"\n")
+                deadline = time.monotonic() + timeout
+                merged: dict[str, dict] = {}
+                for _ in range(self._max_frames):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(remaining)
+                    try:
+                        response = self._read_frame(sock)
+                    except socket.timeout:
+                        break
+                    for rec in parse_board_full_quote_response(response):
+                        code = str(rec.get("code", ""))
+                        if not code:
+                            continue
+                        target = merged.setdefault(code, {"code": code})
+                        for key, value in rec.items():
+                            # 缺键或原值为 None（该帧未携带/哨兵）时写入；
+                            # 真实值会覆盖此前帧的 None。
+                            if key != "code" and (
+                                key not in target or target[key] is None
+                            ):
+                                target[key] = value
+                    have_base = sum(
+                        1 for r in merged.values()
+                        if "dt6" in r and "dt10" in r
+                    )
+                    have_speed_1m = sum(
+                        1 for r in merged.values() if "dt167" in r
+                    )
+                    have_main = sum(
+                        1 for r in merged.values() if "dt250" in r
+                    )
+                    if (
+                        len(merged) >= len(wanted)
+                        and have_base >= len(wanted) - 10
+                        and have_speed_1m >= len(wanted) - 10
+                        and have_main >= len(wanted) - 10
+                    ):
+                        break
+        except OSError as exc:
+            raise ProtocolError(f"板块查询网络错误: {exc}") from exc
+        return [merged[code] for code in wanted_codes if code in merged]
 
     def board_timeline(
         self,

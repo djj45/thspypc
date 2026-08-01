@@ -10,7 +10,8 @@
 响应表型（hd3.1 + BitRLE 位面）：
 
 - 0x130 rec=344：板块行情列表（dt5=代码 16B、dt55=名称 20B GBK、
-  dt6/7/8/9/10/13/19…）
+  dt6/7/8/9/10/13/19…；2026-08-02 抓包起服务端对列表查询改回紧凑表
+  0x20/0x1c/0x22，0x130 仅作兼容保留）
 - 0x64 rec=95：成分股行情（dt5=代码 7B + dt215…dt66 等 21 字段）
 - 0x42 rec=28 [1,10,13,19,22,23,40]：板块指数分时（dt1=packed bar 游标，
   242 点/日）
@@ -20,6 +21,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import struct
 from dataclasses import dataclass
@@ -59,6 +61,28 @@ PAGEID_BOARD_HISTORY = 4181
 BOARD_QUOTE_DATATYPE = [48, 592890, 10, 6, 66]          # 板块列表（普通 392）
 BOARD_QUOTE_DATATYPE_L2 = [271, 13, 3252, 48, 19, 3251, 90, 592890, 3250,
                            39, 10, 275, 38, 3541450, 68285, 6, 45, 66]
+# 2026-08-02 抓包：板块指数**全量**行情请求（DataType=527527、
+# DateTime=8192(-2-0)）。普通账号（pageid=392）查询子帧 route 0x016C、
+# seq 0x01C6；L2（pageid=5716）route 0x0152、seq 0x006A。响应为 hd3.1
+# 紧凑表 0x20/0x1c/0x22（单表 513 行），与 0x130 名称行情表不同。
+BOARD_FULL_QUOTE_DATATYPE = [527527]
+BOARD_FULL_QUOTE_PERIOD = 8192
+BOARD_FULL_QUOTE_ARGS = "-2-0"
+BOARD_FULL_QUOTE_ROUTE_NORMAL = 0x006C
+BOARD_FULL_QUOTE_ROUTE_L2 = 0x0052
+BOARD_FULL_QUOTE_SEQ_NORMAL = 0x01C6
+BOARD_FULL_QUOTE_SEQ_L2 = 0x006A
+# 普通账号基准表 0x20；L2 账号为 0x40/72B（dt6/dt10/dt13/dt19/dt48 等）。
+# 0x1c/11B 是单字段小表（普通 dt250 主力；L2 另有 dt178/179/180/189/202），
+# 0x22/15B 是 1分钟涨速（513×3 行），0x130 是名称行情表（兼容）。
+BOARD_FULL_QUOTE_FLAGS = (0x20, 0x40, 0x1C, 0x22, 0x130)
+# 全量响应小表的 BitRLE 长度头偏移（相对字段表尾）与 0x20 不同（2026-08-02
+# 抓包）：0x1c/11B（dt5+dt250 主力金额）在 +8；0x22/15B（dt5+dt1+dt167
+# 1分钟涨速，1539 行=513×3）在 +10。
+_BOARD_FULL_BITRLE_OFFSET = {(0x1C, 11): 8, (0x22, 15): 10}
+# 板块行情字段的无数据哨兵（2026-08-02 抓包：新板块 886112 的 4分钟涨速
+# dt48=0xFFFFFFFF、主力金额 dt250=0x80000000；同花顺 UI 显示“-”）。
+_BOARD_SENTINEL_U32 = (0xFFFFFFFF, 0x80000000)
 BOARD_TL_DATATYPE = [13, 19, 10, 23, 22, 1110]          # 当日分时
 BOARD_HISTORY_DATATYPE = [13, 19, 40, 10, 23, 22, 6]    # 历史分时
 BOARD_AUCTION_DATATYPE = [10, 27, 33, 49]               # 集合竞价
@@ -73,9 +97,12 @@ BOARD_CONSTITUENT_CONTEXT_DATATYPE_L2 = [
     272, 271, 13, 19, 40, 54, 39, 10, 38, 6, 1110, 1111, 380,
 ]
 
-# 子帧路由（抓包实测值，会话内固定）
+# 子帧路由（抓包实测值，会话内固定）。
+# 2026-08-02 抓包：板块列表查询（pageid=392）前缀/查询子帧路由已从
+# 0x0039/0x0139 改为 0x006C/0x016C（与 527527 全量请求同族）；旧路由形态
+# 服务端不再回复。L2（pageid=5716）保持 0x0052/0x0152。
 _ROUTES = {
-    PAGEID_BOARD_LIST: 0x0039,
+    PAGEID_BOARD_LIST: 0x006C,
     PAGEID_BOARD_LIST_L2: 0x0052,
     PAGEID_BOARD_TL: 0x0041,
     PAGEID_BOARD_TL_L2: 0x0014,
@@ -609,12 +636,22 @@ def build_board_query(
     lack_time: str = "0,3,0,0,0,0,0,0",
     seq: int = 0x1156,
     inner_seq: int = 0,
+    history_flag: bool = True,
+    query_codes: str | None = None,
 ) -> bytes:
-    """构造板块指数查询（双子帧：前缀 + 查询），对齐 2026-08-01 抓包形态。"""
+    """构造板块指数查询（双子帧：前缀 + 查询），对齐 2026-08-01 抓包形态。
+
+    ``history_flag`` 控制查询子帧字节 17（0x20）：分时/竞价沿用抓包默认开启，
+    板块列表查询（0x130/紧凑表）2026-08-02 起不带该标记。
+    ``query_codes`` 提供时查询子帧 CodeList 使用它（真实客户端在查询里携带
+    完整 universe，前缀只注册当前可见页）。
+    """
     route = _route_for(pageid)
     prefix_text = f"CodeList={market}({code},);\r\npageid={pageid}\r\n"
+    if query_codes is None:
+        query_codes = code
     query_text = (
-        f"CodeList={market}({code},);\r\n"
+        f"CodeList={market}({query_codes},);\r\n"
         f"DataType={_datatype_text(datatype)}\r\n"
         f"DateTime={period}({args})\r\n"
         f"LackTime={lack_time}\r\npageid={pageid}\r"
@@ -629,7 +666,7 @@ def build_board_query(
             0x0100 | route,
             seq,
             len(query_text) + 1,
-            history_flag=True,
+            history_flag=history_flag,
         )
         + query_text
     )
@@ -641,18 +678,92 @@ def build_board_list_query(
     *,
     level2: bool = False,
     datatype: list[int] | None = None,
+    universe_codes: list[str] | None = None,
 ) -> bytes:
-    """构造板块列表/行情请求（一次携带全部板块指数代码）。"""
+    """构造板块列表/行情请求（一次携带全部板块指数代码）。
+
+    2026-08-02 抓包（普通账号 pageid=392）：
+    - 前缀子帧 route=0x006C、查询子帧 route=0x016C、seq=0x01C4；
+      L2（pageid=5716）为 0x0052/0x0152、seq=0x0068。
+    - 查询子帧不带 history flag（字节 17=0x00），``LackTime`` 全 0。
+    - 前缀 CodeList 是当前可见页 ``codes``，查询 CodeList 是完整
+      ``universe_codes``（缺省与 ``codes`` 相同）。
+
+    服务端对旧形态（0x0039/0x0139 + history flag + LackTime=0,3,…）静默不回复；
+    且 08-02 起响应表为 0x20/0x1c/0x22 紧凑表（不再是 0x130 名称行情表），
+    解析统一走 :func:`parse_board_full_quote_response`。
+    """
     pageid = PAGEID_BOARD_LIST_L2 if level2 else PAGEID_BOARD_LIST
     if datatype is None:
         datatype = BOARD_QUOTE_DATATYPE_L2 if level2 else BOARD_QUOTE_DATATYPE
+    query_codes = (
+        ",".join(universe_codes) if universe_codes is not None else None
+    )
     return build_board_query(
         ",".join(codes),
         pageid=pageid,
         datatype=datatype,
         period=0,
         args="0-0",
+        lack_time="0,0,0,0,0,0,0,0",
+        seq=0x0068 if level2 else 0x01C4,
+        history_flag=False,
+        query_codes=query_codes,
     )
+
+
+_BOARD_CODES_PATH = Path(__file__).with_name("board_codes.json")
+
+
+def load_board_full_codes() -> tuple[str, ...]:
+    """返回 2026-08-02 抓包确认的板块指数全量代码表（market=48，513 个）。
+
+    包含 881xxx 行业、882xxx、885xxx/886xxx 概念指数；由
+    ``board_codes.json`` 固化（来源：普通账号 2026-08-02 全量请求样本），
+    后续可改为从板块分类表（[5],[55]）响应动态刷新。
+    """
+    data = json.loads(_BOARD_CODES_PATH.read_text(encoding="utf-8"))
+    return tuple(data["codes"])
+
+
+def build_board_full_list_query(
+    codes: list[str],
+    *,
+    level2: bool = False,
+) -> bytes:
+    """构造板块指数全量行情请求（单查询子帧，逐字节对齐 2026-08-02 抓包）。
+
+    请求文本：``CodeList=48(<全部代码>); DataType=527527,
+    DateTime=8192(-2-0)``。普通账号 pageid=392、route 0x016C、seq 0x01C6；
+    L2 pageid=5716、route 0x0152、seq 0x006A。响应解析见
+    :func:`parse_board_full_quote_response`。
+    """
+    pageid = PAGEID_BOARD_LIST_L2 if level2 else PAGEID_BOARD_LIST
+    route = (
+        BOARD_FULL_QUOTE_ROUTE_L2
+        if level2
+        else BOARD_FULL_QUOTE_ROUTE_NORMAL
+    )
+    seq = BOARD_FULL_QUOTE_SEQ_L2 if level2 else BOARD_FULL_QUOTE_SEQ_NORMAL
+    query_text = (
+        f"CodeList={BOARD_MARKET}({','.join(codes)},);\r\n"
+        f"DataType={_datatype_text(BOARD_FULL_QUOTE_DATATYPE)}\r\n"
+        f"DateTime={BOARD_FULL_QUOTE_PERIOD}({BOARD_FULL_QUOTE_ARGS})\r\n"
+        "LackTime=0,3,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r\n"
+    ).encode("gbk")
+    body = (
+        b"\x09"
+        + _subframe_header(
+            0x0009,
+            0x0100 | route,
+            seq,
+            len(query_text),
+            history_flag=True,
+        )
+        + query_text
+    )
+    return encode_frame(body)
 
 
 def build_board_timeline_query(
@@ -952,7 +1063,14 @@ def _hd3_rows(
     # 0x130/0x64 无 shell（字段表后 +4 即 BitRLE 长度）；
     # 0x42/0x32 固定有 26B shell（与 K线 hd3.1 一致）。旧实现两个 offset
     # 都试，shell 内的随机 4 字节偶尔会碰巧像合法 size，导致整表错位解码。
-    offsets = (ft_end + 26,) if flag in (0x42, 0x32) else (ft_end + 4,)
+    # 2026-08-02 全量行情小表另有固定偏移（见 _BOARD_FULL_BITRLE_OFFSET）。
+    override = _BOARD_FULL_BITRLE_OFFSET.get((flag, rec_size))
+    if override is not None:
+        offsets = (ft_end + override,)
+    elif flag in (0x42, 0x32):
+        offsets = (ft_end + 26,)
+    else:
+        offsets = (ft_end + 4,)
     for bo in offsets:
         if len(norm) < bo + 4:
             continue
@@ -991,6 +1109,11 @@ def _decode_row(row: bytes, fields: list[tuple[int, int, int]]) -> dict:
             break
         if datatype == 5:
             code_bytes = chunk.rstrip(b"\x00")
+            # 兼容 0x20 全量表末行代码域尾字节被服务端 padding 污染：
+            # 只要前 7 字节（市场标记 + 6 位数字码）合法，就只取前 7 字节。
+            prefix = code_bytes[:7]
+            if len(prefix) >= 7 and prefix[1:].isdigit():
+                code_bytes = prefix
             # 首字节是市场/类型标记：0x130 为 '0'（"0881101"），
             # 0x64 为 0x11（0x11+"600288"）。去掉后余 6 位数字码。
             if len(code_bytes) >= 7 and code_bytes[1:].isdigit():
@@ -1003,7 +1126,7 @@ def _decode_row(row: bytes, fields: list[tuple[int, int, int]]) -> dict:
                 "name",
                 chunk.rstrip(b"\x00\xff").decode("gbk", errors="replace"),
             )
-        elif fmt in (0x70, 0x64) and width == 4:
+        elif fmt in (0x70, 0x64, 0x7B, 0x7C) and width == 4:
             record.setdefault(
                 f"dt{datatype}",
                 decode_ths_float(struct.unpack("<I", chunk)[0]),
@@ -1025,6 +1148,125 @@ def parse_board_quote_response(body: bytes) -> list[dict]:
     for index in range(len(rows) // rec_size):
         row = rows[index * rec_size: (index + 1) * rec_size]
         records.append(_decode_row(row, fields))
+    return records
+
+
+def _row_field_raw(
+    row: bytes,
+    fields: list[tuple[int, int, int]],
+    datatype: int,
+) -> int | None:
+    """返回行内指定 datatype 的 4 字节原始 u32（用于哨兵判定）。"""
+    offset = 0
+    for d, _fmt, width in fields:
+        if d == datatype and width == 4 and offset + 4 <= len(row):
+            return struct.unpack("<I", row[offset:offset + 4])[0]
+        offset += width
+    return None
+
+
+def parse_board_full_quote_response(body: bytes) -> list[dict]:
+    """解析板块指数全量行情响应（2026-08-02 抓包确认的三表合并）。
+
+    一个响应周期含多帧/多表（DataType=527527）：
+
+    - ``0x20`` 28B：dt5 代码 + dt6 昨收 + dt10 最新 + dt48 4分钟涨速（513 行）
+    - ``0x1c`` 24B：dt5 + dt10 + dt48（0x20 子集，兼容）
+    - ``0x1c`` 11B：dt5(7B) + dt250 主力净流入金额（513 行）
+    - ``0x22`` 15B：dt5(7B) + dt1 bar + dt167 1分钟涨速（513×3 行，每组取
+      bar 最大的一行）
+
+    涨幅由客户端按 ``(dt10/dt6-1)`` 计算；``0xFFFFFFFF`` 哨兵在
+    ``chg_pct/speed_4m/speed_1m/main_inflow`` 友好字段里映射为 ``None``
+    （同花顺 UI 显示“-”），原始 ``dt*`` 键仍保留 THS float 解码值。
+    """
+    norm = _normalize(body)
+    positions = [
+        pos for pos in range(len(norm))
+        if norm.startswith(b"hd3.1\x00", pos)
+    ]
+    candidates = [norm] if len(positions) <= 1 else [norm[pos:] for pos in positions]
+    merged: dict[str, dict] = {}
+
+    def merge(record: dict) -> None:
+        code = str(record.get("code", ""))
+        if not code:
+            return
+        target = merged.setdefault(code, {"code": code})
+        for key, value in record.items():
+            if key != "code":
+                target.setdefault(key, value)
+
+    for candidate in candidates:
+        for flag in BOARD_FULL_QUOTE_FLAGS:
+            parsed = _hd3_rows(candidate, flag)
+            if parsed is None:
+                continue
+            _flag, rec_size, fields, _code, rows = parsed
+            n = len(rows) // rec_size
+            if flag == 0x22:
+                # 每板块 3 行（dt1 三个相邻 bar），1分钟涨速取 bar 最大的一行
+                group: dict[str, list[dict]] = {}
+                for index in range(n):
+                    row = rows[index * rec_size: (index + 1) * rec_size]
+                    rec = _decode_row(row, fields)
+                    code = str(rec.get("code", ""))
+                    if code:
+                        group.setdefault(code, []).append(rec)
+                for code, recs in group.items():
+                    best = max(
+                        recs,
+                        key=lambda r: r.get("bar_index", 0) or 0,
+                    )
+                    merge(best)
+                continue
+            for index in range(n):
+                row = rows[index * rec_size: (index + 1) * rec_size]
+                rec = _decode_row(row, fields)
+                for dt in (6, 10, 48, 167, 250):
+                    raw = _row_field_raw(row, fields, dt)
+                    if raw is not None:
+                        rec[f"dt{dt}_raw"] = raw
+                merge(rec)
+
+    records = []
+    for code, rec in merged.items():
+        dt6 = rec.get("dt6")
+        dt10 = rec.get("dt10")
+        dt6_raw = rec.get("dt6_raw")
+        chg = None
+        if (
+            dt6 is not None
+            and dt10 is not None
+            and dt6_raw not in _BOARD_SENTINEL_U32
+            and dt6
+        ):
+            chg = (dt10 / dt6 - 1) * 100
+        row = {
+            "code": code,
+            "name": rec.get("name"),
+            "pre_close": dt6,
+            "price": dt10,
+            "chg_pct": chg,
+            "speed_4m": (
+                None
+                if rec.get("dt48_raw") in _BOARD_SENTINEL_U32
+                else rec.get("dt48")
+            ),
+            "speed_1m": (
+                None
+                if rec.get("dt167_raw") in _BOARD_SENTINEL_U32
+                else rec.get("dt167")
+            ),
+            "main_inflow": (
+                None
+                if rec.get("dt250_raw") in _BOARD_SENTINEL_U32
+                else rec.get("dt250")
+            ),
+        }
+        for key, value in rec.items():
+            row.setdefault(key, value)
+        records.append(row)
     return records
 
 
@@ -1069,11 +1311,18 @@ def parse_board_timeline_response(body: bytes) -> list[dict]:
 
     dt1 是 packed-date bar 游标（与股票历史分时一致），这里附上
     ``date`` 与 ``minute_index``。
+
+    2026-08-02 抓包发现服务端对日K 查询（DateTime=16384）也回 0x42 表
+    （字段 [1,7,8,9,11,19,13]，dt1=YYYYMMDD，596 根/次），因此必须按
+    字段集区分：非分时字段集（[1,10,13,19,22,23,40]）返回空，避免把
+    日K 误当分时。
     """
     parsed = _hd3_rows(body, 0x42)
     if parsed is None:
         return []
     _flag, rec_size, fields, code, rows = parsed
+    if {dt for dt, _fmt, _width in fields} != {1, 10, 13, 19, 22, 23, 40}:
+        return []
     records = []
     for index in range(len(rows) // rec_size):
         row = rows[index * rec_size: (index + 1) * rec_size]

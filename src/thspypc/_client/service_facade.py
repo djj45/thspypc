@@ -1249,24 +1249,26 @@ class ServiceFacade:
 
     def board_quotes(
         self,
-        codes: list[str],
+        codes: list[str] | None = None,
         *,
         timeout: float = 40.0,
     ) -> list[dict]:
-        """板块指数行情列表（0x130 表：代码/名称/OHLC/量额）。
+        """板块指数行情列表。
 
         板块代码统一挂 market=48（行业 881xxx / 概念 885xxx 等）。首次调用
         自动建立**板块专用通道**（fu4.123ths.com 独立 8901 连接 + 完整引导
         序列），后续查询复用。在 MAIN 连接上重放相同请求只会得到
-        CodeListSize=0（服务器按连接身份路由，见 docs/FEATURE_GAP_ROADMAP.md）。
+        CodeListSize=0（服务器按连接身份路由，见 docs/plans/FEATURE_GAP_ROADMAP.md）。
 
         Args:
-            codes: 板块指数代码列表，如 ``["881101", "885480"]``。
+            codes: 板块指数代码列表，如 ``["881101", "885480"]``；传 ``None``
+                表示发送全量请求（抓包确认的 513 个板块指数一次拉取，
+                DataType=527527，响应为 0x20/0x1c/0x22 紧凑表）。
             timeout: 两条成分连接建连与查询的总超时（秒）。
 
         Returns:
             list[dict]，每条含 ``code``/``name``/``dt10``（最新价）/
-            ``dt6``（昨收）等字段。
+            ``dt6``/``dt48``（涨幅）等字段。
 
         Raises:
             RuntimeError: 未登录或板块通道建连失败。

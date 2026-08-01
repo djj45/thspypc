@@ -17,11 +17,15 @@
     B. 板块成分股：点击某个板块后的成分股列表
     C. 板块指数分时/历史：板块指数（如 881121 半导体）的分时图 + 历史回忆
     D. 盘中实时：板块列表/板块指数的实时刷新（订阅或轮询）
+    E. 板块列表表头排序与翻页：板块列表页点不同表头列排序、翻页
 
 用法
 ----
     py tests/capture_system_blocks.py                  # 默认 240s
     py tests/capture_system_blocks.py --duration 300
+    py tests/capture_system_blocks.py --duration 210 --iface 4   # 非交互指定网卡
+    py tests/capture_system_blocks.py --duration 300 --stop-file captures_live/STOP
+                                                               # 创建该文件即可中途叫停
     py tests/capture_system_blocks.py --analyze-only xxx.pcap
 
 操作步骤（★严格按阶段做，阶段之间停 2-3 秒）：
@@ -35,6 +39,10 @@
           按 ← 方向键翻到昨天/前几天（历史回忆），每停 3-4 秒；
           （若客户端有日历，可直接选 2026-07-23 与 2026-06-30）
        D. 回到板块列表页，保持不动 60 秒（抓盘中实时刷新/订阅）
+       E. 板块列表排序/翻页：在【行业】列表依次点表头 涨幅→1分钟涨速→4分钟涨速→
+          主力净流入金额（每列点两次：先降序停 2-3 秒，再升序停 2-3 秒）；
+          然后点【下一页】→停 3s→【下一页】→停 3s→【上一页】→停 3s；
+          切到【概念】列表再重复一次排序+翻页
     4. 抓够后等待自动结束，脚本输出分析报告并 dump 样本
 
 产物：captures_live/system_blocks_<时间戳>.pcap +
@@ -46,6 +54,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,8 +116,13 @@ def pick_interface():
     return choice if choice in ifaces else default
 
 
-def capture(iface, duration, pcap_path):
+def capture(iface, duration, pcap_path, stop_file=None):
     os.makedirs(PCAP_DIR, exist_ok=True)
+    if stop_file and os.path.exists(stop_file):
+        try:
+            os.unlink(stop_file)
+        except OSError:
+            pass
     print(f"\n{'='*64}")
     print(f"开始抓包 {duration}s（端口 {PORT}，网卡 {iface}）")
     print(f"{'='*64}")
@@ -118,19 +132,41 @@ def capture(iface, duration, pcap_path):
     print("  C【板块指数】打开半导体 881121 的【分时图】停 3s；按 ← 翻历史日期")
     print("    ★ 建议翻到 2026-07-23 和 2026-06-30（每停 4 秒，便于按日期拆帧）")
     print("  D【盘中实时】回到板块列表页不动 60 秒")
+    print("  E【排序/翻页】板块列表页依次点表头 涨幅→1分钟涨速→4分钟涨速→主力净流入金额")
+    print("    （每列点两次：先降序停 2-3s，再升序停 2-3s）；然后 下一页→下一页→上一页（各停 3s）")
+    print("    切到【概念】列表再重复一次排序+翻页")
+    if stop_file:
+        print(f"  中途叫停：创建 {stop_file} 即可提前结束（脚本每 1 秒检查一次）")
     print("-" * 64)
+    proc = subprocess.Popen(
+        [DUMPCAP, "-i", iface, "-f", f"tcp port {PORT}",
+         "-w", pcap_path, "-a", f"duration:{duration}"],
+    )
+    stopped = False
+    deadline = time.time() + duration + 15
     try:
-        subprocess.run(
-            [DUMPCAP, "-i", iface, "-f", f"tcp port {PORT}",
-             "-w", pcap_path, "-a", f"duration:{duration}"],
-            timeout=duration + 15,
-        )
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(1)
+            if stop_file and os.path.exists(stop_file):
+                print("\n★ 收到停止信号，提前结束抓包（已保存已抓部分）")
+                stopped = True
+                break
     except KeyboardInterrupt:
         print("\n抓包提前结束（已保存）")
-    except subprocess.TimeoutExpired:
-        pass
+        stopped = True
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if stop_file and os.path.exists(stop_file):
+        try:
+            os.unlink(stop_file)
+        except OSError:
+            pass
     size = os.path.getsize(pcap_path) if os.path.exists(pcap_path) else 0
-    print(f"\n抓包完成：{pcap_path} ({size:,} bytes)")
+    print(f"\n抓包{'提前' if stopped else ''}完成：{pcap_path} ({size:,} bytes)")
 
 
 # ── 分析逻辑 ──
@@ -202,6 +238,11 @@ def _parse_request(frame_body):
     m = re.search(r"SortBegin=(\d+)", text)
     if m:
         info["sort_begin"] = m.group(1)
+    sort_params: dict[str, str] = {}
+    for m in re.finditer(r"(Sort[A-Za-z]+|OrderBy[A-Za-z]*)=([^,\r\n]*)", text):
+        sort_params[m.group(1)] = m.group(2).rstrip()
+    if sort_params:
+        info["sort_params"] = sort_params
     return info
 
 
@@ -238,11 +279,12 @@ def _decode_response(frame_body, codes):
 
 
 def _print_req(info):
+    sort_repr = info.get("sort_params") or {"SortBegin": info.get("sort_begin", "-")}
     print(f"      pageid={info.get('pageid','?')} "
           f"codes={info.get('codes','?')} "
           f"DateTime={info.get('datetime_period','?')}({info.get('datetime_args','')}) "
           f"DataType={info.get('datatype','?')} "
-          f"SortBegin={info.get('sort_begin','-')}")
+          f"Sort={sort_repr}")
 
 
 def analyze(pcap_path):
@@ -325,6 +367,27 @@ def analyze(pcap_path):
         seen3.add(key)
         _print_req(info)
 
+    # ── 报告 4：板块列表排序/翻页请求特征 ──
+    BOARD_LIST_PAGEIDS = {"392", "4180", "4181", "5716", "6000", "6002", "1341"}
+    print("\n【4】板块列表排序/翻页请求（pageid 家族；完整文本便于 diff 出排序/页码参数）")
+    seen4: dict[str, int] = {}
+    order4: list[str] = []
+    for sid, info, sframes in requests:
+        pid = info.get("pageid", "?")
+        if pid not in BOARD_LIST_PAGEIDS and "sort_params" not in info:
+            continue
+        text = " ".join(info.get("text", "").split())
+        if text not in seen4:
+            seen4[text] = 0
+            order4.append(text)
+        seen4[text] += 1
+    if not order4:
+        print("  ✗ 未抓到板块 pageid 家族请求；请确认抓包期间打开过【板块】列表页并做过排序/翻页")
+    for text in order4:
+        mark = "  ★ 含 Sort/Order 参数" if ("Sort" in text or "Order" in text) else ""
+        suffix = "…" if len(text) > 240 else ""
+        print(f"  [{seen4[text]}x] {text[:240]}{suffix}{mark}")
+
     # ── dump 样本：按 代码×pageid 存原始响应帧 ──
     _dump_samples(streams, pcap_path)
 
@@ -362,15 +425,18 @@ def _dump_samples(streams, pcap_path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--duration", type=int, default=240)
+    ap.add_argument("--iface", help="网卡编号（如 4=WLAN），不传则交互选择")
+    ap.add_argument("--stop-file", metavar="PATH",
+                    help="存在该文件时提前结束抓包（中途叫停用）")
     ap.add_argument("--analyze-only", metavar="PCAP")
     args = ap.parse_args()
     if args.analyze_only:
         analyze(args.analyze_only)
         return
-    iface = pick_interface()
+    iface = args.iface or pick_interface()
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     pcap_path = os.path.join(PCAP_DIR, f"system_blocks_{ts}.pcap")
-    capture(iface, args.duration, pcap_path)
+    capture(iface, args.duration, pcap_path, stop_file=args.stop_file)
     analyze(pcap_path)
 
 
