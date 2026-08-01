@@ -1251,7 +1251,7 @@ class ServiceFacade:
         self,
         codes: list[str],
         *,
-        timeout: float = 15.0,
+        timeout: float = 40.0,
     ) -> list[dict]:
         """板块指数行情列表（0x130 表：代码/名称/OHLC/量额）。
 
@@ -1262,7 +1262,7 @@ class ServiceFacade:
 
         Args:
             codes: 板块指数代码列表，如 ``["881101", "885480"]``。
-            timeout: 单帧读取超时（秒）。
+            timeout: 两条成分连接建连与查询的总超时（秒）。
 
         Returns:
             list[dict]，每条含 ``code``/``name``/``dt10``（最新价）/
@@ -1339,19 +1339,37 @@ class ServiceFacade:
         *,
         timeout: float = 15.0,
     ) -> list[dict]:
-        """板块成分股行情（0x64 表：成分股代码 + 21 字段行情）。
+        """板块成分股行情（L2 0x64；普通账号 0x44/0x50 表）。
+
+        0x64 请求本身接收的是**成分股代码列表**，不具备“板块代码服务端展开”
+        语义。门面先用本机系统板块缓存把稳定板块 ID 展开为股票代码，再走 fu4
+        批量取行情。成分股连接独立于板块指数连接：普通/沪侧使用标准身份，
+        Level2 深侧使用 manual 身份。
 
         Args:
-            codes: 板块指数代码列表。
+            codes: 稳定板块 ID 列表（如 ``["881121"]``）。
             timeout: 单帧读取超时（秒）。
 
         Returns:
             list[dict]，每条含 ``code``（6 位股票代码）及 ``dt<N>`` 字段。
         """
+        stock_codes: list[str] = []
+        stock_markets: dict[str, int | str] = {}
+        seen: set[str] = set()
+        for block_id in codes:
+            for stock in self.system_blocks.constituents(block_id):
+                if not stock.pattern and stock.code not in seen:
+                    seen.add(stock.code)
+                    stock_codes.append(stock.code)
+                    stock_markets[stock.code] = stock.market
         return self._run_default_service(
-            (Capability.BASIC_QUOTE,),
+            (
+                Capability.BASIC_QUOTE,
+                Capability.L2_MARKET_ACCESS,
+            ),
             lambda: self._board_service.board_constituents(
-                codes,
+                stock_codes,
+                stock_markets=stock_markets,
                 timeout=timeout,
             ),
         )

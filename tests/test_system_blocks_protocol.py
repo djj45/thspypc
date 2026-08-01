@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from thspypc.features.system_blocks_protocol import (  # noqa: E402
     BOARD_AUCTION_DATATYPE,
+    BOARD_CONSTITUENT_DATATYPE,
+    BOARD_CONSTITUENT_DATATYPE_L2,
     BOARD_HISTORY_DATATYPE,
     BOARD_QUOTE_DATATYPE,
     PAGEID_BOARD_HISTORY,
@@ -18,6 +20,8 @@ from thspypc.features.system_blocks_protocol import (  # noqa: E402
     PAGEID_BOARD_TL,
     build_board_auction_query,
     build_board_constituents_query,
+    build_board_constituents_selection_query,
+    build_board_constituents_sort_query,
     build_board_list_query,
     build_board_timeline_query,
     parse_board_auction_response,
@@ -29,6 +33,7 @@ from thspypc.features.history_timeline_protocol import (
     date_to_normal_timeline_bar,
     normal_timeline_bar_to_date,
 )
+import thspypc.features.system_blocks_protocol as board_protocol
 
 
 def _sample(name: str) -> Path:
@@ -66,11 +71,89 @@ def test_build_board_list_query_shape():
 
 def test_build_board_constituents_query_groups_markets():
     frame = build_board_constituents_query(["600519", "000938", "920021"])
-    text = frame[12:].decode("gbk", errors="replace")
+    body = frame[12:]
+    text = body.decode("gbk", errors="replace")
     assert "17(600519,);" in text
     assert "33(000938,);" in text
     assert "151(920021,);" in text
     assert f"pageid={PAGEID_BOARD_TL}" in text
+    assert "DataType=" + ",".join(map(str, BOARD_CONSTITUENT_DATATYPE)) in text
+    # 2026-08-01 16:37 干净包：注册 route=0x44，查询 route=0x144。
+    assert body[11:13] == b"\x44\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 10: query_offset + 12] == b"\x44\x01"
+    assert body.endswith(b"\r")
+
+
+def test_build_board_constituents_query_uses_level2_routes_and_datatypes():
+    frame = build_board_constituents_query(
+        ["600519", "000938", "920021"],
+        level2=True,
+    )
+    body = frame[12:]
+    text = body.decode("gbk", errors="replace")
+    assert "pageid=6000" in text
+    assert (
+        "DataType=" + ",".join(map(str, BOARD_CONSTITUENT_DATATYPE_L2))
+        in text
+    )
+    # 2026-08-01 16:40 干净包：两条市场连接均为 0x5c/0x15c。
+    assert body[11:13] == b"\x5c\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 10: query_offset + 12] == b"\x5c\x01"
+    assert body.endswith(b"\r")
+
+
+def test_build_normal_board_constituent_sort_and_selection_shapes():
+    universe = ["600519", "000938", "920021"]
+    sort_frame = build_board_constituents_sort_query(
+        universe,
+        visible_codes=universe[:2],
+        sort_begin=0,
+        sort_count=2,
+    )
+    sort_body = sort_frame[12:]
+    sort_text = sort_body.decode("gbk", errors="replace")
+    assert "SortType=Sort" in sort_text
+    assert "SortBegin=0" in sort_text
+    assert "SortCount=2" in sort_text
+    assert b"\x12\x00\x0f\x00\x44\x01" in sort_body
+    assert sort_body.endswith(b"\r")
+
+    selection_frame = build_board_constituents_selection_query(universe[:2])
+    selection_body = selection_frame[12:]
+    selection_text = selection_body.decode("gbk", errors="replace")
+    assert "DataType=527527," in selection_text
+    assert b"\x12\x00\x09\x00\x44\x01" in selection_body
+    assert selection_body.endswith(b"\r")
+
+    quote_frame = build_board_constituents_query(
+        universe[:2],
+        include_prefix=False,
+    )
+    quote_body = quote_frame[12:]
+    assert quote_body[1:5] == b"\x00\x16\x00\x00"
+    assert quote_body[9:13] == b"\x09\x00\x44\x01"
+    assert quote_body.count(b"CodeList=") == 1
+    assert quote_body.endswith(b"\r")
+
+
+def test_build_board_constituents_preserves_explicit_market_22():
+    frame = build_board_constituents_query(
+        ["600745", "688270", "000938", "920012"],
+        markets={
+            "600745": "22",
+            "688270": 22,
+            "000938": "33",
+            "920012": "-105",
+        },
+    )
+    text = frame.decode("gbk", errors="replace")
+    assert "22(600745,688270,);" in text
+    assert "33(000938,);" in text
+    assert "151(920012,);" in text
 
 
 def test_build_board_auction_query_shape():
@@ -106,6 +189,34 @@ def test_parse_board_constituents_sample():
     assert all("dt10" in r or "dt66" in r for r in records)
 
 
+def test_parse_board_constituents_accepts_normal_account_table_flags(monkeypatch):
+    calls = []
+
+    def fake_rows(_body, *flags):
+        calls.append(flags)
+        return None
+
+    monkeypatch.setattr(board_protocol, "_hd3_rows", fake_rows)
+    assert board_protocol.parse_board_constituents_response(b"response") == []
+    assert calls == [(0x64, 0x44, 0x50)]
+
+
+def test_parse_board_constituents_scans_later_hd3_table(monkeypatch):
+    body = b"prefix-hd3.1\x00other-table-hd3.1\x00constituents"
+
+    def fake_rows(candidate, *flags):
+        assert flags == (0x64, 0x44, 0x50)
+        if not candidate.startswith(b"hd3.1\x00constituents"):
+            return None
+        return 0x64, 7, [(5, 0, 7)], b"", b"\x11600001"
+
+    monkeypatch.setattr(board_protocol, "_hd3_rows", fake_rows)
+
+    assert board_protocol.parse_board_constituents_response(body) == [
+        {"code": "600001"}
+    ]
+
+
 def test_parse_board_timeline_sample():
     path = _sample("_board_timeline.bin")
     if not path.exists():
@@ -115,6 +226,8 @@ def test_parse_board_timeline_sample():
     assert records[0]["bar_index"] == records[0].get("bar_index")
     assert "dt10" in records[0]
     assert records[0]["minute_index"] == 0
+    assert "date" not in records[0]  # 首行是基准价哨兵，不是 packed-date 游标
+    assert records[1]["date"].isoformat() == "2026-02-03"
 
 
 def test_parse_board_auction_sample():
@@ -126,3 +239,4 @@ def test_parse_board_auction_sample():
     assert "time" in records[0]
     assert "dt10" in records[0]
     assert "dt49" in records[0]
+    assert records[0]["time"].date().isoformat() == "2026-07-31"

@@ -229,6 +229,9 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             set_board_socket=lambda value: self._assign_board_socket(value),
             open_board=lambda: self._open_board_channel(),
             board_lock=self._board_lock,
+            open_board_constituent=lambda side: self._open_board_channel(
+                constituent_side=side,
+            ),
         )
         self._connection_runtime = ConnectionRuntime(
             enable_heartbeat=self.enable_heartbeat,

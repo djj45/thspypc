@@ -65,6 +65,37 @@ def test_standard_account_never_opens_l2_roles():
     assert opened == []
 
 
+def test_constituent_roles_preserve_captured_login_identities():
+    opened = []
+    standard = ConnectionManager(
+        _profile(
+            AccountKind.STANDARD,
+            BASIC_QUOTE="YES",
+            L2_MARKET_ACCESS="NO",
+        ),
+        lambda spec: opened.append(spec) or FakeSocket(),
+    )
+
+    sh = standard.acquire(
+        ConnectionRole.BOARD_CONSTITUENT_SH,
+        capability=Capability.BASIC_QUOTE,
+    )
+    assert sh.spec.identity is LoginIdentity.STANDARD
+    with pytest.raises(CapabilityUnavailableError):
+        standard.acquire(ConnectionRole.BOARD_CONSTITUENT_SZ)
+
+    level2 = ConnectionManager(
+        _profile(
+            AccountKind.LEVEL2,
+            BASIC_QUOTE="YES",
+            L2_MARKET_ACCESS="YES",
+        ),
+        lambda spec: opened.append(spec) or FakeSocket(),
+    )
+    sz = level2.acquire(ConnectionRole.BOARD_CONSTITUENT_SZ)
+    assert sz.spec.identity is LoginIdentity.MANUAL
+
+
 def test_unknown_account_does_not_probe_l2_roles():
     opened = []
     manager = ConnectionManager(

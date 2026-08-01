@@ -118,11 +118,13 @@ def test_ip_state_v2_roundtrip_and_role_isolation(tmp_path):
     path = str(tmp_path / "ip_state.json")
     save_ip_state(["10.0.0.1", "10.0.0.2"], 1, role="main", path=path)
     save_ip_state(["10.0.0.9"], 0, role="sz", path=path)
+    save_ip_state(["10.0.0.7", "10.0.0.8"], 1, role="board", path=path)
 
     loaded = load_ip_state(path=path)
     assert loaded is not None
     assert loaded["main"] == (["10.0.0.1", "10.0.0.2"], 1)
     assert loaded["sz"] == (["10.0.0.9"], 0)
+    assert loaded["board"] == (["10.0.0.7", "10.0.0.8"], 1)
     assert "sh" not in loaded  # never probed → absent
 
 

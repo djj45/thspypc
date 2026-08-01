@@ -13,6 +13,7 @@ login + subreal 注册 + MarketCode 初始化 + 分类表 + StockNameVer 引导�
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,7 +40,16 @@ def load_env(path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", choices=("l2", "normal"), default="l2")
+    parser.add_argument(
+        "--dump-dir",
+        default=os.environ.get("THS_FRAME_DUMP_DIR", ""),
+        help="逐帧收发转储目录（设置后自动 export THS_FRAME_DUMP_DIR）",
+    )
     args = parser.parse_args()
+    if args.dump_dir:
+        os.environ["THS_FRAME_DUMP_DIR"] = args.dump_dir
+        os.makedirs(args.dump_dir, exist_ok=True)
+        print(f"鉁?逐帧收发转储已开启：{args.dump_dir}")
 
     env = load_env(ROOT / (".env" if args.env == "l2" else ".env.normal"))
     user, pwd = env.get("THS_USERNAME", ""), env.get("THS_PASSWORD", "")
@@ -64,14 +74,15 @@ def main() -> int:
         quotes = client.board_quotes(["881101", "881121", "885480"], timeout=20.0)
         dt = (time.monotonic() - t0) * 1000
         names = {q.get("code"): q.get("name") for q in quotes}
-        print(f"✓ 板块行情 {dt:.0f}ms: {len(quotes)} 条 "
-              f"{ {k: names.get(k) for k in ('881101', '881121', '885480')} }")
         if not quotes:
-            print("  ✗ 空列表")
+            print(f"✗ 板块行情 {dt:.0f}ms: 空列表")
             failures += 1
         elif quotes[0].get("dt10") is None:
-            print("  ✗ 缺少 dt10（最新价）")
+            print(f"✗ 板块行情 {dt:.0f}ms: 缺少 dt10（最新价）")
             failures += 1
+        else:
+            print(f"✓ 板块行情 {dt:.0f}ms: {len(quotes)} 条 "
+                  f"{ {k: names.get(k) for k in ('881101', '881121', '885480')} }")
     except Exception as exc:
         print(f"✗ 板块行情异常: {type(exc).__name__}: {exc}")
         failures += 1
@@ -97,12 +108,18 @@ def main() -> int:
         auction = client.board_auction("881121", date="2026-07-23", timeout=15.0)
         dt = (time.monotonic() - t0) * 1000
         first = auction[0] if auction else {}
-        print(f"✓ 板块竞价 2026-07-23 {dt:.0f}ms: {len(auction)} tick "
-              f"(首 {first.get('time')} dt10={first.get('dt10')} "
-              f"dt49={first.get('dt49')})")
-        if len(auction) < 5:
-            print(f"  ✗ tick 过少（{len(auction)} < 5）")
+        valid_date = (
+            first.get("time") is not None
+            and first["time"].date().isoformat() == "2026-07-23"
+        )
+        if len(auction) < 5 or not valid_date:
+            print(f"✗ 板块竞价 2026-07-23 {dt:.0f}ms: {len(auction)} tick "
+                  f"(首 {first.get('time')})")
             failures += 1
+        else:
+            print(f"✓ 板块竞价 2026-07-23 {dt:.0f}ms: {len(auction)} tick "
+                  f"(首 {first.get('time')} dt10={first.get('dt10')} "
+                  f"dt49={first.get('dt49')})")
     except Exception as exc:
         print(f"✗ 板块竞价异常: {type(exc).__name__}: {exc}")
         failures += 1
@@ -110,22 +127,28 @@ def main() -> int:
     # 4. 板块成分股行情（0x64：6 位股票代码 + 行情字段）
     t0 = time.monotonic()
     try:
-        members = client.board_constituents(["881121"], timeout=20.0)
+        members = client.board_constituents(["881121"], timeout=45.0)
         dt = (time.monotonic() - t0) * 1000
         codes = [m.get("code", "") for m in members][:6]
-        print(f"✓ 板块成分股 881121 {dt:.0f}ms: {len(members)} 条 "
-              f"(前 6: {codes})")
         if not members:
-            print("  ✗ 空列表")
+            print(f"✗ 板块成分股 881121 {dt:.0f}ms: 空列表")
             failures += 1
         elif any(len(str(c)) != 6 for c in codes):
-            print("  ✗ 存在非 6 位股票代码")
+            print(f"✗ 板块成分股 881121 {dt:.0f}ms: 存在非 6 位股票代码")
             failures += 1
+        else:
+            print(f"✓ 板块成分股 881121 {dt:.0f}ms: {len(members)} 条 "
+                  f"(前 6: {codes})")
     except Exception as exc:
         print(f"✗ 板块成分股异常: {type(exc).__name__}: {exc}")
         failures += 1
 
     client.disconnect()
+    if args.dump_dir:
+        print(
+            "鉁?成分股连接逐帧转储目录："
+            f"{Path(args.dump_dir).resolve()}/board_constituent_*"
+        )
     if failures:
         print(f"\n✗ {failures} 个接口失败")
         return 1

@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import time
 from pathlib import Path
+from types import MappingProxyType
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -14,6 +16,7 @@ from thspypc.features.auth_protocol import (  # noqa: E402
     LoginIdentity,
     build_login_body,
 )
+from thspypc.services.auth import AuthMaterial  # noqa: E402
 from thspypc.features.system_blocks_protocol import (  # noqa: E402
     BOARD_CLASSIFY_MARKETS_L2,
     BOARD_CLASSIFY_MARKETS_NORMAL,
@@ -24,11 +27,14 @@ from thspypc.features.system_blocks_protocol import (  # noqa: E402
     PAGEID_BOARD_LIST_L2,
     PAGEID_BOARD_TL,
     build_board_classification_query,
+    build_board_constituent_bootstrap_stages,
+    build_board_bootstrap_stages,
     build_board_market_init,
     build_board_pageid_register,
     build_board_qureal_init,
     build_board_stockname_query,
     build_board_subreal_registration,
+    load_local_board_stocklink_ver,
 )
 
 CAP_MAC64 = "GHRdIuxqLKg7diotlao7dioNtao7diodpQ=="
@@ -99,18 +105,25 @@ def test_board_subreal_registration_normal_has_seven_channels():
     assert all("pageid=392" in f.decode("gbk") for f in frames)
     assert "market=UNS" in frames[5].decode("gbk")
     assert "market=UHI" in frames[6].decode("gbk")
+    # 抓包字节：class=UNSI / UHII（不是 UNSF/UHIF）
+    assert "class=UNSI" in frames[5].decode("gbk")
+    assert "class=UHII" in frames[6].decode("gbk")
 
 
 def test_board_pageid_register_shape():
-    """pageid 注册帧：3 个子帧、sub=0x0002、文本 \\r\\npageid=N\\r\\n。"""
+    """pageid 注册最后子帧省略 LF，但声明长度仍包含该终止字节。"""
     frame = build_board_pageid_register(level2=True)
     text = frame.decode("gbk", "replace")
     assert text.count("pageid=5716") == 3
     assert "\r\npageid=5716\r\n" in text
+    assert len(frame) == 111
+    assert frame.endswith(b"\r")
     # 长度字段 = len("\r\npageid=5716\r\n") = 15（0x0f）
     assert frame[19:23] == b"\x0f\x00\x00\x00"
     frame_n = build_board_pageid_register(level2=False)
     assert b"pageid=392" in frame_n
+    assert len(frame_n) == 108
+    assert frame_n.endswith(b"\r")
 
 
 def test_board_market_init_header_and_text():
@@ -178,6 +191,223 @@ def test_board_stockname_query_shapes():
         "\tinstid=65536\nmethod=upstockname\nmarket=URS\nStockNameVer=;;\n"
         "prototype=kvproto\npageid=392"
     )
+
+
+def test_board_bootstrap_stages_match_l2_capture_order():
+    """L2 核心引导保留 pcap 中的三阶段边界和二次注册。"""
+    initial, initialize, reregister = build_board_bootstrap_stages(True)
+    assert len(initial) == 16              # subreal 5×3 + pageid
+    assert len(initialize) == 11           # MarketCode init + qureal-init×10
+    assert len(reregister) == 18           # (subreal 5 + pageid)×3
+    assert b"method=subreal" in initial[0]
+    assert b"MarketCode=" in initialize[0]
+    assert b"method=subreal" in reregister[0]
+    assert b"pageid=5716" in reregister[-1]
+
+
+def test_board_bootstrap_stages_match_normal_capture_order():
+    """普通账号在 MarketCode init 前多一轮 subreal/pageid。"""
+    initial, initialize, reregister = build_board_bootstrap_stages(False)
+    assert len(initial) == 22              # subreal 7×3 + pageid
+    assert len(initialize) == 19           # subreal 7 + pageid + init + qureal×10
+    assert len(reregister) == 23           # subreal 7×3 + 两个 pageid 帧
+    assert b"method=subreal" in initialize[0]
+    assert b"pageid=392" in initialize[7]
+    assert b"MarketCode=" in initialize[8]
+    assert b"pageid=392" in reregister[-1]
+
+
+def test_normal_constituent_bootstrap_starts_with_market_init():
+    first, register, settle = build_board_constituent_bootstrap_stages(
+        False,
+        "sh",
+    )
+
+    assert len(first) == 1
+    assert b"MarketCode=" in first[0]
+    assert b"method=subreal" in register[0]
+    assert b"pageid=392" in register[-1]
+    assert b"method=subreal" in settle[0]
+
+
+def test_constituent_bootstrap_uses_stock_market_init_per_side():
+    """成分股连接 MKT_INIT 用股票市场集，不能用板块指数 96;88;128;216;48。"""
+    from thspypc.features.system_blocks_protocol import (
+        BOARD_CONSTITUENT_MARKET_CODES,
+        BOARD_CONSTITUENT_MARKET_DATE,
+    )
+
+    expected = {
+        (False, "sh"): ("16;32;144;", "16(-1738516266);32(-1050958608);144(-924138670);"),
+        (True, "sh"): ("16;144;", "16(-1738516266);144(-924138670);"),
+        (True, "sz"): ("32;", "32(-1050958608);"),
+    }
+    assert BOARD_CONSTITUENT_MARKET_CODES == {
+        (side, level2): codes
+        for (level2, side), (codes, _dates) in expected.items()
+    }
+    assert BOARD_CONSTITUENT_MARKET_DATE == {
+        (side, level2): dates
+        for (level2, side), (_codes, dates) in expected.items()
+    }
+    for (level2, side), (codes, dates) in expected.items():
+        stages = build_board_constituent_bootstrap_stages(level2, side)
+        flat = [frame for stage in stages for frame in stage]
+        init = next(frame for frame in flat if b"MarketCode=" in frame)
+        text = init.decode("gbk", errors="replace")
+        assert f"MarketCode={codes}" in text
+        assert f"MarketDate={dates}" in text
+
+
+def test_l2_constituent_bootstrap_has_no_qureal_init():
+    """成分股连接不发 qureal-init（那是板块指数通道的引导）。"""
+    for side in ("sh", "sz"):
+        stages = build_board_constituent_bootstrap_stages(True, side)
+        flat = [frame for stage in stages for frame in stage]
+        assert not any(b"qustocklink" in frame for frame in flat)
+        assert not any(b"method=init" in frame for frame in flat)
+        assert b"method=subreal" in flat[0]
+
+
+def test_local_stocklink_versions_are_preserved_per_section(tmp_path):
+    """不能把 StockLink.ini 中每个 section 的版本压成统一的 ConfigVer。"""
+    from thspypc.features.stock_list_protocol import INIT_STOCK_LINKS
+
+    root = tmp_path / "hexin"
+    path = root / "system" / "同花顺方案" / "StockLink.ini"
+    path.parent.mkdir(parents=True)
+    sections = ["[ConfigInfo]\nConfigVer=202608010001\n"]
+    for index, name in enumerate(INIT_STOCK_LINKS):
+        sections.append(f"[{name}]\nConfigVer=20260801{index:04d}\n")
+    path.write_text("".join(sections), encoding="gbk")
+
+    value = load_local_board_stocklink_ver(str(root))
+
+    assert value is not None
+    assert "^bConfigInfo^B^r^nConfigVer^e202608010001^r^n" in value
+    assert "^bStock_176_H_QC^B^r^nConfigVer^e202608010000^r^n" in value
+    assert "^bStock_64_F_DL^B^r^nConfigVer^e202608010028^r^n" in value
+
+
+def test_local_stocklink_versions_require_all_sections(tmp_path):
+    root = tmp_path / "hexin"
+    path = root / "system" / "同花顺方案" / "StockLink.ini"
+    path.parent.mkdir(parents=True)
+    path.write_text("[ConfigInfo]\nConfigVer=202608010001\n", encoding="gbk")
+    assert load_local_board_stocklink_ver(str(root)) is None
+
+
+def test_open_board_uses_only_board_identity_and_persists_rotation(monkeypatch):
+    """VerifyCode=0 的其他壳不能替代 BOARD；board offset 必须跨进程写盘。"""
+    from thspypc.client import THSClient
+
+    client = THSClient("offline-user", "offline-password", enable_heartbeat=False)
+    auth_info = MappingProxyType({
+        "passport_bytes": b"M_hqdns=fu4.123ths.com:8901:96;48;:",
+    })
+    material = AuthMaterial(
+        auth_info=auth_info,
+        passport_fields=MappingProxyType({}),
+        passport64=CAP_PASSPORT64,
+        profile=PC_LEVEL2_LOGIN_PROFILE,
+        generation=1,
+    )
+    client._auth_service._current = material
+    client._auth = dict(auth_info)
+    client._login_rr_offset = {"main": 0, "sh": 0, "sz": 0, "board": 0}
+    hosts = [f"10.0.0.{index}" for index in range(1, 10)]
+    client._probe_cache = {"board": (time.time(), hosts)}
+
+    monkeypatch.setattr(
+        "thspypc.protocol.resolve_fu4_hosts",
+        lambda _passport: hosts,
+    )
+    monkeypatch.setattr(
+        client,
+        "_probe_fastest_hosts",
+        lambda candidates, **_kwargs: list(candidates),
+    )
+
+    sent = []
+
+    class FakeSocket:
+        def sendall(self, payload):
+            sent.append(payload)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def close(self):
+            pass
+
+    persisted = []
+    monkeypatch.setattr(
+        "thspypc._client.connection_primitives.socket.create_connection",
+        lambda address, timeout: FakeSocket(),
+    )
+    monkeypatch.setattr(client, "_connection_read_frame", lambda _sock: b"login")
+    monkeypatch.setattr(
+        client,
+        "_parse_connection_login_response",
+        lambda _body: {"VerifyCode": "0"},
+    )
+    monkeypatch.setattr(client, "_send_board_bootstrap", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        client,
+        "_persist_ip_state",
+        lambda ips, offset, role="main": persisted.append((ips, offset, role)),
+    )
+
+    client._open_board_channel()
+
+    from thspypc.protocol import encode_frame
+
+    assert sent == [
+        encode_frame(material.login_body(client.mac64, LoginIdentity.BOARD)) + b"\n"
+    ]
+    assert client._login_rr_offset["board"] == 1
+    assert persisted[-1] == (hosts, 1, "board")
+
+
+def test_board_bootstrap_writes_newline_after_every_fd_frame(monkeypatch):
+    """防止分析工具按 MAGIC 切帧后再次把真实的 0x0a 间隔“优化”掉。"""
+    from thspypc.client import THSClient
+
+    client = THSClient("offline-user", "offline-password", enable_heartbeat=False)
+
+    class FakeSocket:
+        def __init__(self):
+            self.payloads = []
+
+        def sendall(self, payload):
+            self.payloads.append(payload)
+
+        def settimeout(self, _timeout):
+            pass
+
+    sock = FakeSocket()
+    monkeypatch.setattr(
+        "thspypc._client.connection_primitives.time.sleep",
+        lambda _seconds: None,
+    )
+    monkeypatch.setattr(
+        client,
+        "_connection_read_frame",
+        lambda _sock: (_ for _ in ()).throw(socket.timeout()),
+    )
+
+    client._send_board_bootstrap(sock, level2=True, timeout=0.01)
+
+    assert len(sock.payloads) == 3
+    for payload in sock.payloads:
+        offset = 0
+        while offset < len(payload):
+            assert payload[offset: offset + 4] == b"\xfd\xfd\xfd\xfd"
+            size = int(payload[offset + 4: offset + 12], 16)
+            frame_end = offset + 12 + size
+            assert payload[frame_end: frame_end + 1] == b"\n"
+            offset = frame_end + 1
+        assert offset == len(payload)
 
 
 def test_resolve_fu4_hosts_parses_m_hqdns(monkeypatch):

@@ -48,6 +48,7 @@ class ConnectionFactory:
         set_board_socket: Callable[[Any], None],
         open_board: Callable[[], Any],
         board_lock: Any,
+        open_board_constituent: Callable[[str], Any],
     ) -> None:
         self._result_type = result_type
         self._is_connected = is_connected
@@ -72,6 +73,7 @@ class ConnectionFactory:
         self._set_board_socket = set_board_socket
         self._open_board = open_board
         self._board_lock = board_lock
+        self._open_board_constituent = open_board_constituent
 
     def connect_main(self, *, refresh_auth: bool = False):
         """Authenticate on demand and establish the ordinary MAIN channel."""
@@ -194,6 +196,24 @@ class ConnectionFactory:
                 owns_socket=False,
                 initialized=True,
                 request_lock=self._board_lock,
+            )
+
+        constituent_side = {
+            ConnectionRole.BOARD_CONSTITUENT_SH: "sh",
+            ConnectionRole.BOARD_CONSTITUENT_SZ: "sz",
+        }.get(spec.role)
+        if constituent_side is not None:
+            sock = self._open_board_constituent(constituent_side)
+            if sock is None:
+                raise OSError(
+                    f"板块成分股[{constituent_side}]通道建连失败"
+                )
+            # This socket is not mirrored by a legacy facade attribute.  The
+            # ConnectionManager owns and closes it directly.
+            return OpenedConnection(
+                socket=sock,
+                owns_socket=True,
+                initialized=True,
             )
 
         raise OSError(f"不支持的连接角色: {spec.role.value}")

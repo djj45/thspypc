@@ -63,7 +63,11 @@ class ConnectionManager:
         profile: AccountProfile,
         role: ConnectionRole,
     ) -> bool:
-        if role in (ConnectionRole.SH_L2, ConnectionRole.SZ_L2):
+        if role in (
+            ConnectionRole.SH_L2,
+            ConnectionRole.SZ_L2,
+            ConnectionRole.BOARD_CONSTITUENT_SZ,
+        ):
             return (
                 profile.kind is AccountKind.LEVEL2
                 and profile.support(Capability.L2_MARKET_ACCESS)
@@ -113,7 +117,11 @@ class ConnectionManager:
         spec = self._specs[role]
         feature = f"connection:{role.value}"
 
-        if role in (ConnectionRole.SH_L2, ConnectionRole.SZ_L2):
+        if role in (
+            ConnectionRole.SH_L2,
+            ConnectionRole.SZ_L2,
+            ConnectionRole.BOARD_CONSTITUENT_SZ,
+        ):
             if self._profile.kind is AccountKind.STANDARD:
                 raise CapabilityUnavailableError(
                     Capability.L2_MARKET_ACCESS,

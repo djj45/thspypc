@@ -50,6 +50,29 @@ class FakeSocket:
         self.closed = True
 
 
+def test_constituent_connections_are_independent_owned_fu4_roles(monkeypatch):
+    client = _client()
+    opened = []
+    sockets = {"sh": FakeSocket(), "sz": FakeSocket()}
+    monkeypatch.setattr(
+        client,
+        "_open_board_channel",
+        lambda **kwargs: opened.append(kwargs["constituent_side"])
+        or sockets[kwargs["constituent_side"]],
+    )
+    manager = client.configure_service_context(LEVEL2_PROFILE, allow_open=True)
+
+    sh = manager.acquire(ConnectionRole.BOARD_CONSTITUENT_SH)
+    sz = manager.acquire(ConnectionRole.BOARD_CONSTITUENT_SZ)
+
+    assert opened == ["sh", "sz"]
+    assert sh.socket is not sz.socket
+    assert sh.owns_socket and sz.owns_socket
+    assert client._board_sock is None
+    client.disconnect()
+    assert sockets["sh"].closed and sockets["sz"].closed
+
+
 def _client():
     return THSClient(
         "offline-user",

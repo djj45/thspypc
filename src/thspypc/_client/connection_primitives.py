@@ -23,6 +23,7 @@ from ..protocol import (
     parse_init_response,
 )
 from ..transport import ConnectionRole
+from .._transport.tracing import maybe_wrap_board_socket
 
 logger = logging.getLogger(__name__)
 
@@ -781,20 +782,31 @@ class ConnectionPrimitives:
 
     # ── 板块专用通道（fu4 8901）──
 
-    def _open_board_channel(self, timeout: float = 20.0):
-        """打开板块专用通道：BOARD login（fu4 服务器）→ 完整引导序列。
+    def _open_board_channel(
+        self,
+        timeout: float = 20.0,
+        *,
+        constituent_side: str | None = None,
+    ):
+        """打开板块专用通道：BOARD login → 完整引导序列。
 
-        ★ 2026-08-01 抓包铁证：板块行情/分时/竞价/成分股必须走 **fu4** 市场组
+        ★ 2026-08-01 抓包铁证：**板块指数**行情/分时/竞价走 **fu4** 市场组
         （``fu4.123ths.com:8901``，MarketCode=96;128;88;216;48;），在 MAIN
         连接上重放相同引导帧服务器只回 CodeListSize=0。login 壳按账号 profile
         分支（Level2 无用户名 / 普通 __manual，见
         :func:`thspypc.features.auth_protocol.build_login_body` 的
         ``LoginIdentity.BOARD``）。
 
-        引导序列（字节级复刻 2026-08-01 双账号抓包）：subreal 注册×3 →
-        pageid 注册 → MarketCode init → qureal-init×10 → [5],[55] 分类表 →
-        StockNameVer。**帧间不追加额外换行**（fu4 解析器对帧间杂字节敏感，
-        login 帧例外，必须带 ``\\n``）。
+        **成分股独立连接不走 fu4**：普通账号连 ``main.123ths.com``（thsuser，
+        MarketCode=16;32;144;）、L2 沪连 ``shlv2.123ths.com``（thsuser，
+        MarketCode=16;144;）、L2 深连 ``szlv2.123ths.com``（__manual，
+        MarketCode=32;）——与抓包登录回执后端、MKT_INIT 市场集一一对应。
+        连到 fu4（globalthsindex 网关）时服务器对全部 subreal 注册回
+        ``errorcode=-1``，业务查询只回空 Sort 响应。
+
+        核心引导（字节级复刻 2026-08-01 双账号抓包）：MarketCode init →
+        subreal 注册 → pageid 注册；L2 成分股不发 qureal-init。原始 TCP
+        流确认每个完整 FD 帧（包括 login、引导和查询）后均带 ``0x0a`` 分隔符。
 
         Returns:
             已引导的 socket（未收编，调用方负责持有/关闭）。
@@ -808,96 +820,136 @@ class ConnectionPrimitives:
         if self._auth is None:
             self.authenticate()
 
-        def _try_round(material, allow_refresh: bool, identities=None):
-            """用给定票据登录 fu4 + 引导；全失败/引导无响应时可选重新鉴权。
-
-            ``identities`` 按序尝试登录壳：2026-08-01 实测 fu4 服务器对普通
-            账号的 __manual 壳偶发 PromptText=-6 拒绝、thsuser 壳通过，
-            因此保留降级链（BOARD → STANDARD → MANUAL）。
-            """
+        def _try_round(material, allow_refresh: bool):
+            """用给定票据登录 fu4 + 引导；失败时可换票据和 IP 批次重试一次。"""
             profile = material.profile
             passport64 = material.passport64
-            if identities is None:
-                identities = (
-                    LoginIdentity.BOARD,
-                    LoginIdentity.STANDARD,
-                    LoginIdentity.MANUAL,
-                )
             level2 = profile.supports_manual_identity
-            hosts = resolve_fu4_hosts(material.passport_bytes)
-            if not hosts:
-                logger.warning("板块通道：passport 无 fu4 域名，回退 MARKET_HOSTS")
-                from ..protocol import MARKET_HOSTS
-                hosts = list(MARKET_HOSTS)
+            if constituent_side == "sz" and not level2:
+                raise OSError("普通账号没有独立的深市板块成分连接")
+            if constituent_side == "sh":
+                identity = LoginIdentity.STANDARD
+                role_key = "board_constituent_sh"
+            elif constituent_side == "sz":
+                identity = LoginIdentity.MANUAL
+                role_key = "board_constituent_sz"
+            else:
+                identity = LoginIdentity.BOARD
+                role_key = "board"
+            if constituent_side is not None:
+                # 成分股独立连接必须走股票行情网关（main/shlv2/szlv2），
+                # 不能复用板块指数网关 fu4。
+                from ..protocol import (
+                    MARKET_HOSTS,
+                    resolve_l2_hosts_grouped,
+                    resolve_market_hosts,
+                )
+
+                if not level2:
+                    hosts = resolve_market_hosts(material.passport_bytes)
+                    group_name = "main"
+                else:
+                    grouped = resolve_l2_hosts_grouped(
+                        material.passport_bytes
+                    )
+                    hosts = grouped.get(
+                        "sh" if constituent_side == "sh" else "sz",
+                        [],
+                    )
+                    group_name = (
+                        "shlv2" if constituent_side == "sh" else "szlv2"
+                    )
+                if not hosts:
+                    logger.warning(
+                        "成分股通道：passport 无 %s 域名，回退 MARKET_HOSTS",
+                        group_name,
+                    )
+                    hosts = list(MARKET_HOSTS)
+            else:
+                hosts = resolve_fu4_hosts(material.passport_bytes)
+                if not hosts:
+                    logger.warning(
+                        "板块通道：passport 无 fu4 域名，回退 MARKET_HOSTS"
+                    )
+                    from ..protocol import MARKET_HOSTS
+                    hosts = list(MARKET_HOSTS)
             probed = self._probe_fastest_hosts(
-                hosts, timeout=1.0, role="board"
+                hosts, timeout=1.0, role=role_key
             )
             candidates = probed or hosts
-            offset = self._login_rr_offset.get("board", 0) % max(1, len(candidates))
-            batch = (candidates[offset:] + candidates[:offset])[:7]
-            logger.info("板块通道：并发登录 %d 个 fu4 IP（offset=%d）: %s",
-                        len(batch), offset, batch[:3])
+            offset = self._login_rr_offset.get(role_key, 0) % max(1, len(candidates))
+            ordered = candidates[offset:] + candidates[:offset]
+            logger.info(
+                "板块通道：从 fu4 IP offset=%d 单连接登录（共 %d 个候选）",
+                offset,
+                len(ordered),
+            )
 
+            # 板块业务身份必须与真实客户端一致。STANDARD/MANUAL 即使 login
+            # VerifyCode=0，也不代表服务器会激活 fu4 板块路由，不能作为降级壳。
+            login_body = build_login_body(
+                passport64,
+                self.mac64,
+                identity=identity,
+                profile=profile,
+            )
+            # 每个逻辑角色只顺序登录一个 fu4 节点。指数 BOARD、标准身份的
+            # 成分沪侧和 manual 身份的成分深侧是三个不同角色，不能并发登录
+            # 同一角色的多个 IP 再关闭“输家”。
             winner = None
             tried = 0
-            for identity in identities:
-                login_body = build_login_body(
-                    passport64,
-                    self.mac64,
-                    identity=identity,
-                    profile=profile,
+            for host in ordered:
+                tried += 1
+                try:
+                    sock = socket.create_connection(
+                        (host, MARKET_PORT), timeout=min(timeout, 15.0)
+                    )
+                except (socket.timeout, ConnectionError, OSError):
+                    continue
+                sock = maybe_wrap_board_socket(
+                    sock,
+                    role=role_key,
+                    host=host,
+                    level2=level2,
                 )
-                winner = self._concurrent_login(
-                    batch, login_body, timeout=min(timeout, 12.0)
-                )
-                tried = len(batch)
-                if winner is not None:
-                    break
-                logger.info("板块通道：登录壳 %s 全 IP 失败，降级下一壳",
-                            identity.value)
-            if winner is None:
-                # 串行 fallback：补齐测速外的 IP（与 MAIN 同策略）
-                fallback = [h for h in candidates if h not in set(batch)]
-                for host in fallback:
-                    for identity in identities:
-                        tried += 1
-                        try:
-                            sock = socket.create_connection(
-                                (host, MARKET_PORT), timeout=min(timeout, 15.0)
-                            )
-                        except (socket.timeout, ConnectionError, OSError):
-                            continue
-                        try:
-                            login_body = build_login_body(
-                                passport64,
-                                self.mac64,
-                                identity=identity,
-                                profile=profile,
-                            )
-                            try:
-                                sock.sendall(encode_frame(login_body) + b"\n")
-                                sock.settimeout(min(timeout, 8.0))
-                                resp_body = self._connection_read_frame(sock)
-                                result = self._parse_connection_login_response(
-                                    resp_body
-                                )
-                                if result.get("VerifyCode") == "0":
-                                    winner = (host, sock, result)
-                                    break
-                            except (socket.timeout, OSError, ValueError):
-                                try:
-                                    sock.close()
-                                except OSError:
-                                    pass
-                        except (socket.timeout, ConnectionError, OSError):
-                            continue
-                        if winner is not None:
+                try:
+                    try:
+                        sock.sendall(encode_frame(login_body) + b"\n")
+                        sock.settimeout(min(timeout, 8.0))
+                        resp_body = self._connection_read_frame(sock)
+                        result = self._parse_connection_login_response(
+                            resp_body
+                        )
+                        verify_code = result.get("VerifyCode")
+                        logger.info(
+                            "板块通道：%s:%d VerifyCode=%s",
+                            host,
+                            MARKET_PORT,
+                            verify_code,
+                        )
+                        if verify_code == "0":
+                            trace = getattr(sock, "trace", None)
+                            if trace is not None:
+                                trace.mark_login_ok(verify_code)
+                            winner = (host, sock, result)
                             break
-                    if winner is not None:
-                        break
-            self._login_rr_offset["board"] = (
-                self._login_rr_offset.get("board", 0) + max(1, tried)
-            ) % max(1, len(candidates))
+                        sock.close()
+                    except (socket.timeout, OSError, ValueError):
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                except (socket.timeout, ConnectionError, OSError):
+                    continue
+
+            # board 也必须像 MAIN/L2 一样把轮换偏移写盘。此前这里只改内存，
+            # verify 每开一个新进程都会重新打同一批最快 fu4 IP。
+            self._advance_l2_offset(
+                role_key,
+                tried,
+                len(candidates),
+                force_advance=winner is None,
+            )
             if winner is None:
                 if allow_refresh:
                     logger.warning(
@@ -910,7 +962,10 @@ class ConnectionPrimitives:
             host, sock, _result = winner
             try:
                 n_replies = self._send_board_bootstrap(
-                    sock, level2, timeout=timeout
+                    sock,
+                    level2,
+                    timeout=timeout,
+                    constituent_side=constituent_side,
                 )
             except (OSError, ValueError) as exc:
                 try:
@@ -921,9 +976,9 @@ class ConnectionPrimitives:
                     f"板块通道引导失败（{host}）: {exc}"
                 ) from exc
             if n_replies == 0 and allow_refresh:
-                # 引导零响应 = 会话未激活（票据被其他连接消费等），换新票据重试
+                # 引导零响应 = 当前连接未激活；换新票据和下一个 IP 重试一次。
                 logger.warning(
-                    "板块通道：%s 引导零响应（票据可能已被消费），重新鉴权重试",
+                    "板块通道：%s 引导零响应，换票据/IP 重试",
                     host,
                 )
                 try:
@@ -932,8 +987,22 @@ class ConnectionPrimitives:
                     pass
                 fresh = self._refresh_auth_material()
                 return _try_round(fresh, allow_refresh=False)
-            logger.info("✓ 板块通道就绪（%s:%d, level2=%s）",
-                        host, MARKET_PORT, level2)
+            if n_replies and constituent_side is not None:
+                # 成分股连接的成功引导本身就是 L2 市场通道证据：MKT_INIT
+                # 在 shlv2/szlv2 网关完成 = l2_market_init；深市 manual 身份
+                # 登录成功 = manual_login。回填后能力门禁不再依赖该账号是否
+                # 已开过 L2 推送连接。
+                if level2:
+                    self._account_evidence.record_l2_init(Support.YES)
+                if constituent_side == "sz":
+                    self._account_evidence.record_manual_login(Support.YES)
+            logger.info(
+                "✓ 板块通道就绪（%s:%d, level2=%s, role=%s）",
+                host,
+                MARKET_PORT,
+                level2,
+                role_key,
+            )
             return sock
 
         material = self._auth_service.require_current()
@@ -945,22 +1014,69 @@ class ConnectionPrimitives:
         level2: bool,
         *,
         timeout: float = 12.0,
+        constituent_side: str | None = None,
     ) -> int:
-        """发送板块通道引导序列并排空响应；返回读取的响应帧数。"""
-        from ..features.system_blocks_protocol import build_board_bootstrap
+        """按真实客户端的阶段和等待发送板块引导；返回读取的响应帧数。"""
+        from ..features.system_blocks_protocol import (
+            build_board_bootstrap_stages,
+            build_board_constituent_bootstrap_stages,
+            load_local_board_stocklink_ver,
+        )
 
-        frames = build_board_bootstrap(level2)
-        # 每个引导帧是裸 body，发送时补 MAGIC+长度壳；帧间不加额外换行
-        # （login 帧例外，需要尾部 \n；业务查询帧经 MarketSession 配置）。
-        payload = b"".join(encode_frame(frame) for frame in frames)
-        logger.debug("板块通道：发送引导序列 %d 帧 / %dB", len(frames), len(payload))
-        sock.sendall(payload)
+        stocklink_ver = load_local_board_stocklink_ver()
+        if stocklink_ver is None:
+            logger.warning(
+                "板块通道：未找到完整的本机 StockLink.ini 版本表，回退 ConfigVer=0"
+            )
+        else:
+            logger.info("板块通道：使用本机 StockLink.ini 的逐市场版本表")
+        if constituent_side is None:
+            stages = build_board_bootstrap_stages(
+                level2,
+                stocklink_ver=stocklink_ver,
+            )
+        else:
+            stages = build_board_constituent_bootstrap_stages(
+                level2,
+                constituent_side,
+                stocklink_ver=stocklink_ver,
+            )
+
+        # 抓包中 login reply 到第一阶段固定间隔约 0.45s。这个等待让 fu4 完成
+        # 会话角色绑定；旧实现立即突发全部帧，恰好对应零响应/FIN 表型。
+        time.sleep(0.45)
+        for index, frames in enumerate(stages):
+            # pcap 原始 TCP 流中每个 FD 帧后都有 0x0a。早期分析脚本按 MAGIC
+            # split 后丢掉了帧间字节，曾误判为“无换行”；缺少这个分隔符时
+            # fu4 会在第一阶段后直接 FIN。
+            payload = b"".join(
+                encode_frame(frame) + b"\n" for frame in frames
+            )
+            logger.debug(
+                "板块通道：发送引导阶段 %d/%d：%d 帧 / %dB",
+                index + 1,
+                len(stages),
+                len(frames),
+                len(payload),
+            )
+            try:
+                sock.sendall(payload)
+            except OSError as exc:
+                raise OSError(
+                    f"阶段 {index + 1}/{len(stages)} 发送失败: {exc}"
+                ) from exc
+            if index == 0:
+                # L2 抓包约 0.26s；普通账号需等待 subreal 回执，约 0.59s。
+                time.sleep(0.55 if not level2 else 0.26)
+            elif index == 1:
+                # 给 init/qureal-init 留出产生 rettype=ini 的时间，再做二次注册。
+                time.sleep(0.20 if not level2 else 0.06)
 
         # 排空：init 配置帧 / rettype=ini / 分类表 / StockNameVer 响应。
-        # 短超时快速结束，避免把大配置帧全部等完（业务查询会自行跳过无关帧）。
+        # 等服务器完成 init；后续业务查询不应再吞初始化残留帧。
         deadline = time.time() + timeout
         n = 0
-        sock.settimeout(2.0)
+        sock.settimeout(0.8)
         while time.time() < deadline and n < 40:
             try:
                 self._connection_read_frame(sock)

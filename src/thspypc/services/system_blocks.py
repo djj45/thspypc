@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
+import datetime as dt
 from collections.abc import Callable
 from pathlib import Path
 
@@ -42,10 +44,14 @@ from ..features.system_blocks_protocol import (
     PAGEID_BOARD_TL_L2,
     build_board_auction_query,
     build_board_constituents_query,
+    build_board_constituents_page_transition,
+    build_board_constituents_selection_query,
+    build_board_constituents_sort_query,
     build_board_list_query,
     build_board_timeline_query,
     parse_board_auction_response,
     parse_board_constituents_response,
+    parse_board_constituents_selection_response,
     parse_board_quote_response,
     parse_board_timeline_response,
 )
@@ -63,6 +69,16 @@ class SystemBlocksError(Exception):
 
 FrameReader = Callable[[SocketLike], bytes]
 Clock = Callable[[], float]
+
+
+def _coerce_trade_date(value) -> dt.date:
+    if value is None:
+        return dt.date.today()
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    return dt.date.fromisoformat(str(value))
 
 
 # 语义别名 → BlockUpdate 文件 ID（大小写不敏感）
@@ -389,7 +405,7 @@ class BoardService:
         connections: ConnectionManager,
         *,
         frame_reader: FrameReader = read_frame,
-        max_frames: int = 8,
+        max_frames: int = 64,
         level2: bool | None = None,
     ) -> None:
         self._connections = connections
@@ -408,27 +424,86 @@ class BoardService:
         *,
         parsers: tuple[Callable[[bytes], list[dict]], ...],
         timeout: float = 12.0,
+        accept: Callable[[list[dict]], bool] | None = None,
+        role: ConnectionRole = ConnectionRole.BOARD,
     ) -> list[dict]:
         connection = self._connections.acquire(
-            ConnectionRole.BOARD,
+            role,
             capability=Capability.BASIC_QUOTE,
         )
         try:
-            # 板块通道帧间不加额外换行（fu4 解析器对帧间杂字节敏感，
-            # 抓包板块通道请求帧均无尾部 \n；login/引导由建连层处理）。
+            # pcap 原始流确认：板块 login、引导和业务请求的每个 FD 帧后均有
+            # 0x0a 分隔符。此前按 MAGIC 切帧的工具丢掉了这些间隔，产生过
+            # “请求无尾部换行”的错误结论。
             with connection.request(
                 request,
                 timeout=timeout,
-                trailing_newline=False,
+                trailing_newline=True,
             ) as sock:
+                deadline = time.monotonic() + timeout
                 for _ in range(self._max_frames):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(remaining)
                     response = self._read_frame(sock)
                     for parser in parsers:
                         records = parser(response)
-                        if records:
+                        if records and (accept is None or accept(records)):
                             return records
-        except (socket.timeout, OSError) as exc:
-            raise ProtocolError(f"板块查询超时/网络错误: {exc}") from exc
+        except socket.timeout:
+            return []
+        except OSError as exc:
+            raise ProtocolError(f"板块查询网络错误: {exc}") from exc
+        return []
+
+    def _request_sequence(
+        self,
+        requests: tuple[bytes, ...],
+        *,
+        parsers: tuple[Callable[[bytes], list[dict]], ...],
+        timeout: float,
+        accept: Callable[[list[dict]], bool] | None = None,
+        interval: float = 0.04,
+        role: ConnectionRole = ConnectionRole.BOARD,
+    ) -> list[dict]:
+        """在同一 BOARD socket 上连续发送一个页面事务后统一收响应。
+
+        普通账号 4180 抓包中 Sort、527527 选择确认、完整行情三帧的发送间隔
+        约 30--40ms，客户端不会逐帧等待响应。服务端也可能在事务补齐前保持
+        静默，因此不能用三次 :meth:`_request` 串行编排。
+        """
+        if not requests:
+            return []
+        connection = self._connections.acquire(
+            role,
+            capability=Capability.BASIC_QUOTE,
+        )
+        try:
+            with connection.request(
+                requests[0],
+                timeout=timeout,
+                trailing_newline=True,
+            ) as sock:
+                for request in requests[1:]:
+                    if interval > 0:
+                        time.sleep(interval)
+                    sock.sendall(request + b"\n")
+                deadline = time.monotonic() + timeout
+                for _ in range(self._max_frames):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(remaining)
+                    response = self._read_frame(sock)
+                    for parser in parsers:
+                        records = parser(response)
+                        if records and (accept is None or accept(records)):
+                            return records
+        except socket.timeout:
+            return []
+        except OSError as exc:
+            raise ProtocolError(f"板块查询网络错误: {exc}") from exc
         return []
 
     def board_quotes(
@@ -439,10 +514,14 @@ class BoardService:
     ) -> list[dict]:
         """板块指数行情列表（含名称/最新价/量额，0x130 表）。"""
         request = build_board_list_query(codes, level2=self._is_level2())
+        wanted_codes = set(codes)
         return self._request(
             request,
             parsers=(parse_board_quote_response,),
             timeout=timeout,
+            accept=lambda records: any(
+                record.get("code") in wanted_codes for record in records
+            ),
         )
 
     def board_timeline(
@@ -458,11 +537,27 @@ class BoardService:
             date=date,
             level2=self._is_level2(),
         )
-        return self._request(
+        expected_date = _coerce_trade_date(date)
+        records = self._request(
             request,
             parsers=(parse_board_timeline_response,),
             timeout=timeout,
+            accept=lambda records: any(
+                record.get("date") == expected_date for record in records
+            ),
         )
+        matched = [
+            record for record in records
+            if record.get("date") == expected_date
+        ]
+        # 0x42 首行是该日基准价哨兵，dt1 不是 packed-date；保留并显式归属
+        # 到目标日期，避免显示成伪造的远期年份。
+        if records and "date" not in records[0] and matched:
+            baseline = dict(records[0])
+            baseline["date"] = expected_date
+            baseline["is_baseline"] = True
+            return [baseline, *matched]
+        return matched
 
     def board_auction(
         self,
@@ -477,28 +572,185 @@ class BoardService:
             date=date,
             level2=self._is_level2(),
         )
-        return self._request(
+        expected_date = _coerce_trade_date(date)
+        records = self._request(
             request,
             parsers=(parse_board_auction_response,),
             timeout=timeout,
+            accept=lambda records: any(
+                getattr(record.get("time"), "date", lambda: None)()
+                == expected_date
+                for record in records
+            ),
         )
+        start = dt.time(9, 15)
+        end = dt.time(9, 25)
+        return [
+            record for record in records
+            if (
+                isinstance(record.get("time"), dt.datetime)
+                and record["time"].date() == expected_date
+                and start <= record["time"].time() <= end
+            )
+        ]
 
     def board_constituents(
         self,
-        codes: list[str],
+        stock_codes: list[str],
         *,
-        timeout: float = 15.0,
+        stock_markets: dict[str, int | str] | None = None,
+        timeout: float = 40.0,
     ) -> list[dict]:
-        """板块成分股行情（0x64 表）。"""
-        request = build_board_constituents_query(
-            codes,
-            level2=self._is_level2(),
-        )
-        return self._request(
-            request,
-            parsers=(parse_board_constituents_response,),
-            timeout=timeout,
-        )
+        """对已展开的成分股代码批量查询行情（0x64 表）。"""
+        records: list[dict] = []
+        returned_codes: set[str] = set()
+        deadline = time.monotonic() + timeout
+        if self._is_level2():
+            # L2 页面提交整个板块 universe，并按沪/深市场拆到两个等价的
+            # 页面组件连接。服务层可在同一连接上顺序发两个完整市场批次；
+            # 按首屏 21 股切块不是抓包中的协议，服务端会静默忽略。
+            groups: tuple[list[str], ...] = (
+                [
+                    code for code in stock_codes
+                    if str((stock_markets or {}).get(code, "")) != "33"
+                    and not code.startswith(("0", "1", "2", "3"))
+                ],
+                [
+                    code for code in stock_codes
+                    if str((stock_markets or {}).get(code, "")) == "33"
+                    or code.startswith(("0", "1", "2", "3"))
+                ],
+            )
+            for group_index, batch in enumerate(groups):
+                if not batch:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                request = build_board_constituents_query(
+                    batch,
+                    level2=True,
+                    seq=0x1082 + group_index,
+                    route_base=0x005C,
+                    markets=stock_markets,
+                    visible_codes=batch[:21],
+                    context_market=16 if group_index == 0 else 32,
+                )
+                wanted_codes = set(batch)
+                role = (
+                    ConnectionRole.BOARD_CONSTITUENT_SH
+                    if group_index == 0
+                    else ConnectionRole.BOARD_CONSTITUENT_SZ
+                )
+                if group_index == 0:
+                    page_records = self._request_sequence(
+                        (
+                            build_board_constituents_page_transition(True),
+                            request,
+                        ),
+                        parsers=(parse_board_constituents_response,),
+                        timeout=remaining,
+                        accept=lambda result, wanted=wanted_codes: any(
+                            record.get("code") in wanted for record in result
+                        ),
+                        interval=0.0,
+                        role=role,
+                    )
+                else:
+                    page_records = self._request(
+                        request,
+                        parsers=(parse_board_constituents_response,),
+                        timeout=remaining,
+                        accept=lambda result, wanted=wanted_codes: any(
+                            record.get("code") in wanted for record in result
+                        ),
+                        role=role,
+                    )
+                for record in page_records:
+                    code = str(record.get("code", ""))
+                    if code and code not in returned_codes:
+                        returned_codes.add(code)
+                        records.append(record)
+            return records
+
+        # 普通账号先等待 Sort 返回服务端选出的代码页，再用这些代码发送
+        # 527527 和完整行情。新包明确显示 Sort 与后两帧之间存在响应边界，
+        # 不能再拿本地 membership 顺序猜服务端排序页。
+        page_size = 22
+        universe = set(stock_codes)
+        for begin in range(0, len(stock_codes), page_size):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sort_request = build_board_constituents_sort_query(
+                stock_codes,
+                visible_codes=stock_codes[begin: begin + page_size],
+                sort_begin=begin,
+                sort_count=page_size,
+                seq=0x10A7 + begin,
+                route_base=0x0044,
+                markets=stock_markets,
+            )
+            sort_requests = (sort_request,)
+            if begin == 0:
+                sort_requests = (
+                    build_board_constituents_page_transition(False),
+                    sort_request,
+                )
+            sorted_page = self._request_sequence(
+                sort_requests,
+                parsers=(parse_board_constituents_selection_response,),
+                timeout=remaining,
+                accept=lambda result: any(
+                    str(record.get("code", "")) in universe
+                    for record in result
+                ),
+                interval=0.0,
+                role=ConnectionRole.BOARD_CONSTITUENT_SH,
+            )
+            page_codes = list(dict.fromkeys(
+                str(record.get("code", ""))
+                for record in sorted_page
+                if str(record.get("code", "")) in universe
+            ))
+            if not page_codes:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            selection_request = build_board_constituents_selection_query(
+                page_codes,
+                seq=0x10AB + begin,
+                route_base=0x0044,
+                markets=stock_markets,
+            )
+            quote_request = build_board_constituents_query(
+                page_codes,
+                level2=False,
+                seq=0x10AD + begin,
+                include_prefix=False,
+                route_base=0x0044,
+                markets=stock_markets,
+            )
+            wanted_codes = set(page_codes)
+            page_records = self._request_sequence(
+                (selection_request, quote_request),
+                parsers=(parse_board_constituents_response,),
+                timeout=remaining,
+                accept=lambda result, wanted=wanted_codes: any(
+                    record.get("code") in wanted for record in result
+                ),
+                interval=0.0,
+                role=ConnectionRole.BOARD_CONSTITUENT_SH,
+            )
+            for record in page_records:
+                code = str(record.get("code", ""))
+                if code and code not in returned_codes:
+                    returned_codes.add(code)
+                    records.append(record)
+            if len(page_codes) < page_size:
+                break
+        return records
 
 
 __all__ = [

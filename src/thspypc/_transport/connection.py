@@ -21,6 +21,8 @@ class ConnectionRole(str, Enum):
     SZ_L2 = "sz_l2"
     REALORDER = "realorder"
     BOARD = "board"
+    BOARD_CONSTITUENT_SH = "board_constituent_sh"
+    BOARD_CONSTITUENT_SZ = "board_constituent_sz"
 
 
 class LoginIdentity(str, Enum):
@@ -72,6 +74,17 @@ CONNECTION_SPECS = {
         role=ConnectionRole.BOARD,
         identity=LoginIdentity.BOARD,
         port=8901,
+    ),
+    ConnectionRole.BOARD_CONSTITUENT_SH: ConnectionSpec(
+        role=ConnectionRole.BOARD_CONSTITUENT_SH,
+        identity=LoginIdentity.STANDARD,
+        port=8901,
+    ),
+    ConnectionRole.BOARD_CONSTITUENT_SZ: ConnectionSpec(
+        role=ConnectionRole.BOARD_CONSTITUENT_SZ,
+        identity=LoginIdentity.MANUAL,
+        port=8901,
+        required_capability=Capability.L2_MARKET_ACCESS,
     ),
 }
 
