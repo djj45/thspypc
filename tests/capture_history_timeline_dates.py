@@ -20,6 +20,8 @@
 
 操作步骤：
     1. 登录同花顺，打开【000938 紫光股份】的【分时图】（当天即可）
+       ★ 先把分时窗口【放大/最大化】——小窗口会走 0x7A 稀疏模式，
+         服务端只下发部分分钟（201/185 点）；放大后走 0x6C 全量 241 点。
     2. 运行脚本选网卡
     3. 抓包期间，按 ← 方向键逐日回翻：
        2026-07-31 → 07-30 → … → 07-23（停 4 秒）
@@ -164,6 +166,9 @@ def _parse_request(frame_body):
     except Exception:
         return None
     info = {}
+    if len(frame_body) >= 13:
+        # 0x09 + 子帧头(00 16 00 00 | seq2 | 12 00 子类型2 | 路由2 ...)
+        info["route"] = hex(struct.unpack("<H", frame_body[11:13])[0])
     m = re.search(r"DateTime=(\d+)\(([^)]*)\)", text)
     if not m:
         return None
@@ -293,7 +298,13 @@ def analyze(pcap_path):
         print("  ✗ 未抓到历史分时请求（确认：打开的是分时图并按 ← 翻过日期）")
     for (code, date_str), pairs in sorted(found.items()):
         target = "★目标" if date_str in TARGET_DATES else ""
-        print(f"  {code} {date_str} {target}: {len(pairs)} 个请求")
+        routes = sorted({req.get("route", "?") for req, _ in pairs})
+        route_note = ""
+        if "0x7a" in routes:
+            route_note = "（0x7A 稀疏模式：窗口未放大，服务端可能只回部分分钟）"
+        elif "0x6c" in routes:
+            route_note = "（0x6C 全量模式）"
+        print(f"  {code} {date_str} {target}: {len(pairs)} 个请求 route={routes}{route_note}")
 
     # ── 报告 2：目标日期逐点解码 + dt54 哨兵 ──
     print("\n【2】目标日期解码（241 点 + dt54 哨兵原始值）")
