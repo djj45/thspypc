@@ -137,6 +137,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._auth_lock = threading.RLock()
         # 板块/自选股管理（HTTPS，登录后初始化）
         self._blocks = None              # BlockManager 实例
+        self._system_blocks = None       # SystemBlocksService 实例（本地缓存，无需登录）
         self._http_cookies: dict | None = None
         # 短线精灵（9601 TCP，懒连接）
         self._realorder_sock: socket.socket | None = None
@@ -1012,6 +1013,53 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         """列出所有动态板块及其成分股（云端快照）。"""
         self._ensure_blocks()
         return self._blocks.list_dynamic_plates()
+
+    # ── 系统板块（行业/概念/地域…，本地 block_hq 缓存，只读，无需登录）──
+
+    @property
+    def system_blocks(self):
+        """系统板块只读服务（行业/概念/地域等）。
+
+        数据源为本机 hexin 安装目录的 ``BlockUpdate/block_*.ini`` 与
+        ``industry.ini``（本地 block_hq 缓存域），不依赖登录、不走 8901。
+        目录探测：``$THS_HEXIN_DIR`` → 常见安装路径（如
+        ``D:\\同花顺软件\\同花顺``）。未找到时抛
+        :class:`thspypc.services.system_blocks.SystemBlocksError`。
+        """
+        if self._system_blocks is None:
+            from .services.system_blocks import SystemBlocksService
+
+            self._system_blocks = SystemBlocksService()
+        return self._system_blocks
+
+    def system_block_categories(self):
+        """列出系统板块分类（行业/概念/地域/港股/基金…）。"""
+        return self.system_blocks.categories()
+
+    def list_system_blocks(self, category: str | None = None):
+        """列出系统板块（板块发现）。
+
+        Args:
+            category: None=全部分类；否则为分类键/文件 ID/中文名
+                （``industry``、``concept``、``2B``、``概念``…）。
+
+        Returns:
+            list[SystemBlock]，每项含 ``block_id``（稳定 ID）、``name``、
+            ``category``、``category_name``、``source``、``parent_id``。
+        """
+        return self.system_blocks.boards(category)
+
+    def get_system_block_constituents(self, block_id: str):
+        """返回系统板块成分股（稳定 ID → 成分股）。
+
+        Args:
+            block_id: ``881121``（半导体）/``C024``（BC电池）等稳定 ID。
+
+        Returns:
+            list[BlockStock]，每项含 ``code``、``market``（hexin 数字市场码）、
+            ``pattern``（True 表示前缀通配条目，如基金 ``1(36):184*``）。
+        """
+        return self.system_blocks.constituents(block_id)
 
     # ── 短线精灵（异动，9601 端口 qurealorder）──
 
