@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
+from collections.abc import Callable
 from pathlib import Path
 
 from ..features.system_blocks import (
@@ -31,12 +33,36 @@ from ..features.system_blocks import (
     parse_industry_ini,
     tree_root_children,
 )
+from ..features.system_blocks_protocol import (
+    PAGEID_BOARD_HISTORY,
+    PAGEID_BOARD_HISTORY_L2,
+    PAGEID_BOARD_LIST,
+    PAGEID_BOARD_LIST_L2,
+    PAGEID_BOARD_TL,
+    PAGEID_BOARD_TL_L2,
+    build_board_auction_query,
+    build_board_constituents_query,
+    build_board_list_query,
+    build_board_timeline_query,
+    parse_board_auction_response,
+    parse_board_constituents_response,
+    parse_board_quote_response,
+    parse_board_timeline_response,
+)
+from .._transport import ConnectionManager, ConnectionRole, SocketLike
+from ..codecs.framing import read_frame
+from ..errors import ProtocolError
+from ..models import AccountKind, Capability
 
 logger = logging.getLogger(__name__)
 
 
 class SystemBlocksError(Exception):
     """系统板块读取/解析错误。"""
+
+
+FrameReader = Callable[[SocketLike], bytes]
+Clock = Callable[[], float]
 
 
 # 语义别名 → BlockUpdate 文件 ID（大小写不敏感）
@@ -343,4 +369,135 @@ class SystemBlocksService:
         return result
 
 
-__all__ = ["CATEGORY_ALIASES", "SystemBlocksError", "SystemBlocksService", "default_hexin_dir"]
+class BoardService:
+    """系统板块网络查询（MAIN 8901，板块指数 market=48）。
+
+    2026-08-01 抓包确认：Level2 账号走 5716/6000/6002，普通账号走
+    392/4180/4181；响应为 hd3.1 + BitRLE（0x130 板块行情、0x64 成分股、
+    0x42 板块分时、0x32 板块竞价）。
+
+    ⚠ 活网接线状态：板块查询需要**专用板块通道**（独立 8901 连接，先完成
+    subreal 注册 + ``MarketCode=96;128;88;216;48;`` 初始化 + ``[5],[55]``
+    分类表 + StockNameVer 引导）。实测在 MAIN 连接上直接发板块请求
+    （含抓包原样帧）服务器不回数据，因此本类在通道接线完成前仅可用于
+    已初始化通道的调用方。
+    """
+
+    def __init__(
+        self,
+        connections: ConnectionManager,
+        *,
+        frame_reader: FrameReader = read_frame,
+        max_frames: int = 8,
+        level2: bool | None = None,
+    ) -> None:
+        self._connections = connections
+        self._read_frame = frame_reader
+        self._max_frames = max_frames
+        self._level2 = level2
+
+    def _is_level2(self) -> bool:
+        if self._level2 is not None:
+            return self._level2
+        return self._connections.profile.kind is AccountKind.LEVEL2
+
+    def _request(
+        self,
+        request: bytes,
+        *,
+        parsers: tuple[Callable[[bytes], list[dict]], ...],
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        connection = self._connections.acquire(
+            ConnectionRole.MAIN,
+            capability=Capability.BASIC_QUOTE,
+        )
+        try:
+            with connection.request(request, timeout=timeout) as sock:
+                for _ in range(self._max_frames):
+                    response = self._read_frame(sock)
+                    for parser in parsers:
+                        records = parser(response)
+                        if records:
+                            return records
+        except (socket.timeout, OSError) as exc:
+            raise ProtocolError(f"板块查询超时/网络错误: {exc}") from exc
+        return []
+
+    def board_quotes(
+        self,
+        codes: list[str],
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """板块指数行情列表（含名称/最新价/量额，0x130 表）。"""
+        request = build_board_list_query(codes, level2=self._is_level2())
+        return self._request(
+            request,
+            parsers=(parse_board_quote_response,),
+            timeout=timeout,
+        )
+
+    def board_timeline(
+        self,
+        code: str,
+        date=None,
+        *,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """板块指数当日/历史分时（0x42 表，242 点/日）。"""
+        request = build_board_timeline_query(
+            code,
+            date=date,
+            level2=self._is_level2(),
+        )
+        return self._request(
+            request,
+            parsers=(parse_board_timeline_response,),
+            timeout=timeout,
+        )
+
+    def board_auction(
+        self,
+        code: str,
+        date=None,
+        *,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """板块指数集合竞价（0x32 表）。"""
+        request = build_board_auction_query(
+            code,
+            date=date,
+            level2=self._is_level2(),
+        )
+        return self._request(
+            request,
+            parsers=(parse_board_auction_response,),
+            timeout=timeout,
+        )
+
+    def board_constituents(
+        self,
+        codes: list[str],
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """板块成分股行情（0x64 表）。"""
+        request = build_board_constituents_query(
+            codes,
+            level2=self._is_level2(),
+        )
+        return self._request(
+            request,
+            parsers=(parse_board_constituents_response,),
+            timeout=timeout,
+        )
+
+
+__all__ = [
+    "CATEGORY_ALIASES",
+    "BoardService",
+    "SystemBlocksError",
+    "SystemBlocksService",
+    "default_hexin_dir",
+]

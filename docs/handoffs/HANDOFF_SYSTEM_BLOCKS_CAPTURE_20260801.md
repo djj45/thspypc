@@ -88,6 +88,37 @@
       已见 9354/9355 带 881xxx/885xxx/886xxx 代码列表的请求样本）
 - [ ] 逆向：盘中实时（4214 订阅 vs 列表轮询）
 
+## 2026-08-01 第二轮：板块协议已逆向（双账号抓包）
+
+板块指数统一 **market=48**；账号只影响 pageid（Level2: 5716/1341/6000/6002；
+普通: 392/4180/4181）。请求形态为双子帧（前缀 CodeList+pageid + 查询
+DataType/DateTime/LackTime/pageid），历史分时用 packed-date 游标。
+
+响应表型（hd3.1 + BitRLE 位面，已离线解码验证）：
+
+| 表型 | 行宽 | 字段 | 内容 |
+|------|------|------|------|
+| 0x130 | 344B | dt5(16B 代码)、dt55(20B GBK 名称)、dt6/7/8/9/10/13/19…（dt5/dt6 出现两次，取首次） | 板块行情列表 |
+| 0x64 | 95B | dt5(7B 代码)、dt215…dt66 21 字段 | 板块成分股行情 |
+| 0x42 | 28B | dt1/10/13/19/22/23/40 | 板块指数分时（242 点/日） |
+| 0x32 | 12B | dt1(unix 秒)/10/49 | 板块集合竞价 |
+
+已落地：
+
+- `src/thspypc/features/system_blocks_protocol.py`：builders（列表/分时/竞价/
+  成分股，双 pageid 家族）+ parsers（0x130/0x64/0x42/0x32）。
+- `src/thspypc/services/system_blocks.py`：`BoardService`（待板块通道接线）。
+- `tests/test_system_blocks_protocol.py`：9 项离线回归（样本
+  `captures_live/_board_*.bin` + `_board_req_*.bin`）。
+- 双账号抓包原始样本已存 `captures_live/system_blocks_20260801_*.pcap`。
+
+**活网接线遗留**：板块查询必须在**专用板块通道**（独立 8901 连接）上执行，
+引导序列为 subreal 注册（URS/UCT/UNX/UCX/UME）+ ``MarketCode=96;128;88;216;48;``
+（含 MarketDate/StockLinkVer）+ ``DataType=[5],[55]`` 分类表 + StockNameVer。
+实测在 MAIN 连接上重放抓包原样请求，服务器只回 CodeListSize=0/无数据。
+下一步：为 BoardService 实现板块通道建连（复用 8901 login），接线后做活网
+验证（板块行情/分时/竞价/成分股四接口）。
+
 ## 2026-08-01 附加结论（历史分时协议修正）
 
 0. **双账号活网验证通过**（`tests/verify_accounts_241_auction.py`）：

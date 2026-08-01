@@ -11,6 +11,7 @@ from .stock_name import StockNameService
 from .subscription import L2SubscriptionCoordinator
 from .system_blocks import (
     CATEGORY_ALIASES,
+    BoardService,
     SystemBlocksError,
     SystemBlocksService,
     default_hexin_dir,
@@ -35,6 +36,7 @@ __all__ = [
     "StockListService",
     "StockNameService",
     "CATEGORY_ALIASES",
+    "BoardService",
     "SystemBlocksError",
     "SystemBlocksService",
     "default_hexin_dir",
