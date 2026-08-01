@@ -370,17 +370,18 @@ class SystemBlocksService:
 
 
 class BoardService:
-    """系统板块网络查询（MAIN 8901，板块指数 market=48）。
+    """系统板块网络查询（专用板块通道 fu4 8901，板块指数 market=48）。
 
     2026-08-01 抓包确认：Level2 账号走 5716/6000/6002，普通账号走
     392/4180/4181；响应为 hd3.1 + BitRLE（0x130 板块行情、0x64 成分股、
     0x42 板块分时、0x32 板块竞价）。
 
-    ⚠ 活网接线状态：板块查询需要**专用板块通道**（独立 8901 连接，先完成
-    subreal 注册 + ``MarketCode=96;128;88;216;48;`` 初始化 + ``[5],[55]``
-    分类表 + StockNameVer 引导）。实测在 MAIN 连接上直接发板块请求
-    （含抓包原样帧）服务器不回数据，因此本类在通道接线完成前仅可用于
-    已初始化通道的调用方。
+    ★ 活网接线（2026-08-01）：板块查询需要**专用板块通道**（独立 8901 连接，
+    走 fu4.123ths.com 服务器组：login（Level2 无用户名 / 普通 __manual）→
+    subreal 注册 → ``MarketCode=96;128;88;216;48;`` 初始化 → qureal-init×10 →
+    ``[5],[55]`` 分类表 → StockNameVer 引导）。实测在 MAIN 连接上直接发板块
+    请求（含抓包原样帧）服务器不回数据；建连/引导由
+    ``_open_board_channel`` 负责，本服务经 ``ConnectionRole.BOARD`` 取通道。
     """
 
     def __init__(
@@ -409,11 +410,17 @@ class BoardService:
         timeout: float = 12.0,
     ) -> list[dict]:
         connection = self._connections.acquire(
-            ConnectionRole.MAIN,
+            ConnectionRole.BOARD,
             capability=Capability.BASIC_QUOTE,
         )
         try:
-            with connection.request(request, timeout=timeout) as sock:
+            # 板块通道帧间不加额外换行（fu4 解析器对帧间杂字节敏感，
+            # 抓包板块通道请求帧均无尾部 \n；login/引导由建连层处理）。
+            with connection.request(
+                request,
+                timeout=timeout,
+                trailing_newline=False,
+            ) as sock:
                 for _ in range(self._max_frames):
                     response = self._read_frame(sock)
                     for parser in parsers:

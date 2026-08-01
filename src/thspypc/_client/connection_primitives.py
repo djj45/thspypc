@@ -778,3 +778,159 @@ class ConnectionPrimitives:
                 "没有l2权限",
             )
         )
+
+    # ── 板块专用通道（fu4 8901）──
+
+    def _open_board_channel(self, timeout: float = 20.0):
+        """打开板块专用通道：BOARD login（fu4 服务器）→ 完整引导序列。
+
+        ★ 2026-08-01 抓包铁证：板块行情/分时/竞价/成分股必须走 **fu4** 市场组
+        （``fu4.123ths.com:8901``，MarketCode=96;128;88;216;48;），在 MAIN
+        连接上重放相同引导帧服务器只回 CodeListSize=0。login 壳按账号 profile
+        分支（Level2 无用户名 / 普通 __manual，见
+        :func:`thspypc.features.auth_protocol.build_login_body` 的
+        ``LoginIdentity.BOARD``）。
+
+        引导序列（字节级复刻 2026-08-01 双账号抓包）：subreal 注册×3 →
+        pageid 注册 → MarketCode init → qureal-init×10 → [5],[55] 分类表 →
+        StockNameVer。**帧间不追加额外换行**（fu4 解析器对帧间杂字节敏感，
+        login 帧例外，必须带 ``\\n``）。
+
+        Returns:
+            已引导的 socket（未收编，调用方负责持有/关闭）。
+
+        Raises:
+            OSError: 全候选 IP 登录失败或引导失败。
+        """
+        from ..features.auth_protocol import build_login_body
+        from ..protocol import resolve_fu4_hosts
+
+        if self._auth is None:
+            self.authenticate()
+
+        def _try_round(material, allow_refresh: bool):
+            """用给定票据登录 fu4 + 引导；全失败/引导无响应时可选重新鉴权。"""
+            profile = material.profile
+            passport64 = material.passport64
+            login_body = build_login_body(
+                passport64,
+                self.mac64,
+                identity=LoginIdentity.BOARD,
+                profile=profile,
+            )
+            level2 = profile.supports_manual_identity
+            hosts = resolve_fu4_hosts(material.passport_bytes)
+            if not hosts:
+                logger.warning("板块通道：passport 无 fu4 域名，回退 MARKET_HOSTS")
+                from ..protocol import MARKET_HOSTS
+                hosts = list(MARKET_HOSTS)
+            probed = self._probe_fastest_hosts(
+                hosts, timeout=1.0, role="board"
+            )
+            candidates = probed or hosts
+            offset = self._login_rr_offset.get("board", 0) % max(1, len(candidates))
+            batch = (candidates[offset:] + candidates[:offset])[:7]
+            logger.info("板块通道：并发登录 %d 个 fu4 IP（offset=%d）: %s",
+                        len(batch), offset, batch[:3])
+
+            winner = self._concurrent_login(
+                batch, login_body, timeout=min(timeout, 12.0)
+            )
+            tried = len(batch)
+            if winner is None:
+                # 串行 fallback：补齐测速外的 IP（与 MAIN 同策略）
+                fallback = [h for h in candidates if h not in set(batch)]
+                for host in fallback:
+                    tried += 1
+                    try:
+                        sock = socket.create_connection(
+                            (host, MARKET_PORT), timeout=min(timeout, 15.0)
+                        )
+                        sock.sendall(encode_frame(login_body) + b"\n")
+                        sock.settimeout(min(timeout, 8.0))
+                        resp_body = self._connection_read_frame(sock)
+                        result = self._parse_connection_login_response(resp_body)
+                        if result.get("VerifyCode") == "0":
+                            winner = (host, sock, result)
+                            break
+                        sock.close()
+                    except (socket.timeout, ConnectionError, OSError):
+                        continue
+                    except ValueError:
+                        continue
+            self._login_rr_offset["board"] = (
+                self._login_rr_offset.get("board", 0) + max(1, tried)
+            ) % max(1, len(candidates))
+            if winner is None:
+                if allow_refresh:
+                    logger.warning(
+                        "板块通道：全部 fu4 IP 登录失败，重新 HTTP 鉴权拿新鲜票据重试"
+                    )
+                    fresh = self._refresh_auth_material()
+                    return _try_round(fresh, allow_refresh=False)
+                raise OSError("板块通道：全部 fu4 IP 登录失败")
+
+            host, sock, _result = winner
+            try:
+                n_replies = self._send_board_bootstrap(
+                    sock, level2, timeout=timeout
+                )
+            except (OSError, ValueError) as exc:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise OSError(
+                    f"板块通道引导失败（{host}）: {exc}"
+                ) from exc
+            if n_replies == 0 and allow_refresh:
+                # 引导零响应 = 会话未激活（票据被其他连接消费等），换新票据重试
+                logger.warning(
+                    "板块通道：%s 引导零响应（票据可能已被消费），重新鉴权重试",
+                    host,
+                )
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                fresh = self._refresh_auth_material()
+                return _try_round(fresh, allow_refresh=False)
+            logger.info("✓ 板块通道就绪（%s:%d, level2=%s）",
+                        host, MARKET_PORT, level2)
+            return sock
+
+        material = self._auth_service.require_current()
+        return _try_round(material, allow_refresh=True)
+
+    def _send_board_bootstrap(
+        self,
+        sock,
+        level2: bool,
+        *,
+        timeout: float = 12.0,
+    ) -> int:
+        """发送板块通道引导序列并排空响应；返回读取的响应帧数。"""
+        from ..features.system_blocks_protocol import build_board_bootstrap
+
+        frames = build_board_bootstrap(level2)
+        # 每个引导帧是裸 body，发送时补 MAGIC+长度壳；帧间不加额外换行
+        # （login 帧例外，需要尾部 \n；业务查询帧经 MarketSession 配置）。
+        payload = b"".join(encode_frame(frame) for frame in frames)
+        logger.debug("板块通道：发送引导序列 %d 帧 / %dB", len(frames), len(payload))
+        sock.sendall(payload)
+
+        # 排空：init 配置帧 / rettype=ini / 分类表 / StockNameVer 响应。
+        # 短超时快速结束，避免把大配置帧全部等完（业务查询会自行跳过无关帧）。
+        deadline = time.time() + timeout
+        n = 0
+        sock.settimeout(2.0)
+        while time.time() < deadline and n < 40:
+            try:
+                self._connection_read_frame(sock)
+                n += 1
+            except socket.timeout:
+                break
+            except (OSError, ValueError):
+                break
+        logger.debug("板块通道：引导响应排空 %d 帧", n)
+        return n

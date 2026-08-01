@@ -12,6 +12,7 @@ class LoginIdentity(str, Enum):
 
     STANDARD = "standard"
     MANUAL = "manual"
+    BOARD = "board"
 
 
 @dataclass(frozen=True)
@@ -158,7 +159,7 @@ def build_login_body(
     identity: LoginIdentity = LoginIdentity.STANDARD,
     profile: LoginProtocolProfile = DEFAULT_LOGIN_PROTOCOL_PROFILE,
 ) -> bytes:
-    """Build a TCP login body for a standard or ``__manual`` identity."""
+    """Build a TCP login body for a standard/``__manual``/board identity."""
     if identity is LoginIdentity.MANUAL:
         if not profile.supports_manual_identity:
             raise ValueError(
@@ -176,6 +177,43 @@ def build_login_body(
             "C-SupPushDataVer=hq6.0\n"
             "Passport64="
         ).encode("gbk")
+    elif identity is LoginIdentity.BOARD:
+        # 板块专用通道（fu4 服务器）的 login 壳，2026-08-01 双账号抓包字节级确认：
+        #   - Level2 账号（PC_LEVEL2，supports_manual_identity=True）：
+        #     **无 UserName/Password**，直接 VerifyType=1 + Mac64 + 版本行 +
+        #     Passport64；suffix = 计算 check 字节 + 0x09（抓包 ``aa 09``）。
+        #   - 普通账号（PC_STANDARD，supports_manual_identity=False）：
+        #     UserName=__manual/Password=__manual（\r\n\n 分隔），
+        #     suffix 固定 ``5e 07``（抓包字节；不同于 MAIN 的 ``58 07``）。
+        if profile.supports_manual_identity:
+            fields = [
+                ("Ask", "login"),
+                ("C-Version", profile.tcp_version),
+                ("VerifyType", "1"),
+                ("Mac64", mac_b64),
+                ("C-SupportPushVer", "1.0"),
+                ("C-SupReqDataVer", "hq6.0"),
+                ("C-SupPushDataVer", "hq6.0"),
+            ]
+            fixed = (
+                "\n".join(f"{key}={value}" for key, value in fields)
+                + "\nPassport64="
+            ).encode("gbk")
+            suffix = bytes([(len(fixed) + 1) & 0xFF, 0x09])
+        else:
+            fixed = (
+                "Ask=login\n"
+                f"C-Version={profile.tcp_version}\n"
+                "UserName=__manual\r\n\n"
+                "Password=__manual\r\n\n"
+                "VerifyType=1\n"
+                f"Mac64={mac_b64}\n"
+                "C-SupportPushVer=1.0\n"
+                "C-SupReqDataVer=hq6.0\n"
+                "C-SupPushDataVer=hq6.0\n"
+                "Passport64="
+            ).encode("gbk")
+            suffix = b"\x5e\x07"
     else:
         fields = [
             ("Ask", "login"),
@@ -197,10 +235,10 @@ def build_login_body(
             + "\nPassport64="
         ).encode("gbk")
 
-    suffix = profile.login_header_suffix
+    if identity is not LoginIdentity.BOARD:
+        suffix = profile.login_header_suffix
     if suffix is None:
-        check_byte = (len(fixed) + 1) & 0xFF
-        suffix = bytes([check_byte]) + b"\x09"
+        suffix = bytes([(len(fixed) + 1) & 0xFF, 0x09])
     prefix = (
         b"\x09\x41\x09\x00"
         + b"zh_CN.GBK"

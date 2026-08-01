@@ -44,6 +44,10 @@ class ConnectionFactory:
         connect_realorder: Callable[[], None],
         realorder_socket: Callable[[], Any],
         realorder_lock: Any,
+        board_socket: Callable[[], Any],
+        set_board_socket: Callable[[Any], None],
+        open_board: Callable[[], Any],
+        board_lock: Any,
     ) -> None:
         self._result_type = result_type
         self._is_connected = is_connected
@@ -64,6 +68,10 @@ class ConnectionFactory:
         self._connect_realorder = connect_realorder
         self._realorder_socket = realorder_socket
         self._realorder_lock = realorder_lock
+        self._board_socket = board_socket
+        self._set_board_socket = set_board_socket
+        self._open_board = open_board
+        self._board_lock = board_lock
 
     def connect_main(self, *, refresh_auth: bool = False):
         """Authenticate on demand and establish the ordinary MAIN channel."""
@@ -167,6 +175,25 @@ class ConnectionFactory:
                 owns_socket=False,
                 initialized=True,
                 request_lock=self._realorder_lock,
+            )
+
+        if spec.role is ConnectionRole.BOARD:
+            if self._board_socket() is None:
+                opened = self._open_board()
+                with self._board_lock:
+                    current = self._board_socket()
+                    if current is None:
+                        self._set_board_socket(opened)
+                    else:
+                        opened.close()
+            sock = self._board_socket()
+            if sock is None:
+                raise OSError("板块通道建连失败")
+            return OpenedConnection(
+                socket=sock,
+                owns_socket=False,
+                initialized=True,
+                request_lock=self._board_lock,
             )
 
         raise OSError(f"不支持的连接角色: {spec.role.value}")

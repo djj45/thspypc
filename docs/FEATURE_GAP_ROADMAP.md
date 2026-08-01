@@ -77,16 +77,56 @@ PC 版左侧导航的核心功能，当前 `blocks.py` 只覆盖**自定义**板
 | 子能力 | 状态 | 说明 |
 |--------|------|------|
 | 申万一/二/三级行业板块列表 | ❌ | 无 |
-| 同花顺行业板块列表（881xxx 指数） | 🔄 抓包逆向中 | 本地 oracle 已有 881xxx→名称/成分股（~90 个），待 8901 抓包还原请求 |
-| 概念板块列表（半导体/人工智能/新能源…） | 🔄 抓包逆向中 | 本地 oracle 已有十六进制 block_id→名称（~390 个），待 8901 抓包还原 |
-| 按板块查成分股 | 🔄 抓包逆向中 | 本地 oracle 有成分股真值；`query_dynamic_plate("半导体")` 是问财实时选股匹配，非"系统板块成分股"语义 |
-| 板块行情（指数/涨跌幅排行） | ❌ | 无 |
+| 同花顺行业板块列表（881xxx 指数） | 🔄 协议已还原 | 本地 oracle 已有 881xxx→名称/成分股（~90 个）；8901 请求/响应已离线验证（0x130 表），活网通道验证待解（见下） |
+| 概念板块列表（半导体/人工智能/新能源…） | 🔄 协议已还原 | 板块指数统一 market=48（885xxx 概念指数）；同一 0x130 请求形态 |
+| 按板块查成分股 | 🔄 协议已还原 | 0x64 表已离线验证；`query_dynamic_plate("半导体")` 仍是问财实时选股，非系统板块语义 |
+| 板块行情（指数/涨跌幅排行） | 🔄 已接线 | `client.board_quotes()`（0x130 板块行情：代码+GBK 名称+OHLC） |
+| 板块指数分时（当日/历史） | 🔄 已接线 | `client.board_timeline()`（0x42 表，242 点/日，packed-date 游标） |
+| 板块集合竞价 | 🔄 已接线 | `client.board_auction()`（0x32 表：unix 秒+撮合价+累计量） |
 | 板块资金流 | ❌ | 无（依赖系统板块能力） |
 
 > 抓包流程与样本要求见
 > `docs/handoffs/HANDOFF_SYSTEM_BLOCKS_CAPTURE_20260801.md`；抓包脚本：
 > `tests/capture_system_blocks.py`（板块发现/成分股/板块指数分时历史/盘中实时）。
 > `blocks.py` 中无相关常量或代码，独立模块已开始落地。
+
+#### 2026-08-01 第二轮：板块通道建连已落地（活网验证待解）
+
+**专用板块通道 = fu4.123ths.com 市场组**（2026-08-01 抓包铁证）：板块行情/
+分时/竞价/成分股必须走 fu4 服务器（``MarketCode=96;128;88;216;48;``、subreal
+通道 URS/UCT/UNX/UCX/UME），**不能在 MAIN/ifindhq 连接上重放**——MAIN 上
+原样重放引导帧服务器只回 CodeListSize=0。L2/普通账号 pcap 的板块通道 IP
+（106.15.249.238 / 122.9.78.232）均属 ``fu4.123ths.com`` DNS 解析结果。
+
+已落地：
+
+- `LoginIdentity.BOARD`：板块通道 login 壳按账号 profile 分支——Level2 无
+  UserName/Password（suffix=计算 check+09，抓包 ``aa 09``）；普通账号
+  ``UserName=__manual``（``\r\n\n`` 分隔，suffix 固定 ``5e 07``）。
+- `features/system_blocks_protocol.py` 引导 builders：subreal 注册（pageid
+  L2=5716 / 普通=392，5/7 通道）→ pageid 注册 → MarketCode init →
+  qureal-init×10（instid 0xE0000/0x290000 起、步长 0x20000）→ ``[5],[55]``
+  分类表 → StockNameVer（L2 双子帧 / 普通 upstockname）。subreal、分类表、
+  普通 StockNameVer 与抓包**逐字节一致**（离线回归 `tests/test_board_channel.py`）。
+- `resolve_fu4_hosts()`：从 passport M_hqdns 解析 fu4 组 IP（与 MAIN/shlv2
+  分组隔离）。
+- `ConnectionRole.BOARD` + `ConnectionFactory` + `client._board_sock`：
+  `_open_board_channel()` 完成 login（fu4 轮换 IP + 并发登录）→ 引导 →
+  排空，`sync_service_connections` 收编；`disconnect()` 一并关闭。
+- `BoardService` 改走 `ConnectionRole.BOARD`（不再用 MAIN）；
+  THSClient 门面新增 `board_quotes` / `board_timeline` / `board_auction` /
+  `board_constituents`。
+- 活网验证脚本：`tests/verify_board_online.py`（四接口，`--env normal` 换账号）。
+
+**活网验证待解（2026-08-01 15:xx 会话保护窗口）**：双账号 fu4 login 均
+VerifyCode=0，但发送引导帧后服务器**主动 FIN**（个别网关单帧存活、第二帧即
+断；多帧突发必断）。同日 13:23 抓包时同一批 IP/网关正常响应，差异非帧内容
+（已逐字节核对）。当前判定为**账号会话保护**（今天已对该账号做大量 login
+探测；`PromptText=-300`/`-1` 间歇出现，符合 HANDOFF 记录的「同一 Passport64
+短时重复登录触发服务器保护」），需冷却后重跑 `verify_board_online.py`。若
+冷却后仍断连，下一步排查「会话捆绑」：抓包中 hexin 客户端在 10ms 内并开
+7 条连接（main/shlv2/szlv2/fu4…），fu4 可能要求账号其他通道先建（probe:
+`tests/_probe_board_bundle.py`）。
 
 ### 2. Level2 深度行情与逐笔数据
 

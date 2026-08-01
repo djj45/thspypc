@@ -20,12 +20,14 @@ class ConnectionRole(str, Enum):
     SH_L2 = "sh_l2"
     SZ_L2 = "sz_l2"
     REALORDER = "realorder"
+    BOARD = "board"
 
 
 class LoginIdentity(str, Enum):
     STANDARD = "standard"
     MANUAL = "manual"
     REALORDER = "realorder"
+    BOARD = "board"
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,11 @@ CONNECTION_SPECS = {
         identity=LoginIdentity.REALORDER,
         port=9601,
         required_capability=Capability.REALORDER,
+    ),
+    ConnectionRole.BOARD: ConnectionSpec(
+        role=ConnectionRole.BOARD,
+        identity=LoginIdentity.BOARD,
+        port=8901,
     ),
 }
 

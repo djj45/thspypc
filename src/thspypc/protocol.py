@@ -441,6 +441,59 @@ def resolve_l2_hosts_grouped(passport_bytes: bytes) -> dict[str, list[str]]:
     return grouped
 
 
+def resolve_fu4_hosts(passport_bytes: bytes) -> list[str]:
+    """从 passport 的 M_hqdns 解析板块专用通道（fu4）服务器 IP。
+
+    ★ 2026-08-01 抓包铁证（tests/_board_channel_ips.py）：板块行情/分时/竞价/
+    成分股必须走 **fu4.123ths.com** 市场组（``MarketCode=96;128;88;216;48;``，
+    subreal 通道 URS/UCT/UNX/UCX/UME），不能在 MAIN/ifindhq 上重放——MAIN
+    连接即使原样重放引导序列与抓包帧，服务器也只回 CodeListSize=0/无数据。
+    L2 与普通账号的 pcap 板块通道 IP（106.15.249.238 / 122.9.78.232）均属于
+    fu4.123ths.com 解析结果。
+
+    Args:
+        passport_bytes: HTTP 鉴权返回的原始 passport_bytes。
+
+    Returns:
+        fu4 组 IP 列表；passport 无 fu4 域名时返回空列表（调用方回退
+        :data:`MARKET_HOSTS`）。
+    """
+    import socket as _socket
+    text = passport_bytes.decode("latin-1", errors="replace")
+    m = re.search(r'M_hqdns="([^"]*)"', text)
+    if not m:
+        m_hqdns = ""
+        for field in text.split("|"):
+            if field.startswith("M_hqdns="):
+                m_hqdns = field.split("=", 1)[1]
+                break
+    else:
+        m_hqdns = m.group(1)
+
+    ips: list[str] = []
+    seen: set[str] = set()
+    for entry in m_hqdns.split(","):
+        dm = re.match(r'([\w.]+):(\d+):', entry.strip())
+        if not dm or dm.group(2) != str(MARKET_PORT):
+            continue
+        if not dm.group(1).lower().startswith("fu4."):
+            continue
+        try:
+            _, _, addrs = _socket.gethostbyname_ex(dm.group(1))
+        except OSError:
+            continue
+        for ip in addrs:
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+    if ips:
+        logger.info("板块通道服务器（fu4）解析 → %d 个 IP: %s",
+                    len(ips), ips[:5])
+    else:
+        logger.warning("M_hqdns 中无 fu4 域名（板块通道不可用）")
+    return ips
+
+
 # --- 客户端身份参数（PC 免费版，从 login_lv2.pcapng 的 passport 实测）---
 # 首次测试用 Mac 参数被 8901 拒（VerifyCode=-1, PromptText=-6:），服务器返回
 # thshq-hwyeast-globalthsindex-gateway，判定 passport 身份（Mac）与 PC 网关不符。

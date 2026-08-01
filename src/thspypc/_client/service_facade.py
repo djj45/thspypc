@@ -1244,3 +1244,114 @@ class ServiceFacade:
             ),
         )
         return frame_count
+
+    # ── 系统板块网络查询（板块专用通道 fu4 8901）──
+
+    def board_quotes(
+        self,
+        codes: list[str],
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """板块指数行情列表（0x130 表：代码/名称/OHLC/量额）。
+
+        板块代码统一挂 market=48（行业 881xxx / 概念 885xxx 等）。首次调用
+        自动建立**板块专用通道**（fu4.123ths.com 独立 8901 连接 + 完整引导
+        序列），后续查询复用。在 MAIN 连接上重放相同请求只会得到
+        CodeListSize=0（服务器按连接身份路由，见 docs/FEATURE_GAP_ROADMAP.md）。
+
+        Args:
+            codes: 板块指数代码列表，如 ``["881101", "885480"]``。
+            timeout: 单帧读取超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``code``/``name``/``dt10``（最新价）/
+            ``dt6``（昨收）等字段。
+
+        Raises:
+            RuntimeError: 未登录或板块通道建连失败。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.board_quotes(
+                codes,
+                timeout=timeout,
+            ),
+        )
+
+    def board_timeline(
+        self,
+        code: str,
+        date=None,
+        *,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """板块指数当日/历史分时（0x42 表，242 点/日）。
+
+        Args:
+            code: 板块指数代码（如 ``"881121"`` 半导体）。
+            date: ``None``=当日；``"YYYY-MM-DD"``/``date``=历史日（packed-date
+                游标编码）。
+            timeout: 单帧读取超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``date``/``minute_index``/``dt10``/``dt13``/
+            ``dt19`` 等字段。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.board_timeline(
+                code,
+                date=date,
+                timeout=timeout,
+            ),
+        )
+
+    def board_auction(
+        self,
+        code: str,
+        date=None,
+        *,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """板块指数集合竞价（0x32 表：unix 秒 + 撮合价 + 累计量）。
+
+        Args:
+            code: 板块指数代码。
+            date: ``None``=当日；``"YYYY-MM-DD"``/``date``=历史日。
+            timeout: 单帧读取超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``time``/``dt10``/``dt49`` 等字段。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.board_auction(
+                code,
+                date=date,
+                timeout=timeout,
+            ),
+        )
+
+    def board_constituents(
+        self,
+        codes: list[str],
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """板块成分股行情（0x64 表：成分股代码 + 21 字段行情）。
+
+        Args:
+            codes: 板块指数代码列表。
+            timeout: 单帧读取超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``code``（6 位股票代码）及 ``dt<N>`` 字段。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.board_constituents(
+                codes,
+                timeout=timeout,
+            ),
+        )
