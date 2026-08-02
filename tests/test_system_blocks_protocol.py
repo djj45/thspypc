@@ -76,7 +76,7 @@ def test_build_board_list_query_shape():
     assert "DataType=48,592890,10,6,66," in text
     # 2026-08-02 抓包：前缀 route=0x006C、查询 route=0x016C、seq=0x01C4、
     # 查询子帧无 history flag（字节 17=0x00）、LackTime 全 0。
-    # 旧形态（0x0039/0x0139 + history flag + LackTime=0,3,…）服务端不回复。
+    # 旧列表形态（0x0039/0x0139、无 history flag、LackTime 全 0）服务端不回复。
     assert body[11:13] == b"\x6c\x00"
     prefix_length = int.from_bytes(body[19:23], "little")
     query_offset = 23 + prefix_length

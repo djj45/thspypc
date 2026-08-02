@@ -52,7 +52,7 @@ qr_login.py                       二维码和凭证缓存
 4. 通过正确的 session/channel 接入 `THSClient`；
 5. 明确无数据、超时、权限不足和不支持帧的语义；
 6. 完成多市场、多股票、多交易日活网验证；
-7. 更新 `FEATURE_GAP_ROADMAP.md`。
+7. 更新 `docs/plans/FEATURE_GAP_ROADMAP.md`。
 
 五档盘口 `depth_quote` 是第一条按此路径接入的门面功能。
 

@@ -10,7 +10,7 @@
 >
 > 基线提交：以远端该分支最新提交为准；开始前运行 `git pull --ff-only`。
 >
-> 架构约束以 `docs/ARCHITECTURE.md` 为准。本文给出具体迁移顺序，不取代该文档。
+> 架构约束以 `docs/architecture/ARCHITECTURE.md` 为准。本文给出具体迁移顺序，不取代该文档。
 
 ## 1. 重构原则
 
@@ -116,7 +116,7 @@ import thspypc.protocol as proto
 
 ## 3. 目标目录
 
-建议与 `docs/ARCHITECTURE.md` 对齐：
+建议与 `docs/architecture/ARCHITECTURE.md` 对齐：
 
 ```text
 src/thspypc/
@@ -812,7 +812,7 @@ fix: route historical timeline through l2 session
 
 ```text
 HANDOFF_HISTORY_TIMELINE_20260728.md
-docs/HISTORY_TIMELINE_VARLEN_INVESTIGATION.md
+docs/investigations/HISTORY_TIMELINE_VARLEN_INVESTIGATION.md
 ```
 
 重构期间不要改变这些已经验证的事实：

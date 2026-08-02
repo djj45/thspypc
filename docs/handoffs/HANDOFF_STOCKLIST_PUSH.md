@@ -6,7 +6,7 @@
 > 调查记录。逐帧活网消减后，最小完整序列为 MAIN 上的一个
 > `DataType=[5],[55]` 请求（FDF 146 字节，线上加换行共 147 字节）。
 > 生产路由是 `ifindhq.123ths.com:8901`，不是 `shlv2/szlv2`。详见
-> [`docs/SERVER_MATRIX.md`](../SERVER_MATRIX.md)。
+> [`docs/architecture/SERVER_MATRIX.md`](../architecture/SERVER_MATRIX.md)。
 >
 > 会话日期：2026-07-19 ~ 2026-07-23
 > 项目路径：`D:\code\ths_takehome\thspypc`（GitHub: `djj45/thspypc`，分支 `feat/stock-list-full`）
@@ -323,7 +323,7 @@ bar_start = (目标日期 - date(1849,4,6)).days × 2048 + 606
 2026-05-14 → 132477534    2026-07-23 → 132620894
 ```
 （旧文档曾把全部日期锚点记早一天；2026-07-28 已通过返回数据逐点对照 thsdk
-修正。历史分时后续以 `docs/HISTORY_TIMELINE_VARLEN_INVESTIGATION.md` 和新的专项
+修正。历史分时后续以 `docs/investigations/HISTORY_TIMELINE_VARLEN_INVESTIGATION.md` 和新的专项
 交接文档为准。）
 
 **已实现**（`src/thspypc/protocol.py`）：
@@ -861,7 +861,7 @@ upstockname 网络协议已封装但仅能解非 A 股的纯文本段；沪深 A
   `NtQueryInformationProcess` + `fs:[30h]` 直读 PEB BeingDebugged（2 处）。
 - attach 后同花顺 GUI 卡死、登录界面无响应（反调试触发，非单纯断点频繁）。
 - x32dbg 未装 ScyllaHide 插件（`D:\software\x64dbg\release\x32\` 无），不能一键绕过。
-- 操作手册已写好：`docs/x32dbg_变体A调试手册.md`（含 VA→运行时换算 delta=-0x2a0000、
+- 操作手册已写好：`docs/guides/x32dbg_变体A调试手册.md`（含 VA→运行时换算 delta=-0x2a0000、
   下断坐标、dump 步骤）。装 ScyllaHide 后手册可直接用。
 
 **路径 3：Unicorn 静态定位 —— C++ 对象层太厚**
@@ -1213,7 +1213,7 @@ PROTOCOL.md §5.2 揭示推送异动用字段 **203/204(量) + 225/226(金额)**
 | `tests/collect_push_samples.py` | 加 CLI + `match_pushes_with_history` 新增 `full_frames` 参数（matched.csv 带 `push_frame_hex` 完整帧） |
 | `tests/analyze_push_fields.py` | **新增**：基于完整帧的数值字段逆向工具（异动字节锚定 + THS float 验证 + 偏移统计） |
 | `tests/analyze_name_frame.py` | **新增**：upstockname 名称帧编码逆向工具（密文↔明文对照、`--dump-blocks`/`--probe`/`--decode-block` oracle 解码） |
-| `docs/x32dbg_变体A调试手册.md` | **新增**：块状编码动态调试操作手册（VA→运行时换算、下断坐标、dump 步骤；装 ScyllaHide 后可用） |
+| `docs/guides/x32dbg_变体A调试手册.md` | **新增**：块状编码动态调试操作手册（VA→运行时换算、下断坐标、dump 步骤；装 ScyllaHide 后可用） |
 | `pyproject.toml` | `package = false`（绕过 uv_build 被 AppLocker 拦截） |
 | `tests/expand_hfd1_anchors.py` | **新增**：hfd1.0 锚点扩采（v2，零网络依赖，hexin 缓存匹配 ~60K 名称） |
 | `tests/analyze_hfd1_compression.py` | **新增**：代码压缩模式分析（07 控制字节 + 增量编码） |

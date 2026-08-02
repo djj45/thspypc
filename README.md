@@ -282,7 +282,7 @@ with THSClient("账号", "密码") as client:
 `DataType=[5],[55]` 空代码组请求，触发服务器返回全量 hd3.1 代码表。
 线上报文共 147 字节；逐帧 A/B 已确认旧抓包序列的其余 153 帧均不需要。
 服务器角色、权限和完整最小请求见
-[行情服务器矩阵](docs/SERVER_MATRIX.md)。
+[行情服务器矩阵](docs/architecture/SERVER_MATRIX.md)。
 
 ⚠️ **限制**：
 - 默认 `with_names=False` 时 `name` 恒为 `""`；`stock_list(with_names=True)` 会自动
@@ -529,7 +529,7 @@ records = client.auction("603118", trade_date=date(2026, 7, 27))
 详见
 [`docs/handoffs/HANDOFF_SUPERORDER_20260726.md`](docs/handoffs/HANDOFF_SUPERORDER_20260726.md)
 第十七~二十章。
-后续逆向建议先阅读[同花顺协议逆向方法论与实战复盘](docs/THS_REVERSE_ENGINEERING_PLAYBOOK.md)，
+后续逆向建议先阅读[同花顺协议逆向方法论与实战复盘](docs/guides/THS_REVERSE_ENGINEERING_PLAYBOOK.md)，
 其中总结了本次分层判定、语料设计、DMP 加载映像重建、Unicorn 原生 oracle 和
 回归验收方法。
 
@@ -603,6 +603,7 @@ thspypc/
 ```
 
 ## 已知限制
+文档目录：[docs/README.md](docs/README.md)，按「手册指南 / 架构解析 / 规划路线图 / 调查记录 / 交接记录」分类。
 
 - hd3.1 变体（unk=0x36/0x42/0x4a 等非 BitRLE 编码）暂不支持，`parse_hd3_response`
   自动跳过。
@@ -676,7 +677,7 @@ MAIN 普通登录连接在 `VerifyCode=0` 后发送标准 MAIN init，收到服�
 
 `stock_list()` 复用 MAIN，并且不发送 L2 init。它只发送一个最小
 `DataType=[5],[55]` 请求；详细路由见
-[行情服务器矩阵](docs/SERVER_MATRIX.md)。
+[行情服务器矩阵](docs/architecture/SERVER_MATRIX.md)。
 
 修正后的活网 A/B 验证共 4 轮：关闭心跳 2 轮、开启心跳 2 轮，四轮均完成登录、
 立即查询和等待后二次查询；开启心跳的两轮各发送 2 次心跳后连接仍正常。

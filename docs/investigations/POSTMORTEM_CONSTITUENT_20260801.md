@@ -127,6 +127,6 @@ L2 流程在 SH 批次等待把整体 45s 预算耗尽后 `break`，SZ 批次从
 
 ## 与既有文档的关系
 
-- 根因与修复结论已同步到 `docs/FEATURE_GAP_ROADMAP.md`（系统板块 §1）。
+- 根因与修复结论已同步到 `docs/plans/FEATURE_GAP_ROADMAP.md`（系统板块 §1）。
 - 抓包流程与样本要求见 `docs/handoffs/HANDOFF_SYSTEM_BLOCKS_CAPTURE_20260801.md`。
 - 本复盘只讲“为什么卡住”与“怎么避免”，不重复协议细节。

@@ -1,0 +1,36 @@
+[
+  {
+    "code": "000001",
+    "date": "20260514",
+    "raw_bin": "history_companion_000001_000938_20260514_20260728_174530.bin",
+    "normalized_total_length": 45201,
+    "marker_offset": 141,
+    "base_offset": 147,
+    "record_start": 157,
+    "record_end": 22333,
+    "record_length": 22176,
+    "dc": 67109106,
+    "flag": 130,
+    "hs": 92,
+    "fc": 23,
+    "record_region_file": "000001_record_region.bin",
+    "record_region_sha256": "59f1880f82f4eb79dad60a9881ddb7e0c68bd63a00ceabf4c6ecee8aca38e9c0"
+  },
+  {
+    "code": "000938",
+    "date": "20260514",
+    "raw_bin": "history_companion_000001_000938_20260514_20260728_174530.bin",
+    "normalized_total_length": 45201,
+    "marker_offset": 22333,
+    "base_offset": 22339,
+    "record_start": 22349,
+    "record_end": 44735,
+    "record_length": 22386,
+    "dc": 67109106,
+    "flag": 130,
+    "hs": 92,
+    "fc": 23,
+    "record_region_file": "000938_record_region.bin",
+    "record_region_sha256": "b1e9ad44415591d1a5397ee8a87b45372469a461df3696fc5eb93ff6d77a9771"
+  }
+]

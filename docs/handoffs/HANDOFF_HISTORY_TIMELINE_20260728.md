@@ -346,7 +346,7 @@ tests/test_history_timeline_response.py
 tests/probe_history_timeline_companion.py
   正确 szlv2 通道实发 + thsdk 对照
 
-docs/HISTORY_TIMELINE_VARLEN_INVESTIGATION.md
+docs/investigations/HISTORY_TIMELINE_VARLEN_INVESTIGATION.md
   变长响应的技术调查
 
 captures_live/history_companion_000001_000938_20260514_20260728_174530.bin

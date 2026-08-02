@@ -7,7 +7,7 @@
 > `DataType=[5],[55]` 请求；旧 `stock_list_replay.bin` 的另外 153 帧均非必需。
 > 当前 `stock_list()` 复用 `ifindhq.123ths.com:8901` 的 MAIN 连接，不走
 > `shlv2/szlv2`，也不发送 L2 init。最新结论及服务器权限见
-> [`docs/SERVER_MATRIX.md`](../SERVER_MATRIX.md)。
+> [`docs/architecture/SERVER_MATRIX.md`](../architecture/SERVER_MATRIX.md)。
 >
 > 会话日期：2026-07-16 ~ 2026-07-17
 > 项目路径：`D:\code\ths_takehome\thspypc`

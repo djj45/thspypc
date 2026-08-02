@@ -83,7 +83,7 @@ def test_build_full_request_l2_matches_capture():
 
 
 def test_build_list_request_normal_matches_capture():
-    """0x130 列表查询（前缀=可见页 52 码，查询=完整 universe）逐字节对齐抓包。
+    """板块列表查询（前缀=可见页 52 码，查询=完整 universe）逐字节对齐抓包。
 
     2026-08-02 起服务端对旧路由（0x0039/0x0139）静默不回复；本样本为
     ``system_blocks_20260802_002725.pcap`` 流 3 的真实客户端请求（route

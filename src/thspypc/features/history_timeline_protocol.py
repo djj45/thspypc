@@ -545,6 +545,9 @@ def parse_history_timeline_response(
         next_marker = body.find(b"hd1.0", pos)
         block_end = next_marker if next_marker >= 0 else len(body)
         if flag in (0x0042, 0x007E, 0x0082):
+            # 0x0082 与 0x007E/0x0042 一样有内联字段表（fc×4B，紧跟 header），
+            # 之后是壳段（含 ASCII 代码标签）和记录数据。早期代码误以为 0x0082
+            # 没有内联字段表面硬编码 6 字段，实测字段表就在 base+10。
             field_table = base + 10
             raw_table = body[
                 field_table : field_table + field_count * 4

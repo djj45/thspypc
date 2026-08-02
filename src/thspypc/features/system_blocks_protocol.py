@@ -689,9 +689,10 @@ def build_board_list_query(
     - 前缀 CodeList 是当前可见页 ``codes``，查询 CodeList 是完整
       ``universe_codes``（缺省与 ``codes`` 相同）。
 
-    服务端对旧形态（0x0039/0x0139 + history flag + LackTime=0,3,…）静默不回复；
-    且 08-02 起响应表为 0x20/0x1c/0x22 紧凑表（不再是 0x130 名称行情表），
-    解析统一走 :func:`parse_board_full_quote_response`。
+    服务端对旧列表形态（0x0039/0x0139、无 history flag、LackTime 全 0）静默
+    不回复。08-01 同路由另有 history flag + LackTime=0,3,… 的 527527 请求，
+    不能混为同一形态。08-02 起列表响应为 0x20/0x1c/0x22 紧凑表；旧抓包中的
+    0x130 是板块详情相关板块组件的周期推送，解析器仅作兼容保留。
     """
     pageid = PAGEID_BOARD_LIST_L2 if level2 else PAGEID_BOARD_LIST
     if datatype is None:

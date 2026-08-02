@@ -117,7 +117,7 @@ cmd=0x0a 外层压缩流                         ← 已破解 normalize_8901_re
 - LZ77 外层：移植自 RVA `0xf74260`（Unicorn 模拟逐字节对照，见
   `docs/handoffs/HANDOFF_SUPERORDER_20260726.md` 第十七~二十章）。
 - BitRLE：移植自 RVA `0x13746d0`（决策树翻译，见 HANDOFF §1）。
-- 方法论见 [`THS_REVERSE_ENGINEERING_PLAYBOOK.md`](THS_REVERSE_ENGINEERING_PLAYBOOK.md)。
+- 方法论见 [`THS_REVERSE_ENGINEERING_PLAYBOOK.md`](../guides/THS_REVERSE_ENGINEERING_PLAYBOOK.md)。
 
 省略型 codec 的解码函数 RVA 尚未定位，需先用第一步的锚点
 （如 `parse_history_timeline_response` 调用栈、或 dt54 字段编号 54）
