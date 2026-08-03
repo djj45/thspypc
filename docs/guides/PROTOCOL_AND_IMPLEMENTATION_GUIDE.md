@@ -510,8 +510,10 @@ pageid=9355
 
 ## 12. K线：日K / 周K / 月K / 分钟K（`kline`）
 
-客户端入口：`client.kline(code, period="day"|"week"|"month"|"5min"|"15min"|"30min"|"60min")`，
-周期名→周期码见 `client._KLINE_PERIOD_CODES`。
+客户端入口：`client.kline(code, period=..., count=..., anchor=...)`，周期名支持
+`"1min"/"5min"/"15min"/"30min"/"60min"/"day"/"week"/"month"/"quarter"/"year"`
+（2026-08-03 抓包确认 1分K=0x3000、季K=0x6003、年K=0x7001），映射见
+`client._KLINE_PERIOD_CODES`。
 
 请求（`features/kline_protocol.py build_kline_query`，**始终走 MAIN**，pageid=9355）：
 
@@ -519,19 +521,27 @@ pageid=9355
 ReqFuquan=Q
 CodeList=33(000938,);
 DataType=7,8,9,11,13,19,
-DateTime=16384(-2146-0)                 # 周期码(回溯根数-0)，0x4000=日K
+DateTime=16384(-count-anchor)           # 周期码(根数-窗口终点)，0x4000=日K
 LackTime=0,0,0,0,0,0,0,0
 pageid=9355
 ```
 
 | 周期 | 周期码 | route | hdr[17] |
 |---|---|---|---|
-| 5min / 15min / 30min / 60min | 0x3005 / 0x300F / 0x301E / 0x303C | 0x0001 | 0x05 |
+| 1分K / 5min / 15min / 30min / 60min | 0x3000 / 0x3005 / 0x300F / 0x301E / 0x303C | 0x0001 | 0x05 |
 | 日K | 0x4000 | 0x0001 | 0x00 |
-| 周K / 月K | 0x5001 / 0x6001 | 0x014E | 0x01 |
+| 周K / 月K / 季K / 年K | 0x5001 / 0x6001 / 0x6003 / 0x7001 | 0x014E | 0x01 |
 
 字段：`dt7`=开、`dt8`=高、`dt9`=低、`dt11`=收、`dt13`=量、`dt19`=额；
 `ReqFuquan=Q` 为前复权。
+
+`DateTime={period}(-{count}-{anchor})` 语义（2026-08-03 抓包确认）：取
+`count` 根、以 `anchor` 为终点，服务端返回 **`count+1` 根**（含终点，受上市日
+截断）。`anchor=0`=最新一根；日/周/月/季/年K 的 anchor 是 **YYYYMMDD 日期**，
+分钟K 的 anchor 是 **bar_index**。**往前翻页** = 把 anchor 设为上一窗口最早
+一根（日期或 bar_index）再请求，可一直回溯到上市日（客户端 000938 日K：
+`(-1938-0)` → `(-3103-20180727)` → `(-4349-20041109)`，服务端逐段返回
+1939/3104/1195 根，MAIN/9355 与 L2/4417 结果一致）。
 
 响应：`hd3.1`（flag `0x0042/0x0046`），BitRLE 位平面解压 + 转置
 （`parse_kline_hd3_response`），输出 `{code, time/bar_index, open, high, low, close, volume, amount}`。

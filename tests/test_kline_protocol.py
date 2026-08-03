@@ -50,6 +50,38 @@ def test_kline_builder_wire_contracts():
         assert _sha256(frame) == expected_sha256
 
 
+def test_kline_builder_anchor_and_new_periods():
+    """翻页锚点 + 1分/季/年周期码（2026-08-03 抓包确认）。"""
+    default = kline_protocol.build_kline_query(
+        "000938",
+        market=33,
+        period=kline_protocol.KLINE_PERIOD_DAY,
+        count=1938,
+    )
+    assert b"DateTime=16384(-1938-0)" in default
+
+    paged = kline_protocol.build_kline_query(
+        "000938",
+        market=33,
+        period=kline_protocol.KLINE_PERIOD_DAY,
+        count=3103,
+        anchor=20180727,
+    )
+    assert b"DateTime=16384(-3103-20180727)" in paged
+    # 分钟K 锚点是 bar_index；周/月/季/年 route=0x014E
+    minute = kline_protocol.build_kline_query(
+        "000938",
+        market=33,
+        period=kline_protocol.KLINE_PERIOD_1MIN,
+        count=1220,
+        anchor=132639393,
+    )
+    assert b"DateTime=12288(-1220-132639393)" in minute
+    assert kline_protocol.KLINE_PERIOD_1MIN == 0x3000
+    assert kline_protocol.KLINE_PERIOD_QUARTER == 0x6003
+    assert kline_protocol.KLINE_PERIOD_YEAR == 0x7001
+
+
 def test_kline_time_helpers_cover_wire_encodings():
     assert kline_protocol._kline_decode_time(20260728) == datetime.datetime(
         2026, 7, 28
@@ -84,3 +116,9 @@ def test_protocol_reexports_kline_implementations():
     assert protocol.KLINE_PERIOD_DAY == kline_protocol.KLINE_PERIOD_DAY
     assert protocol.KLINE_PERIOD_WEEK == kline_protocol.KLINE_PERIOD_WEEK
     assert protocol.KLINE_PERIOD_MONTH == kline_protocol.KLINE_PERIOD_MONTH
+    assert protocol.KLINE_PERIOD_1MIN == kline_protocol.KLINE_PERIOD_1MIN
+    assert (
+        protocol.KLINE_PERIOD_QUARTER
+        == kline_protocol.KLINE_PERIOD_QUARTER
+    )
+    assert protocol.KLINE_PERIOD_YEAR == kline_protocol.KLINE_PERIOD_YEAR

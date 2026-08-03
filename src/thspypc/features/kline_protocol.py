@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 KLINE_PERIOD_DAY = 0x4000
 KLINE_PERIOD_WEEK = 0x5001
 KLINE_PERIOD_MONTH = 0x6001
+KLINE_PERIOD_QUARTER = 0x6003
+KLINE_PERIOD_YEAR = 0x7001
+KLINE_PERIOD_1MIN = 0x3000
 KLINE_PERIOD_5MIN = 0x3005
 KLINE_PERIOD_15MIN = 0x300F
 KLINE_PERIOD_30MIN = 0x301E
@@ -40,14 +43,21 @@ def build_kline_query(
     period: int = KLINE_PERIOD_DAY,
     fuquan: str = "Q",
     count: int = 2146,
+    anchor: int = 0,
     pageid: int = 9355,
     seq: int = 0x0025,
 ) -> bytes:
-    """Build an 8901 K-line request frame."""
+    """Build an 8901 K-line request frame.
+
+    ``DateTime={period}(-{count}-{anchor})`` 语义（2026-08-03 抓包确认）：
+    取 ``count`` 根、以 ``anchor`` 为终点，服务端返回 ``count+1`` 根（含终点，
+    受上市日截断）。``anchor=0``=最新一根；日/周/月/季/年K 传 YYYYMMDD 日期；
+    分钟K 传 bar_index。翻页时把 anchor 设为上一窗口最早一根即可继续回溯。
+    """
     datatype = ",".join(str(value) for value in KLINE_DATATYPE) + ","
     text = (
         f"ReqFuquan={fuquan}\r\nCodeList={market}({code},);\r\n"
-        f"DataType={datatype}\r\nDateTime={period}({-count}-0)\r\n"
+        f"DataType={datatype}\r\nDateTime={period}(-{count}-{anchor})\r\n"
         f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
     ).encode("gbk")
 

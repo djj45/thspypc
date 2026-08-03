@@ -41,6 +41,7 @@ class KlineService:
         market: int,
         period: int,
         count: int = 2146,
+        anchor: int = 0,
         fuquan: str = "Q",
         timeout: float = 12.0,
     ) -> list[dict]:
@@ -51,6 +52,7 @@ class KlineService:
             period=period,
             fuquan=fuquan,
             count=count,
+            anchor=anchor,
         )
         connection = self._connections.acquire(
             ConnectionRole.MAIN,

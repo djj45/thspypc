@@ -40,8 +40,10 @@ from .protocol import (
     full_http_auth,
     generate_imei,
     generate_mac64,
-    KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN,
-    KLINE_PERIOD_60MIN, KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
+    KLINE_PERIOD_1MIN, KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN,
+    KLINE_PERIOD_30MIN, KLINE_PERIOD_60MIN,
+    KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
+    KLINE_PERIOD_QUARTER, KLINE_PERIOD_YEAR,
     parse_snapshot_push,
     is_snapshot_push,
     parse_login_response,
@@ -941,10 +943,12 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
     # K线周期名 → 周期码（kline/timeline 方法共用）
     _KLINE_PERIOD_CODES = {
-        "5min": KLINE_PERIOD_5MIN, "15min": KLINE_PERIOD_15MIN,
+        "1min": KLINE_PERIOD_1MIN, "5min": KLINE_PERIOD_5MIN,
+        "15min": KLINE_PERIOD_15MIN,
         "30min": KLINE_PERIOD_30MIN, "60min": KLINE_PERIOD_60MIN,
         "day": KLINE_PERIOD_DAY, "week": KLINE_PERIOD_WEEK,
-        "month": KLINE_PERIOD_MONTH,
+        "month": KLINE_PERIOD_MONTH, "quarter": KLINE_PERIOD_QUARTER,
+        "year": KLINE_PERIOD_YEAR,
     }
 
 

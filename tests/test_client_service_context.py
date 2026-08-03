@@ -481,6 +481,7 @@ def test_kline_opt_in_delegates_without_l2(monkeypatch):
                 "market": 17,
                 "period": KLINE_PERIOD_WEEK,
                 "count": 20,
+                "anchor": 0,
                 "fuquan": "H",
                 "timeout": 5.0,
             },

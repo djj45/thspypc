@@ -410,6 +410,7 @@ class ServiceFacade:
         code: str,
         period: str = "day",
         count: int = 2146,
+        anchor: int = 0,
         fuquan: str = "Q",
         market: int = 0,
         timeout: float = 12.0,
@@ -430,8 +431,11 @@ class ServiceFacade:
 
         Args:
             code: 股票代码（纯数字，如 "000089"）
-            period: 周期名（"5min"/"15min"/"30min"/"60min"/"day"/"week"/"month"）
-            count: 取的根数（服务器按实际数据返回，可能少于 count）
+            period: 周期名（"1min"/"5min"/"15min"/"30min"/"60min"/"day"/
+                "week"/"month"/"quarter"/"year"）
+            count: 取的根数（窗口含端点，服务端返回 count+1 根，受上市日截断）
+            anchor: 窗口终点（默认 0=最新一根；日/周/月/季/年K 传 YYYYMMDD，
+                分钟K 传 bar_index；翻页=把上一窗口最早一根的日期/bar_index 传进来）
             fuquan: 复权（"Q"=前复权 "H"=后复权 ""=不复权）
             market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）
             timeout: 单次 read_frame 超时（秒）
@@ -474,6 +478,7 @@ class ServiceFacade:
                             market=market,
                             period=period_code,
                             count=count,
+                            anchor=anchor,
                             fuquan=fuquan,
                             timeout=timeout,
                         ),
@@ -483,9 +488,21 @@ class ServiceFacade:
                     recs = []
                 # ★ 数据完整性校验：部分坏 IP（116.63.x / 119.3.x 等）"成功"返回但
                 # 只给最近部分数据（day 121/336、week 26、month 7，§14j）。这种截断
-                # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）视为坏 IP。
-                # 新股天然根数少，但新股 day/week/month 都少，不会触发（阈值是相对 count）。
-                if recs and count > 20 and len(recs) < count * 0.5:
+                # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）且首末跨度
+                # 小于 2 年才视为坏 IP——**上市日截断**（翻页到上市日附近，根数天然
+                # 不足但首末跨度很大，如 000938 日K 1195/4349、季K 107/558）不是坏 IP，
+                # 不能因此换 IP 或把完整历史结果丢弃。
+                times = [r.get("time") for r in recs if r.get("time")]
+                span_days = 0
+                if len(times) >= 2:
+                    span_days = (max(times) - min(times)).days
+                listing_truncated = span_days >= 730  # 首末跨 ≥2 年 = 拿到上市日起的完整历史
+                if (
+                    recs
+                    and count > 20
+                    and len(recs) < count * 0.5
+                    and not listing_truncated
+                ):
                     logger.warning("kline %s %s 数据不全：%d/%d 根（IP=%s，疑似坏 IP 只返回部分数据）",
                                    code, period, len(recs), count, self._connected_ip or "?")
                     if attempt < retries:

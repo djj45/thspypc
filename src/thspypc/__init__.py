@@ -54,8 +54,10 @@ from .protocol import (
     DEPTH_QUOTE_DATATYPE, DEPTH_QUOTE_DATATYPE_10,
     # K线（hd3.1 变体，flag=0x0042/0x0046）
     parse_kline_hd3_response, build_kline_query, KLINE_DATATYPE,
+    KLINE_PERIOD_1MIN, KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN,
+    KLINE_PERIOD_30MIN, KLINE_PERIOD_60MIN,
     KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
-    KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN, KLINE_PERIOD_30MIN, KLINE_PERIOD_60MIN,
+    KLINE_PERIOD_QUARTER, KLINE_PERIOD_YEAR,
     # 分时图（当日逐点 + 历史回忆）
     build_timeline_query, parse_timeline_response, TIMELINE_DATATYPE,
     build_history_timeline_query, build_normal_history_timeline_query,
@@ -115,8 +117,10 @@ __all__ = [
     "parse_depth_quote_response",
     "DEPTH_QUOTE_DATATYPE", "DEPTH_QUOTE_DATATYPE_10",
     "parse_kline_hd3_response", "build_kline_query", "KLINE_DATATYPE",
+    "KLINE_PERIOD_1MIN", "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN",
+    "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",
     "KLINE_PERIOD_DAY", "KLINE_PERIOD_WEEK", "KLINE_PERIOD_MONTH",
-    "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN", "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",
+    "KLINE_PERIOD_QUARTER", "KLINE_PERIOD_YEAR",
     "build_timeline_query", "parse_timeline_response", "TIMELINE_DATATYPE",
     "build_snapshot_subscribe", "parse_snapshot_push", "is_snapshot_push",
     "SNAPSHOT_PAGEID", "SNAPSHOT_DATATYPE",
