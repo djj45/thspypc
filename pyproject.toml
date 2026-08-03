@@ -19,6 +19,11 @@ qr = [
 dev = [
     "pytest>=8.0",
 ]
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.23,<0.12.0"]

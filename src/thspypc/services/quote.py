@@ -30,11 +30,12 @@ FrameReader = Callable[[SocketLike], bytes]
 
 
 def _repair_short_record(sock, body: bytes) -> bytes:
-    """服务端深度响应帧长比 hs 少 1 字节（末字段末字节落在帧外）。
+    """服务端 hd1.0 响应帧体比记录区少 1 字节（末记录末字节落在帧外）。
 
-    2026-08-03 活网实测：47 字段十档帧 hs=191、字段宽度和=191，但帧体只
-    有 190 字节记录区；缺失的 1 字节（字段表末字段的最末字节，如 dt157
-    卖五量的最高位）随后到达 socket。读取它补回 body，避免最后档位丢失。
+    2026-08-03 活网实测：十档盘口帧（dc=1/hs=191 但记录区 190B）与
+    list_quotes hd1.0 单码/双码帧（dc=1~2，记录区比 dc*hs 少 1B）都存在
+    此怪癖；缺失的 1 字节（末记录末字节）随后到达 socket。读取它补回 body，
+    避免最后记录/档位丢失。
     """
     pos = body.find(b"hd1.0")
     if pos < 0:
@@ -45,7 +46,8 @@ def _repair_short_record(sock, body: bytes) -> bytes:
     hs = struct.unpack("<H", body[base + 6:base + 8])[0]
     fc = struct.unpack("<H", body[base + 8:base + 10])[0]
     field_end = base + 10 + fc * 4
-    if len(body) - field_end != hs - 1:
+    dc = struct.unpack("<I", body[base:base + 4])[0]
+    if len(body) - field_end != dc * hs - 1:
         return body
     try:
         sock.settimeout(1.0)
@@ -102,6 +104,10 @@ class QuoteService:
         with connection.request(frame, timeout=timeout) as sock:
             for _ in range(self._max_frames):
                 response = self._read_frame(sock)
+                # 服务端偶发帧体比 hs*dc 少 1 字节（末记录末字节落在帧外、
+                # 随后来到 socket）：先补读再解析，否则单码/双码 hd1.0 会因
+                # 记录区不足返回空并超时（与十档盘口同型，2026-08-03 实测）。
+                response = _repair_short_record(sock, response)
                 if b"hd3.1\x00" in response:
                     saw_data_frame = True
                     records = parse_hd3_response(response)
