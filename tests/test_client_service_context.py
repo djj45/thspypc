@@ -253,7 +253,7 @@ def test_list_quotes_opt_in_delegates_without_changing_public_arguments(
     calls = []
 
     class FakeQuoteService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def list_quotes(self, codes, **kwargs):
@@ -296,7 +296,7 @@ def test_list_quotes_opt_in_preserves_empty_result_on_protocol_error(
     client._sock = FakeSocket()
 
     class BrokenQuoteService:
-        def __init__(self, _connections, *, evidence=None):
+        def __init__(self, _connections, *, evidence=None, subscriptions=None):
             pass
 
         def list_quotes(self, _codes, **_kwargs):
@@ -341,7 +341,7 @@ def test_depth_quote_opt_in_delegates_with_inferred_market(monkeypatch):
     }
 
     class FakeQuoteService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def depth_quote(self, code, **kwargs):
@@ -362,7 +362,7 @@ def test_depth_quote_opt_in_delegates_with_inferred_market(monkeypatch):
 
     assert result is expected
     assert calls == [
-        ("600519", {"market": 17, "timeout": 4.0}),
+        ("600519", {"market": 17, "timeout": 4.0, "ten_levels": False}),
     ]
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert manager.peek(ConnectionRole.SZ_L2) is None
@@ -373,7 +373,7 @@ def test_depth_quote_opt_in_preserves_empty_on_protocol_error(monkeypatch):
     client._sock = FakeSocket()
 
     class BrokenQuoteService:
-        def __init__(self, _connections, *, evidence=None):
+        def __init__(self, _connections, *, evidence=None, subscriptions=None):
             pass
 
         def depth_quote(self, _code, **_kwargs):
@@ -414,7 +414,7 @@ def test_depth_quote_opt_in_preserves_transport_retry(monkeypatch):
     expected = {"code": "000001", "buy": [], "sell": [], "fields": {}}
 
     class FlakyQuoteService:
-        def __init__(self, _connections, *, evidence=None):
+        def __init__(self, _connections, *, evidence=None, subscriptions=None):
             pass
 
         def depth_quote(self, code, **kwargs):
@@ -451,7 +451,7 @@ def test_kline_opt_in_delegates_without_l2(monkeypatch):
     expected = [{"code": "600519", "close": 141.5}]
 
     class FakeKlineService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def kline(self, code, **kwargs):
@@ -578,7 +578,7 @@ def test_stock_list_hot_opt_in_delegates_without_l2(monkeypatch):
     calls = []
 
     class FakeStockListService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def ranked(self, **kwargs):
@@ -619,7 +619,7 @@ def test_stock_list_opt_in_delegates_full_replay(monkeypatch):
     calls = []
 
     class FakeStockListService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def full_list(self, **kwargs):
@@ -652,7 +652,7 @@ def test_fetch_stock_names_opt_in_delegates_incremental_request(monkeypatch):
     }
 
     class FakeStockNameService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def fetch(self, **kwargs):
@@ -690,7 +690,7 @@ def test_market_snapshot_opt_in_delegates_without_l2(monkeypatch):
     expected = [{"code": "600519", "name": "Kweichow Moutai"}]
 
     class FakeMarketSnapshotService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def snapshot(self, **kwargs):

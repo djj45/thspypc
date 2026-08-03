@@ -105,9 +105,11 @@ from .features.kline_protocol import (
 from .features.quote_protocol import (
     BUY_LEVEL_FIELDS,
     DEPTH_QUOTE_DATATYPE,
+    DEPTH_QUOTE_DATATYPE_10,
     LIST_QUOTE_DATATYPE_DEFAULT,
     SELL_LEVEL_FIELDS,
     build_depth_quote_query,
+    build_depth_ten_query,
     build_list_quote_query,
     parse_depth_quote_response,
 )

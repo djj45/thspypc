@@ -48,8 +48,10 @@ from .protocol import (
     generate_imei, generate_mac64,
     # 行情查询（个股列表）
     build_list_quote_query, parse_hd1_response, parse_hd3_response, decode_ths_float,
-    # 五档盘口
-    build_depth_quote_query, parse_depth_quote_response, DEPTH_QUOTE_DATATYPE,
+    # 五档/十档盘口
+    build_depth_quote_query, build_depth_ten_query,
+    parse_depth_quote_response,
+    DEPTH_QUOTE_DATATYPE, DEPTH_QUOTE_DATATYPE_10,
     # K线（hd3.1 变体，flag=0x0042/0x0046）
     parse_kline_hd3_response, build_kline_query, KLINE_DATATYPE,
     KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
@@ -109,7 +111,9 @@ __all__ = [
     "build_login_body_pc", "build_manual_login_body", "parse_login_response", "parse_passport_fields",
     "generate_imei", "generate_mac64",
     "build_list_quote_query", "parse_hd1_response", "parse_hd3_response", "decode_ths_float",
-    "build_depth_quote_query", "parse_depth_quote_response", "DEPTH_QUOTE_DATATYPE",
+    "build_depth_quote_query", "build_depth_ten_query",
+    "parse_depth_quote_response",
+    "DEPTH_QUOTE_DATATYPE", "DEPTH_QUOTE_DATATYPE_10",
     "parse_kline_hd3_response", "build_kline_query", "KLINE_DATATYPE",
     "KLINE_PERIOD_DAY", "KLINE_PERIOD_WEEK", "KLINE_PERIOD_MONTH",
     "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN", "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",

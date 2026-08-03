@@ -358,6 +358,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             self._quote_service = QuoteService(
                 self._service_connections,
                 evidence=self._account_evidence,
+                subscriptions=self._service_subscriptions,
             )
             self._stock_list_service = StockListService(
                 self._service_connections,

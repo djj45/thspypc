@@ -106,7 +106,7 @@ class DepthLevel(TypedDict):
 
 
 class DepthQuote(TypedDict, total=False):
-    """五档盘口结果；空字典表示服务器未返回可识别盘口帧。"""
+    """盘口结果（普通五档 / Level2 十档，按响应字段实际档数返回）；空字典表示服务器未返回可识别盘口帧。"""
 
     code: str
     buy: list[DepthLevel]

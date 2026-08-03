@@ -113,7 +113,7 @@ def test_default_main_call_creates_service_context(monkeypatch):
     calls = []
 
     class FakeQuoteService:
-        def __init__(self, connections, *, evidence=None):
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
             self.connections = connections
 
         def list_quotes(self, codes, **kwargs):

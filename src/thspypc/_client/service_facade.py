@@ -348,18 +348,23 @@ class ServiceFacade:
         market: int = 0,
         timeout: float = 12.0,
         retries: int = 2,
+        ten_levels: bool = False,
     ) -> DepthQuote:
-        """查询个股五档买卖盘及涨跌停封单额。
+        """查询个股买卖盘（默认五档；``ten_levels=True`` 请求 Level2 十档）及涨跌停封单额。
 
-        当前协议字段覆盖买卖各五档，并非 Level2 十档。盘后服务器仍会返回最后
-        一份盘口快照。返回值包含 ``buy``、``sell``、``seal_amount``、
-        ``seal_type`` 和原始 ``fields``；无盘口数据时返回空字典。
+        五档为普通账号完整复刻口径；十档仅 Level2 账号有，且必须走对应市场
+        L2 连接（沪 shlv2 / 深 szlv2，pageid=4214），不能走 MAIN——MAIN 上
+        即使带完整 DataType 也只回 0xFFFFFFFF 哨兵。盘后服务器仍会返回最后
+        一份盘口快照（含十档真实挂单）。返回值包含 ``buy``、``sell``、
+        ``seal_amount``、``seal_type`` 和原始 ``fields``；无盘口数据时返回
+        空字典。
 
         Args:
             code: 六位股票代码。
             market: 0=按代码推断，17=沪市，33=深市。
             timeout: 单次响应读取超时（秒）。
             retries: 连接异常后的重试次数。
+            ten_levels: True=请求十档（Level2 账号），False=五档。
         """
         if market == 0:
             market = self._market_for_code(code)
@@ -376,12 +381,18 @@ class ServiceFacade:
                 from ..errors import ProtocolError
 
                 try:
+                    capability = (
+                        (Capability.L2_SNAPSHOT_PUSH,)
+                        if ten_levels
+                        else (Capability.BASIC_QUOTE,)
+                    )
                     return self._run_default_service(
-                        (Capability.BASIC_QUOTE,),
+                        capability,
                         lambda: self._quote_service.depth_quote(
                             code,
                             market=market,
                             timeout=timeout,
+                            ten_levels=ten_levels,
                         ),
                     )
                 except ProtocolError as exc:
