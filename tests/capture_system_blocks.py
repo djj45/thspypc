@@ -207,6 +207,27 @@ def _split_frames(stream_bytes):
     return frames
 
 
+def _subframe_routes(frame_body):
+    """提取双子帧请求的前缀/查询 route、seq 与 history flag（对齐 0x09 双子帧）。"""
+    if len(frame_body) < 1 + 22 or frame_body[0:1] != b"\x09":
+        return None
+    prefix_route = int.from_bytes(frame_body[1 + 10:1 + 12], "little")
+    prefix_seq = int.from_bytes(frame_body[1 + 4:1 + 6], "little")
+    text_len = int.from_bytes(frame_body[1 + 18:1 + 22], "little")
+    qh = 1 + 22 + text_len
+    if len(frame_body) < qh + 22:
+        return None
+    query_route = int.from_bytes(frame_body[qh + 10:qh + 12], "little")
+    query_seq = int.from_bytes(frame_body[qh + 4:qh + 6], "little")
+    return {
+        "prefix_route": f"0x{prefix_route:04X}",
+        "query_route": f"0x{query_route:04X}",
+        "prefix_seq": f"0x{prefix_seq:04X}",
+        "query_seq": f"0x{query_seq:04X}",
+        "history_flag": f"0x{frame_body[qh + 17]:02X}",
+    }
+
+
 def _parse_request(frame_body):
     """解析客户端请求，返回 dict 或 None。"""
     try:
@@ -216,6 +237,9 @@ def _parse_request(frame_body):
     if "pageid=" not in text and "CodeList=" not in text:
         return None
     info = {"raw": frame_body, "text": text}
+    routes = _subframe_routes(frame_body)
+    if routes:
+        info.update(routes)
     m = re.search(r"pageid=(\d+)", text)
     if m:
         info["pageid"] = m.group(1)
@@ -280,7 +304,14 @@ def _decode_response(frame_body, codes):
 
 def _print_req(info):
     sort_repr = info.get("sort_params") or {"SortBegin": info.get("sort_begin", "-")}
-    print(f"      pageid={info.get('pageid','?')} "
+    route_repr = ""
+    if info.get("query_route"):
+        route_repr = (
+            f" 前缀route={info.get('prefix_route')} "
+            f"查询route={info.get('query_route')} "
+            f"seq={info.get('query_seq')} h17={info.get('history_flag')}"
+        )
+    print(f"      pageid={info.get('pageid','?')}{route_repr} "
           f"codes={info.get('codes','?')} "
           f"DateTime={info.get('datetime_period','?')}({info.get('datetime_args','')}) "
           f"DataType={info.get('datatype','?')} "
@@ -387,6 +418,36 @@ def analyze(pcap_path):
         mark = "  ★ 含 Sort/Order 参数" if ("Sort" in text or "Order" in text) else ""
         suffix = "…" if len(text) > 240 else ""
         print(f"  [{seen4[text]}x] {text[:240]}{suffix}{mark}")
+
+    # ── 报告 4b：板块列表请求路由分布（08-03 复验后新增；区分新旧路由）──
+    print("\n【4b】板块列表请求路由分布（pageid=392/5716，区分 0x0039 旧路由 / 0x006C、0x0052 新路由）")
+    route_count: dict[tuple, int] = {}
+    route_order: list[tuple] = []
+    for sid, info, _sframes in requests:
+        pid = info.get("pageid", "?")
+        if pid not in ("392", "5716") or not info.get("query_route"):
+            continue
+        key = (
+            pid,
+            info.get("prefix_route"),
+            info.get("query_route"),
+            info.get("history_flag"),
+        )
+        if key not in route_count:
+            route_order.append(key)
+            route_count[key] = 0
+        route_count[key] += 1
+    if not route_order:
+        print("  ✗ 未抓到 pageid=392/5716 列表请求；请确认抓包期间打开过【板块】列表页")
+    for key in route_order:
+        pid, pr, qr, h17 = key
+        note = ""
+        if qr in ("0x0139",):
+            note = "  ← 旧路由（08-01 形态）"
+        elif qr in ("0x016C", "0x0152"):
+            note = "  ← 新路由（08-02 形态）"
+        print(f"  [{route_count[key]}x] pageid={pid} 前缀route={pr} "
+              f"查询route={qr} h17={h17}{note}")
 
     # ── dump 样本：按 代码×pageid 存原始响应帧 ──
     _dump_samples(streams, pcap_path)
