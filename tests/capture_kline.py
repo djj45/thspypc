@@ -34,11 +34,14 @@ datatype=5,55 代码+名称），从没抓到过真正的 K 线请求。**PC 版
     2. 运行本脚本，选网卡
     3. 抓包期间，依次操作（每步停 2-3 秒让请求分开）：
        a. 切到「日K」线图，左右滑动/缩放几次（触发历史 K 线请求）
-       b. 切到「周K」
-       c. 切到「月K」
-       d. 切到「5分K」（或 15分/30分/60分）
-       e. 切回复权前/前复权/后复权（触发 fuquan 参数变化）
-       f. 换一只股票再看日K（触发不同 code 的请求）
+       b. ★ 2147 回溯专项：在日K图上按住 ← 方向键 / 拖到最左，连续翻页
+          10-20 次（触发"加载更早历史"，观察 DateTime 窗口是否从
+          (-2146-0) 变成更早的 (-N-M)）
+       c. 切到「周K」
+       d. 切到「月K」
+       e. 切到「5分K」（或 15分/30分/60分）
+       f. 切回复权前/前复权/后复权（触发 fuquan 参数变化）
+       g. 换一只股票再看日K（触发不同 code 的请求）
     4. 抓够后 Ctrl+C 或等自动结束，脚本自动分析
 
 产物：captures_live/kline_<时间戳>.pcap + 终端分析报告 + resp_streamN.bin
@@ -254,12 +257,13 @@ def _extract_kline_request(frame_body):
     if m:
         info["pageid"] = m.group(1)
     # PC 版 DateTime=周期码(历史偏移-0)，周期码=Mac PERIOD_MAP（0x3005=5分,0x4000=日...）
-    m = re.search(r"DateTime=(\d+)\((-?\d+)-(\d+)\)", text)
+    m = re.search(r"DateTime=(\d+)\((-?\d+)-(-?\d+)\)", text)
     if m:
         dtp = int(m.group(1))
         info["datetime_period"] = dtp
         info["datetime_period_name"] = PERIOD_REF.get(dtp, f"?未知(0x{dtp:x})")
         info["datetime_offset"] = m.group(2)   # 历史偏移（-335/-2146 等）
+        info["datetime_end"] = m.group(3)      # 窗口终点（0=最新；翻页后为更早的负偏移）
     # start/end/count（K 线历史范围）
     m = re.search(r"start=(-?\w+)", text)
     if m:
@@ -391,7 +395,9 @@ def analyze(pcap_path):
         key = (info.get("method") or info.get("id"),
                info.get("period") or info.get("datetime_period"),
                info.get("code") or info.get("codelist"),
-               info.get("fuquan") or info.get("reqfuquan"))
+               info.get("fuquan") or info.get("reqfuquan"),
+               info.get("datetime_offset"),
+               info.get("datetime_end"))
         if key in seen:
             continue
         seen.add(key)
@@ -409,7 +415,9 @@ def analyze(pcap_path):
         if "datetime_period" in info:
             pn = info.get("datetime_period_name", "?")
             print(f"  ★ DateTime = {info['datetime_period']}(0x{info['datetime_period']:x}) → {pn}"
-                  f"  历史偏移={info.get('datetime_offset','?')}")
+                  f"  窗口=({info.get('datetime_offset','?')}-{info.get('datetime_end','?')})")
+            if info.get("datetime_end") not in (None, "0"):
+                print(f"      ← 窗口终点非 0：这是翻页加载更早历史的请求！")
         if "pageid" in info:
             print(f"  pageid = {info['pageid']}"
                   + ("（K线图页面）" if info["pageid"] == "9355" else ""))
