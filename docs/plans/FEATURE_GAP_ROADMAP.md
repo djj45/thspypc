@@ -27,7 +27,7 @@
 | 设备指纹 | `generate_imei` / `generate_mac64` | ✅ 完整 | 已逆向，无需抓包 |
 | 个股列表行情 | `list_quotes` | ✅ 完整 | hd1.0/hd3.1 解码链 |
 | 个股五档盘口 | `depth_quote` | ✅ API 已完成 | 买卖各五档 + 涨跌停封单额；普通账号五档即完整复刻（Level2 十档用 `ten_levels=True`，见下方 Level2 小节） |
-| K线（1分/5分/15分/30分/60分/日/周/月/季/年） | `kline` | ✅ 完整 | 连接复用 + 坏 IP 黑名单；`anchor` 支持往前翻页回溯到上市日（日/周/月/季/年传 YYYYMMDD，分钟传 bar_index） |
+| K线（1分/5分/15分/30分/60分/日/周/月/季/年） | `kline` | ✅ 完整 | 连接复用 + 传输失败自动重连；`anchor` 支持往前翻页回溯到上市日（日/周/月/季/年传 YYYYMMDD，分钟传 bar_index） |
 | 当日分时（普通/L2） | `timeline` | ✅ 完整 | 普通 9354；L2 4214 |
 | 历史分时（普通） | `history_timeline` | ✅ 完整 | MAIN 9355，基础价量额 241 点 |
 | 早盘集合竞价 | `auction` | ✅ 完整 | 普通 current/history + L2 |

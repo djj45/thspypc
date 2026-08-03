@@ -546,8 +546,9 @@ pageid=9355
 响应：`hd3.1`（flag `0x0042/0x0046`），BitRLE 位平面解压 + 转置
 （`parse_kline_hd3_response`），输出 `{code, time/bar_index, open, high, low, close, volume, amount}`。
 
-注意：部分 MAIN IP 不支持大 K 线（成功 IP 多为 8.x/122.9.x），失败 IP 进黑名单并重连；
-K线查询要求 MAIN init 已激活。
+注意：不再做"坏 IP/数据完整性"校验——登录成功即信任该 IP，服务端返回多少根就
+返回多少（新股/上市日截断自然根数少，属正常）；仅传输失败（超时/断连）时自动
+断连重试。K线查询要求 MAIN init 已激活。
 
 ---
 

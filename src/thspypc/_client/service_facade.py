@@ -486,45 +486,14 @@ class ServiceFacade:
                 except ProtocolError as exc:
                     logger.warning("kline: %s", exc)
                     recs = []
-                # ★ 数据完整性校验：部分坏 IP（116.63.x / 119.3.x 等）"成功"返回但
-                # 只给最近部分数据（day 121/336、week 26、month 7，§14j）。这种截断
-                # 不抛异常，必须主动检测。判断：根数远少于请求量（< 50%）且首末跨度
-                # 小于 2 年才视为坏 IP——**上市日截断**（翻页到上市日附近，根数天然
-                # 不足但首末跨度很大，如 000938 日K 1195/4349、季K 107/558）不是坏 IP，
-                # 不能因此换 IP 或把完整历史结果丢弃。
-                times = [r.get("time") for r in recs if r.get("time")]
-                span_days = 0
-                if len(times) >= 2:
-                    span_days = (max(times) - min(times)).days
-                listing_truncated = span_days >= 730  # 首末跨 ≥2 年 = 拿到上市日起的完整历史
-                if (
-                    recs
-                    and count > 20
-                    and len(recs) < count * 0.5
-                    and not listing_truncated
-                ):
-                    logger.warning("kline %s %s 数据不全：%d/%d 根（IP=%s，疑似坏 IP 只返回部分数据）",
-                                   code, period, len(recs), count, self._connected_ip or "?")
-                    if attempt < retries:
-                        if self._connected_ip:
-                            self._bad_kline_ips.add(self._connected_ip)
-                            logger.info("将 %s 加入 K线坏 IP 黑名单（共 %d 个），换 IP 重试",
-                                        self._connected_ip, len(self._bad_kline_ips))
-                        self._drop_connection()
-                        last_err = f"数据不全 {len(recs)}/{count}"
-                        continue
+                # 不再做"坏 IP/数据完整性"校验：登录成功即信任该 IP，服务端返回
+                # 多少根就是多少（新股/上市日截断/坏 IP 都无需区分）。
                 return recs
             except (ConnectionError, OSError, TimeoutError) as e:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("kline %s %s 失败（attempt %d, IP=%s）: %s",
                                code, period, attempt + 1, self._connected_ip or "?", last_err)
-                # ★ 记录坏 IP：部分 IP（116.63.x 等）不支持大 K线查询，重连时跳过。
-                # 日志确认：成功 IP 都是 8.x/122.9.x，失败 IP 都是 116.63.x（§14j）。
-                if self._connected_ip:
-                    self._bad_kline_ips.add(self._connected_ip)
-                    logger.info("将 %s 加入 K线坏 IP 黑名单（共 %d 个），下次 connect 跳过",
-                                self._connected_ip, len(self._bad_kline_ips))
-                # 连接已坏，强制下次重连
+                # 传输失败仅断连重试，不拉黑 IP（登录成功即好 IP）
                 self._drop_connection()
         raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
 

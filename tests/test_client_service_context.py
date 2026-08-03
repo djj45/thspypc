@@ -511,52 +511,6 @@ def test_kline_opt_in_preserves_empty_on_protocol_error(monkeypatch):
     assert client.kline("000001", count=20, retries=0) == []
 
 
-def test_kline_opt_in_preserves_incomplete_data_retry(monkeypatch):
-    client = _client()
-    first_socket = FakeSocket()
-    replacement = FakeSocket()
-    client._sock = first_socket
-    client._connected_ip = "bad-ip"
-    responses = iter(
-        [
-            [{"code": "000001"}] * 10,
-            [{"code": "000001"}] * 100,
-        ]
-    )
-    calls = []
-    connect_calls = []
-
-    class PartialKlineService:
-        def __init__(self, _connections, *, evidence=None):
-            pass
-
-        def kline(self, code, **kwargs):
-            calls.append((code, kwargs))
-            return next(responses)
-
-    def reconnect():
-        connect_calls.append(True)
-        client._sock = replacement
-        client._connected_ip = "good-ip"
-        return LoginResult(success=True)
-
-    monkeypatch.setattr(
-        "thspypc.services.KlineService",
-        PartialKlineService,
-    )
-    monkeypatch.setattr(client, "connect", reconnect)
-    client.configure_service_context(LEVEL2_PROFILE)
-
-    result = client.kline("000001", count=100, retries=1)
-
-    assert len(result) == 100
-    assert len(calls) == 2
-    assert connect_calls == [True]
-    assert "bad-ip" in client._bad_kline_ips
-    assert first_socket.closed
-    assert client._sock is replacement
-
-
 def test_kline_opt_in_enforces_basic_quote_capability():
     client = _client()
     sock = FakeSocket()
