@@ -1,6 +1,7 @@
 """Pure request builder and shared field rules for call auctions."""
 from __future__ import annotations
 
+import json
 import logging
 import struct
 from datetime import date as date_type
@@ -27,9 +28,189 @@ BASIC_HISTORY_AUCTION_PERIOD = 6144
 CLOSING_AUCTION_PERIOD = 7424
 CLOSING_AUCTION_DATATYPE = [10, 49, 287]
 L2_HISTORY_AUCTION_PAGEID = 4417
+INDEX_AUCTION_PAGEID = 6240
+INDEX_CLOSING_AUCTION_CODES = frozenset({"1A0001", "399001", "399006"})
 
 _AUCTION_SENTINELS = frozenset({0x80000000, 0xFFFFFFFF})
 _AUCTION_SENTINEL_FIELDS = frozenset({27, 33})
+
+
+def _index_auction_path(code: str, market: int, closing: bool) -> str:
+    if market == 16:
+        directory, prefix = "USH", "USHI"
+    elif market == 32:
+        directory, prefix = "USZ", "USZI"
+    else:
+        raise ValueError(f"指数竞价暂不支持市场码: {market}")
+    if closing and code not in INDEX_CLOSING_AUCTION_CODES:
+        raise ValueError(
+            "指数尾盘竞价仅支持 1A0001、399001、399006"
+        )
+    close_prefix = "CLOSE_" if closing else ""
+    return (
+        f"/quote/auction/{directory}/{prefix}_{close_prefix}{code}.dat"
+    )
+
+
+def _index_auction_subframe(
+    text: bytes,
+    *,
+    seq: int,
+    subtype: int,
+    route: int,
+    declared_length_delta: int = 0,
+) -> bytes:
+    header = bytearray(22)
+    header[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 4, seq & 0xFFFF)
+    struct.pack_into("<H", header, 6, 0x0012)
+    struct.pack_into("<H", header, 8, subtype)
+    struct.pack_into("<H", header, 10, route)
+    struct.pack_into(
+        "<I",
+        header,
+        18,
+        len(text) + declared_length_delta,
+    )
+    return bytes(header) + text
+
+
+def build_index_auction_context_query(
+    code: str,
+    market: int = 16,
+    *,
+    seq: int = 0x0176,
+    pageid: int = INDEX_AUCTION_PAGEID,
+) -> bytes:
+    """Build the PC client's combined CodeList + opening URL context."""
+    path = _index_auction_path(code, market, False)
+    selection_route = 0x0007 if market == 16 else 0x0067
+    selection_text = (
+        f"CodeList={market}({code},);\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    opening_text = (
+        f"T_URL={path}\r\npageid={pageid}\r"
+    ).encode("gbk")
+    body = (
+        b"\x09"
+        + _index_auction_subframe(
+            selection_text,
+            seq=0,
+            subtype=0x0002,
+            route=selection_route,
+        )
+        + _index_auction_subframe(
+            opening_text,
+            seq=seq,
+            subtype=0x0017,
+            route=0x0100,
+            declared_length_delta=1,
+        )
+    )
+    return encode_frame(body)
+
+
+def build_index_auction_query(
+    code: str,
+    market: int = 16,
+    *,
+    closing: bool = False,
+    seq: int = 0x005A,
+    pageid: int = INDEX_AUCTION_PAGEID,
+) -> bytes:
+    """Build the index auction ``T_URL`` request captured on port 8901."""
+    path = _index_auction_path(code, market, closing)
+    text = (
+        f"T_URL={path}\r\n"
+        f"pageid={pageid}\r"
+    ).encode("gbk")
+
+    header = bytearray(23)
+    header[0] = 0x09
+    header[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 5, seq & 0xFFFF)
+    header[7:11] = b"\x12\x00\x17\x00"
+    struct.pack_into("<H", header, 11, 0x0100)
+    struct.pack_into("<I", header, 19, len(text) + 1)
+    return encode_frame(bytes(header) + text)
+
+
+def parse_index_auction_response(body: bytes) -> list[dict]:
+    """Parse index auction JSON and expose white/lead line aliases."""
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("index auction normalization failed: %s", exc)
+            return []
+
+    roots = ("Auction", "CloseAuction")
+    matches = [
+        (body.find(f'{{"{root}"'.encode("ascii")), root)
+        for root in roots
+    ]
+    matches = [(offset, root) for offset, root in matches if offset >= 0]
+    if not matches:
+        return []
+    start, root = min(matches)
+    end = body.find(b"\x00", start)
+    raw_json = body[start : end if end >= 0 else len(body)].rstrip()
+    candidates = (raw_json, raw_json + b"}")
+    payload = None
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate.decode("utf-8"))
+            break
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get(root)
+    if not isinstance(rows, list):
+        return []
+
+    records: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            new_price = float(row["newprice"])
+            lead_price = float(row["leadprice"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        market_time = row.get("markettime")
+        record = dict(row)
+        record["newprice"] = new_price
+        record["leadprice"] = lead_price
+        record["dt10"] = new_price
+        record["lead_price"] = lead_price
+        record["auction_type"] = (
+            "closing" if root == "CloseAuction" else "opening"
+        )
+        if market_time:
+            try:
+                numeric_time = isinstance(
+                    market_time,
+                    (int, float),
+                ) or str(market_time).isdigit()
+                if numeric_time:
+                    record["time"] = datetime.fromtimestamp(
+                        int(market_time)
+                    )
+                else:
+                    record["time"] = datetime.fromisoformat(
+                        str(market_time)
+                    )
+            except (OSError, OverflowError, ValueError):
+                pass
+        volume = row.get("volume")
+        if volume is not None:
+            try:
+                record["volume"] = int(volume)
+            except (TypeError, ValueError):
+                pass
+        records.append(record)
+    return records
 
 
 def _auction_value(raw: int, datatype: int) -> float | None:

@@ -950,6 +950,42 @@ def test_intraday_combines_historical_phases_in_display_order(
     assert calls[2][0] == "closing"
 
 
+def test_historical_index_intraday_has_no_auction_phases(monkeypatch):
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "auction",
+        lambda *_args, **_kwargs: pytest.fail(
+            "historical index has no opening auction series"
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "closing_auction",
+        lambda *_args, **_kwargs: pytest.fail(
+            "historical index has no closing auction series"
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "history_timeline",
+        lambda *_args, **_kwargs: [{"bar_index": 1, "lead_price": 3919.23}],
+    )
+
+    result = client.intraday(
+        "1A0001",
+        trade_date="2026-07-23",
+    )
+
+    assert result == [
+        {
+            "phase": "continuous",
+            "bar_index": 1,
+            "lead_price": 3919.23,
+        }
+    ]
+
+
 def test_controlled_opener_builds_and_caches_borrowed_l2_socket(
     monkeypatch,
 ):

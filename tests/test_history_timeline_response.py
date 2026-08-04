@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from thspypc.protocol import (
     build_history_timeline_query,
+    build_index_history_timeline_query,
     build_normal_history_timeline_query,
     date_to_normal_timeline_bar,
     date_to_timeline_bar,
@@ -175,6 +176,50 @@ def test_normal_history_query_matches_captured_two_part_request():
     )
     assert b"DateTime=8192(132479582-132479937)" in frame
     assert frame.count(b"pageid=9355") == 2
+
+
+def test_index_history_query_matches_captured_page_77_shape():
+    frame = build_index_history_timeline_query(
+        "1A0001",
+        date="2026-07-23",
+        market=16,
+        seq=0x005B,
+    )
+
+    assert b"CodeList=16(1A0001,);" in frame
+    assert b"DataType=13,19,40,10,23,22,6," in frame
+    assert b"DateTime=8192(132627038-132627393)" in frame
+    assert b"pageid=77" in frame
+    assert frame[23:25] == b"\x00\x01"
+
+
+def test_history_dt40_decodes_as_signed_basis_points():
+    fields = [
+        (1, 0x30, 0, 4),
+        (10, 0x70, 0, 4),
+        (40, 0x30, 0, 4),
+    ]
+    row = struct.pack(
+        "<III",
+        132_627_038,
+        0xA0000000 | 386_809,
+        0xFFFFFFF2,
+    )
+
+    records = history_timeline_protocol._decode_history_timeline_rows(
+        row,
+        [(0, 132_627_038)],
+        fields,
+        12,
+    )
+
+    assert records == [
+        {
+            "bar_index": 132_627_038,
+            "dt10": 3868.09,
+            "dt40": -14,
+        }
+    ]
 
 
 def test_normal_history_response_uses_basic_seven_fields():

@@ -88,6 +88,62 @@ def test_level2_timeline_parser_selects_stock_half(monkeypatch):
     ]
 
 
+def test_index_timeline_parser_decodes_lead_change_and_price(monkeypatch):
+    fields = (
+        (1, 0x30),
+        (10, 0x70),
+        (40, 0x30),
+    )
+    field_table = b"".join(
+        bytes((datatype, fmt, 0, 4)) for datatype, fmt in fields
+    )
+    shell = b"\x16\x00\x01\x00\x10" + b"1A0001" + b"\x00" * 15
+    header = b"hd3.1\x00" + struct.pack("<IHHH", 2, 0x0086, 12, 3)
+    body = header + field_table + shell + struct.pack(">I", 24)
+    rows = (
+        struct.pack("<III", 1, 0xA0000000 | 381_637, 51)
+        + struct.pack("<III", 2, 0xA0000000 | 382_415, 150)
+    )
+    monkeypatch.setattr(
+        timeline_protocol,
+        "_decode_bitrle_0x13746d0",
+        lambda _data, _size: b"\x00" * 24,
+    )
+    monkeypatch.setattr(
+        timeline_protocol,
+        "_transpose_bitplane_0x1763410",
+        lambda _data, _record_size, _record_count: rows,
+    )
+
+    records = timeline_protocol.parse_index_timeline_response(body)
+    timeline_protocol.enrich_index_lead_line(records, 3809.66)
+
+    assert records == [
+        {
+            "code": "1A0001",
+            "minute_index": 0,
+            "bar_index": 1,
+            "dt10": 3816.37,
+            "dt40": 51,
+            "lead_change_bp": 51,
+            "lead_change_pct": 0.51,
+            "prev_close": 3809.66,
+            "lead_price": pytest.approx(3829.089266),
+        },
+        {
+            "code": "1A0001",
+            "minute_index": 1,
+            "bar_index": 2,
+            "dt10": 3824.15,
+            "dt40": 150,
+            "lead_change_bp": 150,
+            "lead_change_pct": 1.5,
+            "prev_close": 3809.66,
+            "lead_price": pytest.approx(3866.8049),
+        },
+    ]
+
+
 def test_normal_timeline_parser_accepts_shanghai_shell(monkeypatch):
     fields = timeline_protocol.TIMELINE_DATATYPE[:8]
     field_table = b"".join(

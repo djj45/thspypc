@@ -201,8 +201,12 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 |---|---|---|---|---|---|---|
 | 当日分时 | 普通 | 9354 | 8192(0-0) | 10 字段 | MAIN | hd3.1 241 行 |
 | 当日分时 | L2 | 4214 | 8192(0-0) | 31 字段 + 基准指数 | shlv2/szlv2 | hd3.1 |
+| 指数当日分时 | 普通/L2 | 9354 / 4214 | 8192(0-0) | 含 10、40 的指数字段表 | main/shlv2/szlv2 | hd3.1 0x3E/0x86/0x9E |
 | 历史分时 | 普通 | 9355 | 8192(bar起-止) | 18 字段 | MAIN | hd1.0 7 字段表 |
 | 历史分时 | L2 | 4417 | 8192(bar起-止) | 26 字段 | shlv2/szlv2 | hd1.0 23 字段表 |
+| 指数历史分时 | 普通/L2 | 77 | 8192(bar起-止) | 13,19,40,10,23,22,6 | main/shlv2/szlv2 | hd1.0 0x42 |
+| 指数早盘竞价 | 当天 | 6240 | T_URL | JSON | main/shlv2/szlv2 | `Auction` |
+| 指数尾盘竞价 | 当天且仅三大指数 | 6240 | T_URL | JSON | main/shlv2/szlv2 | `CloseAuction` |
 | 早盘竞价 | 普通 | 9354 当日 / 9355 历史 | 7176 / 6144 | 10,27,33,49 | MAIN | hd1.0 |
 | 早盘竞价 | L2 | 4214 当日 / 4417 历史 | 7176 / 6144 | 10,27,33,49 | shlv2/szlv2 | hd1.0 |
 | 尾盘竞价 | 普通 | 9354 当日 / 9355 历史 | 7424 | 10,49,287 | MAIN | hd1.0/hd3.1 |
@@ -261,6 +265,29 @@ pageid=4214
   订阅（普通身份发同样的订阅帧会 `CodeListSize=0`）。
 - 31 个 L2 字段含 `dt201-230` 大单金额双线（`dt227/dt229`=主动买/卖额，差值为主力净额曲线）。
 - 解析入口 `parse_timeline_l2_response`；深市必须连 szlv2。
+
+### 7.3 指数白线与领先线（黄线）
+
+指数代码使用指数市场码：沪市 `1A/1B` 自动推断为 16，深市 `399` 自动推断为 32；解析器同时接受
+指数市场码 144。指数不是个股，不走数字股票的快照注册，也不附加 399002/1A0002 基准代码。
+当日请求仍按账号选择：普通账号使用 `build_timeline_query` 的 9354，Level2 使用
+`build_timeline_l2_query` 的 4214。响应是带 26B shell 的 `hd3.1` BitRLE 表，已确认 flag 为
+`0x003E/0x0086/0x009E`。
+
+字段语义以抓包和同花顺客户端画面逐点对照为准：
+
+- `dt10` 是指数白线的绝对点位；
+- `dt40` 不是绝对点位，而是相对上一交易日收盘点位的**有符号基点数**；
+- `lead_change_bp = int32(dt40)`，`lead_change_pct = lead_change_bp / 100`；
+- `lead_price = prev_close × (1 + lead_change_bp / 10000)`，即客户端黄线（领先/等权线）。
+
+`client.timeline()` 会在未显式传入 `prev_close` 时查询日 K 得到上一交易日收盘点位，再补齐
+`lead_change_bp`、`lead_change_pct`、`prev_close`、`lead_price`，同时保留原始 `dt40`。例如：
+
+```python
+rows = client.timeline("1A0001")
+print(rows[-1]["dt10"], rows[-1]["lead_price"])
+```
 
 ---
 
@@ -336,8 +363,24 @@ bar 游标与普通账号一样用 **packed-date 编码**（`(year-1900)<<9 | mo
 - `dt54` 历史分时为 `0xFFFFFFFF` 哨兵 → 0.0；
 - `dt201-230` 为 Level2 大单金额双线（`dt227/dt229`=主动买/卖额累计，差=主力净额曲线）。
 
-> 历史分时 241 点只覆盖盘中。早盘竞价、尾盘竞价需要单独请求（见 9/10 节），
-> `client.intraday()` 会把三段合并。
+### 8.3 指数历史分时（pageid=77）
+
+指数历史分时不是 9355/4417 个股协议。`build_index_history_timeline_query` 使用单请求：
+
+```text
+CodeList=16(1A0001,);
+DataType=13,19,40,10,23,22,6,
+DateTime=8192(132651614-132651969)     # packed-date 游标
+LackTime=0,3,0,0,0,0,0,0
+pageid=77
+```
+
+响应为 `hd1.0` 0x42 表，按 `bar_index` 锚点恢复盘中记录；`dt40` 同样按有符号基点解码，
+`client.history_timeline()` 默认通过日 K 自动取目标日的昨收并还原 `lead_price`。
+
+**指数历史分时没有早盘或尾盘竞价序列。** 同花顺客户端只提供沪深创业板指数的**当天**竞价；
+查询历史指数时，`client.intraday()` 只返回带 `phase="continuous"` 的盘中记录，不调用
+`auction()` / `closing_auction()`。个股历史分时仍按 9/10 节分别请求竞价并合成三段。
 
 ---
 
@@ -387,6 +430,22 @@ pageid=9355
 
 沪市原始响应可能走 `cmd=0x0a` 外层压缩或变体壳，由 `_parse_auction_sh` 兜底。
 
+### 9.4 指数当天开盘竞价（T_URL）
+
+指数竞价不是个股的 7176/6144 表，而是 `pageid=6240` 的 `T_URL` JSON 接口，仅提供当前交易日：
+
+```text
+# 沪市
+T_URL=/quote/auction/USH/USHI_1A0001.dat
+# 深市（深证成指/创业板指同形）
+T_URL=/quote/auction/USZ/USZI_399001.dat
+```
+
+PC 客户端先在同一 8901 外层帧中发送 `CodeList + pageid` 子帧和开盘 `T_URL` 子帧。
+`T_URL` 文本实际以单个 `\r` 结束，但头部声明长度比实际文本多 1；这是抓包确认的线协议，不应
+“修正”为普通 `\r\n`。响应 JSON 根为 `Auction`，字段 `markettime/newprice/leadprice/volume`；
+解析后另提供 `time`、`dt10=newprice`、`lead_price=leadprice`、`auction_type="opening"`。
+
 ---
 
 ## 10. 尾盘竞价（`closing_auction`，14:57-15:00）
@@ -407,6 +466,38 @@ pageid=9355
   遇时间戳出窗即停（保留已解记录）。
 
 实测节奏：沪市约 61 点（3s/tick），深市约 20-21 点（9s/tick）——市场真实节奏，非 bug。
+
+### 10.1 指数当天尾盘竞价（T_URL）
+
+指数尾盘竞价只存在于当前交易日，并且客户端只为三大指数提供：上证指数 `1A0001`、深证成指
+`399001`、创业板指 `399006`。对应 URL 为：
+
+```text
+/quote/auction/USH/USHI_CLOSE_1A0001.dat
+/quote/auction/USZ/USZI_CLOSE_399001.dat
+/quote/auction/USZ/USZI_CLOSE_399006.dat
+```
+
+直接只发 close URL 不能稳定复现 PC 行为。正确线序是：
+
+```text
+① 一个外层帧：CodeList 子帧 + 开盘 T_URL 上下文子帧
+② 一个 LF（0x0A）分隔
+③ 一个外层帧：CloseAuction T_URL 子帧
+```
+
+两条 T_URL 均以单个 `\r` 结尾且声明长度 `+1`。服务读取时会跳过先到达的 `Auction` 响应，直到
+JSON 根为 `CloseAuction`；解析别名为 `dt10=newprice`、`lead_price=leadprice`、
+`auction_type="closing"`。2026-08-04 同花顺 PC 客户端抓包与活网 API 逐点一致，三个指数均为
+12 点（约 15 秒一个点）：
+
+| 指数 | 首点 | 15:00 白线 `dt10` | 15:00 黄线 `lead_price` |
+|---|---|---:|---:|
+| 上证指数 1A0001 | 14:57:11 | 3822.2800 | 3872.138424 |
+| 深证成指 399001 | 14:57:12 | 13885.7110 | 13722.634096 |
+| 创业板指 399006 | 14:57:12 | 3488.9663 | 3402.620768 |
+
+历史指数没有对应的竞价 URL 数据；传历史日期时接口会明确报错，而不是回退到个股协议。
 
 ---
 
@@ -558,8 +649,8 @@ pageid=9355
 
 | 类 | 文件 | 职责 |
 |---|---|---|
-| `TimelineService` | `services/timeline.py` | 当日/历史分时：选 plan → 发请求 → 读帧 → 解析；L2 前注册订阅 |
-| `AuctionService` | `services/auction.py` | 早盘/尾盘竞价；历史 L2 自动组三条流水线 bundle |
+| `TimelineService` | `services/timeline.py` | 个股/指数当日与历史分时：选 plan → 发请求 → 读帧 → 解析；指数黄线保留 dt40 |
+| `AuctionService` | `services/auction.py` | 个股早盘/尾盘竞价；历史 L2 三条 bundle；指数当天 T_URL 开盘/尾盘线序 |
 | `KlineService` | `services/kline.py` | 单请求持有 MAIN 锁，读到 hd3.1 为止 |
 | `BoardService` | `services/system_blocks.py` | 板块行情/分时/竞价（BOARD 通道）+ 成分股（独立连接事务） |
 | `ConnectionManager` | `_transport/connection_manager.py` | 角色连接注册表 + capability 门控 |
@@ -572,11 +663,11 @@ pageid=9355
 
 | 方法 | 底层 |
 |---|---|
-| `timeline(code, market)` | 普通→9354 / L2→4214 |
-| `history_timeline(code, date, market)` | 普通→9355 / L2→4417 |
-| `auction(code, trade_date)` | 普通→9354/9355 / L2→4214/4417 |
-| `closing_auction(code, trade_date)` | 普通→9354/9355 / L2→4214/4417 |
-| `intraday(code, trade_date)` | 早盘 + 盘中 + 尾盘三段合并，加 `phase` 标签 |
+| `timeline(code, market, prev_close)` | 个股/指数：普通→9354 / L2→4214；指数额外还原黄线 |
+| `history_timeline(code, date, market, prev_close)` | 个股：普通→9355 / L2→4417；指数→77 并还原黄线 |
+| `auction(code, trade_date)` | 个股→9354/9355/4214/4417；指数当天→6240 T_URL |
+| `closing_auction(code, trade_date)` | 个股→9354/9355/4214/4417；三大指数当天→6240 T_URL |
+| `intraday(code, trade_date)` | 个股三段合并；历史指数仅盘中，记录均加 `phase` 标签 |
 | `kline(code, period)` | MAIN 9355，日/周/月/分钟 |
 | `board_quotes / board_timeline / board_auction / board_constituents` | 板块指数与成分股（见 11 节） |
 | `list_quotes / market_snapshot` | MAIN 批量行情（非本文范围） |
@@ -589,6 +680,8 @@ opening_auction = auction(trade_date)        # 9:15-9:25
 continuous      = history_timeline(date)     # 历史：241 点；当天：timeline()
 closing_auction = closing_auction(trade_date)# 14:57-15:00
 合并输出，每条记录带 phase 字段
+
+例外：historical and index -> 只查询 continuous；历史指数没有两段竞价数据
 ```
 
 ---
@@ -610,6 +703,10 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
     注册全部 `errorcode=-1`，现象是等约 47s 后返回空列表。
 11. **登录成功 ≠ 通道就绪**：新通道（fu4/成分）必须以引导阶段逐帧响应为准（开
     `THS_FRAME_DUMP_DIR`），不能拿 `VerifyCode=0` 当作绑定成功。
+12. **指数黄线 dt40 是有符号基点，不是价格**：必须结合上一交易日收盘点位还原；直接按 THS float
+    或无符号整数解释都会得到错误曲线。
+13. **历史指数无竞价**：只有上证指数、深证成指、创业板指有当天尾盘竞价，不要把个股历史竞价
+    协议套到指数上，也不要用空数组伪装成服务端存在历史竞价数据。
 
 ---
 
@@ -620,15 +717,15 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
 | `src/thspypc/client.py` | `THSClient` 门面、连接治理、`_run_default_service`、K线周期映射 |
 | `src/thspypc/protocol.py` | HTTP 鉴权、login/init/heartbeat 帧、8901 压缩入口、公共常量 |
 | `src/thspypc/features/auth_protocol.py` | login 帧构造（thsuser/__manual）、login 响应解析 |
-| `src/thspypc/features/timeline_protocol.py` | 当日分时请求构造 + hd3.1 解析（普通/L2） |
-| `src/thspypc/features/history_timeline_protocol.py` | 历史分时请求构造（9355/4417）+ hd1.0 解析、bar 游标编码 |
-| `src/thspypc/features/auction_protocol.py` | 早盘/尾盘竞价请求构造 + 解析（含末条截断容错、深市 9s 步长） |
+| `src/thspypc/features/timeline_protocol.py` | 当日分时请求 + hd3.1 解析；指数 dt40 有符号解码与黄线还原 |
+| `src/thspypc/features/history_timeline_protocol.py` | 个股 9355/4417、指数 77 历史分时请求 + hd1.0 解析、bar 游标编码 |
+| `src/thspypc/features/auction_protocol.py` | 个股竞价表与指数 6240 T_URL builder/parser（Auction/CloseAuction） |
 | `src/thspypc/features/kline_protocol.py` | K线请求构造 + hd3.1 BitRLE 解析 |
 | `src/thspypc/features/system_blocks.py` | 本地 block_hq 缓存解析（离线 oracle：板块树/概念/行业） |
 | `src/thspypc/features/system_blocks_protocol.py` | 板块通道引导 + 板块指数/成分股 builder/parser（0x130/0x64/0x42/0x32） |
 | `src/thspypc/features/account_profile.py` | 账号类型判定、能力证据沉淀 |
 | `src/thspypc/services/timeline.py` | 分时 plan 选择、读帧循环、L2 订阅前置 |
-| `src/thspypc/services/auction.py` | 竞价服务、历史 L2 三条流水线 bundle |
+| `src/thspypc/services/auction.py` | 个股竞价、历史 L2 三条 bundle、指数当天 T_URL 上下文/尾盘 bundle |
 | `src/thspypc/services/kline.py` | K线服务（MAIN 锁 + 多帧收集） |
 | `src/thspypc/services/system_blocks.py` | `BoardService` 四接口 + `SystemBlocksService`（本地缓存门面） |
 | `src/thspypc/services/subscription.py` | 4214 订阅注册/保活 |

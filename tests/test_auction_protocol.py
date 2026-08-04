@@ -4,6 +4,7 @@ import hashlib
 import struct
 from datetime import date
 
+import pytest
 import thspypc.protocol as protocol
 from thspypc.features import auction_protocol
 
@@ -77,6 +78,85 @@ def test_basic_auction_builders_match_current_and_history_shapes():
         "3c57adb3a09e7f41f8acf87c4bab8bc4"
         "9d62f48452cc50dc1f16a0ac271bd521",
     )
+
+
+def test_index_auction_builder_and_json_parser():
+    frame = auction_protocol.build_index_auction_query(
+        "1A0001",
+        market=16,
+        seq=0x005A,
+    )
+    assert frame.startswith(b"\xfd\xfd\xfd\xfd")
+    assert b"\x12\x00\x17\x00\x00\x01" in frame
+    assert (
+        b"T_URL=/quote/auction/USH/USHI_1A0001.dat\r\n"
+        b"pageid=6240\r"
+    ) in frame
+
+    context = auction_protocol.build_index_auction_context_query(
+        "1A0001",
+        market=16,
+        seq=0x0176,
+    )
+    close_frame = auction_protocol.build_index_auction_query(
+        "1A0001",
+        market=16,
+        closing=True,
+        seq=0x0177,
+    )
+    assert (len(context), _sha256(context)) == (
+        147,
+        "4d5f3a1e2603412fe6c4ea2cdfb598cf"
+        "daba795bdc79aa2b75253f42c5d6d5ee",
+    )
+    assert (len(close_frame), _sha256(close_frame)) == (
+        95,
+        "602500726e7d1bf4eff6ab1aa318cdcc"
+        "00fd6a8ea37ef3bb18fd0226f0b4a33a",
+    )
+
+    # The capture ends the JSON with NUL before the root object's final brace.
+    body = (
+        b'{"Auction":[{"markettime":"2026-08-04 09:25:00",'
+        b'"newprice":3816.37,"leadprice":3829.089266,'
+        b'"volume":404086720}]\x00'
+    )
+    records = auction_protocol.parse_index_auction_response(body)
+
+    assert len(records) == 1
+    assert records[0]["dt10"] == 3816.37
+    assert records[0]["lead_price"] == 3829.089266
+    assert records[0]["volume"] == 404086720
+    assert records[0]["time"].isoformat(sep=" ") == "2026-08-04 09:25:00"
+
+    numeric_time = auction_protocol.parse_index_auction_response(
+        b'{"Auction":[{"markettime":1785806700,'
+        b'"newprice":3816.37,"leadprice":3829.089266,'
+        b'"volume":404086720}]}'
+    )
+    assert numeric_time[0]["time"].year == 2026
+
+    closing = auction_protocol.build_index_auction_query(
+        "399001",
+        market=32,
+        closing=True,
+    )
+    assert b"/quote/auction/USZ/USZI_CLOSE_399001.dat" in closing
+
+    closing_records = auction_protocol.parse_index_auction_response(
+        b'{"CloseAuction":[{"markettime":1785826632,'
+        b'"newprice":13820.100098,"leadprice":13719.849663,'
+        b'"volume":51439929}]}'
+    )
+    assert closing_records[0]["auction_type"] == "closing"
+    assert closing_records[0]["lead_price"] == 13719.849663
+
+    with pytest.raises(ValueError, match="1A0001"):
+        auction_protocol.build_index_auction_query(
+            "399002",
+            market=32,
+            closing=True,
+        )
 
 
 def test_closing_auction_parser_accepts_hd3_bitrle(monkeypatch):

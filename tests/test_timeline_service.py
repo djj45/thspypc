@@ -87,6 +87,12 @@ def test_level2_index_market_codes_use_their_market_l2_roles():
         LEVEL2_PROFILE,
         144,
     ).role is ConnectionRole.SH_L2
+    plan = select_timeline_plan(LEVEL2_PROFILE, 16)
+    assert build_timeline_request(
+        plan,
+        "1A0001",
+        market=16,
+    ) == build_timeline_l2_query("1A0001", market=16)
 
 
 def test_level2_account_can_force_basic_for_protocol_comparison():
@@ -186,6 +192,34 @@ def test_level2_workflow_uses_selected_role_and_matches_response(monkeypatch):
     assert len(sock.sent) == 2
     assert b"CodeList=33(000938,);" in sock.sent[0]
     assert b"pageid=4214" in sock.sent[1]
+
+
+def test_level2_index_workflow_skips_stock_snapshot_registration(monkeypatch):
+    opened = []
+    manager = ConnectionManager(
+        LEVEL2_PROFILE,
+        lambda spec: opened.append(spec.role) or FakeSocket(),
+    )
+    expected = [{"code": "1A0001", "dt10": 3822.28, "dt40": 164}]
+    service = TimelineService(
+        manager,
+        frame_reader=lambda _sock: b"hd3.1\x00index",
+        max_frames=1,
+    )
+    monkeypatch.setattr(
+        service._subscriptions,
+        "ensure_registered",
+        lambda *_args, **_kwargs: pytest.fail(
+            "index timeline must not use numeric-stock snapshot registration"
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.timeline.parse_timeline_l2_response",
+        lambda _body: expected,
+    )
+
+    assert service.timeline("1A0001", market=16) == expected
+    assert opened == [ConnectionRole.SH_L2]
 
 
 def test_level2_workflow_distinguishes_parser_failure(monkeypatch):

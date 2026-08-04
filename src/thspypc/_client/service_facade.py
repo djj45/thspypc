@@ -454,7 +454,7 @@ class ServiceFacade:
             raise ValueError(f"period 不支持: {period}，可选: {list(self._KLINE_PERIOD_CODES)}")
         period_code = self._KLINE_PERIOD_CODES[period]
         if market == 0:
-            market = 17 if code.startswith("6") else 33
+            market = self._market_for_code(code)
 
         last_err = ""
         for attempt in range(retries + 1):
@@ -497,6 +497,68 @@ class ServiceFacade:
                 self._drop_connection()
         raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
 
+    def _index_previous_close(
+        self,
+        code: str,
+        *,
+        market: int,
+        target_date: date_type,
+        timeout: float,
+    ) -> float | None:
+        """Fetch the last daily close strictly before ``target_date``."""
+        anchor = int(target_date.strftime("%Y%m%d"))
+        bars = self.kline(
+            code,
+            period="day",
+            count=10,
+            anchor=anchor,
+            fuquan="",
+            market=market,
+            timeout=timeout,
+            retries=1,
+        )
+        candidates: list[tuple[date_type, float]] = []
+        for bar in bars:
+            bar_time = bar.get("time")
+            close = bar.get("close")
+            if close is None or not isinstance(bar_time, datetime):
+                continue
+            bar_date = bar_time.date()
+            if bar_date < target_date:
+                candidates.append((bar_date, float(close)))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def _enrich_index_timeline(
+        self,
+        records: list[dict],
+        code: str,
+        *,
+        market: int,
+        target_date: date_type,
+        prev_close: float | None,
+        timeout: float,
+    ) -> list[dict]:
+        from ..features.timeline_protocol import enrich_index_lead_line
+
+        if prev_close is None:
+            try:
+                prev_close = self._index_previous_close(
+                    code,
+                    market=market,
+                    target_date=target_date,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "指数领先线昨收查询失败 %s %s: %s",
+                    code,
+                    target_date,
+                    exc,
+                )
+        return enrich_index_lead_line(records, prev_close)
+
     def timeline(
         self,
         code: str,
@@ -504,20 +566,24 @@ class ServiceFacade:
         timeout: float = 12.0,
         skip_init: bool = False,
         use_main_ip: bool = False,
+        prev_close: float | None = None,
     ) -> list[dict]:
-        """查当日分时图（逐点行情：现价/均价/量额，复刻 hexin 分时白线）。
+        """查当日分时图（含指数白线及领先线）。
 
         普通账号走 MAIN 上的 ``pageid=9354`` 请求-响应；Level2 账号走
         ``pageid=4214`` 的市场专用通道。两种响应统一返回逐点行情记录。
 
         Args:
-            code: 股票代码（纯数字，如 ``"000938"``）。
-            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
+            code: 股票或指数代码（如 ``"000938"``、``"1A0001"``）。
+            market: 市场码（0=按代码前缀自动推断，含 1A/1B/399 指数）。
             timeout: 单次 read_frame 超时（秒）。
+            prev_close: 指数昨收；不传时自动查询前一交易日日 K 收盘。
 
         Returns:
-            记录列表，每条 ``{time, dt10(现价), dt13(量), dt19(额), dt14(均价), ...}``，
-            按时间正序。非交易日/盘前当天无分时数据时返回空列表。
+            记录列表，每条 ``{time, dt10(现价), dt13(量), dt19(额), ...}``，
+            按时间正序。指数记录额外包含 ``dt40``、``lead_change_bp``、
+            ``lead_change_pct``、``prev_close``、``lead_price``；其中
+            ``lead_price`` 即领先线（黄线）绝对点位。
 
         Raises:
             RuntimeError: 未登录或 L2 市场连接建立失败。
@@ -529,7 +595,7 @@ class ServiceFacade:
                 "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
             )
         if market == 0:
-            market = 17 if code.startswith("6") else 33
+            market = self._market_for_code(code)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -551,7 +617,7 @@ class ServiceFacade:
                 "l2_snapshot",
                 "后台快照线程正在读取 4214 连接",
             )
-        return self._run_default_service(
+        records = self._run_default_service(
             (capability,),
             lambda: self._timeline_service.timeline(
                 code,
@@ -559,6 +625,16 @@ class ServiceFacade:
                 timeout=timeout,
             ),
         )
+        if market in (16, 32, 144) and records:
+            return self._enrich_index_timeline(
+                records,
+                code,
+                market=market,
+                target_date=date_type.today(),
+                prev_close=prev_close,
+                timeout=timeout,
+            )
+        return records
 
     def auction(
         self,
@@ -575,7 +651,7 @@ class ServiceFacade:
         用 ``pageid=9355/period=6144``。Level2 账号保留 4214 通道路径。
 
         Args:
-            code: 股票代码（纯数字，如 ``"000938"``）。
+            code: 股票或指数代码（如 ``"000938"``、``"1A0001"``）。
             market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
             trade_date: 交易日。``None``（默认）= 最近交易日；传 ``date``/``datetime``
                 = 指定交易日（算该日 9:15/9:25 unix 时间戳）。沪深竞价时段相同。
@@ -583,7 +659,9 @@ class ServiceFacade:
             timeout: 单次 read_frame 超时（秒）。
 
         Returns:
-            集合竞价记录列表，每条 ``{time, dt10(撮合价), dt49(累计量·股),
+            集合竞价记录列表。指数 T_URL 响应返回 ``dt10``（白线）及
+            ``lead_price``/``leadprice``（黄线）；个股记录为 ``{time,
+            dt10(撮合价), dt49(累计量·股),
             dt27(买方未匹配·股), dt33(卖方未匹配·股)}``，按时间正序
             （9:15:00-9:24:57）。非交易日/无竞价数据时返回空列表。
 
@@ -604,7 +682,7 @@ class ServiceFacade:
                 "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
             )
         if market == 0:
-            market = 17 if code.startswith("6") else 33
+            market = self._market_for_code(code)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -651,7 +729,7 @@ class ServiceFacade:
         请求头不混用。
         """
         if market == 0:
-            market = 17 if code.startswith("6") else 33
+            market = self._market_for_code(code)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -706,11 +784,16 @@ class ServiceFacade:
             value = value.date()
         historical = value is not None and value != date_type.today()
 
-        opening = self.auction(
-            code,
-            market=market,
-            trade_date=trade_date,
-            timeout=timeout,
+        historical_index = historical and market in (16, 32, 144)
+        opening = (
+            []
+            if historical_index
+            else self.auction(
+                code,
+                market=market,
+                trade_date=trade_date,
+                timeout=timeout,
+            )
         )
         if historical:
             continuous = self.history_timeline(
@@ -726,11 +809,15 @@ class ServiceFacade:
                 market=market,
                 timeout=timeout,
             )
-        closing = self.closing_auction(
-            code,
-            market=market,
-            trade_date=trade_date,
-            timeout=timeout,
+        closing = (
+            []
+            if historical_index
+            else self.closing_auction(
+                code,
+                market=market,
+                trade_date=trade_date,
+                timeout=timeout,
+            )
         )
 
         result: list[dict] = []
@@ -752,11 +839,12 @@ class ServiceFacade:
         market: int = 0,
         timeout: float = 12.0,
         retries: int = 3,
+        prev_close: float | None = None,
     ) -> list[dict]:
         """查**历史分时（回忆）**：某交易日的逐点分时行情（现价/量额/level2 大单）。
 
-        普通账号走 MAIN 的 ``pageid=9355``；Level2 账号走市场专用连接上的
-        ``pageid=4417``。两种协议使用不同的日期游标编码，由服务自动选择。
+        个股按账号走 ``pageid=9355/4417``；指数走抓包一致的
+        ``pageid=77``。日期游标编码由服务自动选择。
 
         **与当日分时的区别**：Level2 历史响应包含 201-230 大单字段；普通账号
         返回基础价量额字段，不虚构无权限字段。
@@ -771,14 +859,15 @@ class ServiceFacade:
             code: 股票代码（如 ``"000938"``；指数用 ``"1A0002"``）。
             date: 目标交易日（``date``/``datetime``/``"YYYY-MM-DD"`` 字符串）。
                 必须是历史交易日（非当天，当天用 :meth:`timeline`）。
-            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33；
-                指数 1A0002 等需手动传 16）。
+            market: 市场码（0=按代码前缀自动推断，含 1A/1B/399 指数）。
             timeout: 单次 read_frame 超时（秒）。
             retries: 连接失败时的重试次数（每次重连轮换 IP）。
+            prev_close: 目标历史日的昨收；不传时自动查询日 K。
 
         Returns:
             记录列表，每条 ``{bar_index, dt10, dt13, dt19, dt22, dt23, ...}``。
             dt10=现价、dt13=成交量、dt19=成交额、dt201-230=level2 大单金额。
+            指数记录额外包含 ``dt40`` 和还原后的 ``lead_price``（黄线）。
             指数和完整锚点型个股帧均可解；服务器确实缺少某个 bar 时保留其余有效点，
             不凭空补值。
 
@@ -844,6 +933,20 @@ class ServiceFacade:
                     ),
                 )
                 if records:
+                    if market in (16, 32, 144):
+                        target_date = date
+                        if isinstance(target_date, str):
+                            target_date = date_type.fromisoformat(target_date)
+                        elif isinstance(target_date, datetime):
+                            target_date = target_date.date()
+                        records = self._enrich_index_timeline(
+                            records,
+                            code,
+                            market=market,
+                            target_date=target_date,
+                            prev_close=prev_close,
+                            timeout=timeout,
+                        )
                     return records
                 last_err = "收到强状态省略帧或未找到历史分时数据"
                 logger.info(

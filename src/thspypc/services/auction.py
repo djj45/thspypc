@@ -14,10 +14,13 @@ from ..errors import (
 from ..features.auction_protocol import (
     build_auction_query,
     build_basic_auction_query,
+    build_index_auction_context_query,
+    build_index_auction_query,
     build_l2_closing_auction_query,
     build_l2_history_auction_query,
     parse_auction_response,
     parse_closing_auction_response,
+    parse_index_auction_response,
 )
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.history_timeline_protocol import (
@@ -31,9 +34,9 @@ FrameReader = Callable[[SocketLike], bytes]
 
 
 def _auction_role(market: int) -> ConnectionRole:
-    if market == 17:
+    if market in (16, 17):
         return ConnectionRole.SH_L2
-    if market == 33:
+    if market in (32, 33):
         return ConnectionRole.SZ_L2
     raise ValueError(f"集合竞价暂不支持市场码: {market}")
 
@@ -78,6 +81,26 @@ def _build_l2_history_auction_bundle(
     return b"\n".join((history, closing, opening))
 
 
+def _build_index_closing_auction_bundle(
+    code: str,
+    *,
+    market: int,
+) -> bytes:
+    """Prime the index auction context before requesting CloseAuction."""
+    opening = build_index_auction_context_query(
+        code,
+        market=market,
+        seq=0x0176,
+    )
+    closing = build_index_auction_query(
+        code,
+        market=market,
+        closing=True,
+        seq=0x0177,
+    )
+    return b"\n".join((opening, closing))
+
+
 class AuctionService:
     """Run account-specific opening and closing call-auction requests."""
 
@@ -108,20 +131,32 @@ class AuctionService:
         timeout: float = 12.0,
     ) -> list[dict]:
         profile = self._connections.profile
+        index_auction = market in (16, 32)
+        if index_auction and _is_historical_date(trade_date):
+            raise ValueError("指数 T_URL 竞价接口只提供当前交易日")
         if profile.kind is AccountKind.STANDARD:
             capability = Capability.BASIC_AUCTION
             role = ConnectionRole.MAIN
             historical = _is_historical_date(trade_date)
-            frame = build_basic_auction_query(
-                code,
-                market=market,
-                trade_date=trade_date,
-                historical=historical,
+            frame = (
+                build_index_auction_context_query(code, market=market)
+                if index_auction
+                else build_basic_auction_query(
+                    code,
+                    market=market,
+                    trade_date=trade_date,
+                    historical=historical,
+                )
             )
         elif profile.kind is AccountKind.LEVEL2:
             capability = Capability.L2_AUCTION
             role = _auction_role(market)
-            if _is_historical_date(trade_date):
+            if index_auction:
+                frame = build_index_auction_context_query(
+                    code,
+                    market=market,
+                )
+            elif _is_historical_date(trade_date):
                 frame = _build_l2_history_auction_bundle(
                     code,
                     market=market,
@@ -157,7 +192,7 @@ class AuctionService:
             role,
             capability=capability,
         )
-        if role is not ConnectionRole.MAIN:
+        if role is not ConnectionRole.MAIN and not index_auction:
             self._subscriptions.ensure_registered(
                 connection,
                 code,
@@ -172,10 +207,16 @@ class AuctionService:
                 if (
                     not response.startswith(b"\x0a")
                     and b"hd1.0" not in response
+                    and b'{"Auction"' not in response
+                    and b'{"CloseAuction"' not in response
                 ):
                     continue
                 saw_auction_frame = True
-                records = parse_auction_response(response)
+                records = (
+                    parse_index_auction_response(response)
+                    if index_auction
+                    else parse_auction_response(response)
+                )
                 if records:
                     if (
                         self._evidence is not None
@@ -201,20 +242,35 @@ class AuctionService:
     ) -> list[dict]:
         """Return the 14:57-15:00 closing-auction companion series."""
         profile = self._connections.profile
+        index_auction = market in (16, 32)
+        if index_auction and _is_historical_date(trade_date):
+            raise ValueError("指数 T_URL 竞价接口只提供当前交易日")
         if profile.kind is AccountKind.STANDARD:
             capability = Capability.BASIC_AUCTION
             role = ConnectionRole.MAIN
-            frame = build_basic_auction_query(
-                code,
-                market=market,
-                trade_date=trade_date,
-                closing=True,
-                historical=_is_historical_date(trade_date),
+            frame = (
+                _build_index_closing_auction_bundle(
+                    code,
+                    market=market,
+                )
+                if index_auction
+                else build_basic_auction_query(
+                    code,
+                    market=market,
+                    trade_date=trade_date,
+                    closing=True,
+                    historical=_is_historical_date(trade_date),
+                )
             )
         elif profile.kind is AccountKind.LEVEL2:
             capability = Capability.L2_AUCTION
             role = _auction_role(market)
-            if _is_historical_date(trade_date):
+            if index_auction:
+                frame = _build_index_closing_auction_bundle(
+                    code,
+                    market=market,
+                )
+            elif _is_historical_date(trade_date):
                 frame = _build_l2_history_auction_bundle(
                     code,
                     market=market,
@@ -249,7 +305,7 @@ class AuctionService:
             role,
             capability=capability,
         )
-        if role is not ConnectionRole.MAIN:
+        if role is not ConnectionRole.MAIN and not index_auction:
             self._subscriptions.ensure_registered(
                 connection,
                 code,
@@ -264,10 +320,22 @@ class AuctionService:
                     not response.startswith(b"\x0a")
                     and b"hd1.0" not in response
                     and b"hd3.1" not in response
+                    and b'{"Auction"' not in response
+                    and b'{"CloseAuction"' not in response
                 ):
                     continue
                 saw_frame = True
-                records = parse_closing_auction_response(response)
+                records = (
+                    parse_index_auction_response(response)
+                    if index_auction
+                    else parse_closing_auction_response(response)
+                )
+                if (
+                    index_auction
+                    and records
+                    and records[0].get("auction_type") != "closing"
+                ):
+                    continue
                 if records:
                     if (
                         self._evidence is not None

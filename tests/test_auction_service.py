@@ -339,3 +339,29 @@ def test_level2_current_closing_uses_4214(monkeypatch):
 
     assert b"pageid=4214" in sock.sent[1]
     assert b"pageid=4417" not in sock.sent[1]
+
+
+def test_index_closing_primes_opening_and_waits_for_close_root(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([b"\x0aopening", b'{"CloseAuction":[]}'])
+    opening = [{"auction_type": "opening", "lead_price": 3829.09}]
+    closing = [{"auction_type": "closing", "lead_price": 3872.14}]
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_index_auction_response",
+        lambda body: opening if body == b"\x0aopening" else closing,
+    )
+    service = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=2,
+    )
+
+    result = service.closing_auction("1A0001", market=16)
+
+    assert result == closing
+    assert len(sock.sent) == 1
+    bundle = sock.sent[0]
+    assert bundle.count(b"\xfd\xfd\xfd\xfd") == 2
+    assert b"/quote/auction/USH/USHI_1A0001.dat" in bundle
+    assert b"/quote/auction/USH/USHI_CLOSE_1A0001.dat" in bundle

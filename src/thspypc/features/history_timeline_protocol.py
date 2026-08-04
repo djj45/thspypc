@@ -66,6 +66,8 @@ NORMAL_HISTORY_TIMELINE_DATATYPE = [
     407,
     1111,
 ]
+INDEX_HISTORY_TIMELINE_PAGEID = 77
+INDEX_HISTORY_TIMELINE_DATATYPE = [13, 19, 40, 10, 23, 22, 6]
 HISTORY_TIMELINE_BAR_SPAN = 355
 
 TIMELINE_BAR_EPOCH_ORDINAL = 675064
@@ -343,6 +345,44 @@ def build_normal_history_timeline_query(
     return encode_frame(b"\x09" + prefix + query)
 
 
+def build_index_history_timeline_query(
+    code: str,
+    bar_start: int | None = None,
+    market: int = 16,
+    datatype: list[int] | None = None,
+    pageid: int = INDEX_HISTORY_TIMELINE_PAGEID,
+    seq: int = 0x005B,
+    date=None,
+) -> bytes:
+    """Build the captured pageid=77 index historical-timeline request."""
+    if date is not None:
+        bar_start = date_to_normal_timeline_bar(date)
+    if bar_start is None:
+        raise ValueError("必须传 bar_start 或 date 之一")
+    if datatype is None:
+        datatype = INDEX_HISTORY_TIMELINE_DATATYPE
+
+    datatype_text = ",".join(str(value) for value in datatype) + ","
+    bar_end = bar_start + HISTORY_TIMELINE_BAR_SPAN
+    text = (
+        f"CodeList={market}({code},);\r\n"
+        f"DataType={datatype_text}\r\n"
+        f"DateTime={TIMELINE_PERIOD}({bar_start}-{bar_end})\r\n"
+        "LackTime=0,3,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r\n"
+    ).encode("gbk")
+
+    header = bytearray(23)
+    header[0] = 0x09
+    header[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 5, seq & 0xFFFF)
+    header[7:11] = b"\x12\x00\x09\x00"
+    struct.pack_into("<H", header, 11, 0x0100)
+    header[18] = 0x20
+    struct.pack_into("<I", header, 19, len(text))
+    return encode_frame(bytes(header) + text)
+
+
 def history_timeline_request_codes(
     code: str,
     *,
@@ -466,7 +506,7 @@ def _decode_history_timeline_rows(
             break
         record: dict = {}
         field_offset = row_offset
-        for datatype, _fmt, _flags, width in fields:
+        for datatype, fmt, _flags, width in fields:
             chunk = body[field_offset : field_offset + width]
             field_offset += width
             if len(chunk) < width:
@@ -477,7 +517,14 @@ def _decode_history_timeline_rows(
                 record["bar_index"] = bar_index
             else:
                 raw_value = struct.unpack("<I", chunk)[0]
-                record[f"dt{datatype}"] = decode_ths_float(raw_value)
+                if datatype == 40 and fmt not in (0x70, 0x64):
+                    record[f"dt{datatype}"] = (
+                        None
+                        if raw_value == 0xFFFFFFFF
+                        else struct.unpack("<i", chunk)[0]
+                    )
+                else:
+                    record[f"dt{datatype}"] = decode_ths_float(raw_value)
         records.append(record)
     return records
 

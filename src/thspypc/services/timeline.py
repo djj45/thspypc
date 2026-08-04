@@ -16,11 +16,13 @@ from ..errors import (
 from ..features.timeline_protocol import (
     build_timeline_l2_query,
     build_timeline_query,
+    is_index_timeline,
     parse_timeline_l2_response,
     parse_timeline_response,
 )
 from ..features.history_timeline_protocol import (
     build_history_timeline_query,
+    build_index_history_timeline_query,
     build_normal_history_timeline_query,
     history_timeline_request_codes,
     parse_history_timeline_response,
@@ -134,6 +136,12 @@ def build_timeline_request(
             kwargs["seq"] = seq
         return build_timeline_query(code, **kwargs)
 
+    if is_index_timeline(code, market):
+        kwargs = {"market": market}
+        if seq is not None:
+            kwargs["seq"] = seq
+        return build_timeline_l2_query(code, **kwargs)
+
     benchmark = {
         17: "16(1A0002,);",
         33: "32(399002,);",
@@ -192,7 +200,7 @@ class TimelineService:
             plan.role,
             capability=plan.capability,
         )
-        if plan.level2:
+        if plan.level2 and not is_index_timeline(code, market):
             self._subscriptions.ensure_registered(
                 connection,
                 code,
@@ -240,33 +248,51 @@ class TimelineService:
         benchmark_code: str | None = None,
     ) -> list[dict]:
         profile = self._connections.profile
+        index_timeline = is_index_timeline(code, market)
         if profile.kind is AccountKind.STANDARD:
             capability = Capability.BASIC_HISTORY_TIMELINE
             role = ConnectionRole.MAIN
             requested_codes = (code,)
-            frame = build_normal_history_timeline_query(
-                code,
-                bar_start=bar_start,
-                date=date,
-                market=market,
-            )
+            if index_timeline:
+                frame = build_index_history_timeline_query(
+                    code,
+                    bar_start=bar_start,
+                    date=date,
+                    market=market,
+                )
+            else:
+                frame = build_normal_history_timeline_query(
+                    code,
+                    bar_start=bar_start,
+                    date=date,
+                    market=market,
+                )
         elif profile.kind is AccountKind.LEVEL2:
             capability = Capability.L2_HISTORY_TIMELINE
             role = _l2_role(market)
-            requested_codes, _, _ = history_timeline_request_codes(
-                code,
-                market=market,
-                benchmark_market=benchmark_market,
-                benchmark_code=benchmark_code,
-            )
-            frame = build_history_timeline_query(
-                code,
-                bar_start=bar_start,
-                date=date,
-                market=market,
-                benchmark_market=benchmark_market,
-                benchmark_code=benchmark_code,
-            )
+            if index_timeline:
+                requested_codes = (code,)
+                frame = build_index_history_timeline_query(
+                    code,
+                    bar_start=bar_start,
+                    date=date,
+                    market=market,
+                )
+            else:
+                requested_codes, _, _ = history_timeline_request_codes(
+                    code,
+                    market=market,
+                    benchmark_market=benchmark_market,
+                    benchmark_code=benchmark_code,
+                )
+                frame = build_history_timeline_query(
+                    code,
+                    bar_start=bar_start,
+                    date=date,
+                    market=market,
+                    benchmark_market=benchmark_market,
+                    benchmark_code=benchmark_code,
+                )
         else:
             raise UnsupportedAccountFeatureError(
                 "history_timeline",
