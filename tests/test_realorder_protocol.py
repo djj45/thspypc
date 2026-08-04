@@ -139,6 +139,32 @@ def test_push_parser_contract():
     assert records[0]["异动编码"] == 0xD6
 
 
+def test_push_parser_prefers_each_record_market_marker():
+    def push_record(marker: int, code: str) -> bytes:
+        return (
+            bytes((marker,))
+            + code.encode("ascii")
+            + b"\xd6\x0c\x08\x40"
+            + b"\xff\x32\x32\x00"
+            + b"\x00\x00"
+            + struct.pack("<I", 5_000_000)
+            + _ths_divided(325)
+        )
+
+    body = (
+        b"\x09method=pushrealorder\nmarket=16\n\x00hq1.0\x00\x00\x00"
+        + push_record(0x21, "000938")
+        + push_record(0x11, "600519")
+    )
+
+    records = realorder_protocol.parse_pushrealorder_response(body)
+
+    assert [(row["代码"], row["市场"]) for row in records] == [
+        ("000938", "32"),
+        ("600519", "16"),
+    ]
+
+
 def test_realorder_frame_reader_uses_len_minus_one_contract():
     body = b"realorder"
     wire = b"noise" + b"\xfd\xfd\xfd\xfd00000008" + body

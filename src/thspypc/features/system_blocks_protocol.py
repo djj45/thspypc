@@ -787,7 +787,9 @@ def build_board_timeline_query(
         else PAGEID_BOARD_HISTORY
     )
     if bar_start is None:
-        bar_start = date_to_normal_timeline_bar(date)
+        import datetime
+        value = date if date is not None else datetime.date.today()
+        bar_start = date_to_normal_timeline_bar(value)
     return build_board_query(
         code,
         pageid=pageid,
@@ -813,7 +815,7 @@ def build_board_auction_query(
     )
     if start_ts is None:
         import datetime
-        value = date
+        value = date if date is not None else datetime.date.today()
         if isinstance(value, str):
             value = datetime.date.fromisoformat(value)
         start_ts = int(

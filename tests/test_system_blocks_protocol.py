@@ -1,6 +1,7 @@
 """系统板块 8901 协议离线回归（2026-08-01 抓包样本）。"""
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 from pathlib import Path
@@ -65,6 +66,16 @@ def test_build_board_history_query_shape():
     assert "DataType=13,19,40,10,23,22,6," in text
     assert "LackTime=0,3,0,0,0,0,0,0" in text
     assert f"pageid={PAGEID_BOARD_HISTORY}" in text
+
+
+def test_build_board_timeline_query_defaults_to_today():
+    today = datetime.date.today()
+    bar_start = date_to_normal_timeline_bar(today)
+
+    frame = build_board_timeline_query("886090")
+    text = frame[12:].decode("gbk", errors="replace")
+
+    assert f"DateTime=8192({bar_start}-{bar_start + 355})" in text
 
 
 def test_build_board_list_query_shape():
@@ -194,11 +205,21 @@ def test_build_board_constituents_preserves_explicit_market_22():
 def test_build_board_auction_query_shape():
     frame = build_board_auction_query("886090", date="2026-07-23")
     text = frame[12:].decode("gbk", errors="replace")
-    import datetime
     start = int(datetime.datetime(2026, 7, 23, 9, 15).timestamp())
     end = int(datetime.datetime(2026, 7, 23, 9, 25).timestamp())
     assert f"DateTime=7176({start}-{end})" in text
     assert "DataType=10,27,33,49," in text
+
+
+def test_build_board_auction_query_defaults_to_today():
+    today = datetime.date.today()
+    start = int(datetime.datetime.combine(today, datetime.time(9, 15)).timestamp())
+    end = int(datetime.datetime.combine(today, datetime.time(9, 25)).timestamp())
+
+    frame = build_board_auction_query("886090")
+    text = frame[12:].decode("gbk", errors="replace")
+
+    assert f"DateTime=7176({start}-{end})" in text
 
 
 def test_parse_board_quote_sample():

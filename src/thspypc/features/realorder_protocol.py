@@ -169,7 +169,7 @@ ANOMALY_BYTE_MAP = {
 
 SUBREALORDER_MARKETS = [16, 32, 151, 48]
 
-_PUSH_CODE_RE_A = re.compile(rb"\x21([036]\d{5})")
+_PUSH_CODE_RE_A = re.compile(rb"[\x11\x21]([036]\d{5})")
 _PUSH_CODE_RE_B = re.compile(rb"\x2d.{1,2}([036]\d{5})", re.DOTALL)
 
 
@@ -396,6 +396,12 @@ def parse_pushrealorder_response(body: bytes) -> list[dict]:
     anomaly_bytes = {key[0] for key in ANOMALY_MAP_DXJL}
     for index, code_match in enumerate(code_matches):
         code = code_match.group(1).decode("ascii", errors="replace")
+        # 0x11/0x21 marker before the code overrides the frame-header market:
+        # pushrealorder frame market= can disagree with the record market.
+        record_market = market
+        marker_pos = code_match.start(1) - 1
+        if marker_pos >= 0 and body[marker_pos] in (0x11, 0x21):
+            record_market = "16" if body[marker_pos] == 0x11 else "32"
         record_end = (
             code_matches[index + 1].start()
             if index + 1 < len(code_matches)
@@ -465,7 +471,7 @@ def parse_pushrealorder_response(body: bytes) -> list[dict]:
             records.append(
                 {
                     "代码": code,
-                    "市场": market,
+                    "市场": record_market,
                     "异动类型": anomaly_type,
                     "异动编码": anomaly_byte,
                     "金额": amount,
