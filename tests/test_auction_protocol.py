@@ -14,16 +14,22 @@ def _sha256(value: bytes) -> str:
 
 
 def test_auction_builder_wire_contracts():
+    # 2026-08-05 抓包对齐：L2 当日竞价 pageid 4214→1334；trade_date=None 现解析为
+    # 最近交易日（显式时间戳，原 0-0 盘后超时）。测试用显式日期保证确定性。
     cases = [
         (
-            auction_protocol.build_auction_query("000938", market=33),
-            140,
-            "b80de83d83887458baa85aeeb00da9abf2423ea607000c285bc4e5b4169bb39f",
+            auction_protocol.build_auction_query(
+                "000938", market=33, trade_date=date(2026, 8, 4)
+            ),
+            158,
+            "df7fcf8f129087dbb1decdc9f28335a30962e7a05ff956892f562db182155a3f",
         ),
         (
-            auction_protocol.build_auction_query("603118", market=17),
-            140,
-            "ea9107a0c80939cd661f5bf29b2b7ed5ec135748549c239e2a79a53c0d495550",
+            auction_protocol.build_auction_query(
+                "603118", market=17, trade_date=date(2026, 8, 4)
+            ),
+            158,
+            "9c558f67311e22860d94938937531e3e1187e6e1d5a5472f6bf431be20c2c4a1",
         ),
         (
             auction_protocol.build_auction_query(
@@ -32,7 +38,7 @@ def test_auction_builder_wire_contracts():
                 trade_date=date(2026, 7, 24),
             ),
             158,
-            "e69869c9a35ae98986354b08ec71942c26ead54ea15a94b20756f6affd371ef0",
+            "135cd3e29eace96eaac6d657660e6c597ac14f3117fba64a5a248a0f13b22236",
         ),
     ]
 
@@ -353,6 +359,7 @@ def test_closing_auction_parser_handles_sz_9s_stride():
 
 
 def test_level2_closing_builders_match_captured_sh_sz_requests():
+    # 2026-08-05 抓包对齐：当日尾盘 pageid 4214→1334，hash 同步更新
     cases = [
         (
             auction_protocol.build_l2_closing_auction_query(
@@ -361,8 +368,8 @@ def test_level2_closing_builders_match_captured_sh_sz_requests():
                 trade_date=date(2026, 7, 24),
                 seq=0x0121,
             ),
-            "a4d1e0e597374bd2acbc43e221b7cb09"
-            "bb12cee52061bca2573ab53689218039",
+            "8f138ffbb562f7fcb3bbc71970857991"
+            "f4883d2864d30490b44f61a75f534933",
         ),
         (
             auction_protocol.build_l2_closing_auction_query(
@@ -371,15 +378,15 @@ def test_level2_closing_builders_match_captured_sh_sz_requests():
                 trade_date=date(2026, 7, 24),
                 seq=0x0155,
             ),
-            "11f06a46dffcfba8e4dd3df0b2fe2f00"
-            "54496a5a97fac0e11b09065893a321d5",
+            "54406290fdbf6cff4fda94415fcd5e0b"
+            "5ec7383332ee6d2ad00113325713cf8d",
         ),
     ]
 
     for frame, captured_body_hash in cases:
         assert len(frame) == 156
         assert _sha256(frame[12:]) == captured_body_hash
-        assert b"pageid=4214" in frame
+        assert b"pageid=1334" in frame
         assert b"DateTime=7424(" in frame
         assert b"DataType=10,49,287," in frame
         assert b"pageid=9354" not in frame

@@ -266,8 +266,18 @@ def build_timeline_l2_query(
     extra_codelist: str = "",
     datatype: list[int] | None = None,
     seq: int = 0x005B,
+    pageid: int = TIMELINE_L2_PAGEID,
 ) -> bytes:
-    """Build the pageid=4214 timeline request used by Level2 accounts."""
+    """Build the Level2 timeline request.
+
+    2026-08-05 抓包对齐：真实客户端 Level2 分时主体用 pageid=1334（走 L2 连接），
+    DataType 仍含 L2 大单字段（dt223-230），响应仍为 flag=0x00B4 的 hd3.1 双码表，
+    由 ``parse_timeline_l2_response`` 解析。
+
+    Args:
+        pageid: 默认 ``TIMELINE_L2_PAGEID``(4214) 保持向后兼容；真实客户端用 1334。
+            两者 DataType 相同（含大单曲线），route/subtype/响应解析不变，仅 pageid 文本不同。
+    """
     if datatype is None:
         datatype = TIMELINE_L2_DATATYPE
     datatype_text = ",".join(str(value) for value in datatype) + ","
@@ -281,7 +291,7 @@ def build_timeline_l2_query(
         f"CodeList={codelist}\r\nDataType={datatype_text}\r\n"
         f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
         f"LackTime=0,3,0,0,20031231,2,0,0\r\n"
-        f"pageid={TIMELINE_L2_PAGEID}\r\n"
+        f"pageid={pageid}\r\n"
     ).encode("gbk")
 
     header = bytearray(23)

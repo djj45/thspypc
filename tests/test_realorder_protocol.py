@@ -30,9 +30,11 @@ def test_realorder_builder_wire_contracts():
     subscription = realorder_protocol.build_subrealorder_query(700002, 16)
     heartbeat = realorder_protocol.build_heartbeat_9601(0x123456)
 
-    assert len(query) == 212
+    # 2026-08-05 抓包对齐：字段顺序改为 maxcount/endtime/datatype/market/accept_ziptype/rettype，
+    # 新增 accept_ziptype=snappy（真实客户端 46/46 帧全带）。
+    assert len(query) == 234
     assert _sha256(query) == (
-        "d3a53ce2600d3fd0f7f97d5c24a62ebb857d424ffd2455579b4c7105ab0f8c2a"
+        "a9cc3de5d9bacaeb4ec539258ae96ae372434664be8ece98887aa4593e289884"
     )
     assert len(subscription) == 92
     assert _sha256(subscription) == (

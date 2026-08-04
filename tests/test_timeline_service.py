@@ -56,7 +56,8 @@ def test_standard_auto_uses_main_and_pageid_9354():
     assert b"pageid=9354" in frame
 
 
-def test_level2_auto_uses_market_specific_role_and_pageid_4214():
+def test_level2_auto_uses_market_specific_role_and_pageid_1334():
+    # 2026-08-05 抓包对齐：Level2 分时 pageid 改 1334
     sh_plan = select_timeline_plan(LEVEL2_PROFILE, 17)
     sz_plan = select_timeline_plan(LEVEL2_PROFILE, 33)
 
@@ -68,8 +69,9 @@ def test_level2_auto_uses_market_specific_role_and_pageid_4214():
         "603118",
         market=17,
         extra_codelist="16(1A0002,);",
+        pageid=1334,
     )
-    assert b"pageid=4214" in build_timeline_request(
+    assert b"pageid=1334" in build_timeline_request(
         sz_plan, "000938", market=33
     )
 
@@ -92,7 +94,7 @@ def test_level2_index_market_codes_use_their_market_l2_roles():
         plan,
         "1A0001",
         market=16,
-    ) == build_timeline_l2_query("1A0001", market=16)
+    ) == build_timeline_l2_query("1A0001", market=16, pageid=1334)
 
 
 def test_level2_account_can_force_basic_for_protocol_comparison():
@@ -191,7 +193,7 @@ def test_level2_workflow_uses_selected_role_and_matches_response(monkeypatch):
     assert sock.timeout == 6.0
     assert len(sock.sent) == 2
     assert b"CodeList=33(000938,);" in sock.sent[0]
-    assert b"pageid=4214" in sock.sent[1]
+    assert b"pageid=1334" in sock.sent[1]
 
 
 def test_level2_index_workflow_skips_stock_snapshot_registration(monkeypatch):

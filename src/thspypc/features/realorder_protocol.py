@@ -232,17 +232,38 @@ def build_qurealorder_query(
     maxcount: int = 80,
     datatype: str | None = None,
 ) -> bytes:
-    """Build a qurealorder history-page request body."""
+    """Build a qurealorder history-page request body.
+
+    字段顺序与真实客户端对齐（2026-08-05 抓包 ``kanpan_20260804_235612.pcap``）：
+    ``instid/method/reqtype/maxcount/endtime/datatype/market/accept_ziptype/rettype``。
+
+    Args:
+        maxcount: 每页最大条数。真实客户端按市场/场景取值，不写死：
+          - **80**：个股市场（16 沪 / 32 深 / 151 北交所）标准每页条数；
+          - **120**：北交所等异动较少市场的翻页条数；
+          - **1000**：板块（market=48）异动少，一次拉满；或首批全量加载。
+          默认 80 适用个股市场；查板块异动时建议传 1000。
+        endtime_us: 翻页游标（微秒时间戳）。0 或省略=最新一页（真实客户端
+            首页请求不带 endtime，翻页时才带）。
+    """
     if datatype is None:
         datatype = DXJL_DATATYPE
-    text = (
-        f"instid={instance}\n"
-        f"method=qurealorder\nreqtype=4\nmaxcount={maxcount}\n"
-        f"market={market}\n"
-        f"datatype={datatype}\n"
-        f"rettype=hqfile\nendtime={endtime_us}"
-    )
-    return b"\x09" + text.encode("gbk")
+    parts = [
+        f"instid={instance}",
+        "method=qurealorder",
+        "reqtype=4",
+        f"maxcount={maxcount}",
+    ]
+    if endtime_us:
+        # 翻页时带 endtime（真实客户端首页不带，翻页带；thspypc 始终带以兼容）
+        parts.append(f"endtime={endtime_us}")
+    parts += [
+        f"datatype={datatype}",
+        f"market={market}",
+        "accept_ziptype=snappy",   # 2026-08-05 抓包：46/46 帧全带（响应实测未压缩）
+        "rettype=hqfile",
+    ]
+    return b"\x09" + "\n".join(parts).encode("gbk")
 
 
 def parse_qurealorder_response(body: bytes, market: str) -> list[dict]:

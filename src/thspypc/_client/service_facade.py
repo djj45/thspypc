@@ -456,6 +456,19 @@ class ServiceFacade:
         if market == 0:
             market = self._market_for_code(code)
 
+        # 按账号类型选 capability：普通=BASIC_QUOTE(MAIN)，Level2=L2_TIMELINE(L2连接)
+        # 2026-08-05 抓包对齐：Level2 K线走 pageid=1334 + L2 连接（见 build_kline_l2_query）
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        kline_capability = (
+            Capability.BASIC_QUOTE
+            if profile.kind is AccountKind.STANDARD
+            else Capability.L2_TIMELINE
+        )
+
         last_err = ""
         for attempt in range(retries + 1):
             # ensure_connected 对从未登录会 raise；这里统一用 is_connected 判断，
@@ -472,7 +485,7 @@ class ServiceFacade:
 
                 try:
                     recs = self._run_default_service(
-                        (Capability.BASIC_QUOTE,),
+                        (kline_capability,),
                         lambda: self._kline_service.kline(
                             code,
                             market=market,

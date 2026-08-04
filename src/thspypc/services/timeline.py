@@ -136,8 +136,9 @@ def build_timeline_request(
             kwargs["seq"] = seq
         return build_timeline_query(code, **kwargs)
 
+    # 2026-08-05 抓包对齐：Level2 分时主体用 pageid=1334（DataType 含大单字段不变）
     if is_index_timeline(code, market):
-        kwargs = {"market": market}
+        kwargs = {"market": market, "pageid": 1334}
         if seq is not None:
             kwargs["seq"] = seq
         return build_timeline_l2_query(code, **kwargs)
@@ -151,6 +152,7 @@ def build_timeline_request(
     kwargs = {
         "market": market,
         "extra_codelist": benchmark,
+        "pageid": 1334,
     }
     if seq is not None:
         kwargs["seq"] = seq

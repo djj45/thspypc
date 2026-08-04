@@ -46,6 +46,7 @@ def build_kline_query(
     anchor: int = 0,
     pageid: int = 9355,
     seq: int = 0x0025,
+    route: int | None = None,
 ) -> bytes:
     """Build an 8901 K-line request frame.
 
@@ -53,6 +54,12 @@ def build_kline_query(
     取 ``count`` 根、以 ``anchor`` 为终点，服务端返回 ``count+1`` 根（含终点，
     受上市日截断）。``anchor=0``=最新一根；日/周/月/季/年K 传 YYYYMMDD 日期；
     分钟K 传 bar_index。翻页时把 anchor 设为上一窗口最早一根即可继续回溯。
+
+    Args:
+        pageid: 普通账号走 9355（MAIN）；Level2 账号真实客户端走 1334（L2 连接），
+            见 ``build_kline_l2_query``。
+        route: 子帧路由。None=按 period 自动选（周月季年以上=0x014E，否则=0x0001），
+            适合普通账号 9355；Level2 账号 1334 抓包用 0x0100。
     """
     datatype = ",".join(str(value) for value in KLINE_DATATYPE) + ","
     text = (
@@ -66,7 +73,8 @@ def build_kline_query(
     header[1:5] = b"\x00\x16\x00\x00"
     struct.pack_into("<H", header, 5, seq & 0xFFFF)
     header[7:11] = b"\x12\x00\x09\x00"
-    route = 0x014E if period >= 0x5000 else 0x0001
+    if route is None:
+        route = 0x014E if period >= 0x5000 else 0x0001
     struct.pack_into("<H", header, 11, route)
     header[17] = (
         0x01 if period >= 0x5000 else (0x05 if period < 0x4000 else 0x00)
@@ -74,6 +82,37 @@ def build_kline_query(
     header[18] = (period >> 8) & 0xFF
     struct.pack_into("<H", header, 19, len(text) + 1)
     return encode_frame(bytes(header) + text)
+
+
+def build_kline_l2_query(
+    code: str,
+    market: int = 33,
+    period: int = KLINE_PERIOD_DAY,
+    fuquan: str = "Q",
+    count: int = 2146,
+    anchor: int = 0,
+    seq: int = 0x0025,
+) -> bytes:
+    """Build the pageid=1334 K-line request used by Level2 accounts.
+
+    2026-08-05 抓包（``kanpan_20260805_001523.pcap``）确认 Level2 账号的日K
+    请求用 pageid=1334、route=0x0100，走 L2 连接（shlv2/szlv2），DataType 仍为
+    基础 OHLCV（7,8,9,11,13,19），不含 L2 增强字段。响应仍是 hd3.1（flag
+    0x0042/0x0046），由 ``parse_kline_hd3_response`` 解析（与普通账号同解析器）。
+
+    普通账号仍用 ``build_kline_query``（pageid=9355, MAIN）。
+    """
+    return build_kline_query(
+        code,
+        market=market,
+        period=period,
+        fuquan=fuquan,
+        count=count,
+        anchor=anchor,
+        pageid=1334,
+        seq=seq,
+        route=0x0100,
+    )
 
 
 def _kline_decode_time(tv: int) -> datetime.datetime:

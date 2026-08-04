@@ -18,8 +18,8 @@ flowchart LR
     B --> B1[MAIN 普通行情]
     B --> B2[shlv2 沪市 L2]
     B --> B3[szlv2 深市 L2]
-    B1 --> C[日K / 9354 当日分时 / 9355 历史分时 / 早盘尾盘竞价 / 股票列表]
-    B2 --> D[4214 当日L2分时·竞价·推送 / 4417 历史L2分时·竞价]
+    B1 --> C[普通: 9354 当日分时 / 9355 日K·历史分时 / 竞价 / 列表]
+    B2 --> D[L2: 1334 分时·日K·竞价 / 4214 十档·逐笔 / 4417 历史]
     B3 --> E[同左，深市]
     B --> B4[REALORDER 9601 异动订阅/推送]
     B --> B5[fu4 板块指数 8901 通道]
@@ -218,9 +218,17 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 | 板块行情列表 | 板块通道 | L2 5716/1341 · 普通 392 | 8192 | 见 11.2 | fu4 | hd3.1 0x130 |
 | 板块指数分时/竞价 | 板块通道 | L2 6002 · 普通 4181 | 8192(packed) / unix 区间 | 见 11.2 | fu4 | 0x42 / 0x32 |
 | 板块成分股 | 成分连接 | L2 6000 · 普通 4180 | 8192 | 见 11.2 | main/shlv2/szlv2 | hd3.1 0x64 |
+| 短线精灵历史翻页 | 任意 | —（纯文本协议） | — | `DXJL_DATATYPE` | REALORDER 9601 | hq1.0 |
 
 > 竞价类请求的 `DateTime` 两个参数是 **unix 时间戳区间**（如 9:15-9:25）；分时/历史分时是
 > **bar 游标区间**；K线是 **`-count-0` 回溯窗口**。三者语义不同，勿混用。
+
+> **pageid 与账号类型（2026-08-05 看盘抓包对齐）**：上表的 9354/9355 是**普通账号**路径
+> （MAIN 通道），抓包与真实客户端普通账号一致。**Level2 账号**的真实客户端用 `pageid=1334`
+> （走 L2 连接）做分时/K线/竞价主体（DataType 仍含 L2 大单字段 dt223-230，不丢失），再用
+> 4214/4417 做历史/L2 增强。thspypc 已于 2026-08-05 对齐：分时/日K/当日竞价改 1334，
+> 历史分时/历史竞价保留 4417（有 fixture 背书）。详见
+> `docs/handoffs/HANDOFF_KANPAN_CAPTURE_20260805.md`。普通账号路径（9354/9355）保持不变。
 
 ---
 
@@ -247,7 +255,7 @@ companion 子帧（route 0x0100，DataType 26 个 companion 字段，`DateTime=0
 响应：`hd3.1`（flag `0x0042/0x0046`，`record_count=241`），`parse_timeline_response` 先解 8901
 外层再解析。字段示例：`time`、`dt10`(现价)、`dt13`(成交量)、`dt19`(成交额)、`dt14`(主动买量)…
 
-### 7.2 Level2 账号（4214）
+### 7.2 Level2 账号（1334，2026-08-05 抓包对齐）
 
 请求文本（`build_timeline_l2_query`，route `0x0201`，`hdr[18]=0x20`，seq 高字节 `0x10`）：
 
@@ -256,7 +264,7 @@ CodeList=32(399002,);33(000938,);      # 深市自动带基准指数；沪市为
 DataType=1,16,229,14,207,15,228,13,227,19,40,226,54,18,204,39,225,10,203,210,38,224,23,202,209,223,230,15,22,201,208,
 DateTime=8192(0-0)
 LackTime=0,3,0,0,20031231,2,0,0
-pageid=4214
+pageid=1334                             # 2026-08-05 改：原 4214，DataType/route 不变
 ```
 
 关键点：
@@ -264,7 +272,8 @@ pageid=4214
 - 必须先通过 `L2SubscriptionCoordinator.ensure_registered` 在对应市场 L2 连接上注册 4214
   订阅（普通身份发同样的订阅帧会 `CodeListSize=0`）。
 - 31 个 L2 字段含 `dt201-230` 大单金额双线（`dt227/dt229`=主动买/卖额，差值为主力净额曲线）。
-- 解析入口 `parse_timeline_l2_response`；深市必须连 szlv2。
+  **pageid 改 1334 不影响 L2 字段**——抓包确认 1334 请求的 DataType 仍含 dt223-230。
+- 解析入口 `parse_timeline_l2_response`（校验 flag=0x00B4）；深市必须连 szlv2。
 
 ### 7.3 指数白线与领先线（黄线）
 
@@ -606,7 +615,8 @@ JSON 根为 `CloseAuction`；解析别名为 `dt10=newprice`、`lead_price=leadp
 （2026-08-03 抓包确认 1分K=0x3000、季K=0x6003、年K=0x7001），映射见
 `client._KLINE_PERIOD_CODES`。
 
-请求（`features/kline_protocol.py build_kline_query`，**始终走 MAIN**，pageid=9355）：
+请求（`features/kline_protocol.py build_kline_query`，**普通账号走 MAIN**，pageid=9355；
+**Level2 账号走 L2 连接**，pageid=1334 route=0x0100，见 `build_kline_l2_query`）：
 
 ```text
 ReqFuquan=Q
@@ -614,7 +624,7 @@ CodeList=33(000938,);
 DataType=7,8,9,11,13,19,
 DateTime=16384(-count-anchor)           # 周期码(根数-窗口终点)，0x4000=日K
 LackTime=0,0,0,0,0,0,0,0
-pageid=9355
+pageid=9355                             # 普通账号；Level2 账号=1334
 ```
 
 | 周期 | 周期码 | route | hdr[17] |
@@ -736,3 +746,88 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
 | `src/thspypc/codecs/` | framing（FDF）、hd 字段表、numeric（THS float）、compression（8901 LZ77 / BitRLE） |
 | `docs/architecture/SERVER_MATRIX.md` | 服务器域名/权限/路由详细矩阵 |
 | `docs/handoffs/*.md` | 各协议逆向证据链（竞价、分时、推送、历史分时、系统板块） |
+
+---
+
+## 16. 短线精灵 / 异动（`realorder`，9601）
+
+短线精灵（异动精灵）走独立的 **9601 端口**（`REALORDER_HOST=106.14.65.90`），与 8901 行情通道
+隔离。三类业务：
+
+| 业务 | method | 说明 |
+|---|---|---|
+| 历史翻页查询 | `qurealorder` | 按市场拉历史异动，分页 |
+| 实时订阅 | `subrealorder` | 注册推送（market=16/32/151/48） |
+| 实时推送 | `pushrealorder` | 盘中服务器主动推（~500-800 帧/分钟） |
+
+### 16.1 历史翻页请求（`build_qurealorder_query`）
+
+纯文本帧（`\x09` + GBK 文本行），字段顺序（2026-08-05 抓包对齐）：
+
+```text
+instid=<实例号>
+method=qurealorder
+reqtype=4
+maxcount=<每页条数>
+[endtime=<微秒游标>]     # 翻页时带；首页不带
+datatype=<异动类别表达式>
+market=<市场码>
+accept_ziptype=snappy    # 2026-08-05 抓包：真实客户端 46/46 帧全带
+rettype=hqfile
+```
+
+**maxcount 取值**（真实客户端按市场/场景动态选，不写死）：
+
+| maxcount | 适用 market | 含义 |
+|---|---|---|
+| 80 | 16(沪)/32(深)/151(北交所)/48(板块) | 个股市场标准每页条数（异动多） |
+| 120 | 151/16/32/48 | 北交所等异动较少市场的翻页条数 |
+| 1000 | 48(板块)/16(首批) | 板块异动少，一次拉满；或首批全量加载 |
+
+thspypc 默认 80（适用个股市场）；查板块异动（market=48）建议传 1000。
+
+**accept_ziptype=snappy**：客户端声明可接受 snappy 压缩响应。实测盘后小响应**未压缩**
+（明文 hq1.0，`record_count=80 record_len=45`，数据区可见明文股票代码）；盘中大响应是否
+压缩待验证。thspypc 解析器按明文 hq1.0 处理，无需解压逻辑。
+
+**datatype（异动类别）**：普通账号 23 类、Level2 全选 53 类（`STANDARD_REALORDER_CATEGORY_IDS` /
+`ALL_REALORDER_CATEGORY_IDS`）。带阈值的类别形如 `1074269398{19[10000~-]|17[5000000~-]}`
+（成交手数≥1万 OR 成交金额≥500万）。`DXJL_DATATYPE` 是默认 4 类基础表达式。
+
+### 16.2 响应解析（`parse_qurealorder_response`）
+
+响应为 `hq1.0` 表（与 hd1.0 类似的定长记录表）：`record_count / field_count / record_length`
++ 字段表 + 定长记录。字段由 datatype 决定（时间、代码、异动类型、价量等）。
+
+---
+
+## 17. 看盘界面协议缺口（2026-08-05 抓包）
+
+对照同花顺 PC 看盘主界面布局抓包（`tests/capture_kanpan.py`），记录 thspypc 未实现的协议。
+完整抓包结论见 `docs/handoffs/HANDOFF_KANPAN_CAPTURE_20260805.md`。
+
+### 17.1 盘口逐笔协议（未实现，复杂，P2-R&D）
+
+Level2 账号在盘口/逐笔区用了未实现的 period（2026-08-05 抓包确认请求形态）：
+
+| period | pageid | DataType | route | 业务 | 备注 |
+|---|---|---|---|---|---|
+| 7169 | 4214 | 10,12,13 | 0x02FC | 逐笔成交回放（全天逐笔） | 真实 pageid 是 **4214**，非 `HANDOFF_SUPERORDER_20260726` 推测的 4260 |
+| 7173 | 4214 | 10 | 0x02FC | 逐笔委托 | 请求形态已确认（与 7169 同族） |
+| 4096 | 4417 | 7,49,12,18,75,10 | — | 分笔 tick（个股） | 类比指数分笔 period=4096 |
+
+> 请求构造简单（与竞价/分时同族，route=0x02FC），难点在**响应解析**：逐笔回放单帧
+> 440KB+，变长字段，`HANDOFF_SUPERORDER_20260726` 的 fmt 子标记 22/34 未破译。暂不实现。
+> 7174（之前抓包出现过 1 次）在 2026-08-05 抓包中未复现，可能为偶发。
+
+### 17.2 9601 板块统计协议（未实现）
+
+真实客户端板块列表除 8901（392/1334）外，还走 9601 的纯文本计算协议：
+
+| method | 请求特征 | 返回 | 用途 |
+|---|---|---|---|
+| `statscalc` | `market=48, codelist=48(881xxx,...) datatype=330342 dataclass=intervalcalc rettype=hdfile` | hdfile | 板块批量统计（服务端区间聚合计算） |
+| `calcext` | `codelist=33(003017,) datatype=199359 rettype=json` | json | 单板块/个股扩展计算 |
+
+与 thspypc `board_quotes`（8901 fu4 通道，pageid 392/5716，取预存字段）是不同协议；
+statscalc 是服务端计算型，功能更强。两者可互补。

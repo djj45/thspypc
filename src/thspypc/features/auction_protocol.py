@@ -5,7 +5,7 @@ import json
 import logging
 import struct
 from datetime import date as date_type
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from ..codecs.compression import normalize_8901_response
 from ..codecs.compression import (
@@ -230,29 +230,27 @@ def build_auction_query(
     datatype: list[int] | None = None,
     seq: int = 0x0079,
 ) -> bytes:
-    """Build a pageid=4214, period=7176 call-auction request."""
+    """Build a Level2 call-auction request (period=7176, route=0x01FC).
+
+    2026-08-05 抓包对齐：当日开盘竞价 pageid 改 1334（原 4214），route 0x01FC 不变。
+    历史竞价仍走 ``build_l2_history_auction_query``（pageid=4417）。
+    """
     if datatype is None:
         datatype = AUCTION_DATATYPE
     datatype_text = ",".join(str(value) for value in datatype) + ","
 
-    if trade_date is None:
-        datetime_args = "0-0"
-    else:
-        value = (
-            trade_date.date()
-            if hasattr(trade_date, "date") and callable(trade_date.date)
-            else trade_date
-        )
-        start = datetime.combine(value, time(9, 15, 0))
-        end = datetime.combine(value, time(9, 25, 0))
-        datetime_args = f"{int(start.timestamp())}-{int(end.timestamp())}"
+    # 2026-08-05 抓包对齐：trade_date=None → 最近交易日显式时间戳（原 0-0 盘后超时）
+    value = resolve_trade_date(trade_date)
+    start = datetime.combine(value, time(9, 15, 0))
+    end = datetime.combine(value, time(9, 25, 0))
+    datetime_args = f"{int(start.timestamp())}-{int(end.timestamp())}"
 
     text = (
         f"CodeList={market}({code},);\r\n"
         f"DataType={datatype_text}\r\n"
         f"DateTime={AUCTION_PERIOD}({datetime_args})\r\n"
         f"LackTime=0,0,0,0,0,0,0,0\r\n"
-        f"pageid={TIMELINE_L2_PAGEID}\r\n"
+        f"pageid=1334\r\n"
     ).encode("gbk")
 
     header = bytearray(23)
@@ -276,6 +274,40 @@ def _coerce_trade_date(value) -> date_type:
     return value
 
 
+def resolve_trade_date(value=None) -> date_type:
+    """Resolve a trade-date argument to a concrete date.
+
+    ``None`` / 未传 → 最近已收盘的交易日（周末回退；收盘前 15:00 回退到前一交易日）。
+    传 ``date``/``datetime``/ISO 字符串 → 原样返回（不强加交易日校验）。
+
+    2026-08-05 抓包确认：同花顺客户端盘后查竞价/尾盘时，默认查的是**最近交易日**
+    （8/4 周一）的时间戳，而非"今天"（8/5）。此前代码用 ``datetime.now().date()``
+    导致盘后/周末请求当日竞价超时（当日无数据）。
+    """
+    if value is not None:
+        return _coerce_trade_date(value)
+    now = datetime.now()
+    d = now.date()
+    # 收盘前（15:00 前）且是工作日 → 当日竞价/尾盘可能尚未产生，回退到前一交易日
+    if d.weekday() < 5 and now.time() < time(15, 0):
+        return _trading_days_back(d, 1)
+    # 周末或收盘后 → 回退到最近的工作日（不处理节假日，需调用方传显式日期）
+    while d.weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d
+
+
+def _trading_days_back(from_date: date_type, n: int) -> date_type:
+    """Go back n trading days (skipping weekends; holidays not handled)."""
+    d = from_date
+    count = 0
+    while count < n:
+        d = d - timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+    return d
+
+
 def build_basic_auction_query(
     code: str,
     market: int = 33,
@@ -286,7 +318,7 @@ def build_basic_auction_query(
     seq: int = 0x015A,
 ) -> bytes:
     """Build normal-account opening or closing auction requests on MAIN."""
-    value = _coerce_trade_date(trade_date or datetime.now().date())
+    value = resolve_trade_date(trade_date)
     if closing:
         start_time, end_time = time(14, 57), time(15, 0)
         datatype = CLOSING_AUCTION_DATATYPE
@@ -334,8 +366,12 @@ def build_l2_closing_auction_query(
     historical: bool = False,
     seq: int = 0x0121,
 ) -> bytes:
-    """Build current (4214) or historical (4417) Level2 closing auction."""
-    value = _coerce_trade_date(trade_date or datetime.now().date())
+    """Build current (1334) or historical (4417) Level2 closing auction.
+
+    2026-08-05 抓包对齐：当日尾盘竞价 pageid 改 1334（原 4214），route 0x0100 不变；
+    历史尾盘仍用 4417（抓包确认）。
+    """
+    value = resolve_trade_date(trade_date)
     start = datetime.combine(value, time(14, 57))
     end = datetime.combine(value, time(15, 0))
     datatype_text = ",".join(
@@ -344,7 +380,7 @@ def build_l2_closing_auction_query(
     pageid = (
         L2_HISTORY_AUCTION_PAGEID
         if historical
-        else TIMELINE_L2_PAGEID
+        else 1334
     )
     text = (
         f"CodeList={market}({code},);\r\n"
@@ -374,7 +410,7 @@ def build_l2_history_auction_query(
     seq: int = 0x0123,
 ) -> bytes:
     """Build the captured pageid=4417 historical opening-auction request."""
-    value = _coerce_trade_date(trade_date or datetime.now().date())
+    value = resolve_trade_date(trade_date)
     start = datetime.combine(value, time(9, 15))
     end = datetime.combine(value, time(9, 25))
     datatype_text = ",".join(

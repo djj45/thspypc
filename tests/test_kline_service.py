@@ -9,6 +9,7 @@ from thspypc._transport import ConnectionManager, ConnectionRole
 from thspypc.errors import CapabilityUnavailableError, ProtocolError
 from thspypc.features.kline_protocol import (
     KLINE_PERIOD_DAY,
+    build_kline_l2_query,
     build_kline_query,
 )
 from thspypc.models import AccountKind, AccountProfile, Capability, Support
@@ -35,14 +36,18 @@ class FakeSocket:
 
 
 def _profile(kind, support=Support.YES):
+    caps = {Capability.BASIC_QUOTE: support}
+    if kind is AccountKind.LEVEL2:
+        caps[Capability.L2_MARKET_ACCESS] = support
+        caps[Capability.L2_TIMELINE] = support
     return AccountProfile(
         kind=kind,
-        capabilities={Capability.BASIC_QUOTE: support},
+        capabilities=caps,
     )
 
 
-@pytest.mark.parametrize("kind", [AccountKind.STANDARD, AccountKind.LEVEL2])
-def test_kline_uses_only_main_and_merges_data_frames(monkeypatch, kind):
+def test_kline_standard_uses_main_and_merges_data_frames(monkeypatch):
+    """普通账号 K线走 MAIN + pageid=9355。"""
     sock = FakeSocket()
     opened = []
     responses = iter(
@@ -58,7 +63,7 @@ def test_kline_uses_only_main_and_merges_data_frames(monkeypatch, kind):
         b"hd3.1\x00second": [{"code": "600519", "bar": 2}],
     }
     manager = ConnectionManager(
-        _profile(kind),
+        _profile(AccountKind.STANDARD),
         lambda spec: opened.append(spec.role) or sock,
     )
     monkeypatch.setattr(
@@ -93,6 +98,60 @@ def test_kline_uses_only_main_and_merges_data_frames(monkeypatch, kind):
         )
         + b"\n"
     ]
+
+
+def test_kline_level2_uses_l2_role_and_pageid_1334(monkeypatch):
+    """Level2 账号 K线走 SH_L2 + pageid=1334（2026-08-05 抓包对齐）。"""
+    sock = FakeSocket()
+    opened = []
+    responses = iter(
+        [
+            b"MarketTime=closed",
+            b"hd3.1\x00first",
+            b"hd3.1\x00second",
+            b"request-boundary",
+        ]
+    )
+    parsed = {
+        b"hd3.1\x00first": [{"code": "600519", "bar": 1}],
+        b"hd3.1\x00second": [{"code": "600519", "bar": 2}],
+    }
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda spec: opened.append(spec.role) or sock,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd3_response",
+        parsed.__getitem__,
+    )
+    service = KlineService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=4,
+    )
+
+    result = service.kline(
+        "600519",
+        market=17,
+        period=KLINE_PERIOD_DAY,
+        count=2,
+        timeout=4.0,
+    )
+
+    assert [record["bar"] for record in result] == [1, 2]
+    assert opened == [ConnectionRole.SH_L2]
+    assert manager.peek(ConnectionRole.MAIN) is None
+    assert sock.timeout == 2.0
+    assert sock.sent == [
+        build_kline_l2_query(
+            "600519",
+            market=17,
+            period=KLINE_PERIOD_DAY,
+            count=2,
+        )
+        + b"\n"
+    ]
+    assert b"pageid=1334" in sock.sent[0]
 
 
 def test_kline_timeout_after_data_finishes_successfully(monkeypatch):

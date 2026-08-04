@@ -153,7 +153,7 @@ def test_level2_uses_market_role_and_matches_response(
     assert sock.timeout == 6.0
     assert len(sock.sent) == 2
     assert b"CodeList=" in sock.sent[0]
-    assert b"pageid=4214" in sock.sent[1]
+    assert b"pageid=1334" in sock.sent[1]
     assert b"DateTime=7176(" in sock.sent[1]
 
 
@@ -337,7 +337,7 @@ def test_level2_current_closing_uses_4214(monkeypatch):
         trade_date=date.today(),
     )
 
-    assert b"pageid=4214" in sock.sent[1]
+    assert b"pageid=1334" in sock.sent[1]
     assert b"pageid=4417" not in sock.sent[1]
 
 
