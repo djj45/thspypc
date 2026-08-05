@@ -23,6 +23,7 @@ class ConnectionRole(str, Enum):
     BOARD = "board"
     BOARD_CONSTITUENT_SH = "board_constituent_sh"
     BOARD_CONSTITUENT_SZ = "board_constituent_sz"
+    BOARD_STATS = "board_stats"
 
 
 class LoginIdentity(str, Enum):
@@ -85,6 +86,12 @@ CONNECTION_SPECS = {
         identity=LoginIdentity.MANUAL,
         port=8901,
         required_capability=Capability.L2_MARKET_ACCESS,
+    ),
+    ConnectionRole.BOARD_STATS: ConnectionSpec(
+        role=ConnectionRole.BOARD_STATS,
+        identity=LoginIdentity.STANDARD,
+        port=9601,
+        required_capability=Capability.BASIC_QUOTE,
     ),
 }
 

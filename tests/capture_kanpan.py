@@ -424,9 +424,9 @@ def _classify_text_method(text: str) -> str:
     if "method=qurealorder" in text:
         return "qurealorder(短线精灵历史查询)"
     if "method=statscalc" in text:
-        return "statscalc(板块统计计算,未知协议)"
+        return "statscalc(板块统计计算,9601独立节点)"
     if "method=calcext" in text:
-        return "calcext(板块扩展计算,未知协议)"
+        return "calcext(板块扩展计算,9601 REALORDER节点)"
     if "method=" in text and "method=s" not in text:
         # 其他 method= 开头的纯文本协议（非 sub/stats/qureal）
         m = re.search(r"method=(\w+)", text)
@@ -466,8 +466,9 @@ def identify_frame(body: bytes) -> dict:
     method_label = _classify_text_method(text)
     if method_label:
         info["method"] = method_label
-        # 已实现的基础设施 vs 未知纯文本协议
-        if any(k in method_label for k in ("未知", "statscalc", "calcext")):
+        # 已实现的基础设施/业务 vs 未知纯文本协议
+        # statscalc/calcext 已实现（BoardStatsService，见 features/board_stats_protocol.py）
+        if "未知" in method_label:
             info["status"] = "unknown"
         else:
             info["status"] = "infra"

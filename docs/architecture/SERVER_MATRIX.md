@@ -46,7 +46,8 @@ pageid=5716
 | MAIN | `main.123ths.com:8901`（优先）/ `ifindhq.123ths.com:8901`（兼容回退） | 普通登录；`VerifyCode=0` 后发送标准 MAIN init，不发送 `__manual` L2 init | `BASIC_QUOTE` / `BASIC_TIMELINE` / `BASIC_HISTORY_TIMELINE` / `BASIC_AUCTION` | 日 K、9354 当日分时、9355 历史分时、早盘/尾盘竞价、股票列表与批量行情 |
 | SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + 标准行情登录壳（`thsuser`）；init `MarketCode=16;144;` | Level2 账号，且 `L2_MARKET_ACCESS` 已有成功证据；具体功能还分别受 `L2_TIMELINE`、`L2_AUCTION`、`L2_SNAPSHOT_PUSH`、`L2_HISTORY_TIMELINE` 控制 | 沪市主板/科创板 L2 分时、竞价、快照推送、历史分时 |
 | SZ_L2 | `szlv2.123ths.com:8901` | Level2 passport + 标准行情登录壳（`thsuser`）；init `MarketCode=32;` | 同 SH_L2 | 深市 L2 分时、竞价、快照推送、历史分时 |
-| REALORDER | 固定 seed/default `106.14.65.90:9601`；官方客户端可缓存动态首选物理节点 | 独立 9601 登录 | 通道权限 `REALORDER` 独立于 Level2；异动类别再细分为普通账号基础 23 类和 Level2 额外 30 类 | `qurealorder` 历史异动、`subrealorder` 实时异动订阅、`pushrealorder` 接收 |
+| REALORDER | 固定 seed/default `106.14.65.90:9601`；官方客户端可缓存动态首选物理节点 | 独立 9601 登录 | 通道权限 `REALORDER` 独立于 Level2；异动类别再细分为普通账号基础 23 类和 Level2 额外 30 类 | `qurealorder` 历史异动、`subrealorder` 实时异动订阅、`pushrealorder` 接收、`calcext` 单股/单板块扩展计算（与 qurealorder 共享 socket） |
+| BOARD_STATS | 独立统计节点 `8.132.233.77:9601`（抓包快照，不在 DNS/passport，客户端缓存发现；可用 `THSPYPC_STATSCALC_HOST` 覆盖） | 独立 9601 PC 登录（passport64 + `VerifyCode=0`） | `BASIC_QUOTE` | `statscalc` 板块批量统计（区间涨跌幅/涨速聚合、涨跌停统计，hd1.0 表） |
 
 权限判断采用“业务成功证据优先”原则。域名出现在 `M_hqdns`、TCP 能连通或登录
 成功，都不等于某个具体业务已获授权；超时、RST 也不能单独证明账号无权限。
@@ -96,5 +97,11 @@ pageid=5716
   `gateway_116.205.182.140` 被缓存为 `8.132.233.78:9601`，但后者只承载
   `statscalc`，属于统计计算服务，不能作为 REALORDER 备选地址。两条物理 IP
   均未出现在抓包内的传统 DNS 响应中。
+- **statscalc 独立统计节点**（2026-08-05 实现为 `ConnectionRole.BOARD_STATS`）：
+  抓包确认 `8.132.233.77:9601`（L2）/ `8.132.233.78:9601`（普通）只承载
+  `statscalc`，与 REALORDER 节点分服。thspypc 默认连 `8.132.233.77`，可用
+  `THSPYPC_STATSCALC_HOST` 环境变量覆盖；连接失败时 `board_stats_*` 优雅降级
+  返回空列表（可降级 `board_quotes`），不影响 `calcext`（后者走 REALORDER）。
+  `calcext` 与 `qurealorder` 共享 REALORDER socket，按请求锁串行化。
 - DNS 结果会轮换。文档中的 IP 只作为某次活网证据，运行时始终应解析 passport
   下发的域名。

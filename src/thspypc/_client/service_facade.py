@@ -1488,3 +1488,92 @@ class ServiceFacade:
                 timeout=timeout,
             ),
         )
+
+    # ── 板块统计计算（9601 statscalc / calcext，独立于 fu4 8901 板块通道）──
+
+    def board_stats_interval(
+        self,
+        codes: list[str],
+        *,
+        market: int = 48,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """板块区间涨跌幅/涨速聚合统计（9601 statscalc，hd1.0 表）。
+
+        服务端计算型协议（``dataclass=intervalcalc datatype=330342``），与
+        :meth:`board_quotes`（8901 fu4 预存字段）互补；两者可交叉验证。走独立
+        统计节点（``8.132.233.77:9601``，不在 DNS/passport）。
+
+        Args:
+            codes: 板块指数代码列表（如 ``["881121", "885897"]``）。
+            market: 板块市场（默认 48）。
+            timeout: 单次请求超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``code``（前导零补齐，如 ``"0881121"``）/
+            ``date``（形如 20160127）/``value``（涨跌幅%，浮点）。统计节点不可达
+            或超时时返回空列表（可降级 :meth:`board_quotes`）。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_stats_service.statscalc_interval(
+                codes,
+                market=market,
+                timeout=timeout,
+            ),
+        )
+
+    def board_stats_updownlimit(
+        self,
+        codes: list[str],
+        *,
+        market: int = 48,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """板块涨跌停统计（9601 statscalc，dataclass=updownlimit）。
+
+        Args/Returns 同 :meth:`board_stats_interval`，``value`` 为涨跌停家数统计。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_stats_service.statscalc_updownlimit(
+                codes,
+                market=market,
+                timeout=timeout,
+            ),
+        )
+
+    def board_calcext(
+        self,
+        code: str,
+        market: int,
+        *,
+        datatype: str = "199359",
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """单股/单板块扩展计算（9601 calcext，rettype=json）。
+
+        走 REALORDER 节点（与 ``qurealorder`` 共享 9601 socket）。常用于取流通
+        市值（``datatype=199359``）等单点扩展字段。
+
+        Args:
+            code: 单个证券代码（如 ``"600030"`` / ``"881121"``）。
+            market: 代码所属市场（17=沪 / 33=深 / 48=板块）。
+            datatype: 计算字段编号，默认 ``199359``（流通市值）。
+            timeout: 单次请求超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``market``/``code``/``value``（数值，类型取决于
+            datatype）。REALORDER 通道不可达时返回空列表。
+        """
+        # calcext 与 qurealorder 共享 REALORDER 9601 socket，门控与短线精灵一致
+        # （REALORDER 能力证据在首次 9601 建连时懒建立）。
+        return self._run_default_service(
+            (Capability.REALORDER,),
+            lambda: self._board_stats_service.calcext(
+                code,
+                market,
+                datatype=datatype,
+                timeout=timeout,
+            ),
+        )

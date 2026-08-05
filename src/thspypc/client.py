@@ -145,6 +145,8 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._realorder_sock: socket.socket | None = None
         # 板块专用通道（fu4 8901，懒连接；BoardService 查询走这条独立连接）
         self._board_sock: socket.socket | None = None
+        # 板块统计通道（statscalc 独立 9601 节点，懒连接；与 REALORDER 不同服）
+        self._board_stats_sock: socket.socket | None = None
         self._connected_ip: str = ""     # 当前 8901 连接的 IP（诊断用）
         self._bad_kline_ips: set[str] = set()  # K线查询失败过的 IP（重连时跳过）
         self._instance = 700000          # 请求序列号
@@ -156,6 +158,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._market_session = MarketSession(lambda: self._sock, self._sock_lock)
         self._realorder_lock = threading.Lock()         # 保护 9601 socket send
         self._board_lock = threading.RLock()            # 保护板块通道 socket
+        self._board_stats_lock = threading.Lock()       # 保护 statscalc 9601 socket send
         # 实时分时推送（8901 pageid=4214 订阅后的逐 tick 快照）
         # L2 推送连接池，按沪深分服（shlv2=沪, szlv2=深）。
         # ★ 2026-07-24 实测：沪深 L2 是两套独立服务器，IP 0 重叠。沪市票必须连
@@ -185,6 +188,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._auction_service = None
         self._realorder_service = None
         self._board_service = None
+        self._board_stats_service = None
         # 连接治理（避免反复 connect 触发 VerifyCode=-1）
         self._last_connect_ts: float = 0.0   # 上次成功 connect 的时刻
         self._CONNECT_COOLDOWN = 20.0        # 同 IP 会话冲突窗口（秒）
@@ -234,6 +238,9 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             open_board_constituent=lambda side: self._open_board_channel(
                 constituent_side=side,
             ),
+            connect_board_stats=lambda: self._connect_board_stats_server(),
+            board_stats_socket=lambda: self._board_stats_sock,
+            board_stats_lock=self._board_stats_lock,
         )
         self._connection_runtime = ConnectionRuntime(
             enable_heartbeat=self.enable_heartbeat,
@@ -249,6 +256,8 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             preheat_threads=self._preheat_threads,
             service_connections=lambda: self._service_connections,
             close_owned_sockets=self._close_owned_sockets,
+            board_stats_socket=lambda: self._board_stats_sock,
+            board_stats_lock=self._board_stats_lock,
         )
 
     @property
@@ -336,6 +345,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             from .services import (
                 AuctionService,
                 BoardService,
+                BoardStatsService,
                 KlineService,
                 L2SubscriptionCoordinator,
                 MarketSnapshotService,
@@ -386,6 +396,10 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             )
             self._board_service = BoardService(
                 self._service_connections,
+            )
+            self._board_stats_service = BoardStatsService(
+                self._service_connections,
+                self._next_request_instance,
             )
         elif self._service_allow_open != allow_open:
             raise ValueError("service context 的 allow_open 模式不可中途切换")
@@ -538,6 +552,8 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             realorder_socket = self._realorder_sock
         with self._board_lock:
             board_socket = self._board_sock
+        with self._board_stats_lock:
+            board_stats_socket = self._board_stats_sock
 
         for key, role in (
             ("sh", ConnectionRole.SH_L2),
@@ -563,6 +579,15 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             board_socket,
             request_lock=self._board_lock,
             initialized=board_socket is not None,
+        )
+        # statscalc 独立统计节点（懒连接）：socket 在首次查询时才建立，这里只
+        # 同步已建立的连接；未建立时传 None 让 ConnectionManager 在 acquire 时建连。
+        self._sync_service_role(
+            manager,
+            ConnectionRole.BOARD_STATS,
+            board_stats_socket,
+            request_lock=self._board_stats_lock,
+            initialized=board_stats_socket is not None,
         )
         if (
             manager.profile.support(Capability.REALORDER)
@@ -1184,6 +1209,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             ("_sock", self._sock_lock),
             ("_realorder_sock", self._realorder_lock),
             ("_board_sock", self._board_lock),
+            ("_board_stats_sock", self._board_stats_lock),
         ):
             with lock:
                 sock = getattr(self, attr, None)

@@ -820,14 +820,81 @@ Level2 账号在盘口/逐笔区用了未实现的 period（2026-08-05 抓包确
 > 440KB+，变长字段，`HANDOFF_SUPERORDER_20260726` 的 fmt 子标记 22/34 未破译。暂不实现。
 > 7174（之前抓包出现过 1 次）在 2026-08-05 抓包中未复现，可能为偶发。
 
-### 17.2 9601 板块统计协议（未实现）
+### 17.2 9601 板块统计协议（statscalc / calcext）
 
-真实客户端板块列表除 8901（392/1334）外，还走 9601 的纯文本计算协议：
+真实客户端板块列表除 8901（392/1334）外，还走 9601 的纯文本计算协议。两者
+共享一个帧封装：``\x09`` + ``\n`` 分隔的 GBK key=value 文本 + ``\x00`` 结束符
+（请求与响应同构，**无二进制子帧头、无 route/seq**，纯文本协议）。
 
-| method | 请求特征 | 返回 | 用途 |
+| method | 节点 | 请求特征 | 返回 | 用途 |
+|---|---|---|---|---|
+| `statscalc` | 独立统计节点 `8.132.233.77:9601`（不在 DNS/passport，客户端缓存发现） | `instid/method/market=48/codelist=48(881xxx,...)/datatype=330342/dataclass=intervalcalc/interval=0-0/rightstype=forward/period=0/datetime=0(0-0)/rettype=hdfile` | hd1.0 表（每码 24B：code8+pad8+date4LE+value4float） | 板块批量统计（区间涨跌幅/涨速聚合、涨跌停统计） |
+| `calcext` | REALORDER 节点 `106.14.65.90:9601`（普通）/ `122.9.184.31:9601`（L2），与 `qurealorder` 共享 socket | `instid/method/codelist=<m>(<code>,)/datatype=199359/rightstype=forward/rettype=json` | JSON `{"data":[{"3":<market>,"4":"<code>","199359":<value>}]}` | 单板块/个股扩展计算（流通市值等） |
+
+**节点路由铁证**（``SERVER_MATRIX.md``）：statscalc 走独立统计节点，不能复用
+REALORDER seed ``106.14.65.90``；calcext 与 qurealorder 共用 REALORDER 节点。
+
+**thspypc 实现**（2026-08-05）：
+- ``features/board_stats_protocol.py``：请求构造（``build_statscalc_query`` /
+  ``build_calcext_query``）+ 响应解析（``parse_statscalc_response`` /
+  ``parse_calcext_response``），字段顺序逐字节对齐抓包。
+- ``services/board_stats.py`` ``BoardStatsService``：statscalc 走
+  ``ConnectionRole.BOARD_STATS``（独立统计节点，懒连接），calcext 走
+  ``ConnectionRole.REALORDER``（复用 9601 socket，门控用 ``Capability.REALORDER``
+  与短线精灵一致）。
+- 公开 API：``board_stats_interval`` / ``board_stats_updownlimit`` /
+  ``board_calcext``。statscalc 节点不可达时优雅降级返回空列表（可降级
+  ``board_quotes``）。
+
+**⚠ 使用注意**：statscalc 是**低频计算协议**——抓包确认真实客户端请求间隔约 **9 秒**
+（服务端区间聚合计算耗时），连续高频调用会被限流导致超时。正确用法是低频轮询
+（≥10s 间隔），首次请求还需预留独立节点建连时间（~15s）。calcext 无此限制，可连续调用。
+
+与 thspypc `board_quotes`（8901 fu4 通道，pageid 392/5716，取预存字段）是不同
+协议；statscalc 是服务端计算型，功能更强。两者可互补、交叉验证。
+
+### 17.3 看盘界面指数实时推送（✅ 已实现 2026-08-05）
+
+客户端启动时通过 pageid=5716 + ``PushField=16:241;32:241`` + subreal（URS/UCT/
+UNX/UCX/UME）一次性注册**五大指数全局推送列表**，服务端持续推送 ``09 7b d0 0f``
+头的二进制帧。页面切换只做分时/K线查询，不负责建立基础指数快照推送。
+
+**五大指数**（客户端启动注册列表）：
+
+| 代码 | 名称 | 服务器 | 帧格式 |
 |---|---|---|---|
-| `statscalc` | `market=48, codelist=48(881xxx,...) datatype=330342 dataclass=intervalcalc rettype=hdfile` | hdfile | 板块批量统计（服务端区间聚合计算） |
-| `calcext` | `codelist=33(003017,) datatype=199359 rettype=json` | json | 单板块/个股扩展计算 |
+| 1A0001 | 上证指数 | 8.134.115.123:8901（沪） | 298-302B，代码@33 |
+| 1B0680 | 科创50 | 同上 | 同上 |
+| 899050 | 北证50 | 同上 | 97-98B 紧凑帧，代码@29 |
+| 399001 | 深证成指 | 121.37.31.87:8901（深） | 321B 定长，代码@22 |
+| 399006 | 创业板指 | 8.134.86.216:8901（深） | 同上 |
 
-与 thspypc `board_quotes`（8901 fu4 通道，pageid 392/5716，取预存字段）是不同协议；
-statscalc 是服务端计算型，功能更强。两者可互补。
+**字段布局**（4 字节 LE THS-float，深市/沪市字段顺序一致，起点偏移不同）：
+
+| 字段 | 含义 | 深市偏移 | 沪市偏移 | 北证（相对代码） |
+|---|---|---|---|---|
+| dt6 | 昨收（固定） | 48 | 39 | — |
+| dt7 | 开盘（固定） | 52 | 43 | — |
+| 最高 | 日内最高 | 56 | 47 | — |
+| 最低 | 日内最低 | 60 | 51 | — |
+| dt10 | **最新价**（变化） | 64 | 55 | code+6 |
+| dt19 | 成交额（递增） | 76 | 63 | code+14 |
+| 成交量 | （递增） | 80 | 67 | code+10 (dt13) |
+
+北证50 紧凑帧无 dt6/dt7/高/低（需从分时响应取）；另有 code+30=dt22、code+34=dt23。
+存在 93B 子类型（字段掩码不同），按非稳态帧处理。
+
+**thspypc 实现**：``features/index_push_protocol.py`` 的 ``parse_index_push``，
+支持深市（399xxx）/ 沪市（1A0001/1B0680）/ 北证（899050）三套布局。活网验证
+（2026-08-05 盘中）：399001=14129/+1.76%、1A0001=3872/+1.32%、1B0680=1928/+4.72%、
+899050=1114。
+
+### 17.4 北证50 分时解析兼容（✅ 已修复 2026-08-05）
+
+北证50（899050）当日分时响应走 pageid=9354，但返回 ``flag=0x0046`` 的 hd3.1 表
+（230 点，字段表 dt14,dt13,dt19,dt54,dt10,dt23,dt15,dt22），无 dt40 领先线。
+现有 ``parse_timeline_response`` 只接受指数分时 flag（0x3E/0x86/0x9E + dt40）或
+个股分时 ``record_count==241``，两者都拒绝导致超时。
+
+**修复**：``timeline_protocol.py`` 个股分时路径放宽 ``record_count`` 约束
+（200-242，兼容北证50 的 230 点）+ shell 市场标记扩展（0x11/0x12/0x13/0x21/0x25）。

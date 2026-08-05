@@ -49,6 +49,9 @@ class ConnectionFactory:
         open_board: Callable[[], Any],
         board_lock: Any,
         open_board_constituent: Callable[[str], Any],
+        connect_board_stats: Callable[[], None],
+        board_stats_socket: Callable[[], Any],
+        board_stats_lock: Any,
     ) -> None:
         self._result_type = result_type
         self._is_connected = is_connected
@@ -74,6 +77,9 @@ class ConnectionFactory:
         self._open_board = open_board
         self._board_lock = board_lock
         self._open_board_constituent = open_board_constituent
+        self._connect_board_stats = connect_board_stats
+        self._board_stats_socket = board_stats_socket
+        self._board_stats_lock = board_stats_lock
 
     def connect_main(self, *, refresh_auth: bool = False):
         """Authenticate on demand and establish the ordinary MAIN channel."""
@@ -216,6 +222,21 @@ class ConnectionFactory:
                 initialized=True,
             )
 
+        if spec.role is ConnectionRole.BOARD_STATS:
+            # statscalc 走独立统计节点（8.132.233.77:9601），与 REALORDER seed
+            # 不同服；懒建连，失败抛 OSError 由服务层捕获后返回空列表。
+            if self._board_stats_socket() is None:
+                self._connect_board_stats()
+            sock = self._board_stats_socket()
+            if sock is None:
+                raise OSError("板块统计(statscalc)通道建连失败")
+            return OpenedConnection(
+                socket=sock,
+                owns_socket=False,
+                initialized=True,
+                request_lock=self._board_stats_lock,
+            )
+
         raise OSError(f"不支持的连接角色: {spec.role.value}")
 
 
@@ -238,6 +259,8 @@ class ConnectionRuntime:
         preheat_threads: dict,
         service_connections: Callable[[], Any],
         close_owned_sockets: Callable[[], None],
+        board_stats_socket: Callable[[], Any] | None = None,
+        board_stats_lock: Any = None,
     ) -> None:
         self.enable_heartbeat = enable_heartbeat
         self._main_socket = main_socket
@@ -252,11 +275,14 @@ class ConnectionRuntime:
         self._preheat_threads = preheat_threads
         self._service_connections = service_connections
         self._close_owned_sockets = close_owned_sockets
+        self._board_stats_socket = board_stats_socket
+        self._board_stats_lock = board_stats_lock
 
         self.heartbeat_thread: threading.Thread | None = None
         self.heartbeat_stop = threading.Event()
         self.heartbeat_seq_main = 0
         self.heartbeat_seq_realorder = 0
+        self.heartbeat_seq_board_stats = 0
         self.snapshot_thread: threading.Thread | None = None
         self.snapshot_stop = threading.Event()
         self.snapshot_codes: set[str] = set()
@@ -439,6 +465,29 @@ class ConnectionRuntime:
                                 )
                 except OSError as exc:
                     logger.debug("9601 心跳发送失败（不影响查询）: %s", exc)
+            # statscalc 独立统计节点（9601）心跳：与 realorder 同为 5 字节 9601 心跳，
+            # 但走独立 socket/lock。仅在连接已建立时发送。
+            if (
+                tick % 10 == 0
+                and self._board_stats_socket is not None
+                and self._board_stats_socket() is not None
+                and self._board_stats_lock is not None
+            ):
+                try:
+                    self.heartbeat_seq_board_stats += 1
+                    with self._board_stats_lock:
+                        sock = self._board_stats_socket()
+                        if sock:
+                            sock.sendall(
+                                build_realorder(
+                                    self.heartbeat_seq_board_stats
+                                )
+                                + b"\n"
+                            )
+                except OSError as exc:
+                    logger.debug(
+                        "statscalc 9601 心跳发送失败（不影响查询）: %s", exc
+                    )
 
     def disconnect(self) -> None:
         self.stop_heartbeat()

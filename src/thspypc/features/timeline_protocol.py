@@ -337,7 +337,8 @@ def parse_timeline_response(body: bytes) -> list[dict]:
             "<IHHH", body, base
         )
         if (
-            record_count != 241
+            record_count < 200
+            or record_count > 242
             or flag not in (0x0042, 0x0046)
             or record_size == 0
             or not 1 <= field_count <= 50
@@ -362,7 +363,7 @@ def parse_timeline_response(body: bytes) -> list[dict]:
         if (
             len(shell) != shell_size
             or shell[:4] != b"\x16\x00\x01\x00"
-            or shell[4] not in (0x11, 0x21)
+            or shell[4] not in (0x11, 0x12, 0x13, 0x21, 0x25)
         ):
             continue
         code = shell[5:11].decode("ascii", errors="replace")

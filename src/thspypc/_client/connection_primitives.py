@@ -18,6 +18,8 @@ from ..protocol import (
     MARKET_PORT,
     REALORDER_HOST,
     REALORDER_PORT,
+    STATSCALC_HOST,
+    STATSCALC_PORT,
     build_init_query,
     encode_frame,
     parse_init_response,
@@ -522,6 +524,48 @@ class ConnectionPrimitives:
                 logger.warning("9601 登录失败: VerifyCode=%s", result.get("VerifyCode"))
         except Exception as e:
             logger.warning("9601 短线精灵服务连接失败: %s", e)
+
+    def _connect_board_stats_server(self) -> None:
+        """懒连接板块统计（statscalc）独立 9601 节点（passport64 登录）。
+
+        与 REALORDER 同为 9601 PC login，但走**独立统计节点**
+        （``STATSCALC_HOST``，抓包确认 ``8.132.233.77``，不在 DNS/passport，
+        是客户端缓存发现的）。``SERVER_MATRIX.md`` 明确警告不能把该节点作为
+        REALORDER 备选——两节点承载不同 method（statscalc vs qurealorder）。
+
+        失败时优雅降级（记 warning，不抛异常）；服务层捕获后返回空列表。
+        """
+        if self._board_stats_sock:
+            return
+        try:
+            if self._auth is None:
+                self.authenticate()
+            passport64 = self._current_passport64()
+            login_body = self._auth_service.login_body_for_passport(
+                passport64,
+                LoginIdentity.STANDARD,
+            )
+            sock = socket.create_connection(
+                (STATSCALC_HOST, STATSCALC_PORT), timeout=15
+            )
+            sock.sendall(encode_frame(login_body) + b"\n")
+            resp = self._connection_read_frame(sock)
+            result = self._parse_connection_login_response(resp)
+            if result.get("VerifyCode") == "0":
+                self._board_stats_sock = sock
+                logger.info(
+                    "9601 板块统计服务连接成功 (%s:%d)",
+                    STATSCALC_HOST,
+                    STATSCALC_PORT,
+                )
+            else:
+                sock.close()
+                logger.warning(
+                    "9601 板块统计登录失败: VerifyCode=%s",
+                    result.get("VerifyCode"),
+                )
+        except Exception as e:
+            logger.warning("9601 板块统计服务连接失败: %s", e)
 
     def _preheat_other_market(self, current_key: str) -> None:
         """后台异步预热另一市的 L2 连接（复刻 hexin 启动即双连行为）。

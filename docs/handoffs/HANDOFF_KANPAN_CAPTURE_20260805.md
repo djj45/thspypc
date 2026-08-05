@@ -62,14 +62,16 @@
 
 > 这组协议复杂（逐笔回放单帧 440KB+），本轮**暂不实现**，仅记录。
 
-### 3. 9601 板块统计协议（statscalc/calcext，未实现）
+### 3. 9601 板块统计协议（statscalc/calcext，✅ 已实现 2026-08-05）
 
-真实客户端的板块列表除 8901 的 392/1334 请求外，还走 9601 的**纯文本计算协议**：
+真实客户端的板块列表除 8901 的 392/1334 请求外，还走 9601 的**纯文本计算协议**。
+两者共享帧封装 ``\x09`` + ``\n`` 分隔 GBK key=value 文本 + ``\x00``（请求/响应
+同构，无二进制子帧头）：
 
-| method | 端口 | 请求格式 | 返回 | 用途 |
+| method | 节点 | 请求格式 | 返回 | 用途 |
 |---|---|---|---|---|
-| `statscalc` | 9601 | `instid= method=statscalc market=48, codelist=48(881101,...) datatype=330342 dataclass=intervalcalc interval=0-0 rightstype=forward period=0 rettype=hdfile` | hdfile | 板块批量统计（涨跌幅/涨速/资金流聚合计算） |
-| `calcext` | 9601 | `instid= method=calcext codelist=33(003017,) datatype=199359 rightstype=forward rettype=json` | json | 单板块/个股扩展计算 |
+| `statscalc` | 独立统计节点 `8.132.233.77:9601`（不在 DNS/passport） | `instid= method=statscalc market=48, codelist=48(881101,...) datatype=330342 dataclass=intervalcalc interval=0-0 rightstype=forward period=0 datetime=0(0-0) rettype=hdfile` | hd1.0 表（每码 24B：code8+pad8+date4LE+value4float） | 板块批量统计（涨跌幅/涨速/资金流聚合计算） |
+| `calcext` | REALORDER 节点 `106.14.65.90:9601`（与 qurealorder 共享） | `instid= method=calcext codelist=33(003017,) datatype=199359 rightstype=forward rettype=json` | JSON `{"data":[{"3":<market>,"4":"<code>","199359":<value>}]}` | 单板块/个股扩展计算 |
 
 实测数据：
 - `statscalc` `dataclass=updownlimit datatype=330326,330328` → 涨跌停统计
@@ -77,8 +79,30 @@
 - 端口：全部 9601（与短线精灵同端口，但走独立 instid 流）
 - thspypc 的 `board_quotes` 走 8901 fu4 通道（pageid 392/5716），是另一套协议，功能可达但路径不同
 
+**thspypc 实现**（2026-08-05）：
+- `features/board_stats_protocol.py`：请求构造（`build_statscalc_query` /
+  `build_calcext_query`，字段顺序逐字节对齐抓包）+ 响应解析
+  （`parse_statscalc_response` / `parse_calcext_response`，record_len 由 payload
+  计算不写死 24）。
+- `services/board_stats.py` `BoardStatsService`：statscalc 走
+  `ConnectionRole.BOARD_STATS`（独立统计节点，懒连接 + 心跳），calcext 走
+  `ConnectionRole.REALORDER`（复用 9601 socket，门控用 `Capability.REALORDER`
+  与短线精灵一致，REALORDER 能力证据在首次 9601 建连时懒建立）。
+- 公开 API：`board_stats_interval` / `board_stats_updownlimit` / `board_calcext`。
+  statscalc 节点不可达时优雅降级返回空列表（可降级 `board_quotes`），不影响 calcext。
+- 节点 IP 用 `THSPYPC_STATSCALC_HOST` 环境变量覆盖。
+
+**活网验证结论**（2026-08-05）：
+- ✅ statscalc：`board_stats_interval(["881121"])` 返回 `{code:0881121, date:20160127, value:-3.19}`，hd1.0 解析正确。
+- ✅ calcext：`board_calcext("600030", 17)` 返回流通市值 `4054 亿`，JSON 解析正确。
+- ⚠ **statscalc 是低频计算协议**：抓包确认真实客户端请求间隔 **~9 秒**（服务端区间聚合
+  计算耗时）。连续高频调用（如循环批量查）会被服务端限流/丢弃导致超时。正确用法是
+  低频轮询（≥10s 间隔），不要像行情查询那样连续发。首次请求还需预留建连时间
+  （PC login 到独立统计节点 ~15s）。
+- calcext 与 qurealorder 共享 REALORDER socket，无此限流问题，可连续调用。
+
 **与 8901 board_quotes 的区别**：statscalc 是**服务端计算型**（`dataclass=intervalcalc` 让
-服务器做区间聚合），8901 board_quotes 只取预存字段。两者可互补，本轮不实现 statscalc。
+服务器做区间聚合），8901 board_quotes 只取预存字段。两者可互补、交叉验证。
 
 ### 4. 短线精灵翻页（qurealorder）：基本对齐，3 处差异
 
@@ -227,6 +251,42 @@ Level2 账号（2026-08-05 盘后）全部通过：
 
 **关键确认**：1334 分时请求的 DataType 仍含 dt223-230 大单字段，改 pageid 不丢失
 L2 大单曲线；响应仍为 flag=0x00B4 的 L2 表，解析器无需改。
+
+### F. 看盘界面指数实时推送（✅ 已实现 2026-08-05）
+
+盘中抓包（``captures_live/kanpan_push_20260805_132347.pcap`` +
+``index_push_20260805_140642.pcapng``）发现看盘界面有一类 ``09 7b d0 0f`` 头的
+实时推送帧（之前归在"其他"里），是 pageid=5716 subreal 订阅的服务端推送。
+
+**五大指数全局推送**：客户端启动时一次性注册（pageid=5716 + PushField=16:241;32:241
++ subreal URS/UCT/UNX/UCX/UME），服务端持续推送指数点位。
+
+**字段解码**（4 字节 LE THS-float，深市/沪市字段顺序一致，起点偏移不同；北证50
+紧凑帧用相对代码偏移，与分时响应交叉验证逐字节确认）：
+
+| 字段 | 深市(399xxx) | 沪市(1Axxxx) | 北证(899050) |
+|---|---|---|---|
+| dt6 昨收 | off=48 | off=39 | — |
+| dt7 开盘 | off=52 | off=43 | — |
+| 最高 | off=56 | off=47 | — |
+| 最低 | off=60 | off=51 | — |
+| dt10 最新 | off=64 | off=55 | code+6 |
+| dt19 成交额 | off=76 | off=63 | code+14 |
+
+**活网验证**（2026-08-05 盘中）：399001=14129/+1.76%、1A0001=3872/+1.32%、
+1B0680=1928/+4.72%、899050=1114。
+
+**实现**：``features/index_push_protocol.py`` 的 ``parse_index_push``，支持三套
+布局（深市/沪市/北证），9 个测试（含真实帧）全通过。
+
+### G. 北证50 分时解析兼容（✅ 已修复 2026-08-05）
+
+北证50（899050）当日分时返回 ``flag=0x0046`` hd3.1 表（230 点，无 dt40），现有
+``parse_timeline_response`` 拒绝（只接受指数 flag 0x3E/0x86/0x9E + dt40，或个股
+record_count==241）导致超时。**这不是权限问题，是解析器兼容问题**。
+
+修复：``timeline_protocol.py`` 个股分时路径放宽 record_count（200-242）+ shell
+市场标记扩展（0x11/0x12/0x13/0x21/0x25）。
 
 ## 抓包方法学补充（给 capture_kanpan.py 的后续维护）
 

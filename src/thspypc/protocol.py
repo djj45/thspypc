@@ -1616,6 +1616,27 @@ from .features.realorder_protocol import (  # noqa: E402,F811
     read_frame_realorder,
 )
 
+from .features.board_stats_protocol import (  # noqa: E402,F811
+    BOARD_MARKET as _BOARD_STATS_MARKET,
+    DATATYPE_INTERVAL_STAT,
+    DATATYPE_MARKETCAP,
+    DATATYPE_UPDOWNLIMIT,
+    STATSCALC_HOST,
+    STATSCALC_PORT,
+    build_calcext_query,
+    build_statscalc_query,
+    parse_calcext_response,
+    parse_statscalc_response,
+    read_frame_board_stats,
+)
+
+from .features.index_push_protocol import (  # noqa: E402,F811
+    INDEX_PUSH_MAGIC,
+    SZ_INDEX_FLAG,
+    is_index_push,
+    parse_index_push,
+)
+
 # Preserve the historical protocol surface while authentication callers move to
 # AuthService; the duplicate authentication source block has been removed.
 from .features.auth_protocol import (  # noqa: E402,F811

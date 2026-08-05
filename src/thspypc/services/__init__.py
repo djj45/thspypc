@@ -2,6 +2,7 @@
 
 from .auth import AuthMaterial, AuthService
 from .auction import AuctionService
+from .board_stats import BoardStatsService
 from .kline import KlineService
 from .market_snapshot import MarketSnapshotService
 from .quote import QuoteService
@@ -28,6 +29,7 @@ __all__ = [
     "AuthMaterial",
     "AuthService",
     "AuctionService",
+    "BoardStatsService",
     "KlineService",
     "L2SubscriptionCoordinator",
     "MarketSnapshotService",
