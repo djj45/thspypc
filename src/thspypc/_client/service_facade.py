@@ -727,6 +727,93 @@ class ServiceFacade:
             ),
         )
 
+    def superorder(
+        self,
+        code: str,
+        start,
+        end,
+        *,
+        market: int = 0,
+        pageid: int = 4214,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """查逐笔成交回放（period=7169，超级盘口 / 逐笔面板按区间拖动所见）。
+
+        返回 ``[start, end]`` 区间内每一笔撮合的逐笔记录。**仅 Level2 账号可用**
+        （普通账号无 L2 通道）。走对应市场的 Level2 连接（沪 shlv2 / 深 szlv2），
+        先 4214 注册再发 7169 区间请求。
+
+        Args:
+            code: 股票代码（如 ``"000938"``、``"603118"``）。
+            start: 区间起点，``datetime`` / ``time`` / unix 秒 int 均可。
+                ``time`` 对象按当日日期补全；int 视为 unix 时间戳。
+            end: 区间终点，类型规则同 ``start``。
+            market: 市场码（0=按代码前缀自动推断）。
+            pageid: ``4214``（逐笔面板，默认）或 ``4260``（超级盘口）。两通道响应同构。
+            timeout: 单次 read_frame 超时（秒）。
+
+        Returns:
+            逐笔记录列表，每条 ``{code, time, price, volume, direction,
+            delegate_a, delegate_b, seq, trade_no, dt1, dt56, ...}``，按时间正序。
+
+        Raises:
+            CapabilityUnavailableError: 普通账号无 L2 通道。
+            ChannelUnavailableError: 后台快照线程正在占用 4214 连接。
+
+        Note:
+            ``delegate_a``(dt12)/``delegate_b``(dt74) 的买卖语义沪深不同：深市
+            a=卖方/b=买方，沪市 a=主动方/b=被动方挂单。详见
+            ``superorder_protocol`` 模块 docstring。
+        """
+        from ..errors import ChannelUnavailableError
+
+        if market == 0:
+            market = self._market_for_code(code)
+        start_ts = self._superorder_ts(start)
+        end_ts = self._superorder_ts(end)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+
+        # L2 逐笔回放单次请求（与 timeline/depth_ten 一致；连接治理交给
+        # ConnectionManager，它在 acquire 时自动重建失效连接）。
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._superorder_service.superorder(
+                code,
+                market=market,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                pageid=pageid,
+                timeout=timeout,
+            ),
+        )
+
+    @staticmethod
+    def _superorder_ts(value) -> int:
+        """把 datetime / time / int 统一转成 unix 时间戳（秒）。"""
+        if isinstance(value, int):
+            return value
+        if isinstance(value, datetime):
+            return int(value.timestamp())
+        # time 对象：按当日补全
+        from datetime import date as _date
+        combined = datetime.combine(_date.today(), value)
+        return int(combined.timestamp())
+
     def closing_auction(
         self,
         code: str,

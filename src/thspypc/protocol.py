@@ -136,6 +136,17 @@ from .features.snapshot_protocol import (
     is_snapshot_push,
     parse_snapshot_push,
 )
+from .features.superorder_protocol import (
+    SUPERORDER_DATATYPE,
+    SUPERORDER_FIELD_COUNT,
+    SUPERORDER_FLAG,
+    SUPERORDER_L2_PAGEID,
+    SUPERORDER_PERIOD,
+    SUPERORDER_RECORD_SIZE,
+    SUPERORDER_SUPER_PAGEID,
+    build_superorder_query,
+    parse_superorder_response,
+)
 from .features.stock_list_protocol import (
     FULL_STOCK_LIST_MARKETS,
     INIT_C_MODULES,

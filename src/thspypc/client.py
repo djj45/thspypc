@@ -186,6 +186,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._stock_name_service = None
         self._timeline_service = None
         self._auction_service = None
+        self._superorder_service = None
         self._realorder_service = None
         self._board_service = None
         self._board_stats_service = None
@@ -353,6 +354,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
                 RealOrderService,
                 StockListService,
                 StockNameService,
+                SuperorderService,
                 TimelineService,
             )
 
@@ -386,6 +388,11 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
                 evidence=self._account_evidence,
             )
             self._auction_service = AuctionService(
+                self._service_connections,
+                subscriptions=self._service_subscriptions,
+                evidence=self._account_evidence,
+            )
+            self._superorder_service = SuperorderService(
                 self._service_connections,
                 subscriptions=self._service_subscriptions,
                 evidence=self._account_evidence,

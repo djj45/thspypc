@@ -10,6 +10,7 @@ from .realorder import RealOrderService
 from .stock_list import StockListService
 from .stock_name import StockNameService
 from .subscription import L2SubscriptionCoordinator
+from .superorder import SuperorderService
 from .system_blocks import (
     CATEGORY_ALIASES,
     BoardService,
@@ -37,6 +38,7 @@ __all__ = [
     "RealOrderService",
     "StockListService",
     "StockNameService",
+    "SuperorderService",
     "CATEGORY_ALIASES",
     "BoardService",
     "SystemBlocksError",

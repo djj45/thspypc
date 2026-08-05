@@ -535,6 +535,175 @@ def _dump_samples(classified, pcap_path):
               f"{sum(len(f) for f in frames):,}B")
 
 
+# ── 盘口十档对照抓包（破译 4214 推送帧用）──
+
+# 对照锚点时刻（相对抓包开始的秒数）。每个锚点提示用户截图，
+# 并收集该时刻前后 ±2s 内的所有 snapshot 推送帧。
+DEPTH_ANCHOR_TIMES = [10, 30, 60]
+DEPTH_WINDOW = 2.0  # 锚点前后 ±2s 的帧都收集（十档同一秒通常不变）
+
+
+def _collect_depth_anchor_frames(pcap_path, anchor_times, window):
+    """收集每个锚点时刻 ±window 内的 snapshot4214 推送帧。
+
+    返回 [{anchor_t, frames: [{t, hex, len, detail}]}]
+    """
+    server_frames = _collect_server_frames(pcap_path)
+    results = []
+    for at in anchor_times:
+        nearby = []
+        for t, body, stream, srcport in server_frames:
+            if abs(t - at) > window:
+                continue
+            kind, detail = classify_server_frame(body, srcport)
+            if kind != "snapshot4214":
+                continue
+            nearby.append({
+                "t": round(t, 3),
+                "hex": body.hex(),
+                "len": len(body),
+                "detail": detail,
+            })
+        results.append({
+            "anchor_t": at,
+            "frame_count": len(nearby),
+            "frames": nearby,
+        })
+    return results
+
+
+def capture_depth_anchor(iface, code, duration, pcap_path):
+    """盘口十档对照抓包模式：抓推送 + 在锚点时刻提示截图（不阻塞）。
+
+    流程：
+      1. 后台启动 dumpcap（不阻塞）
+      2. 在 DEPTH_ANCHOR_TIMES 每个时刻，打印截图提示，立刻继续
+      3. 用户看到提示就截同花顺盘口面板的图，存到 captures_live/
+      4. 抓包结束后，收集每个锚点 ±2s 的推送帧，存 JSON
+
+    产物：
+      - pcap 文件
+      - depth_push_anchor_<code>_<ts>.json（含锚点时刻 + 推送帧字节）
+      - 用户手动存的 depth_shot_<code>_1/2/3.png（事后对照读十档数字）
+    """
+    import json
+
+    os.makedirs(PCAP_DIR, exist_ok=True)
+    bpf = " or ".join(f"tcp port {p}" for p in PORTS)
+
+    print(f"\n{'='*64}")
+    print(f"★ 盘口十档对照抓包模式（股票 {code}，{duration}s）")
+    print(f"{'='*64}")
+    print("本模式用于破译 4214 推送帧的十档字段。")
+    print()
+    print("操作要求（严格按顺序，决定能否破译成功）：")
+    print(f"  1. 同花顺打开【{code}】的看盘界面")
+    print("  2. ★ 确保盘口面板显示【十档买卖盘】（Level2 账号才有十档）")
+    print("  3. 抓包开始后，在以下时刻【截图】同花顺盘口面板：")
+    for i, at in enumerate(DEPTH_ANCHOR_TIMES, 1):
+        print(f"     t={at:>3d}s（第 {i} 张）→ 存为 depth_shot_{code}_{i}.png")
+    print("  4. 截图存到 captures_live/ 目录，文件名必须按上面的格式")
+    print("  5. 截图要包含完整的买1-5、卖1-5 的价格和挂单量")
+    print()
+    print(">>> 准备好后按回车开始抓包...")
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        print("已取消")
+        return
+
+    # 启动后台抓包（不阻塞）
+    proc = subprocess.Popen(
+        [DUMPCAP, "-i", iface, "-f", bpf,
+         "-w", pcap_path, "-a", f"duration:{duration}"],
+    )
+    start = time.time()
+
+    print(f"\n抓包已启动。现在去同花顺看盘口！")
+    print(f"（看到 ★ 提示就截图，脚本不会暂停等你）")
+    print("-" * 64)
+
+    # 在锚点时刻提示截图（不阻塞）
+    anchors_done = 0
+    for i, at in enumerate(DEPTH_ANCHOR_TIMES, 1):
+        # 等到锚点时刻
+        while True:
+            elapsed = time.time() - start
+            remaining = at - elapsed
+            if remaining <= 0:
+                break
+            if remaining > 1:
+                time.sleep(min(remaining - 0.5, 1.0))
+            else:
+                time.sleep(0.1)
+        elapsed = time.time() - start
+        print(f"\n★ [t={elapsed:.1f}s] 第 {i} 张截图！"
+              f"→ captures_live/depth_shot_{code}_{i}.png")
+        anchors_done = i
+        # 不阻塞，继续等下一锚点
+
+    # 等剩余抓包时间结束
+    print(f"\n锚点提示完毕，等待抓包完成...")
+    deadline = start + duration + 15
+    while proc.poll() is None and time.time() < deadline:
+        time.sleep(1)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    size = os.path.getsize(pcap_path) if os.path.exists(pcap_path) else 0
+    print(f"\n抓包完成：{pcap_path} ({size:,} bytes)")
+
+    # 收集锚点推送帧
+    print(f"\n{'='*64}")
+    print("收集锚点时刻的推送帧...")
+    print(f"{'='*64}")
+    anchors = _collect_depth_anchor_frames(pcap_path, DEPTH_ANCHOR_TIMES, DEPTH_WINDOW)
+
+    total_frames = sum(a["frame_count"] for a in anchors)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path = os.path.join(PCAP_DIR, f"depth_push_anchor_{code}_{ts}.json")
+
+    doc = {
+        "code": code,
+        "pcap": os.path.basename(pcap_path),
+        "anchor_window_sec": DEPTH_WINDOW,
+        "anchors": anchors,
+        "screenshot_names": [
+            f"depth_shot_{code}_{i}.png"
+            for i in range(1, len(DEPTH_ANCHOR_TIMES) + 1)
+        ],
+        "note": (
+            "每个 anchor 对应一张截图（screenshot_names[i-1]）。"
+            "破译时：从截图读十档数字，在 frames 的 hex 字节里反查对应值的位置。"
+        ),
+    }
+    Path(json_path).write_text(
+        json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(f"\n锚点推送帧统计：")
+    for i, a in enumerate(anchors, 1):
+        shot = f"depth_shot_{code}_{i}.png"
+        shot_exists = os.path.exists(os.path.join(PCAP_DIR, shot))
+        mark = " ✓截图已存" if shot_exists else " ✗截图未存"
+        print(f"  锚点 {i} (t={a['anchor_t']}s): {a['frame_count']} 帧推送{mark}")
+    print(f"\n总推送帧: {total_frames}")
+    if total_frames == 0:
+        print("  ✗ 未抓到 snapshot4214 推送帧！可能原因：")
+        print("    - 不是 Level2 账号（普通号订阅必失败 CodeListSize=0）")
+        print("    - 没打开盘口面板 / 面板不是十档")
+        print("    - 选错网卡")
+
+    print(f"\n对照数据已存档：{json_path}")
+    print(f"pcap：{pcap_path}")
+    print(f"\n下一步：")
+    print(f"  1. 确认截图已存到 captures_live/depth_shot_{code}_1/2/3.png")
+    print(f"  2. 运行: py tests/analyze_depth_push.py \"{json_path}\"")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--duration", type=int, default=180)
@@ -542,12 +711,23 @@ def main():
     ap.add_argument("--stop-file", metavar="PATH",
                     help="存在该文件时提前结束抓包（中途叫停用）")
     ap.add_argument("--analyze-only", metavar="PCAP")
+    ap.add_argument("--depth-anchor", action="store_true",
+                    help="盘口十档对照抓包模式（破译4214推送帧十档字段，盘中专用）")
+    ap.add_argument("--code", default="000938",
+                    help="目标股票代码（depth-anchor 模式用，默认 000938）")
     args = ap.parse_args()
     if args.analyze_only:
         analyze(args.analyze_only)
         return
     iface = args.iface or pick_interface()
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.depth_anchor:
+        # depth-anchor 默认 75s（覆盖 3 个锚点 + 尾部窗口）
+        duration = args.duration if args.duration != 180 else 75
+        pcap_path = os.path.join(
+            PCAP_DIR, f"depth_push_{args.code}_{ts}.pcap")
+        capture_depth_anchor(iface, args.code, duration, pcap_path)
+        return
     pcap_path = os.path.join(PCAP_DIR, f"kanpan_push_{ts}.pcap")
     capture(iface, args.duration, pcap_path, stop_file=args.stop_file)
     analyze(pcap_path)
