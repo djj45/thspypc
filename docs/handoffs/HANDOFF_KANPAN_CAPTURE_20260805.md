@@ -628,8 +628,34 @@ py tests/capture_kanpan_push.py --depth-anchor --code 000938
 - **普通账号（加了 14/15 后）与 Level2 结果完全一致**：net_force、红绿比例一字不差。
 - 指数涨但 net_force 为负（卖强）是正常的：指数按市值加权（大盘股权重），
   买卖力量按成交量（小票活跃），两者维度不同。
-- **北证50（899050）**：Level2 走 SH_L2 连接返回 dt14/dt15 全 0（服务端不提供
-  主动买卖拆分，dt13 正常）；普通账号 MAIN 连接对 market=144 超时不响应。已知限制。
+
+### I.8 ★ 北交所（BSE）分时协议 + 网关发现（2026-08-06 盘后）
+
+> 用户需求：北交所个股（920xxx）和北证50（899050）的分时协议，与沪深不同。
+
+**抓包发现（普通账号 + Level2 双账号 pcap）：北交所用完全不同的 pageid 和 market 码。**
+
+| 标的 | market | pageid | 请求 route | DataType | dt14/dt15 | 买卖力量 |
+|---|---|---|---|---|---|---|
+| 北交所个股 920xxx | **151** | **10443** | SUB1=0x014a, SUB2=0x0100 | `14,13,19,54,10,23,15,22` | ✓ 含 | **有** |
+| 北证50 指数 899050 | **144** | **11695** | SUB1=0x003e, SUB2=0x013e | `272,207,42,271,...` | ✗ 无 | **无**（与客户端一致）|
+
+**网关发现（关键）：北交所数据只在 `main.123ths.com` 的 IP 上可用，`ifindhq` 不支持。**
+- `main.123ths.com` → `218.245.102.0` / `8.134.108.168` 等（支持 market 151）
+- `ifindhq.123ths.com` → `8.134.123.179` 等（不支持 151，请求超时）
+- passport 的 M_hqdns 不含 main.123ths.com（只有 ifindhq），需硬编码补上
+- init MarketCode 不需要加 151（加了反而部分 IP 拒绝 init）
+
+**改动：**
+- `protocol.py resolve_market_hosts`：优先 `main.123ths.com`（硬编码补入），只在 main DNS 失败时 fallback ifindhq
+- `history_timeline_protocol.py`：新增 `build_beijing_timeline_query`（pageid=10443）+ `build_beijing_index_timeline_query`（pageid=11695），双子帧 0x09
+- `client.py _market_for_code`：加北交所前缀（43/83/87/920→151，899→144）
+- `services/timeline.py`：market=151 / 899 强制走 BASIC+MAIN（不分账号类型）；`select_timeline_plan` 加 code 参数区分 899050
+- `timeline_protocol.py`：新增 `BEIJING_TIMELINE_FLAGS = {0x0046, 0x006e}`，parser 放宽 dt40 要求
+
+**活网验证（Level2 账号，盘后）：**
+- 920493 北交所个股：241 条，dt14/dt15 单调，买卖力量 net=-306002 红90:绿148 ✓
+- 899050 北证50：241 条，dt14/dt15 全 0（无买卖力量，与客户端一致）✓
 
 ## J. 超级盘口响应帧全分类破译（2026-08-05 盘后，§H.8 下一步 1 已完成）
 

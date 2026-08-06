@@ -278,7 +278,14 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
             ):
                 fallback_domains.append(dm.group(1))
 
-    domains = main_domains or fallback_domains
+    # 2026-08-06：优先 main.123ths.com（支持北交所 market 151），
+    # ifindhq 的 IP 不支持北交所。passport 不含 main 时硬编码补上。
+    # 只在 main 解析不出 IP 时才 fallback 到 ifindhq。
+    if "main.123ths.com" not in main_domains:
+        main_domains.insert(0, "main.123ths.com")
+    domains = main_domains
+    if not domains:
+        domains = fallback_domains
     if not domains:
         return []
 

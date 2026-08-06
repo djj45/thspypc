@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 HISTORY_TIMELINE_PAGEID = 4417
 NORMAL_HISTORY_TIMELINE_PAGEID = 9355
+# 北交所（BSE）专用 pageid（2026-08-06 抓包确认）
+# 个股（920xxx 等，market=151）当日分时走 pageid=10443，DataType 含 dt14/dt15（买卖力量）
+BEIJING_TIMELINE_PAGEID = 10443
+BEIJING_TIMELINE_DATATYPE = [14, 13, 19, 54, 10, 23, 15, 22]
+# 北证50 指数（899050，market=144）当日分时走 pageid=11695，DataType 无 dt14/dt15（无买卖力量）
+BEIJING_INDEX_TIMELINE_PAGEID = 11695
+BEIJING_INDEX_TIMELINE_DATATYPE = [272, 207, 42, 271, 228, 13, 41, 227, 19, 40, 10, 224, 23, 202, 223, 22, 201, 208]
 HISTORY_TIMELINE_DATATYPE = [
     229,
     207,
@@ -690,3 +697,85 @@ def parse_history_timeline_response(
     fields, first_offset = ordered[0][1][1], ordered[0][1][0]
     rows_out = [(offset, bar_index) for bar_index, (offset, _f) in ordered]
     return _decode_history_timeline_rows(body, rows_out, fields, record_size)
+
+
+# ── 北交所（BSE）当日分时请求 ──
+# 2026-08-06 抓包确认：
+# - 个股（920xxx，market=151）走 pageid=10443，双子帧 0x09
+#   SUB1 route=0x014a hist=0x20（分时主体，DataType 含 14/15）
+#   SUB2 route=0x0100 hist=0x00（五档伴随，DataType=13,18,24,...,157）
+# - 北证50 指数（899050，market=144）走 pageid=11695，双子帧 0x09
+#   SUB1 route=0x003e hist=0x00（前缀 CodeList+pageid）
+#   SUB2 route=0x013e hist=0x20（分时主体，DataType 无 14/15）
+# 响应均为 hd3.1 BitRLE 表（flag=0x0046 个股 / 0x006e 指数），走
+# parse_index_timeline_response 解码。
+
+BEIJING_TIMELINE_COMPANION_DATATYPE = [
+    13, 18, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+    122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157,
+]
+
+
+def build_beijing_timeline_query(
+    code: str,
+    market: int = 151,
+    datatype: list[int] | None = None,
+    pageid: int = BEIJING_TIMELINE_PAGEID,
+    seq: int = 0x1181,
+    companion_seq: int = 0x0184,
+) -> bytes:
+    """构建北交所个股（market=151）当日分时请求（pageid=10443）。
+
+    双子帧结构（0x09 前缀）：
+      SUB1 route=0x014a hist=0x20 — 分时主体（DataType 含 14/15 买卖力量）
+      SUB2 route=0x0100 hist=0x00 — 五档伴随（DataType=TIMELINE_COMPANION）
+    """
+    if datatype is None:
+        datatype = BEIJING_TIMELINE_DATATYPE
+    target = f"{market}({code},);"
+    dt_text = ",".join(str(v) for v in datatype) + ","
+    query_text = (
+        f"CodeList={target}\r\nDataType={dt_text}\r\n"
+        f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
+        f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    companion_dt = ",".join(str(v) for v in BEIJING_TIMELINE_COMPANION_DATATYPE) + ","
+    companion_text = (
+        f"CodeList={target}\r\nDataType={companion_dt}\r\n"
+        f"DateTime=0(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    sub1 = _subframe_header(0x0009, 0x014A, seq, len(query_text), history_flag=True) + query_text
+    sub2 = _subframe_header(0x0009, 0x0100, companion_seq, len(companion_text), history_flag=False) + companion_text
+    return encode_frame(b"\x09" + sub1 + sub2)
+
+
+def build_beijing_index_timeline_query(
+    code: str,
+    market: int = 144,
+    datatype: list[int] | None = None,
+    pageid: int = BEIJING_INDEX_TIMELINE_PAGEID,
+    seq: int = 0x10B8,
+    prefix_seq: int = 0x0000,
+) -> bytes:
+    """构建北证50 指数（899050，market=144）当日分时请求（pageid=11695）。
+
+    双子帧结构（0x09 前缀）：
+      SUB1 route=0x003e hist=0x00 — 前缀（CodeList+pageid）
+      SUB2 route=0x013e hist=0x20 — 分时主体（DataType 无 14/15，北证50 无买卖力量）
+    """
+    if datatype is None:
+        datatype = BEIJING_INDEX_TIMELINE_DATATYPE
+    target = f"{market}({code},);"
+    prefix_text = (
+        f"CodeList={target}\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    dt_text = ",".join(str(v) for v in datatype) + ","
+    query_text = (
+        f"CodeList={target}\r\nDataType={dt_text}\r\n"
+        f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
+        f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    sub1 = _subframe_header(0x0002, 0x003E, prefix_seq, len(prefix_text), history_flag=False) + prefix_text
+    sub2 = _subframe_header(0x0009, 0x013E, seq, len(query_text), history_flag=True) + query_text
+    return encode_frame(b"\x09" + sub1 + sub2)

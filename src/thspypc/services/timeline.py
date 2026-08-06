@@ -22,6 +22,8 @@ from ..features.timeline_protocol import (
     parse_timeline_response,
 )
 from ..features.history_timeline_protocol import (
+    build_beijing_index_timeline_query,
+    build_beijing_timeline_query,
     build_history_timeline_query,
     build_index_history_timeline_query,
     build_normal_history_timeline_query,
@@ -43,7 +45,7 @@ class TimelineMode(str, Enum):
 class TimelinePlan:
     mode: TimelineMode
     role: ConnectionRole
-    capability: Capability
+    capability: Capability | None
 
     @property
     def level2(self) -> bool:
@@ -80,9 +82,18 @@ def select_timeline_plan(
     profile: AccountProfile,
     market: int,
     mode: TimelineMode | str = TimelineMode.AUTO,
+    code: str = "",
 ) -> TimelinePlan:
     """Choose account-specific transport and wire protocol without I/O."""
     mode = TimelineMode(mode)
+    # 北交所（BSE）走专用 pageid + MAIN 连接，不分 BASIC/LEVEL2
+    # （2026-08-06 抓包确认两种账号都在 MAIN 上请求 pageid=10443/11695）
+    if market == 151 or (market == 144 and code.startswith("899")):
+        return TimelinePlan(
+            mode=TimelineMode.BASIC,
+            role=ConnectionRole.MAIN,
+            capability=None,  # MAIN 连接不需要能力校验
+        )
     if mode is TimelineMode.BASIC:
         _require(
             profile,
@@ -172,6 +183,13 @@ def build_timeline_request(
     seq: int | None = None,
 ) -> bytes:
     """Build the exact wire request selected by a timeline plan."""
+    # 北交所（BSE）走专用 pageid（10443 个股 / 11695 指数），不分 BASIC/LEVEL2，
+    # 均走 MAIN 连接（2026-08-06 抓包确认两种账号都在 MAIN 上请求）。
+    if market == 151:
+        return build_beijing_timeline_query(code, market=market)
+    if market == 144 and code.startswith("899"):
+        return build_beijing_index_timeline_query(code, market=market)
+
     if not plan.level2:
         # 2026-08-06 抓包修正：普通账号当日分时走 pageid=9355（同历史分时），
         # 非 9354（已废弃，服务端不响应）。today=True 用 DateTime=8192(0-0)。
@@ -236,6 +254,7 @@ class TimelineService:
             self._connections.profile,
             market,
             mode,
+            code=code,
         )
 
         frame = build_timeline_request(plan, code, market=market)

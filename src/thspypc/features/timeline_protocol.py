@@ -29,6 +29,10 @@ INDEX_TIMELINE_FLAGS = frozenset({0x003E, 0x0086, 0x009E})
 NORMAL_TODAY_TIMELINE_FLAG = 0x005E
 NORMAL_TODAY_TIMELINE_FLAG_WITH_FORCE = 0x0066
 TODAY_TIMELINE_FLAGS = frozenset({NORMAL_TODAY_TIMELINE_FLAG, NORMAL_TODAY_TIMELINE_FLAG_WITH_FORCE})
+# 北交所（BSE）当日分时响应 flag（2026-08-06 抓包确认）：
+# 0x0046 = 个股（pageid=10443，rs=32，fields 含 dt14/dt15，无 dt40）
+# 0x006e = 北证50 指数（pageid=11695，rs=72，18 字段，无 dt40）
+BEIJING_TIMELINE_FLAGS = frozenset({0x0046, 0x006E})
 
 TIMELINE_DATATYPE = [14, 13, 19, 54, 10, 23, 15, 22, 6, 45]
 TIMELINE_COMPANION_DATATYPE = [
@@ -143,9 +147,10 @@ def parse_index_timeline_response(body: bytes) -> list[dict]:
             "<IHHH", body, base
         )
         is_today = flag in TODAY_TIMELINE_FLAGS
+        is_beijing = flag in BEIJING_TIMELINE_FLAGS
         if (
             record_count == 0
-            or flag not in INDEX_TIMELINE_FLAGS and not is_today
+            or flag not in INDEX_TIMELINE_FLAGS and not is_today and not is_beijing
             or record_size == 0
             or not 1 <= field_count <= 50
         ):
@@ -156,8 +161,8 @@ def parse_index_timeline_response(body: bytes) -> list[dict]:
             len(fields) != field_count
             or sum(width for _, _, width in fields) != record_size
             or not any(datatype == 10 for datatype, _, _ in fields)
-            # dt40（领先线）只在老 index flag 有；0x005e 当日分时无 dt40
-            or (not is_today and not any(
+            # dt40（领先线）只在老 index flag 有；当日分时(0x005e/0x0066)和北交所(0x0046/0x006e)无 dt40
+            or (not is_today and not is_beijing and not any(
                 datatype == 40 for datatype, _, _ in fields
             ))
         ):

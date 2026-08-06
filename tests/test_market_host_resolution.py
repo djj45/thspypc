@@ -67,19 +67,25 @@ def test_main_host_resolution_uses_ifindhq_when_main_is_absent(
         "fu2.123ths.com:8901:64;80;"
     )
 
+    # 2026-08-06: 即使 passport 不含 main，也硬编码补 main.123ths.com
+    # （支持北交所 market 151），优先于 ifindhq。
     assert resolve_market_hosts(passport) == ["10.0.0.1"]
-    assert queried == ["ifindhq.123ths.com"]
+    assert queried == ["main.123ths.com"]
 
 
 def test_main_host_resolution_returns_empty_without_ifindhq(monkeypatch):
-    monkeypatch.setattr(
-        socket,
-        "gethostbyname_ex",
-        lambda domain: (domain, [], ["10.0.0.1"]),
-    )
+    # 2026-08-06: main.123ths.com 总会被尝试（硬编码），所以不再返回空
+    # 除非 DNS 解析失败
+    def lookup(domain):
+        if domain == "main.123ths.com":
+            raise OSError("dns failed")
+        return domain, [], ["10.0.0.1"]
+
+    monkeypatch.setattr(socket, "gethostbyname_ex", lookup)
     passport = _passport(
         "fu4.123ths.com:8901:96;128;,"
         "hkus.123ths.com:8901:176;112;"
     )
 
+    # main DNS 失败 → fallback ifindhq，但 passport 也没 ifindhq → 空
     assert resolve_market_hosts(passport) == []

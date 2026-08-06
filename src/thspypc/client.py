@@ -1000,6 +1000,10 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             return 16
         if code.startswith("39"):            # 深市指数
             return 32
+        if code.startswith("899"):           # 北证50 等北交所指数
+            return 144
+        if code.startswith(("43", "83", "87", "920")):  # 北交所个股
+            return 151
         return 33
 
 

@@ -41,6 +41,9 @@ SORT_BY_VALUES = {
 }
 
 INIT_C_MODULES = "MEQT"
+# 16=沪市 144=科创/北证指数
+# 151(北交所个股)不加到 init MarketCode——部分 main.123ths.com IP 拒绝含 151 的 init，
+# 且北交所分时在 main.123ths.com 上不需要 init 里声明 151 即可请求 pageid=10443/11695。
 INIT_MARKET_CODE = "16;144;"
 INIT_STOCK_LINKS = [
     "Stock_176_H_QC",
