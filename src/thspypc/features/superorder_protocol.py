@@ -60,6 +60,24 @@ _TS_HI = 1_900_000_000   # 2030-03
 # 逐笔序号合理性上限（A 股单票一天逐笔 <1 亿，超此必为帧边界错位的垃圾字节）
 _SEQ_MAX = 100_000_000
 
+# ── 4096 盘口快照回放（超级盘口分时曲线，2026-08-06 抓包破译）──
+# 走 4260 通道，DateTime=4096(0-0) 返回全天每 3 秒一个完整盘口快照。
+# 响应是标准 hd1.0 行主序（flag=0x00FE，非 BitRLE），rc≈4927, hs=216, fc=54。
+SNAPSHOT_REPLAY_PERIOD = 4096
+SNAPSHOT_REPLAY_PAGEID = 4260
+SNAPSHOT_REPLAY_FLAG = 0x00FE
+# 请求 DataType：十档价量（dt24-35 + dt102-125）+ dt10/13/19/49/74/75 + 扩展
+SNAPSHOT_REPLAY_DATATYPE = [
+    10, 12, 13, 14, 18, 19, 20, 21,
+    25, 26, 27, 28, 29, 31, 32, 33, 34, 35,
+    49, 74, 75,
+    102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
+    122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157,
+    6, 45, 407, 619, 1110,
+]
+SNAPSHOT_REPLAY_COMPANION_DATATYPE = [7, 10, 2419, 2420, 6, 45, 402, 619]
+_SNAPSHOT_REPLAY_ROUTE = 0x0158
+
 # 外层请求路由标记（2026-08-05 抓包确认，0x02FC = 小端 fc 02；区别于 auction 的 0x01FC）
 _SUPERORDER_ROUTE = b"\xfc\x02"
 
@@ -331,6 +349,137 @@ def parse_superorder_response(body: bytes) -> list[dict]:
     return records
 
 
+def build_snapshot_replay_query(
+    code: str,
+    market: int = 33,
+    *,
+    pageid: int = SNAPSHOT_REPLAY_PAGEID,
+    seq: int = 0x00C0,
+    companion_seq: int = 0x00C2,
+) -> bytes:
+    """构造 4096 盘口快照回放请求（pageid=4260，超级盘口分时曲线）。
+
+    双子帧 0x09（route=0x0158）：SUB1=盘口快照主体（DataType 含十档），
+    SUB2=伴随查询（DataType=7,10,2419,...）。
+    DateTime=4096(0-0) 返回全天每 3 秒一个完整盘口快照（~4927 点）。
+
+    Args:
+        code: 股票代码（如 ``"000938"``）。
+        market: 市场码（17=沪, 33=深）。
+    """
+    target = f"{market}({code},);"
+    dt_text = ",".join(str(v) for v in SNAPSHOT_REPLAY_DATATYPE) + ","
+    main_text = (
+        f"CodeList={target}\r\nDataType={dt_text}\r\n"
+        f"DateTime={SNAPSHOT_REPLAY_PERIOD}(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+    comp_dt = ",".join(str(v) for v in SNAPSHOT_REPLAY_COMPANION_DATATYPE) + ","
+    comp_text = (
+        f"CodeList={target}\r\nDataType={comp_dt}\r\n"
+        f"DateTime=0(0-0)\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+    ).encode("gbk")
+
+    def _sub(seq_val, text):
+        h = bytearray(22)
+        h[0:4] = b"\x00\x16\x00\x00"
+        struct.pack_into("<H", h, 4, seq_val & 0xFFFF)
+        h[6:10] = b"\x12\x00\x09\x00"
+        struct.pack_into("<H", h, 10, _SNAPSHOT_REPLAY_ROUTE)
+        h[12:14] = b"\x00\x00"
+        h[14:16] = b"\x00\x10"
+        struct.pack_into("<I", h, 18, len(text))
+        return bytes(h) + text
+
+    return encode_frame(b"\x09" + _sub(seq, main_text) + _sub(companion_seq, comp_text))
+
+
+def parse_snapshot_replay_response(body: bytes) -> list[dict]:
+    """解析 4096 盘口快照回放响应（hd1.0 行主序，flag=0x00FE）。
+
+    每条记录是一个时刻的完整盘口快照（~3 秒间隔），含：
+    - ``time``：dt1 unix 时间戳 → datetime
+    - ``price``：dt10 最新价
+    - 十档买卖价量（dt24-35 买1-买5/卖1-卖5 + dt102-125 六~十档）
+
+    Args:
+        body: 8901 响应帧（可能含 0x0a 外层压缩）。
+
+    Returns:
+        盘口快照记录列表，按时间正序。
+    """
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("snapshot replay normalization failed: %s", exc)
+            return []
+
+    pos = body.find(b"hd1.0")
+    if pos < 0:
+        return []
+    base = pos + 6
+    if base + 10 > len(body):
+        return []
+
+    record_count = struct.unpack_from("<I", body, base)[0]
+    flag = struct.unpack_from("<H", body, base + 4)[0]
+    record_size = struct.unpack_from("<H", body, base + 6)[0]
+    field_count = struct.unpack_from("<H", body, base + 8)[0]
+    if flag != SNAPSHOT_REPLAY_FLAG or record_size == 0 or record_count == 0:
+        return []
+
+    # 字段表（fc 可能 >50，手动解析）
+    ft_off = base + 10
+    if ft_off + field_count * 4 > len(body):
+        return []
+    fields = []
+    for i in range(field_count):
+        ft = body[ft_off + i * 4 : ft_off + i * 4 + 4]
+        fields.append((ft[0], ft[1], ft[2], ft[3]))  # dt, fmt, flags, width
+
+    # 壳段（22B，含代码标签）
+    shell_off = ft_off + field_count * 4
+    if shell_off + 22 > len(body):
+        return []
+    data_off = shell_off + 22
+
+    # 字段偏移表
+    offsets = {}
+    off = 0
+    for dt, fmt, _flags, width in fields:
+        offsets[dt] = (off, width)
+        off += width
+
+    records: list[dict] = []
+    for index in range(record_count):
+        row_start = data_off + index * record_size
+        row = body[row_start : row_start + record_size]
+        if len(row) < record_size:
+            break
+        rec: dict = {}
+        for dt, (value_off, width) in offsets.items():
+            chunk = row[value_off : value_off + width]
+            if width != 4 or len(chunk) != 4:
+                continue
+            raw_value = struct.unpack("<I", chunk)[0]
+            if dt == 1:
+                rec["time"] = datetime.fromtimestamp(raw_value).strftime("%H:%M:%S")
+                rec["ts"] = raw_value
+            elif dt == 10:
+                rec["price"] = round(decode_ths_float(raw_value), 3)
+            elif dt in (13, 19, 49):
+                rec[f"dt{dt}"] = decode_ths_float(raw_value)
+            elif dt in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                        102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+                        112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
+                        122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157):
+                rec[f"dt{dt}"] = decode_ths_float(raw_value)
+        records.append(rec)
+    return records
+
+
 __all__ = [
     "SUPERORDER_PERIOD",
     "SUPERORDER_L2_PAGEID",
@@ -339,6 +488,12 @@ __all__ = [
     "SUPERORDER_FLAG",
     "SUPERORDER_RECORD_SIZE",
     "SUPERORDER_FIELD_COUNT",
+    "SNAPSHOT_REPLAY_PERIOD",
+    "SNAPSHOT_REPLAY_PAGEID",
+    "SNAPSHOT_REPLAY_DATATYPE",
+    "SNAPSHOT_REPLAY_FLAG",
     "build_superorder_query",
     "parse_superorder_response",
+    "build_snapshot_replay_query",
+    "parse_snapshot_replay_response",
 ]
