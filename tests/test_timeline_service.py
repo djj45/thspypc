@@ -13,6 +13,9 @@ from thspypc.features.timeline_protocol import (
     build_timeline_l2_query,
     build_timeline_query,
 )
+from thspypc.features.history_timeline_protocol import (
+    build_normal_history_timeline_query,
+)
 from thspypc.models import AccountKind, AccountProfile, Capability, Support
 from thspypc.services.timeline import (
     TimelineMode,
@@ -52,8 +55,11 @@ def test_standard_auto_uses_main_and_pageid_9354():
 
     assert plan.mode is TimelineMode.BASIC
     assert plan.role is ConnectionRole.MAIN
-    assert frame == build_timeline_query("000938", market=33)
-    assert b"pageid=9354" in frame
+    # 2026-08-06 抓包修正：普通账号当日分时走 pageid=9355（同历史分时），非 9354
+    assert frame == build_normal_history_timeline_query(
+        "000938", market=33, today=True
+    )
+    assert b"pageid=9355" in frame
 
 
 def test_level2_auto_uses_market_specific_role_and_pageid_1334():
@@ -104,7 +110,7 @@ def test_level2_account_can_force_basic_for_protocol_comparison():
     assert not plan.level2
     assert build_timeline_request(
         plan, "000938", market=33
-    ) == build_timeline_query("000938", market=33)
+    ) == build_normal_history_timeline_query("000938", market=33, today=True)
 
 
 def test_standard_account_cannot_force_level2():
@@ -159,8 +165,9 @@ def test_standard_workflow_uses_main_and_basic_parser(monkeypatch):
         max_frames=1,
     )
     expected = [{"code": "000938", "minute_index": 0, "dt10": 37.33}]
+    # 2026-08-06: BASIC 当日分时改用 parse_index_timeline_response（接受 0x005e）
     monkeypatch.setattr(
-        "thspypc.services.timeline.parse_timeline_response",
+        "thspypc.services.timeline.parse_index_timeline_response",
         lambda _body: expected,
     )
 

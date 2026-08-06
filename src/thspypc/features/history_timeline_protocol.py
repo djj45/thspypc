@@ -299,18 +299,32 @@ def build_normal_history_timeline_query(
     inner_seq: int = 0,
     dt_prev_off: int = -367,
     date=None,
+    *,
+    today: bool = False,
 ) -> bytes:
-    """Build the two-part MAIN request used by normal accounts."""
-    if date is not None:
-        bar_start = date_to_normal_timeline_bar(date)
-    if bar_start is None:
-        raise ValueError("必须传 bar_start 或 date 之一")
+    """Build the two-part MAIN request used by normal accounts.
+
+    ``today=True`` 时构造**当日分时**请求（``DateTime=8192(0-0)``，无需 bar_start）。
+    2026-08-06 抓包确认：同花顺普通账号当日分时走 pageid=9355 + 同一 DataType
+    （与历史分时完全一致），只是 DateTime 用 8192(0-0) 而非 packed-date 游标。
+    旧代码用的 pageid=9354 已废弃（服务端不响应）。
+    """
+    if today:
+        bar_start = None  # 当日模式不需要 packed-date 游标
+    else:
+        if date is not None:
+            bar_start = date_to_normal_timeline_bar(date)
+        if bar_start is None:
+            raise ValueError("必须传 bar_start 或 date 之一（或 today=True）")
     if datatype is None:
         datatype = NORMAL_HISTORY_TIMELINE_DATATYPE
 
     target_list = f"{market}({code},);"
     datatype_text = ",".join(str(value) for value in datatype) + ","
-    bar_end = bar_start + HISTORY_TIMELINE_BAR_SPAN
+    if today:
+        datetime_arg = "0-0"
+    else:
+        datetime_arg = f"{bar_start}-{bar_start + HISTORY_TIMELINE_BAR_SPAN}"
     prefix_text = (
         f"CodeList={target_list}\r\npageid={pageid}\r\n"
     ).encode("gbk")
@@ -318,7 +332,7 @@ def build_normal_history_timeline_query(
     # with CR only.  Preserve that wire contract for MAIN compatibility.
     query_text = (
         f"CodeList={target_list}\r\nDataType={datatype_text}\r\n"
-        f"DateTime={TIMELINE_PERIOD}({bar_start}-{bar_end})\r\n"
+        f"DateTime={TIMELINE_PERIOD}({datetime_arg})\r\n"
         f"DTPrevOff={dt_prev_off}\r\n"
         f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r"
     ).encode("gbk")

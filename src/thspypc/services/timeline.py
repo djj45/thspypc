@@ -17,6 +17,7 @@ from ..features.timeline_protocol import (
     build_timeline_l2_query,
     build_timeline_query,
     is_index_timeline,
+    parse_index_timeline_response,
     parse_timeline_l2_response,
     parse_timeline_response,
 )
@@ -122,6 +123,40 @@ def select_timeline_plan(
     )
 
 
+def _enrich_buy_sell_force(records: list[dict]) -> None:
+    """给 9355 分时记录加主动买卖力量字段（红绿柱数据）。
+
+    dt22/dt23 是主动买/主动卖的**累计值**，逐分钟相减得到每分钟增量：
+    - ``buy_force``：本分钟主动买入量
+    - ``sell_force``：本分钟主动卖出量
+    - ``net_force``：买卖净力量（正=红柱/买强，负=绿柱/卖强）
+
+    对应同花顺指数分时图零轴上下的红绿柱：同一分钟柱子只能红或绿，
+    由 net_force 正负决定。首条无前值时三个字段均为 0。
+    """
+    prev_buy = None
+    prev_sell = None
+    for r in records:
+        buy = r.get("dt22")
+        sell = r.get("dt23")
+        if isinstance(buy, (int, float)) and isinstance(sell, (int, float)):
+            if prev_buy is not None:
+                b = buy - prev_buy
+                s = sell - prev_sell
+                r["buy_force"] = b
+                r["sell_force"] = s
+                r["net_force"] = b - s
+            else:
+                r["buy_force"] = 0
+                r["sell_force"] = 0
+                r["net_force"] = 0
+            prev_buy, prev_sell = buy, sell
+        else:
+            r["buy_force"] = 0
+            r["sell_force"] = 0
+            r["net_force"] = 0
+
+
 def build_timeline_request(
     plan: TimelinePlan,
     code: str,
@@ -131,10 +166,9 @@ def build_timeline_request(
 ) -> bytes:
     """Build the exact wire request selected by a timeline plan."""
     if not plan.level2:
-        kwargs = {"market": market}
-        if seq is not None:
-            kwargs["seq"] = seq
-        return build_timeline_query(code, **kwargs)
+        # 2026-08-06 抓包修正：普通账号当日分时走 pageid=9355（同历史分时），
+        # 非 9354（已废弃，服务端不响应）。today=True 用 DateTime=8192(0-0)。
+        return build_normal_history_timeline_query(code, market=market, today=True)
 
     # 2026-08-05 抓包对齐：Level2 分时主体用 pageid=1334（DataType 含大单字段不变）
     if is_index_timeline(code, market):
@@ -222,10 +256,14 @@ class TimelineService:
                 parser = (
                     parse_timeline_l2_response
                     if plan.level2
-                    else parse_timeline_response
+                    else parse_index_timeline_response
                 )
                 records = parser(response)
                 if records:
+                    if not plan.level2:
+                        # 普通账号 9355 分时含 dt22/dt23（主动买/卖累计），
+                        # 计算逐分钟增量得到红绿柱买卖力量。
+                        _enrich_buy_sell_force(records)
                     if self._evidence is not None and plan.level2:
                         self._evidence.record_feature(
                             Capability.L2_TIMELINE,
