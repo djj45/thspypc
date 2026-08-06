@@ -124,9 +124,15 @@ def select_timeline_plan(
 
 
 def _enrich_buy_sell_force(records: list[dict]) -> None:
-    """给 9355 分时记录加主动买卖力量字段（红绿柱数据）。
+    """给分时记录加主动买卖力量字段（红绿柱数据）。
 
-    dt22/dt23 是主动买/主动卖的**累计值**，逐分钟相减得到每分钟增量：
+    主动买卖累计量的字段来源因协议而异：
+    - **Level2 1334**：用 **dt14/dt15**（fmt=0x70 ths_float，严格单调递增，
+      ``dt14 + dt15 ≈ dt13``）。此路径的 dt22/dt23 经实测非单调（116/97 个
+      回撤点），不是累计主动买卖量，不可用。
+    - **普通账号 9355**：字段表无 dt14/dt15，只有 dt22/dt23，回退使用。
+
+    逐分钟相减得到每分钟增量：
     - ``buy_force``：本分钟主动买入量
     - ``sell_force``：本分钟主动卖出量
     - ``net_force``：买卖净力量（正=红柱/买强，负=绿柱/卖强）
@@ -134,11 +140,16 @@ def _enrich_buy_sell_force(records: list[dict]) -> None:
     对应同花顺指数分时图零轴上下的红绿柱：同一分钟柱子只能红或绿，
     由 net_force 正负决定。首条无前值时三个字段均为 0。
     """
+    # 优先 dt14/dt15（Level2，单调可靠），回退 dt22/dt23（普通账号仅有此字段）
+    has_dt14 = any(
+        isinstance(r.get("dt14"), (int, float)) for r in records
+    )
+    buy_key, sell_key = ("dt14", "dt15") if has_dt14 else ("dt22", "dt23")
     prev_buy = None
     prev_sell = None
     for r in records:
-        buy = r.get("dt22")
-        sell = r.get("dt23")
+        buy = r.get(buy_key)
+        sell = r.get(sell_key)
         if isinstance(buy, (int, float)) and isinstance(sell, (int, float)):
             if prev_buy is not None:
                 b = buy - prev_buy
@@ -260,9 +271,21 @@ class TimelineService:
                 )
                 records = parser(response)
                 if records:
-                    if not plan.level2:
-                        # 普通账号 9355 分时含 dt22/dt23（主动买/卖累计），
-                        # 计算逐分钟增量得到红绿柱买卖力量。
+                    # 指数分时的买卖力量（红绿柱）：Level2 用 dt14/dt15（单调），
+                    # 普通账号 9355 只有 dt22/dt23（回退）。两者都有时优先 dt14/dt15。
+                    # Level2 指数走 parse_timeline_l2_response → 内部转调
+                    # parse_index_timeline_response，字段一致。
+                    if any(
+                        (
+                            isinstance(r.get("dt14"), (int, float))
+                            and isinstance(r.get("dt15"), (int, float))
+                        )
+                        or (
+                            isinstance(r.get("dt22"), (int, float))
+                            and isinstance(r.get("dt23"), (int, float))
+                        )
+                        for r in records
+                    ):
                         _enrich_buy_sell_force(records)
                     if self._evidence is not None and plan.level2:
                         self._evidence.record_feature(
