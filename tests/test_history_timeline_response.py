@@ -169,10 +169,10 @@ def test_normal_history_query_matches_captured_two_part_request():
         market=17,
     )
 
-    assert len(frame) == 283
+    assert len(frame) == 289
     assert hashlib.sha256(frame).hexdigest() == (
-        "df3e66be63fe07726ac1e9bf04fcb07e"
-        "d6113e6ac27194b2c8830c092adb2646"
+        "48c11c53e9b41ad94341cb230f0a1773"
+        "5170ad268dfd03e7c582c23866fc7fed"
     )
     assert b"DateTime=8192(132479582-132479937)" in frame
     assert frame.count(b"pageid=9355") == 2

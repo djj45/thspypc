@@ -25,7 +25,10 @@ INDEX_TIMELINE_MARKETS = frozenset({16, 32, 144})
 INDEX_TIMELINE_FLAGS = frozenset({0x003E, 0x0086, 0x009E})
 # 2026-08-06 抓包确认：普通账号当日分时（pageid=9355, today=True）响应 flag=0x005e，
 # 标准 BitRLE 表，字段含 dt10/dt22/dt23（无 dt40）。纳入 index parser 接受集。
+# 加 dt14/dt15 后 flag 变为 0x0066（rs 从 56→64，多了 2 个 4 字节字段）。
 NORMAL_TODAY_TIMELINE_FLAG = 0x005E
+NORMAL_TODAY_TIMELINE_FLAG_WITH_FORCE = 0x0066
+TODAY_TIMELINE_FLAGS = frozenset({NORMAL_TODAY_TIMELINE_FLAG, NORMAL_TODAY_TIMELINE_FLAG_WITH_FORCE})
 
 TIMELINE_DATATYPE = [14, 13, 19, 54, 10, 23, 15, 22, 6, 45]
 TIMELINE_COMPANION_DATATYPE = [
@@ -139,7 +142,7 @@ def parse_index_timeline_response(body: bytes) -> list[dict]:
         record_count, flag, record_size, field_count = struct.unpack_from(
             "<IHHH", body, base
         )
-        is_today = flag == NORMAL_TODAY_TIMELINE_FLAG
+        is_today = flag in TODAY_TIMELINE_FLAGS
         if (
             record_count == 0
             or flag not in INDEX_TIMELINE_FLAGS and not is_today
