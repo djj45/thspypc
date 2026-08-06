@@ -3,7 +3,8 @@
 > 目标：读这一份文档就能理解 thspypc 如何登录、如何向哪台服务器发送什么请求、如何解析响应，
 > 以及各功能在源码里的位置，无需再逐行翻源码。需要精确到字节时，再按“代码地图”进入对应文件。
 >
-> 适用范围：A 股（沪深）免费 PC 行情。日期基准：2026-08-01，协议以同花顺 PC 客户端抓包逆向为准。
+> 适用范围：A 股（沪深北）免费 PC 行情。日期基准：2026-08-06，协议以同花顺 PC 客户端抓包逆向为准。
+> 2026-08-06 增补：买卖力量字段（dt14/dt15）、北交所（BSE）分时协议（pageid 10443/11695）、main.123ths.com 网关发现。
 > 2026-08-01 增补：系统板块（行业/概念板块指数、成分股）通道与协议、历史分时 packed-date 游标修正。
 
 ---
@@ -115,8 +116,9 @@ fetch_rsa_pubkey()          # 取 RSA 公钥
 
 ### 4.2 TCP 8901 login（`_client/connection_primitives.py`）
 
-1. 从 `M_hqdns` 解析候选域名：MAIN 只取 `main.123ths.com`（缺失时回退 `ifindhq.123ths.com`），
-   L2 只取 `shlv2.123ths.com` / `szlv2.123ths.com`（`resolve_market_hosts` / `resolve_l2_hosts`）。
+1. 从 `M_hqdns` 解析候选域名：MAIN 优先 `main.123ths.com`（passport 不含时硬编码补入，
+   支持北交所 market 151），DNS 失败时回退 `ifindhq.123ths.com`；L2 只取 `shlv2.123ths.com` /
+   `szlv2.123ths.com`（`resolve_market_hosts` / `resolve_l2_hosts`）。
 2. **并发 TCP 测速**选最快 IP，再**并发向多个 IP 发 login 帧**，取第一个 `VerifyCode=0` 的连接，
    其余关闭——复刻 hexin 策略，避免串行重复 login 触发 `VerifyCode=-1` 会话冲突。
 3. login 帧（`features/auth_protocol.build_login_body`）：
@@ -172,7 +174,7 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 | 角色 | 地址 | 登录/init | 权限前提 | 已验证用途 |
 |---|---|---|---|---|
 | HTTP | `auth.10jqka.com.cn:80` | 三步鉴权 | 有效账号/二维码 | passport、signature、M_hqdns |
-| MAIN | `main.123ths.com:8901`（优先）/ `ifindhq.123ths.com:8901`（回退） | 普通登录 + 标准 init | `BASIC_*` | 日K、9354 当日分时、9355 历史分时、早盘/尾盘竞价、股票列表、批量行情 |
+| MAIN | `main.123ths.com:8901`（优先，支持北交所）/ `ifindhq.123ths.com:8901`（回退，不支持北交所） | 普通登录 + 标准 init | `BASIC_*` | 日K、9355 当日分时、9355 历史分时、早盘/尾盘竞价、股票列表、批量行情、北交所分时(10443/11695) |
 | SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + thsuser 壳；init `16;144;` | `L2_MARKET_ACCESS` + `L2_*` | 沪市 L2 分时、竞价、快照推送、历史分时 |
 | SZ_L2 | `szlv2.123ths.com:8901` | 同左；init `32;` | 同左 | 深市 L2 同左 |
 | BOARD | `fu4.123ths.com:8901` | 板块壳（身份回退链 BOARD→STANDARD→MANUAL）；引导 subreal URS/UCT/UNX/UCX/UME → `MarketCode=96;128;88;216;48;` → qureal-init×10 → `[5],[55]` 分类表 → StockNameVer | `ConnectionRole.BOARD` | 板块行情/分时/竞价（仅板块指数，不做成分股） |
@@ -218,6 +220,8 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 | 板块行情列表 | 板块通道 | L2 5716/1341 · 普通 392 | 8192 | 见 11.2 | fu4 | hd3.1 0x130 |
 | 板块指数分时/竞价 | 板块通道 | L2 6002 · 普通 4181 | 8192(packed) / unix 区间 | 见 11.2 | fu4 | 0x42 / 0x32 |
 | 板块成分股 | 成分连接 | L2 6000 · 普通 4180 | 8192 | 见 11.2 | main/shlv2/szlv2 | hd3.1 0x64 |
+| **北交所个股分时** | 普通/L2 | **10443** | 8192(0-0) | 14,13,19,54,10,23,15,22 | **main** | hd3.1 0x0046 |
+| **北证50指数分时** | 普通/L2 | **11695** | 8192(0-0) | 272,207,42,271,… | **main** | hd3.1 0x006e |
 | 短线精灵历史翻页 | 任意 | —（纯文本协议） | — | `DXJL_DATATYPE` | REALORDER 9601 | hq1.0 |
 
 > 竞价类请求的 `DateTime` 两个参数是 **unix 时间戳区间**（如 9:15-9:25）；分时/历史分时是
@@ -237,23 +241,27 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 客户端入口：`client.timeline(code, market=...)` → `TimelineService.timeline` →
 `select_timeline_plan` 按账号自动选 BASIC/LEVEL2。
 
-### 7.1 普通账号（MAIN 9354）
+### 7.1 普通账号（MAIN 9355，2026-08-06 抓包修正）
 
-请求文本（`features/timeline_protocol.py build_timeline_query`，两段子帧流水线）：
+> **2026-08-06 修正**：当日分时走 pageid=**9355**（同历史分时 builder），非 9354（已废弃）。
+> DataType 末尾追加 `14,15`（主动买卖累计量），用于计算买卖力量红绿柱。
+
+请求文本（`features/history_timeline_protocol.py build_normal_history_timeline_query(today=True)`，两段子帧）：
 
 ```text
 CodeList=33(000938,);
-DataType=14,13,19,54,10,23,15,22,6,45,
+DataType=207,13,19,54,204,10,203,210,23,202,209,22,201,208,6,1110,407,1111,14,15,
 DateTime=8192(0-0)
+DTPrevOff=-367
 LackTime=0,3,0,0,0,0,0,0
-pageid=9354
+pageid=9355
 ```
 
-companion 子帧（route 0x0100，DataType 26 个 companion 字段，`DateTime=0(0-0)`）。
-主请求子帧 route `0x010A`，`history_flag=0x20`。
+prefix 子帧 route `0x006C`；query 子帧 route `0x016C`，`history_flag=0x20`。
+加 dt14/dt15 后响应 flag 从 0x005e 变为 **0x0066**（rs 56→64）。
 
-响应：`hd3.1`（flag `0x0042/0x0046`，`record_count=241`），`parse_timeline_response` 先解 8901
-外层再解析。字段示例：`time`、`dt10`(现价)、`dt13`(成交量)、`dt19`(成交额)、`dt14`(主动买量)…
+响应：`hd3.1`（flag 0x0066，`record_count=241`），`parse_index_timeline_response` 解析。
+字段含 dt10(现价)、dt13/dt19(累计量/额)、**dt14/dt15(主动买/卖累计)**。
 
 ### 7.2 Level2 账号（1334，2026-08-05 抓包对齐）
 
@@ -297,6 +305,51 @@ pageid=1334                             # 2026-08-05 改：原 4214，DataType/r
 rows = client.timeline("1A0001")
 print(rows[-1]["dt10"], rows[-1]["lead_price"])
 ```
+
+### 7.4 买卖力量（红绿柱，dt14/dt15）
+
+指数分时图零轴上下的红绿柱（买卖力量对比）来源是 **dt14/dt15**（累计主动买入/卖出量），
+不是 dt22/dt23。
+
+**关键纠正（2026-08-06）**：dt22/dt23 经实测**不是累计主动买卖量**——在 Level2(0x009e)
+和普通账号(0x005e)两张表里都非单调（109-111/82-96 个回撤点），翻转任何单个 bit 都不能修复。
+dt14/dt15 严格单调（0/240），`dt14 + dt15 ≈ dt13`（成交总量）。
+
+| 字段 | 含义 | 单调性 | 买卖力量 |
+|---|---|---|---|
+| **dt14** | 累计主动买入量 | 0/240 ✓ | buy_force = dt14[t] - dt14[t-1] |
+| **dt15** | 累计主动卖出量 | 0/240 ✓ | sell_force = dt15[t] - dt15[t-1] |
+| dt22 | 实时快照（非累计） | 109/240 ✗ | ✗ 不可用 |
+| dt23 | 实时快照（非累计） | 82/240 ✗ | ✗ 不可用 |
+
+`services/timeline.py _enrich_buy_sell_force` 在分时 records 含 dt14/dt15 时自动计算：
+- `buy_force`：本分钟主动买入量
+- `sell_force`：本分钟主动卖出量
+- `net_force = buy_force - sell_force`（正=红柱/买强，负=绿柱/卖强）
+
+普通账号 9355 和 Level2 1334 的 DataType 都含 14/15，结果完全一致。
+**北证50（899050）dt14/dt15 全为 0**——服务端不提供北交所指数的主动买卖拆分，
+与同花顺客户端一致（客户端也没有北证50 买卖力量）。
+
+### 7.5 北交所分时（BSE，pageid 10443/11695）
+
+北交所（BSE）用与沪深完全不同的 pageid 和 market 码，走 `main.123ths.com` 的 MAIN 连接
+（不分 BASIC/LEVEL2，均走 MAIN）：
+
+| 标的 | market | pageid | DataType | dt14/dt15 | 响应 flag |
+|---|---|---|---|---|---|
+| 北交所个股（920xxx/83xxx/43xxx/87xxx） | **151** | **10443** | `14,13,19,54,10,23,15,22` | ✓ 含 | 0x0046 |
+| 北证50 指数（899050） | **144** | **11695** | `272,207,42,271,228,13,…` | ✗ 无 | 0x006e |
+
+**网关发现（关键）**：北交所数据只在 `main.123ths.com` 的 IP 上可用（如 `218.245.102.0`），
+`ifindhq.123ths.com` 不支持。`resolve_market_hosts` 硬编码优先 `main.123ths.com`（passport
+不含此域名），DNS 失败时才 fallback ifindhq。init MarketCode 不需要加 151。
+
+请求 builder：`build_beijing_timeline_query`（个股，route SUB1=0x014a/SUB2=0x0100）、
+`build_beijing_index_timeline_query`（指数，route SUB1=0x003e/SUB2=0x013e），均为双子帧 0x09。
+parser：`BEIJING_TIMELINE_FLAGS = {0x0046, 0x006e}`，放宽 dt40 要求。
+
+`_market_for_code` 按代码前缀路由：`43/83/87/920` → market 151，`899` → market 144。
 
 ---
 
@@ -717,6 +770,11 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
     或无符号整数解释都会得到错误曲线。
 13. **历史指数无竞价**：只有上证指数、深证成指、创业板指有当天尾盘竞价，不要把个股历史竞价
     协议套到指数上，也不要用空数组伪装成服务端存在历史竞价数据。
+14. **买卖力量用 dt14/dt15，不是 dt22/dt23**：dt22/dt23 是实时快照（非累计、非单调），
+    翻转任何 bit 都不修复；dt14/dt15 严格单调（`dt14+dt15≈dt13`），是真正的主动买卖累计量。
+15. **北交所走独立 pageid + main.123ths.com**：个股 market=151/pageid=10443，指数 market=144/
+    pageid=11695，均走 main.123ths.com 的 MAIN 连接。ifindhq 不支持北交所。北证50 无买卖力量
+    （dt14/dt15 全 0，与客户端一致）。
 
 ---
 
@@ -727,8 +785,8 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
 | `src/thspypc/client.py` | `THSClient` 门面、连接治理、`_run_default_service`、K线周期映射 |
 | `src/thspypc/protocol.py` | HTTP 鉴权、login/init/heartbeat 帧、8901 压缩入口、公共常量 |
 | `src/thspypc/features/auth_protocol.py` | login 帧构造（thsuser/__manual）、login 响应解析 |
-| `src/thspypc/features/timeline_protocol.py` | 当日分时请求 + hd3.1 解析；指数 dt40 有符号解码与黄线还原 |
-| `src/thspypc/features/history_timeline_protocol.py` | 个股 9355/4417、指数 77 历史分时请求 + hd1.0 解析、bar 游标编码 |
+| `src/thspypc/features/timeline_protocol.py` | 当日分时请求 + hd3.1 解析；指数 dt40 有符号解码与黄线还原；买卖力量 flag (0x005e/0x0066/0x0046/0x006e) |
+| `src/thspypc/features/history_timeline_protocol.py` | 个股 9355/4417、指数 77 历史分时请求 + hd1.0 解析、bar 游标编码；北交所分时 builder (10443/11695) |
 | `src/thspypc/features/auction_protocol.py` | 个股竞价表与指数 6240 T_URL builder/parser（Auction/CloseAuction） |
 | `src/thspypc/features/kline_protocol.py` | K线请求构造 + hd3.1 BitRLE 解析 |
 | `src/thspypc/features/system_blocks.py` | 本地 block_hq 缓存解析（离线 oracle：板块树/概念/行业） |
@@ -913,12 +971,10 @@ UNX/UCX/UME）一次性注册**五大指数全局推送列表**，服务端持�
 （2026-08-05 盘中）：399001=14129/+1.76%、1A0001=3872/+1.32%、1B0680=1928/+4.72%、
 899050=1114。
 
-### 17.4 北证50 分时解析兼容（✅ 已修复 2026-08-05）
+### 17.4 北证50 分时（✅ 已实现 2026-08-06）
 
-北证50（899050）当日分时响应走 pageid=9354，但返回 ``flag=0x0046`` 的 hd3.1 表
-（230 点，字段表 dt14,dt13,dt19,dt54,dt10,dt23,dt15,dt22），无 dt40 领先线。
-现有 ``parse_timeline_response`` 只接受指数分时 flag（0x3E/0x86/0x9E + dt40）或
-个股分时 ``record_count==241``，两者都拒绝导致超时。
+北证50（899050，market=144）当日分时走**专用 pageid=11695**（非 9354/9355），
+走 `main.123ths.com` 的 MAIN 连接。DataType `272,207,42,271,228,13,…`（Level2 风格，
+无 dt14/dt15 → **无买卖力量**，与同花顺客户端一致）。响应 flag=0x006e。
 
-**修复**：``timeline_protocol.py`` 个股分时路径放宽 ``record_count`` 约束
-（200-242，兼容北证50 的 230 点）+ shell 市场标记扩展（0x11/0x12/0x13/0x21/0x25）。
+详见 §7.5 北交所分时。
