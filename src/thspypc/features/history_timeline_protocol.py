@@ -8,7 +8,11 @@ from collections.abc import Sequence
 from datetime import date as date_type
 from datetime import datetime
 
-from ..codecs.compression import normalize_8901_response
+from ..codecs.compression import (
+    _decode_bitrle_0x13746d0,
+    _transpose_bitplane_0x1763410,
+    normalize_8901_response,
+)
 from ..codecs.framing import encode_frame
 from ..codecs.numeric import decode_ths_float
 from .timeline_protocol import TIMELINE_PERIOD
@@ -77,6 +81,9 @@ NORMAL_HISTORY_TIMELINE_DATATYPE = [
 ]
 INDEX_HISTORY_TIMELINE_PAGEID = 77
 INDEX_HISTORY_TIMELINE_DATATYPE = [13, 19, 40, 10, 23, 22, 6]
+# 北证50 指数（899050）历史分时 pageid=5703（2026-08-07 盘后抓包确认，
+# 与沪/深指数历史分时的 77 不同；DataType 相同 = [13,19,40,10,23,22,6]）
+BEIJING_INDEX_HISTORY_PAGEID = 5703
 HISTORY_TIMELINE_BAR_SPAN = 355
 
 TIMELINE_BAR_EPOCH_ORDINAL = 675064
@@ -378,6 +385,9 @@ def build_index_history_timeline_query(
     date=None,
 ) -> bytes:
     """Build the captured pageid=77 index historical-timeline request."""
+    if market == 144 and code.startswith("899"):
+        # 北证50 指数历史分时走 pageid=5703（2026-08-07 盘后抓包）
+        pageid = BEIJING_INDEX_HISTORY_PAGEID
     if date is not None:
         bar_start = date_to_normal_timeline_bar(date)
     if bar_start is None:
@@ -572,7 +582,13 @@ def parse_history_timeline_response(
             )
             return []
 
-    requested = tuple(requested_codes or ())
+    # code 单独传入时（如字母代码 1A0001/1B0680，显式壳标签正则匹配不到），
+    # 把它作为请求代码序，保证 assigned_code 能对上。
+    requested = (
+        tuple(requested_codes)
+        if requested_codes
+        else ((code,) if code else ())
+    )
     table_index = 0
     pos = 0
     candidates: list[
@@ -582,10 +598,24 @@ def parse_history_timeline_response(
             bool,
         ]
     ] = []
+    # 北证50 指数历史分时（hd3.1 BitRLE）解码产物：
+    # (解码后行 buffer, [(row_offset, bar_index)], 字段表)
+    bitrle_buffers: list[
+        tuple[bytes, list[tuple[int, int]], tuple[tuple[int, int, int, int], ...]]
+    ] = []
     while True:
-        marker = body.find(b"hd1.0", pos)
-        if marker < 0:
+        p1 = body.find(b"hd1.0", pos)
+        p3 = body.find(b"hd3.1", pos)
+        # 北证50 指数历史分时响应是 hd3.1 标记（2026-08-07 盘后抓包），
+        # 其余指数/个股是 hd1.0；表头布局一致，统一按最近标记扫描。
+        if p1 < 0 and p3 < 0:
             break
+        if p1 < 0:
+            marker = p3
+        elif p3 < 0 or p1 < p3:
+            marker = p1
+        else:
+            marker = p3
         pos = marker + 6
         base = marker + 6
         if base + 10 > len(body):
@@ -612,7 +642,14 @@ def parse_history_timeline_response(
         ):
             continue
 
-        next_marker = body.find(b"hd1.0", pos)
+        next_p1 = body.find(b"hd1.0", pos)
+        next_p3 = body.find(b"hd3.1", pos)
+        if next_p1 < 0:
+            next_marker = next_p3
+        elif next_p3 < 0:
+            next_marker = next_p1
+        else:
+            next_marker = min(next_p1, next_p3)
         block_end = next_marker if next_marker >= 0 else len(body)
         if flag in (0x0042, 0x007E, 0x0082):
             # 0x0082 与 0x007E/0x0042 一样有内联字段表（fc×4B，紧跟 header），
@@ -655,8 +692,64 @@ def parse_history_timeline_response(
             else explicit_code
         )
         table_index += 1
-        if code is not None and code not in (explicit_code, assigned_code):
+        # 显式壳标签优先；缺失时才用请求代码序（2026-08-07 修正：
+        # 混合响应里基准表 explicit="399002" 不能用 assigned 兜底而误收）。
+        label = explicit_code if explicit_code is not None else assigned_code
+        if code is not None and code != label:
             continue
+
+        marker_kind = body[marker : marker + 5]
+        if (
+            marker_kind == b"hd3.1"
+            and flag == 0x0042
+            and record_size == 28
+            and field_count == 7
+        ):
+            # 北证50 指数历史分时（899050，pageid=5703）响应是 hd3.1 BitRLE 表
+            # （2026-08-07 盘后抓包）：壳 26B（16 00 01 00 + 0x90 + 6 位代码 +
+            # 填充），随后 BE u32 expected_size = count × hs，再是 BitRLE 位流。
+            shell_off = base + 10 + field_count * 4
+            if shell_off + 30 <= block_end:
+                shell = body[shell_off : shell_off + 26]
+                bitrle_off = shell_off + 26
+                count = record_count & 0xFFFF
+                expected = count * record_size
+                if (
+                    shell[:4] == b"\x16\x00\x01\x00"
+                    and struct.unpack_from(">I", body, bitrle_off)[0] == expected
+                ):
+                    bitplane = _decode_bitrle_0x13746d0(
+                        body[bitrle_off:],
+                        expected,
+                    )
+                    if len(bitplane) >= expected:
+                        rows_bytes = _transpose_bitplane_0x1763410(
+                            bitplane,
+                            record_size,
+                            count,
+                        )
+                        if len(rows_bytes) >= expected:
+                            buffer = bytes(rows_bytes)
+                            # 北证50 历史分时响应 241 个有效点、bar 有固定缺口
+                            # （2026-08-07 抓包实测），不要求连续，只保留合法 bar 行。
+                            valid_rows = [
+                                (i * record_size, bar)
+                                for i in range(count)
+                                if 100_000_000
+                                <= (
+                                    bar := struct.unpack_from(
+                                        "<I", buffer, i * record_size
+                                    )[0]
+                                )
+                                <= 200_000_000
+                            ]
+                            if len(valid_rows) >= _HISTORY_TIMELINE_MIN_TABLE_ROWS:
+                                bitrle_buffers.append((
+                                    buffer,
+                                    valid_rows,
+                                    tuple(fields),
+                                ))
+                                continue
 
         first_row = _history_timeline_first_row(
             body,
@@ -675,7 +768,24 @@ def parse_history_timeline_response(
         candidates.append((tuple(fields), rows, level2_table))
 
     if not candidates:
-        return []
+        if not bitrle_buffers:
+            return []
+        # 899050 历史分时只有 BitRLE 表；按 bar_index 排序后从解码 buffer 解码。
+        buffer, rows, fields = bitrle_buffers[0]
+        merged: dict[int, tuple[int, tuple]] = {
+            bar: (row_offset, fields)
+            for row_offset, bar in rows
+        }
+        ordered = sorted(merged.items())
+        rows_out = [(offset, bar) for bar, (offset, _f) in ordered]
+        if len(rows_out) < _HISTORY_TIMELINE_NORMAL_MIN_ROWS:
+            return []
+        return _decode_history_timeline_rows(
+            buffer,
+            rows_out,
+            fields,
+            record_size,
+        )
 
     # 稀疏响应会把同一代码/同一日期的行拆到多张 0x42 表里（行段乱序），
     # 合并后再统一解码；不同形状（普通 vs Level2）的表不合并。

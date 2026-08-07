@@ -1,5 +1,9 @@
 # 沪市竞价 32 位离线 Harness 实施计划
 
+> ⚠ 2026-08-07：本计划针对的「沪市 7169/7176 变长编码需 x32dbg 逆向」前提已被
+> `HANDOFF_KANPAN_CAPTURE_20260805.md` §J.6bis 推翻（normalize 后沪深同构定长），
+> `_parse_auction_sh` 兜底也已删除。本文仅作历史存档。
+
 > 状态：hlib 请求链已排除；hexin CHQuoteFile 入口已由内存快照静态确认
 > 创建日期：2026-07-27
 > 工作分支：`feat/stock-list-full`

@@ -391,6 +391,7 @@ class TimelineService:
                 if (
                     not response.startswith(b"\x0a")
                     and b"hd1.0" not in response
+                    and b"hd3.1" not in response
                 ):
                     continue
                 saw_history_frame = True

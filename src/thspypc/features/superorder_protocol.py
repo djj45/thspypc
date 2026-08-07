@@ -66,6 +66,30 @@ _SEQ_MAX = 100_000_000
 SNAPSHOT_REPLAY_PERIOD = 4096
 SNAPSHOT_REPLAY_PAGEID = 4260
 SNAPSHOT_REPLAY_FLAG = 0x00FE
+# 4417 盘后/历史通道（2026-08-07 盘后抓包确认）：同花顺客户端超级盘口在盘后/历史
+# 走 pageid=4417 + period=4096，响应是 flag=0x009E hs=120 fc=30 的定长行主序表
+# （dt1=unix 秒、dt10=最新价），与盘中 4260@4096 的 0x00FE/216/54 布局不同。
+SNAPSHOT_REPLAY_HIST_PAGEID = 4417
+SNAPSHOT_REPLAY_HIST_FLAG = 0x009E
+SNAPSHOT_REPLAY_HIST_RECORD_SIZE = 120
+SNAPSHOT_REPLAY_HIST_FIELD_COUNT = 30
+# 指数历史超级盘口（2026-08-07 盘后抓包）：pageid=77 + period=4096，
+# 响应是 hd1.0 flag=0x0046 hs=32 fc=8 行主序，字段 [dt1,dt10,dt13,dt19,dt49,dt18,dt123,dt125]。
+# 与 7169 逐笔同 flag/hs/fc，但字段表不同（7169 是 dt1/dt56/dt10/...），靠 dt10@4 区分。
+SNAPSHOT_REPLAY_INDEX_FLAG = 0x0046
+SNAPSHOT_REPLAY_INDEX_RECORD_SIZE = 32
+SNAPSHOT_REPLAY_INDEX_FIELD_COUNT = 8
+# 指数历史超级盘口 pageid（2026-08-07 盘后抓包：1A0001/1B0680/399001/399006
+# 均走 pageid=77 + period=4096；北证50 无历史超级盘口）
+SNAPSHOT_REPLAY_INDEX_PAGEID = 77
+# 4417@4096 请求 DataType（2026-08-07 盘后抓包 fr1986 字节级确认）
+SNAPSHOT_REPLAY_HIST_DATATYPE = [
+    7, 10, 12, 13, 18, 19, 20, 21,
+    25, 26, 27, 28, 29, 31, 32, 33, 34, 35,
+    49, 75, 123, 125,
+    150, 151, 152, 153, 154, 155, 156, 157,
+    6, 66, 1110,
+]
 # 请求 DataType：十档价量（dt24-35 + dt102-125）+ dt10/13/19/49/74/75 + 扩展
 SNAPSHOT_REPLAY_DATATYPE = [
     10, 12, 13, 14, 18, 19, 20, 21,
@@ -356,22 +380,107 @@ def build_snapshot_replay_query(
     pageid: int = SNAPSHOT_REPLAY_PAGEID,
     seq: int = 0x00C0,
     companion_seq: int = 0x00C2,
+    start_ts: int = 0,
+    end_ts: int = 0,
 ) -> bytes:
-    """构造 4096 盘口快照回放请求（pageid=4260，超级盘口分时曲线）。
+    """构造 4096 盘口快照回放请求（超级盘口分时曲线）。
 
-    双子帧 0x09（route=0x0158）：SUB1=盘口快照主体（DataType 含十档），
-    SUB2=伴随查询（DataType=7,10,2419,...）。
-    DateTime=4096(0-0) 返回全天每 3 秒一个完整盘口快照（~4927 点）。
+    - ``pageid=4417``（盘后/历史）：**单子帧** 0x09/0x017d，字节对齐
+      2026-08-07 盘后抓包 fr1986（DataType=7,10,12,13,...,157,6,66,1110）。
+    - ``pageid=4260``（盘中）：双子帧 0x09（route=0x0158），SUB1=盘口快照主体
+      （DataType 含十档），SUB2=伴随查询（DataType=7,10,2419,...）。
+    DateTime=4096(<start>-<end>)：
+      - 0-0：当日全天每 3 秒一个完整盘口快照（~4927 点）
+      - 绝对 unix 秒区间：历史日期（如 4096(1785979800-1785999660) = 08-06 全天）
+      - 相对负区间：如 4096(-6-0)
+    pageid：盘中 4260（默认）；盘后/历史 4417（2026-08-07 抓包确认）。
 
     Args:
         code: 股票代码（如 ``"000938"``）。
         market: 市场码（17=沪, 33=深）。
+        pageid: 4260（盘中）或 4417（盘后/历史）。
+        start_ts: 区间起点 unix 秒；0 = 当日全天/从开头。
+        end_ts: 区间终点 unix 秒；0 = 到当前/收盘。也可传负值表示相对窗口。
     """
     target = f"{market}({code},);"
+    if pageid == SNAPSHOT_REPLAY_HIST_PAGEID:
+        # 单子帧形态（抓包 fr1986，字节级对齐）
+        dt_text = ",".join(str(v) for v in SNAPSHOT_REPLAY_HIST_DATATYPE) + ","
+        text = (
+            f"CodeList={target}\r\n"
+            f"DataType={dt_text}\r\n"
+            f"DateTime={SNAPSHOT_REPLAY_PERIOD}({start_ts}-{end_ts})\r\n"
+            f"LackTime=0,0,0,0,0,0,0,0\r\n"
+            f"pageid={pageid}\r"
+        ).encode("gbk")
+        header = bytearray(23)
+        header[0] = 0x09
+        header[1:5] = b"\x00\x16\x00\x00"
+        struct.pack_into("<H", header, 5, seq & 0xFFFF)
+        header[7:11] = b"\x12\x00\x09\x00"
+        header[11:13] = b"\x7d\x01"
+        header[13:19] = b"\x00\x00\x00\x00\x00\x10"
+        struct.pack_into("<I", header, 19, len(text) + 1)
+        return encode_frame(bytes(header) + text)
+
+    if pageid == SNAPSHOT_REPLAY_INDEX_PAGEID:
+        # 指数双子帧形态（2026-08-07 盘后抓包 fr112/fr542，字节级对齐）：
+        # 每对 = outer 0x0002/0x0038（CodeList+pageid）+ inner 0x0009/0x0138
+        # （CodeList+DataType+DateTime+LackTime+pageid）。
+        # 客户端一帧内发两对：4096(0-0) + 4096(<请求区间>)，服务器因此回两张表
+        # （今日 + 目标日），由服务层按请求区间过滤出目标日。
+        dt_text = ",".join(str(v) for v in SNAPSHOT_REPLAY_HIST_DATATYPE) + ","
+
+        def _pair(
+            inner_seq: int,
+            start: int,
+            end: int,
+            *,
+            final: bool = False,
+        ) -> bytes:
+            outer_text = (
+                f"CodeList={target}\r\npageid={pageid}\r\n"
+            ).encode("gbk")
+            # 抓包：中间子帧以 \r\n 结尾，帧内最后一个子帧只以 \r 结尾。
+            pageid_suffix = "\r" if final else "\r\n"
+            inner_text = (
+                f"CodeList={target}\r\n"
+                f"DataType={dt_text}\r\n"
+                f"DateTime={SNAPSHOT_REPLAY_PERIOD}({start}-{end})\r\n"
+                f"LackTime=0,0,0,0,0,0,0,0\r\n"
+                f"pageid={pageid}{pageid_suffix}"
+            ).encode("gbk")
+            # 帧级 0x09 只出现一次（在 encode_frame 前手动加），
+            # 每对的 outer 头是 22B，无 0x09（2026-08-07 抓包字节确认）。
+            outer_header = bytearray(22)
+            outer_header[0:4] = b"\x00\x16\x00\x00"
+            outer_header[6:10] = b"\x12\x00\x02\x00"
+            outer_header[10:12] = b"\x38\x00"
+            struct.pack_into("<I", outer_header, 18, len(outer_text))
+            inner_header = bytearray(22)
+            inner_header[0:4] = b"\x00\x16\x00\x00"
+            struct.pack_into("<H", inner_header, 4, inner_seq & 0xFFFF)
+            inner_header[6:10] = b"\x12\x00\x09\x00"
+            inner_header[10:12] = b"\x38\x01"
+            inner_header[12:18] = b"\x00\x00\x00\x00\x00\x10"
+            # 抓包：帧内最后一个子帧的 length 字段 = 文本长度 + 1（与 4417 单帧一致）
+            struct.pack_into(
+                "<I",
+                inner_header,
+                18,
+                len(inner_text) + (1 if final else 0),
+            )
+            return bytes(outer_header) + outer_text + bytes(inner_header) + inner_text
+
+        body = _pair(seq, 0, 0, final=(start_ts <= 0 and end_ts <= 0))
+        if start_ts > 0 or end_ts > 0:
+            body += _pair(companion_seq, start_ts, end_ts, final=True)
+        return encode_frame(b"\x09" + body)
+
     dt_text = ",".join(str(v) for v in SNAPSHOT_REPLAY_DATATYPE) + ","
     main_text = (
         f"CodeList={target}\r\nDataType={dt_text}\r\n"
-        f"DateTime={SNAPSHOT_REPLAY_PERIOD}(0-0)\r\n"
+        f"DateTime={SNAPSHOT_REPLAY_PERIOD}({start_ts}-{end_ts})\r\n"
         f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
     ).encode("gbk")
     comp_dt = ",".join(str(v) for v in SNAPSHOT_REPLAY_COMPANION_DATATYPE) + ","
@@ -396,12 +505,17 @@ def build_snapshot_replay_query(
 
 
 def parse_snapshot_replay_response(body: bytes) -> list[dict]:
-    """解析 4096 盘口快照回放响应（hd1.0 行主序，flag=0x00FE）。
+    """解析 4096 盘口快照回放响应（hd1.0 行主序）。
 
     每条记录是一个时刻的完整盘口快照（~3 秒间隔），含：
     - ``time``：dt1 unix 时间戳 → datetime
     - ``price``：dt10 最新价
     - 十档买卖价量（dt24-35 买1-买5/卖1-卖5 + dt102-125 六~十档）
+
+    支持两种服务端布局：
+    - 盘中 4260 通道：flag=0x00FE，hs=216，fc=54（2026-08-06 破译）
+    - 盘后/历史 4417 通道：flag=0x009E，hs=120，fc=30（2026-08-07 抓包确认，
+      字段为 dt1/10/13/12/20/21/49/18/19/75 + 买卖档位，无 102-125）
 
     Args:
         body: 8901 响应帧（可能含 0x0a 外层压缩）。
@@ -416,10 +530,26 @@ def parse_snapshot_replay_response(body: bytes) -> list[dict]:
             logger.debug("snapshot replay normalization failed: %s", exc)
             return []
 
-    pos = body.find(b"hd1.0")
-    if pos < 0:
-        return []
-    base = pos + 6
+    records: list[dict] = []
+    pos = 0
+    while True:
+        marker = body.find(b"hd1.0", pos)
+        if marker < 0:
+            break
+        pos = marker + 6
+        table_records = _parse_snapshot_replay_table(body, marker)
+        if table_records:
+            records.extend(table_records)
+    return records
+
+
+def _parse_snapshot_replay_table(body: bytes, marker_pos: int) -> list[dict]:
+    """解析单个 hd1.0 快照回放表（0xFE / 0x9E / 0x46 布局）。
+
+    一个响应帧可能含多张表（如指数帧 = 今日 + 请求历史日），主解析器遍历全部
+    hd1.0 标记并逐表调用本函数，结果按顺序拼接。
+    """
+    base = marker_pos + 6
     if base + 10 > len(body):
         return []
 
@@ -427,8 +557,17 @@ def parse_snapshot_replay_response(body: bytes) -> list[dict]:
     flag = struct.unpack_from("<H", body, base + 4)[0]
     record_size = struct.unpack_from("<H", body, base + 6)[0]
     field_count = struct.unpack_from("<H", body, base + 8)[0]
-    if flag != SNAPSHOT_REPLAY_FLAG or record_size == 0 or record_count == 0:
+    if flag not in (
+        SNAPSHOT_REPLAY_FLAG,
+        SNAPSHOT_REPLAY_HIST_FLAG,
+        SNAPSHOT_REPLAY_INDEX_FLAG,
+    ):
         return []
+    if record_size == 0 or record_count == 0:
+        return []
+    # 历史嵌套帧的 dc 高 16 位是壳标记，低 16 位才是记录数（如 0x040012E2 → 4834）
+    if record_count > 0xFFFF:
+        record_count &= 0xFFFF
 
     # 字段表（fc 可能 >50，手动解析）
     ft_off = base + 10
@@ -443,7 +582,28 @@ def parse_snapshot_replay_response(body: bytes) -> list[dict]:
     shell_off = ft_off + field_count * 4
     if shell_off + 22 > len(body):
         return []
+    # 行起点：优先用「壳后连续 ≥2 条合法 unix 秒」定位（历史帧壳后有 0xFF 填充），
+    # 找不到再退回 shell+22。
     data_off = shell_off + 22
+    best = None
+    for ds in range(shell_off + 18, min(shell_off + 160, len(body) - record_size * 2)):
+        n = 0
+        prev = None
+        for i in range(8):
+            o = ds + i * record_size
+            if o + 4 > len(body):
+                break
+            v = struct.unpack_from("<I", body, o)[0]
+            if not (1_700_000_000 <= v <= 1_900_000_000):
+                break
+            if prev is not None and not (0 < v - prev <= 300):
+                break
+            prev = v
+            n += 1
+        if n > (best[0] if best else 0):
+            best = (n, ds)
+    if best is not None and best[0] >= 2:
+        data_off = best[1]
 
     # 字段偏移表
     offsets = {}
@@ -451,13 +611,40 @@ def parse_snapshot_replay_response(body: bytes) -> list[dict]:
     for dt, fmt, _flags, width in fields:
         offsets[dt] = (off, width)
         off += width
+    # 指数 0x46/32/8 布局与 7169 逐笔同 flag，必须用字段表区分：
+    # 指数快照 dt1@0、dt10@4；7169 逐笔 dt1@0、dt56@4。
+    if flag == SNAPSHOT_REPLAY_INDEX_FLAG and (
+        offsets.get(1) != (0, 4) or offsets.get(10) != (4, 4)
+    ):
+        return []
+    if offsets.get(1) is None or offsets.get(10) is None:
+        return []
 
     records: list[dict] = []
+    prev_ts: int | None = None
+    first_date = None
     for index in range(record_count):
         row_start = data_off + index * record_size
         row = body[row_start : row_start + record_size]
         if len(row) < record_size:
             break
+        # dt1 时间戳校验：合法 unix 秒 + 与首行同日期 + 间隔 ≤2h（午休 11:30-13:00），
+        # 超出即截断（历史嵌套帧尾部会混入后续小表的字节）。
+        ts_value = struct.unpack_from("<I", row, offsets[1][0])[0]
+        if not (1_700_000_000 <= ts_value <= 1_900_000_000):
+            break
+        from datetime import datetime as _datetime
+        try:
+            ts_date = _datetime.fromtimestamp(ts_value).date()
+        except (OSError, ValueError, OverflowError):
+            break
+        if first_date is None:
+            first_date = ts_date
+        elif ts_date != first_date:
+            break
+        if prev_ts is not None and not (0 < ts_value - prev_ts <= 7200):
+            break
+        prev_ts = ts_value
         rec: dict = {}
         for dt, (value_off, width) in offsets.items():
             chunk = row[value_off : value_off + width]
@@ -474,7 +661,8 @@ def parse_snapshot_replay_response(body: bytes) -> list[dict]:
             elif dt in (24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
                         102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
                         112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
-                        122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157):
+                        122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157,
+                        18):
                 rec[f"dt{dt}"] = decode_ths_float(raw_value)
         records.append(rec)
     return records
@@ -492,6 +680,15 @@ __all__ = [
     "SNAPSHOT_REPLAY_PAGEID",
     "SNAPSHOT_REPLAY_DATATYPE",
     "SNAPSHOT_REPLAY_FLAG",
+    "SNAPSHOT_REPLAY_HIST_PAGEID",
+    "SNAPSHOT_REPLAY_HIST_FLAG",
+    "SNAPSHOT_REPLAY_HIST_RECORD_SIZE",
+    "SNAPSHOT_REPLAY_HIST_FIELD_COUNT",
+    "SNAPSHOT_REPLAY_HIST_DATATYPE",
+    "SNAPSHOT_REPLAY_INDEX_FLAG",
+    "SNAPSHOT_REPLAY_INDEX_RECORD_SIZE",
+    "SNAPSHOT_REPLAY_INDEX_FIELD_COUNT",
+    "SNAPSHOT_REPLAY_INDEX_PAGEID",
     "build_superorder_query",
     "parse_superorder_response",
     "build_snapshot_replay_query",

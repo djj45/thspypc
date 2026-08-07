@@ -280,3 +280,125 @@ def test_protocol_reexports_superorder():
     assert protocol.build_superorder_query is superorder_protocol.build_superorder_query
     assert protocol.parse_superorder_response is superorder_protocol.parse_superorder_response
     assert protocol.SUPERORDER_PERIOD == 7169
+
+
+# ────────────────── 4096 盘口快照回放（超级盘口分时曲线）──────────────────
+
+def test_build_snapshot_replay_query_4417_matches_capture_fixture():
+    """4417@4096 单子帧请求与 2026-08-07 盘后抓包 fr1986 字节级一致。"""
+    fixture = FIXTURES / "req_002384_4417_p4096.bin"
+    if not fixture.exists():
+        pytest.skip("本机无 4417@4096 抓包 fixture")
+    ref = fixture.read_bytes()
+    built = superorder_protocol.build_snapshot_replay_query(
+        "002384",
+        market=33,
+        pageid=superorder_protocol.SNAPSHOT_REPLAY_HIST_PAGEID,
+        seq=0x1195,
+        start_ts=1785979800,
+        end_ts=1785999660,
+    )
+    assert built[12:] == ref
+    assert _sha256(built) == (
+        "8176fac827f588fb448565c589af107a"
+        "6f288ac5e539a718e3e8aaca46392d60"
+    )
+
+
+def test_build_snapshot_replay_query_4417_structure():
+    """4417 历史请求文本：DataType/DateTime/pageid 与抓包一致。"""
+    frame = superorder_protocol.build_snapshot_replay_query(
+        "002384",
+        market=33,
+        pageid=superorder_protocol.SNAPSHOT_REPLAY_HIST_PAGEID,
+        start_ts=1785979800,
+        end_ts=1785999660,
+    )
+    body = frame[12:].decode("gbk", errors="replace")
+    assert "pageid=4417" in body
+    assert "DateTime=4096(1785979800-1785999660)" in body
+    assert (
+        "DataType=7,10,12,13,18,19,20,21,25,26,27,28,29,31,32,33,34,35,"
+        "49,75,123,125,150,151,152,153,154,155,156,157,6,66,1110,"
+    ) in body
+
+
+def test_parse_snapshot_replay_response_0x9e_synthetic():
+    """4417@4096 响应（flag=0x9E，hs=120，fc=30）合成帧可解析出价/时间。"""
+    fields = [(1, 0x30, 4), (10, 0x70, 4), (13, 0x70, 4), (12, 0x30, 4)]
+    fields += [(20 + i, 0x70, 4) for i in range(26)]
+    field_table = b"".join(
+        bytes((dt, fmt, 0, width)) for dt, fmt, width in fields
+    )
+    shell = bytes.fromhex(
+        "16000100213030323338340000000000000000003813"
+    )
+    price_raw = 0x9000076C  # ths_float 190.0
+    rows = b"".join(
+        struct.pack("<II", 1786065300 + i * 3, price_raw) + b"\x00" * 112
+        for i in range(3)
+    )
+    body = (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", 3, 0x009E, 120, 30)
+        + field_table
+        + shell
+        + rows
+    )
+    recs = superorder_protocol.parse_snapshot_replay_response(body)
+    assert len(recs) == 3
+    assert [r["price"] for r in recs] == [190.0, 190.0, 190.0]
+    assert [r["time"] for r in recs] == ["09:15:00", "09:15:03", "09:15:06"]
+
+
+def test_build_snapshot_replay_query_77_matches_capture_fixture():
+    """指数 4096@77 双查询对与 2026-08-07 盘后抓包 fr542 字节级一致。"""
+    fixture = FIXTURES / "req_399001_77_p4096.bin"
+    if not fixture.exists():
+        pytest.skip("本机无 4096@77 抓包 fixture")
+    ref = fixture.read_bytes()
+    built = superorder_protocol.build_snapshot_replay_query(
+        "399001",
+        market=32,
+        pageid=superorder_protocol.SNAPSHOT_REPLAY_INDEX_PAGEID,
+        seq=0x123B,
+        companion_seq=0x123D,
+        start_ts=1785979800,
+        end_ts=1785999660,
+    )
+    assert built[12:] == ref
+
+
+def test_parse_snapshot_replay_response_index_multi_table():
+    """指数 0x46/32/8 布局：一帧两张表（今日+历史日）全部返回。"""
+    fields = [(1, 0x30, 0, 4), (10, 0x70, 0, 4), (13, 0x70, 0, 4),
+              (19, 0x70, 0, 4), (49, 0x70, 0, 4), (18, 0x70, 0, 4),
+              (123, 0x70, 0, 4), (125, 0x70, 0, 4)]
+    field_table = b"".join(
+        bytes((dt, fmt, flags, width)) for dt, fmt, flags, width in fields
+    )
+    shell = bytes.fromhex(
+        "16000100203339393030310000000000000000003813"
+    )
+    price_raw = 0x9000076C  # 190.0
+
+    def table(dc: int, base_ts: int) -> bytes:
+        rows = b"".join(
+            struct.pack("<II", base_ts + i * 3, price_raw) + b"\x00" * 24
+            for i in range(3)
+        )
+        return (
+            b"hd1.0\x00"
+            + struct.pack("<IHHH", dc, 0x0046, 32, 8)
+            + field_table
+            + shell
+            + rows
+        )
+
+    body = table(3, 1786065300) + table(0x04000003, 1785978900)
+    recs = superorder_protocol.parse_snapshot_replay_response(body)
+    assert len(recs) == 6
+    assert [r["ts"] for r in recs] == [
+        1786065300, 1786065303, 1786065306,
+        1785978900, 1785978903, 1785978906,
+    ]

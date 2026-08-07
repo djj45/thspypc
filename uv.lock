@@ -491,6 +491,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "pycryptodome" },
+    { name = "qrcode" },
     { name = "requests" },
 ]
 
@@ -513,6 +514,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "pycryptodome", specifier = ">=3.20.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "qrcode", specifier = ">=8.2" },
     { name = "qrcode", marker = "extra == 'qr'", specifier = ">=7.0" },
     { name = "requests", specifier = ">=2.28" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.29" },

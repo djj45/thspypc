@@ -14,6 +14,9 @@ from ..errors import (
 )
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.superorder_protocol import (
+    SNAPSHOT_REPLAY_HIST_PAGEID,
+    SNAPSHOT_REPLAY_INDEX_PAGEID,
+    SNAPSHOT_REPLAY_PAGEID,
     build_snapshot_replay_query,
     build_superorder_query,
     parse_snapshot_replay_response,
@@ -99,7 +102,9 @@ class SuperorderService:
             capability=Capability.L2_TIMELINE,
         )
         # 先 4214 注册（与十档盘口同一套机制；7169 复用 4214 通道）
-        if self._subscriptions is not None:
+        # 指数 77 通道不需要 4214 注册（2026-08-07 盘后抓包确认），
+        # 且 build_snapshot_subscribe 只接受纯数字代码（1A0001/1B0680 会抛错）。
+        if self._subscriptions is not None and pageid != SNAPSHOT_REPLAY_INDEX_PAGEID:
             self._subscriptions.ensure_registered(
                 connection,
                 code,
@@ -165,16 +170,24 @@ class SuperorderService:
         code: str,
         *,
         market: int,
+        start_ts: int = 0,
+        end_ts: int = 0,
+        pageid: int = SNAPSHOT_REPLAY_PAGEID,
         timeout: float = 30.0,
     ) -> list[dict]:
-        """请求并解析 4096 盘口快照回放（pageid=4260，超级盘口分时曲线）。
+        """请求并解析 4096 盘口快照回放（超级盘口分时曲线）。
 
-        返回全天每 ~3 秒一个完整盘口快照（~4927 点），每条记录含十档买卖价量。
-        响应是标准 hd1.0 行主序（flag=0x00FE），非 BitRLE。
+        返回区间内每 ~3 秒一个完整盘口快照（全天 ~4927 点），每条含十档买卖价量。
+        - 盘中 4260@4096(0-0)：flag=0x00FE hs=216 fc=54
+        - 盘后/历史 4417@4096(<start>-<end>)：flag=0x009E hs=120 fc=30
+          （2026-08-07 盘后抓包确认，``SNAPSHOT_REPLAY_HIST_PAGEID``）
 
         Args:
             code: 股票代码（如 ``"000938"``）。
             market: 市场码（17=沪, 33=深）。
+            start_ts/end_ts: 区间 unix 秒；0-0 = 当日全天，绝对区间 = 历史日期，
+                负值 = 相对窗口。
+            pageid: 4260（盘中，默认）或 4417（盘后/历史）。
             timeout: 单次 read_frame 超时（秒）。全天数据 ~500KB，需较长超时。
         """
         profile = self._connections.profile
@@ -195,7 +208,9 @@ class SuperorderService:
             role,
             capability=Capability.L2_TIMELINE,
         )
-        if self._subscriptions is not None:
+        # 指数 77 通道不需要 4214 注册（2026-08-07 盘后抓包确认），
+        # 且 build_snapshot_subscribe 只接受纯数字代码（1A0001/1B0680 会抛错）。
+        if self._subscriptions is not None and pageid != SNAPSHOT_REPLAY_INDEX_PAGEID:
             self._subscriptions.ensure_registered(
                 connection,
                 code,
@@ -203,7 +218,13 @@ class SuperorderService:
                 timeout=min(timeout, 5.0),
             )
 
-        request = build_snapshot_replay_query(code, market=market)
+        request = build_snapshot_replay_query(
+            code,
+            market=market,
+            pageid=pageid,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
         records: list[dict] = []
         saw_frame = False
 
@@ -228,6 +249,14 @@ class SuperorderService:
 
                 if response.startswith(b"\x0a") or b"hd1.0" in response:
                     parsed = parse_snapshot_replay_response(response)
+                    if parsed and start_ts > 0 and end_ts > 0:
+                        # 指数响应一个帧常含多张表（今日 + 请求历史日），
+                        # 按请求区间过滤出目标日期的记录。
+                        parsed = [
+                            r
+                            for r in parsed
+                            if start_ts <= r.get("ts", 0) <= end_ts
+                        ]
                     if parsed:
                         records.extend(parsed)
                         sock.settimeout(2.0)

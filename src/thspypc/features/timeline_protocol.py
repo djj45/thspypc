@@ -18,7 +18,9 @@ from ..codecs.numeric import decode_ths_float
 logger = logging.getLogger(__name__)
 
 TIMELINE_PERIOD = 0x2000
-TIMELINE_PAGEID = 9354
+# 2026-08-06 抓包修正：普通账号当日分时走 9355（同历史分时）；旧 9354 已废弃，
+# 服务端不响应（见 docs/handoffs/HANDOFF_NORMAL_ACCOUNT_PAGEID_4341_20260806.md）。
+TIMELINE_PAGEID = 9355
 TIMELINE_L2_PAGEID = 4214
 
 INDEX_TIMELINE_MARKETS = frozenset({16, 32, 144})
@@ -227,7 +229,7 @@ def build_timeline_query(
     seq: int = 0x1122,
     companion_seq: int = 0x0125,
 ) -> bytes:
-    """Build the two-part pageid=9354 request used by normal accounts."""
+    """Build the two-part pageid=9355 request used by normal accounts."""
     if datatype is None:
         datatype = TIMELINE_DATATYPE
     datatype_text = ",".join(str(value) for value in datatype) + ","
@@ -327,7 +329,7 @@ def build_timeline_l2_query(
 
 
 def parse_timeline_response(body: bytes) -> list[dict]:
-    """Parse the normal-account ``pageid=9354`` intraday table.
+    """Parse the normal-account ``pageid=9355`` intraday table.
 
     The MAIN servers return a single-instrument ``hd3.1`` BitRLE table.  The
     instrument shell uses either ``0x11`` or ``0x21`` depending on market, but

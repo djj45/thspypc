@@ -8,6 +8,7 @@ import struct
 from ..codecs.compression import (
     _decode_bitrle_0x13746d0,
     _transpose_bitplane_0x1763410,
+    normalize_8901_response,
 )
 from ..codecs.framing import encode_frame
 from ..codecs.hd import _parse_hd_field_table, parse_hd3_response
@@ -232,6 +233,14 @@ def build_init_query(
 def parse_init_response(body: bytes) -> dict:
     """Parse server metadata and the largest standard unk=0x18 hd3.1 table."""
     result = {"stocks": [], "server_info": {}, "hd31_frames": []}
+    # 服务器配置帧可能套 cmd=0x0a 外层压缩（2026-08-07 盘后抓包 fr178 实测：
+    # 107KB 压缩帧解压后才含 S-OS/S-Version/S-Name 文本），必须先解压再解析，
+    # 否则 server_info 恒空 → MAIN init 被误判失败。
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("init response 0x0a 解压失败，按原样解析: %s", exc)
     text = body.decode("gbk", errors="replace")
     for key in (
         "S-OS",

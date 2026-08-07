@@ -483,3 +483,30 @@ def test_companion_capture_normalizes_to_native_oracle_bytes():
         if normalized[index : index + 6] == b"hd1.0\x00"
     ]
     assert offsets == [0x8D, 0x5821, 0xAFB5, 0xB025]
+
+
+def test_bse_index_899050_history_bitrle_0x42():
+    """北证50 指数（899050）历史分时：hd3.1 flag=0x42 BitRLE 表可解析出 dt40。
+
+    2026-08-07 盘后抓包 `superorder_20260807_163545.pcap` frame43。
+    行起点用 BitRLE 位平面转置（壳 26B + BE expected_size），bar 有固定缺口，
+    只保留合法 bar 行。
+    """
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "history"
+        / "899050_history_0x42.bin"
+    )
+    if not fixture.exists():
+        pytest.skip("缺少 899050 历史分时 fixture")
+
+    records = parse_history_timeline_response(
+        fixture.read_bytes(),
+        code="899050",
+    )
+    assert len(records) == 241
+    assert all(record.get("dt40") is not None for record in records)
+    assert records[0]["bar_index"] == 132_657_758
+    assert records[-1]["bar_index"] == 132_658_112
+    assert 1000 < records[0]["dt10"] < 1200

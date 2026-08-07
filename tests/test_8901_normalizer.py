@@ -76,26 +76,15 @@ def test_captured_auction_frames_match_x86_oracle():
         assert set(records[0]) == {"time", "dt10", "dt49", "dt27", "dt33"}
 
 
-def test_older_captures_select_fixed_or_stateful_inner_parser():
+def test_older_captures_parse_via_fixed_inner_layout():
     capture_dir = Path(__file__).resolve().parents[1] / "captures_live"
     fixed_path = capture_dir / "_sh_auction_resp_603118.bin"
-    fallback_path = capture_dir / "_sh_auction_resp_600276.bin"
-    if not fixed_path.exists() or not fallback_path.exists():
+    if not fixed_path.exists():
         pytest.skip("本机没有旧沪市竞价语料")
 
     fixed_records = parse_auction_response(fixed_path.read_bytes())
     assert len(fixed_records) == 201
     assert set(fixed_records[0]) == {"time", "dt10", "dt49", "dt27", "dt33"}
-
-    stateful_records = parse_auction_response(fallback_path.read_bytes())
-    assert len(stateful_records) == 159
-    assert set(stateful_records[0]) == {"time", "dt10", "dt49", "dt27", "dt33"}
-    assert stateful_records[12]["time"].strftime("%H:%M:%S") == "09:15:50"
-    assert stateful_records[12]["dt10"] == 54.71
-    assert stateful_records[15]["time"].strftime("%H:%M:%S") == "09:16:08"
-    assert stateful_records[15]["dt33"] == 1100
-    assert stateful_records[16]["time"].strftime("%H:%M:%S") == "09:16:14"
-    assert stateful_records[16]["dt10"] == 54.51
 
 
 def test_auction_sentinel_fields_return_none():

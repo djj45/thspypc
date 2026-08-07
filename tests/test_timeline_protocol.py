@@ -21,13 +21,13 @@ def test_normal_account_timeline_builder_wire_contracts():
 
     assert len(shenzhen) == 359
     assert _sha256(shenzhen) == (
-        "7c58ac0b8e6103924255f4aceda2782f"
-        "0efe271f2fe4867d46b4509ae9eb9f77"
+        "4ce5500b0ff5c599bb1716d0f26972cf"
+        "087b8e36f22200d6386de2d323ce2703"
     )
     assert len(shanghai) == 359
     assert _sha256(shanghai) == (
-        "20dad8b5fff206c0302e3489964beb6cc"
-        "f2a1d3fac55bea08bd3d7ba527af737"
+        "d73511fb128abb85834648a87ef2d361"
+        "2874843440238eff6cc4b0762026cd06"
     )
     assert shanghai[12:] == timeline_protocol.build_timeline_query(
         "603118", market=17

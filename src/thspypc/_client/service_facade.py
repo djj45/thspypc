@@ -7,6 +7,11 @@ from datetime import date as date_type, datetime
 
 from ..errors import ChannelUnavailableError, ProtocolError
 from ..models import AccountKind, Capability, DepthQuote
+from ..features.superorder_protocol import (
+    SNAPSHOT_REPLAY_HIST_PAGEID,
+    SNAPSHOT_REPLAY_INDEX_PAGEID,
+    SNAPSHOT_REPLAY_PAGEID,
+)
 from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
 from ..transport import ConnectionRole
 from .stock_cache import (
@@ -583,7 +588,7 @@ class ServiceFacade:
     ) -> list[dict]:
         """查当日分时图（含指数白线及领先线）。
 
-        普通账号走 MAIN 上的 ``pageid=9354`` 请求-响应；Level2 账号走
+        普通账号走 MAIN 上的 ``pageid=9355`` 请求-响应；Level2 账号走
         ``pageid=4214`` 的市场专用通道。两种响应统一返回逐点行情记录。
 
         Args:
@@ -819,16 +824,23 @@ class ServiceFacade:
         code: str,
         *,
         market: int = 0,
+        start=None,
+        end=None,
         timeout: float = 30.0,
     ) -> list[dict]:
         """查盘口快照回放（period=4096，超级盘口分时曲线）。
 
-        返回全天每 ~3 秒一个完整盘口快照（~4927 点），每条含十档买卖价量。
-        **仅 Level2 账号可用**。走对应市场的 Level2 连接（pageid=4260）。
+        返回区间内每 ~3 秒一个完整盘口快照，每条含十档买卖价量。
+        **仅 Level2 账号可用**。
+        - 不传 ``start/end``：盘中路径 pageid=4260，``4096(0-0)`` 当日全天。
+        - 传 ``start/end``（datetime / time / unix 秒）：盘后/历史路径
+          pageid=4417，``4096(<start>-<end>)``（2026-08-07 抓包对齐）。
 
         Args:
             code: 股票代码（如 ``"000938"``、``"603118"``）。
             market: 市场码（0=按代码前缀自动推断）。
+            start: 区间起点，``datetime`` / ``time`` / unix 秒 int 均可。
+            end: 区间终点，类型规则同 ``start``。
             timeout: 单次 read_frame 超时（秒）。全天数据 ~500KB，默认 30s。
 
         Returns:
@@ -843,6 +855,18 @@ class ServiceFacade:
 
         if market == 0:
             market = self._market_for_code(code)
+        historical = start is not None or end is not None
+        start_ts = self._superorder_ts(start) if start is not None else 0
+        end_ts = self._superorder_ts(end) if end is not None else 0
+        if market in (16, 32, 144):
+            # 指数超级盘口统一走 pageid=77（2026-08-07 抓包，盘中盘后都是）；
+            # 0-0 与历史区间作为同一帧的两个查询对发出。
+            pageid = SNAPSHOT_REPLAY_INDEX_PAGEID
+        elif historical:
+            # 个股盘后/历史走 4417。
+            pageid = SNAPSHOT_REPLAY_HIST_PAGEID
+        else:
+            pageid = SNAPSHOT_REPLAY_PAGEID
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -865,6 +889,9 @@ class ServiceFacade:
             lambda: self._superorder_service.snapshot_replay(
                 code,
                 market=market,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                pageid=pageid,
                 timeout=timeout,
             ),
         )
@@ -1302,7 +1329,7 @@ class ServiceFacade:
         2026-07-29 PC 抓包确认该 L2 连接使用 ``thsuser`` 标准行情登录壳，
         Level2 passport + 正确的 shlv2/szlv2 路由和市场 init 才决定 4214 注册能力。
 
-        ⚠️ 需要 **level2 账号**：普通账号打开分时走 pageid=9354（请求-响应，无推送）。
+        ⚠️ 需要 **level2 账号**：普通账号打开分时走 pageid=9355（请求-响应，无推送）。
         ⚠️ 需在**盘中**（9:30-15:00）才有逐笔成交推送；收盘后注册成功但无推送数据。
 
         推送连接独立于主连接（``self._sock``），不影响 kline/list_quotes 等

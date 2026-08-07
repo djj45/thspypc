@@ -438,14 +438,6 @@ def test_protocol_reexports_auction_builder():
         is auction_protocol._auction_ts_in_range
     )
     assert (
-        protocol._split_auction_state_rows
-        is auction_protocol._split_auction_state_rows
-    )
-    assert (
-        protocol._parse_auction_sh
-        is auction_protocol._parse_auction_sh
-    )
-    assert (
         protocol.parse_auction_response
         is auction_protocol.parse_auction_response
     )
