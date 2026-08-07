@@ -23,8 +23,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from thspypc import THSClient
 
 
-def load_dotenv() -> None:
-    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+def load_dotenv(env_path: str | None = None) -> None:
+    """加载账号配置。``env_path`` 传 ``.env``/``.env.normal`` 等相对项目根
+    的文件名；缺省用 ``.env``。已存在的环境变量优先（便于外部注入）。"""
+    if env_path is None:
+        env_path = ".env"
+    if not os.path.isabs(env_path):
+        env_path = os.path.join(os.path.dirname(__file__), "..", env_path)
     if not os.path.exists(env_path):
         return
     with open(env_path, "r", encoding="utf-8") as f:
@@ -48,7 +53,13 @@ def _fmt(value, ndigits: int = 3) -> str:
 
 
 def main() -> int:
-    load_dotenv()
+    # --env <file> 指定账号配置（.env Level2 / .env.normal 普通）
+    env_file = ".env"
+    if "--env" in sys.argv:
+        i = sys.argv.index("--env")
+        if i + 1 < len(sys.argv):
+            env_file = sys.argv[i + 1]
+    load_dotenv(env_file)
     username = os.environ.get("THS_USERNAME", "").strip()
     password = os.environ.get("THS_PASSWORD", "").strip()
     imei = os.environ.get("THS_IMEI", "").strip() or None
@@ -56,7 +67,7 @@ def main() -> int:
 
     print("=" * 64)
     print(f"热点板块(94) 活网验证 @ {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
-    print(f"账号: {username}  full={full}")
+    print(f"账号: {username}  env={env_file}  full={full}")
     print("=" * 64)
 
     client = THSClient(username, password, imei)
