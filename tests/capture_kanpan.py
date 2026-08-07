@@ -132,6 +132,9 @@ KNOWN_PAGEIDS: dict[str, tuple[str, str]] = {
     "4180": ("板块成分股/分时(普通)", "ok"),
     "4181": ("板块历史分时/K线/竞价(普通)", "ok"),
     "1341": ("subreal实时订阅(板块)", "ok"),
+    # 2026-08-07 双账号抓包：94 热点板块页面（Level2 0x0053/0x0153 路由族，
+    # 普通 0x003A/0x013A；响应为 hd3.1 紧凑表，board_hot 已实现离线部分）
+    "12480": ("热点板块(94, pageid=12480, hot_boards)", "ok"),
 }
 # 已知缺口 pageid（路线图/ HANDOFF 标注未实现，但协议已部分破解）
 GAP_PAGEIDS: dict[str, str] = {

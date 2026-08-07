@@ -57,6 +57,35 @@ PAGEID_BOARD_LIST = 392
 PAGEID_BOARD_TL = 4180
 PAGEID_BOARD_HISTORY = 4181
 
+# ── 热点板块（94 页面，pageid=12480，2026-08-07 双账号抓包确认）──
+# 与板块列表（392/5716）共用同一批 fu4 板块通道连接，仅组件实例号不同：
+# 普通账号与 392 旧路由 0x0039/0x0139 相邻（0x003A/0x013A 板块、0x003B/0x013B
+# 成分股），L2 与 5716 路由 0x0052/0x0152 相邻（0x0053/0x0153、0x0054/0x0154）。
+PAGEID_BOARD_HOT = 12480
+HOT_BOARD_ROUTE_NORMAL = 0x003A
+HOT_BOARD_ROUTE_L2 = 0x0053
+HOT_STOCK_ROUTE_NORMAL = 0x003B
+HOT_STOCK_ROUTE_L2 = 0x0054
+# 热点板块列表 Datatype（双账号抓包：板块指数全字段表；普通账号同样能取到
+# 271/3252 等增强字段，无需像 392 那样回退基础集）
+HOT_BOARD_DATATYPE = [
+    271, 13, 3252, 48, 19, 3251, 90, 3250, 39, 10, 275, 38, 6, 45, 66,
+]
+# 板块表头各列的 SortBy 值（2026-08-07 排序抓包确认：点击表头即发
+# subtype=0x000f Sort 请求，SortBy=<该列字段>；响应为 method=sort + dt5/dt15 表）
+HOT_SORT_BY_CHG = 199112        # 涨幅（进入页面默认）
+HOT_SORT_BY_SPEED_1M = 527527   # 1分钟涨速（dt167）
+HOT_SORT_BY_SPEED_4M = 48       # 4分钟涨速（dt48）
+HOT_SORT_BY_MAIN_INFLOW = 592890  # 主力净流入（dt250）
+HOT_SORT_BY_LIMIT_UP = 271      # 涨停数
+HOT_SORT_BY_UP_COUNT = 38       # 涨家数
+HOT_SORT_BY_DOWN_COUNT = 39     # 跌家数
+# 热点板块详情表（0x40/72B）字段含义（885927 CRO概念 2026-08-07 实测确认）
+HOT_DETAIL_LIMIT_UP_DT = 15     # 涨停数
+HOT_DETAIL_UP_COUNT_DT = 38     # 涨家数
+HOT_DETAIL_DOWN_COUNT_DT = 39   # 跌家数
+HOT_DETAIL_SPEED_4M_DT = 48     # 4分钟涨速
+
 # 抓包实测的请求参数
 BOARD_QUOTE_DATATYPE = [48, 592890, 10, 6, 66]          # 板块列表（普通 392）
 BOARD_QUOTE_DATATYPE_L2 = [271, 13, 3252, 48, 19, 3251, 90, 592890, 3250,
@@ -641,6 +670,7 @@ def build_board_query(
     inner_seq: int = 0,
     history_flag: bool = True,
     query_codes: str | None = None,
+    route_base: int | None = None,
 ) -> bytes:
     """构造板块指数查询（双子帧：前缀 + 查询），对齐 2026-08-01 抓包形态。
 
@@ -648,8 +678,11 @@ def build_board_query(
     板块列表查询（0x130/紧凑表）2026-08-02 起不带该标记。
     ``query_codes`` 提供时查询子帧 CodeList 使用它（真实客户端在查询里携带
     完整 universe，前缀只注册当前可见页）。
+    ``route_base`` 覆盖组件路由（页面实例号）。缺省按 ``pageid`` 查
+    ``_ROUTES``；热点板块（12480）等页面用相邻实例号，须显式传入
+    （普通 0x003A、Level2 0x0053，见 :func:`build_board_hot_query`）。
     """
-    route = _route_for(pageid)
+    route = _route_for(pageid) if route_base is None else route_base
     prefix_text = f"CodeList={market}({code},);\r\npageid={pageid}\r\n"
     if query_codes is None:
         query_codes = code
@@ -771,6 +804,125 @@ def build_board_full_list_query(
         + query_text
     )
     return encode_frame(body)
+
+
+def build_board_hot_query(
+    codes: list[str],
+    *,
+    level2: bool = False,
+    datatype: list[int] | None = None,
+    period: int = 0,
+    args: str = "0-0",
+    lack_time: str = "0,0,0,0,0,0,0,0",
+    seq: int | None = None,
+    query_codes: list[str] | None = None,
+    history_flag: bool = False,
+) -> bytes:
+    """构造热点板块（94 页面）查询，pageid=12480。
+
+    2026-08-07 双账号抓包确认：热点板块与板块列表（392/5716）共用同一批
+    fu4 板块通道连接，请求形态为同构双子帧（前缀 CodeList + 查询
+    DataType/DateTime/LackTime/pageid），仅组件路由不同——普通账号
+    ``HOT_BOARD_ROUTE_NORMAL``(0x003A/0x013A)，Level2
+    ``HOT_BOARD_ROUTE_L2``(0x0053/0x0153)。响应为标准 hd3.1 表
+    （普通账号明文 / Level2 走 0x0a 外层压缩），现有板块解析器可直接复用。
+
+    Args:
+        codes: 板块指数代码（market=48，如 886099/881101）。
+        level2: Level2 账号（默认走普通账号路由）。
+        datatype: 查询字段集，缺省 ``HOT_BOARD_DATATYPE``（全字段表）。
+        period/args: DateTime 游标（0(0-0) 当日；8192(-2-0) 全量等）。
+        lack_time: LackTime 文本。
+        seq: 查询子帧序号（会话内实例号，服务端不严格校验）。
+        query_codes: 查询子帧携带的完整 universe（缺省与 ``codes`` 相同）。
+        history_flag: 查询子帧是否带 0x20 标记（列表查询不带）。
+    """
+    if not codes:
+        raise ValueError("hot board query requires at least one board code")
+    pageid = PAGEID_BOARD_HOT
+    if datatype is None:
+        datatype = HOT_BOARD_DATATYPE
+    route_base = HOT_BOARD_ROUTE_L2 if level2 else HOT_BOARD_ROUTE_NORMAL
+    if seq is None:
+        seq = 0x114A if level2 else 0x1182
+    query_codes_text = (
+        ",".join(query_codes) if query_codes is not None else ",".join(codes)
+    )
+    return build_board_query(
+        ",".join(codes),
+        pageid=pageid,
+        datatype=datatype,
+        period=period,
+        args=args,
+        lack_time=lack_time,
+        seq=seq,
+        history_flag=history_flag,
+        query_codes=query_codes_text,
+        route_base=route_base,
+    )
+
+
+def build_board_hot_sort_query(
+    universe_codes: list[str],
+    *,
+    visible_codes: list[str] | None = None,
+    sort_by: int = HOT_SORT_BY_CHG,
+    sort_dir: str = "D",
+    sort_begin: int = 0,
+    sort_count: int = 26,
+    level2: bool = False,
+    seq: int | None = None,
+) -> bytes:
+    """构造热点板块（94 页面）表头排序请求（subtype=0x000f）。
+
+    2026-08-07 排序抓包（kanpan_20260807_231038.pcap）：点击板块表头即发
+    ``SortType=Sort`` + ``SortBy=<该列字段>`` + ``SortDir=D/A`` +
+    ``SortAppend=YC`` + ``SortBegin/SortCount`` 分页 + ``FuncPeriod=0``。
+    SortBy 取值见 ``HOT_SORT_BY_*``（199112 涨幅 / 527527 1分钟涨速 /
+    592890 主力净流入 / 271 涨停数 / 38 涨家数 / 39 跌家数 / 48 4分钟涨速）。
+
+    ``universe_codes`` 是全部板块代码；``visible_codes`` 是当前页展示代码
+    （用于前置 CodeList 注册）。响应为 ``method=sort`` 文本 + hd3.1 表
+    （dt5 代码 + dt15 排序值，``sortcount=26``），由
+    :func:`parse_board_hot_sort_response` 解析。
+    """
+    if not universe_codes:
+        raise ValueError("hot board sort requires a code universe")
+    if visible_codes is None:
+        visible_codes = universe_codes[sort_begin: sort_begin + sort_count]
+    if not visible_codes:
+        visible_codes = universe_codes[:sort_count]
+    pageid = PAGEID_BOARD_HOT
+    route_base = HOT_BOARD_ROUTE_L2 if level2 else HOT_BOARD_ROUTE_NORMAL
+    if seq is None:
+        seq = 0x114A if level2 else 0x1182
+    visible_list = f"{BOARD_MARKET}({','.join(visible_codes)},);"
+    universe_list = f"{BOARD_MARKET}({','.join(universe_codes)},);"
+    prefix_text = (
+        f"CodeList={visible_list}\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    query_text = (
+        f"CodeList={universe_list}\r\n"
+        f"DataType={sort_by},\r\n"
+        "SortType=Sort\r\n"
+        f"SortBy={sort_by}\r\nSortDir={sort_dir}\r\n"
+        "SortAppend=YC\r\n"
+        f"SortBegin={sort_begin}\r\nSortCount={sort_count}\r\n"
+        "FuncPeriod=0\r\nDateTime=0(0-0)\r\n"
+        "LackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r"
+    ).encode("gbk")
+    prefix = (
+        _subframe_header(0x0002, route_base, 0, len(prefix_text))
+        + prefix_text
+    )
+    query = (
+        _subframe_header(
+            0x000F, 0x0100 | route_base, seq, len(query_text) + 1
+        )
+        + query_text
+    )
+    return encode_frame(b"\x09" + prefix + query)
 
 
 def build_board_timeline_query(
@@ -1157,6 +1309,116 @@ def parse_board_quote_response(body: bytes) -> list[dict]:
     for index in range(len(rows) // rec_size):
         row = rows[index * rec_size: (index + 1) * rec_size]
         records.append(_decode_row(row, fields))
+    return records
+
+
+def parse_board_hot_detail_response(body: bytes) -> list[dict]:
+    """解析热点板块（94 页面）详情表（hd3.1 0x40，72B/行）。
+
+    2026-08-07 普通账号抓包（kanpan_20260807_231038.pcap 帧949）：热点板块
+    详情请求（pageid=12480，DataType=271,...）的响应帧含多个 hd3.1 表，
+    其中 0x40/72B 是详情表，字段：dt5(16B 代码)、dt6 昨收、dt10 最新、
+    dt13、dt19、dt38 涨家数、dt39 跌家数、dt90、dt15 涨停数、dt19(16B)、
+    dt48 4分钟涨速、dt45。
+
+    885927 CRO概念 实测对照（UI）：涨幅 +8.05% = dt10/dt6-1；涨停数 8 =
+    dt15；涨家数 73 = dt38；跌家数 3 = dt39；4分钟涨速 -0.00% = dt48。
+
+    Returns:
+        list[dict]，每条含 ``code``/``pre_close``/``price``/``chg_pct``/
+        ``limit_up``/``up_count``/``down_count``/``speed_4m``。
+    """
+    norm = _normalize(body)
+    positions = [
+        pos for pos in range(len(norm))
+        if norm.startswith(b"hd3.1\x00", pos)
+    ]
+    candidates = (
+        [norm] if len(positions) <= 1 else [norm[pos:] for pos in positions]
+    )
+    records = []
+    seen_codes: set[str] = set()
+    for candidate in candidates:
+        parsed = _hd3_rows(candidate, 0x40)
+        if parsed is None:
+            continue
+        _flag, rec_size, fields, _code, rows = parsed
+        for index in range(len(rows) // rec_size):
+            row = rows[index * rec_size: (index + 1) * rec_size]
+            rec = _decode_row(row, fields)
+            code = str(rec.get("code", ""))
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            dt6 = rec.get("dt6")
+            dt10 = rec.get("dt10")
+            chg = None
+            if dt6 and dt10:
+                chg = (dt10 / dt6 - 1) * 100
+
+            def _field(dt: int):
+                # 涨停/涨家/跌家是整数编码的 THS float（fmt=0x48/0x49），
+                # _decode_row 只留 raw；这里统一按 u32 → THS float 解码。
+                raw = _row_field_raw(row, fields, dt)
+                return (
+                    decode_ths_float(raw)
+                    if raw is not None and raw not in _BOARD_SENTINEL_U32
+                    else None
+                )
+
+            record = {
+                "code": code,
+                "pre_close": dt6,
+                "price": dt10,
+                "chg_pct": chg,
+                "limit_up": _field(HOT_DETAIL_LIMIT_UP_DT),
+                "up_count": _field(HOT_DETAIL_UP_COUNT_DT),
+                "down_count": _field(HOT_DETAIL_DOWN_COUNT_DT),
+                "speed_4m": rec.get(f"dt{HOT_DETAIL_SPEED_4M_DT}"),
+            }
+            for key, value in rec.items():
+                record.setdefault(key, value)
+            records.append(record)
+    return records
+
+
+def parse_board_hot_sort_response(body: bytes) -> list[dict]:
+    """解析热点板块表头排序响应（method=sort + hd3.1 dt5 + dt<SortBy> 表）。
+
+    2026-08-07 排序抓包确认：排序请求（subtype=0x000f，SortBy=<列>）的
+    响应为 ``instid=...\\nmethod=sort\\norderlist=\\nrettype=hdfile\\n
+    indexname=199112:ZHANGDIEFU;...\\nsortbegin=0\\nsortcalcprogress=1\\
+    sortcount=26\\nsorttotal=...`` 文本 + hd3.1 表（dt5 代码 + **dt<SortBy>**
+    排序字段值）。**SortBy 值即响应第二个字段的 dt 编号**：
+
+    - ``199112`` → dt200 涨跌幅（ZHANGDIEFU）
+    - ``527527`` → dt167 1分钟涨速（onerise）
+    - ``592890`` → dt250 主力净流入（bigtrademoneynow）
+    - ``271`` → dt15 涨停数；``38`` → dt38 涨家数；``39`` → dt39 跌家数
+
+    返回记录含 ``code`` 与 ``value``（排序字段的 THS float 解码值，单位与
+    语义随 SortBy 变化：涨跌幅/涨速为百分比数，主力为元，涨停/涨跌家为个数）。
+    """
+    parsed = _hd3_rows(body, 0x1C)
+    if parsed is None:
+        return []
+    _flag, rec_size, fields, _code, rows = parsed
+    records = []
+    for index in range(len(rows) // rec_size):
+        row = rows[index * rec_size: (index + 1) * rec_size]
+        rec = _decode_row(row, fields)
+        record = {"code": rec.get("code")}
+        for d, _fmt, width in fields:
+            if d == 5:
+                continue
+            raw = _row_field_raw(row, fields, d)
+            if raw is not None and raw not in _BOARD_SENTINEL_U32:
+                record["value"] = decode_ths_float(raw)
+                record[f"dt{d}"] = decode_ths_float(raw)
+            elif width == 4:
+                record["value"] = None
+                record[f"dt{d}"] = None
+        records.append(record)
     return records
 
 

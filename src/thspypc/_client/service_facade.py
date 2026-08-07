@@ -1538,6 +1538,86 @@ class ServiceFacade:
 
     # ── 系统板块网络查询（板块专用通道 fu4 8901）──
 
+    def hot_boards(
+        self,
+        codes: list[str] | None = None,
+        *,
+        timeout: float = 40.0,
+    ) -> list[dict]:
+        """热点板块（94 页面）行情，pageid=12480。
+
+        2026-08-07 双账号抓包确认：94 热点板块与板块列表（392/5716）共用
+        同一批 fu4 板块通道连接，仅组件路由不同（普通 0x003A/0x013A、L2
+        0x0053/0x0153）。返回字段含 ``code``/``pre_close``/``price``/
+        ``chg_pct``（dt6/dt10）、``limit_up``（dt15 涨停数）、``up_count``
+        （dt38 涨家数）、``down_count``（dt39 跌家数）、``speed_4m``
+        （dt48 4分钟涨速）、``speed_1m``（dt167）、``main_inflow``
+        （dt250 主力净流入）。
+
+        Args:
+            codes: 板块指数代码列表；传 ``None`` 表示按全量板块代码表发送。
+            timeout: 板块通道查询总超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``code``/``pre_close``/``price``/``chg_pct``
+            /``limit_up``/``up_count``/``down_count``/``speed_4m`` 等字段。
+
+        Raises:
+            RuntimeError: 未登录或板块通道建连失败。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.hot_boards(
+                codes,
+                timeout=timeout,
+            ),
+        )
+
+    def hot_boards_sorted(
+        self,
+        sort_by: int,
+        *,
+        codes: list[str] | None = None,
+        sort_dir: str = "D",
+        sort_begin: int = 0,
+        sort_count: int = 26,
+        timeout: float = 40.0,
+    ) -> list[dict]:
+        """热点板块表头排序，返回按列排序后的 (code, value) 记录。
+
+        2026-08-07 排序抓包确认：点击板块表头即发 ``SortType=Sort`` +
+        ``SortBy=<该列字段>``（subtype=0x000f），响应为 ``method=sort``
+        + hd3.1 表（dt5 代码 + **dt<SortBy>** 排序字段值）。``sort_by``
+        取值与排序字段：
+        - ``199112`` 涨幅 → dt200（ZHANGDIEFU）
+        - ``527527`` 1分钟涨速 → dt167（onerise）
+        - ``592890`` 主力净流入 → dt250（bigtrademoneynow）
+        - ``271`` 涨停数 → dt15；``38`` 涨家数 → dt38；``39`` 跌家数 → dt39
+
+        Args:
+            sort_by: 排序列字段编号（见上）。
+            codes: 排序 universe（``None``=全量板块代码表）。
+            sort_dir: ``"D"`` 降序 / ``"A"`` 升序。
+            sort_begin/sort_count: 排序分页窗口（服务端默认返回
+                ``sortcount=26``）。
+
+        Returns:
+            list[dict]，按排序序，每条含 ``code`` + ``value``（排序字段值，
+            语义随 sort_by：涨跌幅/涨速为百分比，主力为元，涨停/涨跌家为
+            个数）+ ``dt<SortBy>`` 原始键。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.hot_boards_sorted(
+                sort_by,
+                codes=codes,
+                sort_dir=sort_dir,
+                sort_begin=sort_begin,
+                sort_count=sort_count,
+                timeout=timeout,
+            ),
+        )
+
     def board_quotes(
         self,
         codes: list[str] | None = None,

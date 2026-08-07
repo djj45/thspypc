@@ -48,6 +48,8 @@ from ..features.system_blocks_protocol import (
     build_board_constituents_selection_query,
     build_board_constituents_sort_query,
     build_board_full_list_query,
+    build_board_hot_query,
+    build_board_hot_sort_query,
     build_board_list_query,
     build_board_timeline_query,
     load_board_full_codes,
@@ -55,6 +57,8 @@ from ..features.system_blocks_protocol import (
     parse_board_constituents_response,
     parse_board_constituents_selection_response,
     parse_board_full_quote_response,
+    parse_board_hot_detail_response,
+    parse_board_hot_sort_response,
     parse_board_timeline_response,
 )
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
@@ -554,6 +558,202 @@ class BoardService:
         return [
             record for record in records
             if str(record.get("code", "")) in wanted_codes
+        ]
+
+    def hot_boards(
+        self,
+        codes: list[str] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """热点板块（94 页面）行情，pageid=12480。
+
+        2026-08-07 双账号抓包（kanpan_20260807_224017.pcap Level2 /
+        kanpan_20260807_225319.pcap 普通 / kanpan_20260807_231038.pcap 排序）
+        确认：热点板块与板块列表（392/5716）共用同一批 fu4 板块通道连接，
+        请求为同构双子帧，仅组件路由不同（普通 0x003A/0x013A、L2
+        0x0053/0x0153）。
+
+        ``codes=None`` 时在同一 BOARD socket 连续发送两个请求并跨帧合并：
+        - **详情请求**（DataType=271,...）：0x40/72B 表，含
+          ``pre_close``/``price``/``chg_pct``（dt6/dt10）、``limit_up``
+          （dt15 涨停数）、``up_count``（dt38 涨家数）、``down_count``
+          （dt39 跌家数）、``speed_4m``（dt48 4分钟涨速）；
+        - **527527 全量请求**（DateTime=8192(-2-0)）：0x22 1分钟涨速
+          （dt167 ``speed_1m``）、0x1c 主力净流入（dt250 ``main_inflow``）。
+
+        885927 CRO概念 实测对照（2026-08-07）：chg +8.05%、涨停 8、
+        涨家 73、跌家 3、4分钟涨速 -0.00% 与 94 页面 UI 一致。
+
+        显式传 ``codes`` 时只发详情请求（单请求，轻量）。表头排序见
+        :meth:`hot_boards_sorted`。
+        """
+        if codes is None:
+            codes = list(load_board_full_codes())
+        wanted_codes = set(codes)
+        level2 = self._is_level2()
+        detail_request = build_board_hot_query(
+            codes,
+            level2=level2,
+            lack_time="0,0,0,0,0,0,0,0",
+        )
+        if len(codes) < 60:
+            # 显式/小批量：单个详情请求
+            records = self._request(
+                detail_request,
+                parsers=(
+                    parse_board_hot_detail_response,
+                    parse_board_full_quote_response,
+                ),
+                timeout=timeout,
+                accept=lambda records: any(
+                    record.get("code") in wanted_codes for record in records
+                ),
+            )
+            return [
+                record for record in records
+                if str(record.get("code", "")) in wanted_codes
+            ]
+        # 全量：详情 + 527527 全量 合并（与 board_quotes(None) 同构）。
+        # 抓包（kanpan_20260807_231038.pcap 帧920）hot 的 527527 请求是
+        # DateTime=0(0-0)、LackTime 全 0（区别于 board_quotes 的 8192(-2-0)）。
+        full_request = build_board_hot_query(
+            codes,
+            level2=level2,
+            datatype=[527527],
+            period=0,
+            args="0-0",
+            history_flag=False,
+            lack_time="0,0,0,0,0,0,0,0",
+        )
+        return self._request_hot_full(
+            (detail_request, full_request), codes, timeout=timeout
+        )
+
+    def _request_hot_full(
+        self,
+        requests: tuple[bytes, ...],
+        wanted_codes: list[str],
+        *,
+        timeout: float,
+    ) -> list[dict]:
+        """发送热点板块全量请求序列并跨帧合并详情(0x40) + 全量(0x20/0x1c/0x22)。"""
+        if not requests:
+            return []
+        connection = self._connections.acquire(
+            ConnectionRole.BOARD,
+            capability=Capability.BASIC_QUOTE,
+        )
+        wanted = set(wanted_codes)
+        try:
+            with connection.request(
+                requests[0],
+                timeout=timeout,
+                trailing_newline=True,
+            ) as sock:
+                for request in requests[1:]:
+                    time.sleep(0.04)
+                    sock.sendall(request + b"\n")
+                deadline = time.monotonic() + timeout
+                merged: dict[str, dict] = {}
+                for _ in range(self._max_frames):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(remaining)
+                    try:
+                        response = self._read_frame(sock)
+                    except socket.timeout:
+                        break
+                    for parser in (
+                        parse_board_hot_detail_response,
+                        parse_board_full_quote_response,
+                    ):
+                        for rec in parser(response):
+                            code = str(rec.get("code", ""))
+                            if not code:
+                                continue
+                            target = merged.setdefault(code, {"code": code})
+                            for key, value in rec.items():
+                                if key != "code" and (
+                                    key not in target or target[key] is None
+                                ):
+                                    target[key] = value
+                    have_detail = sum(
+                        1 for r in merged.values() if "up_count" in r
+                    )
+                    have_speed_1m = sum(
+                        1 for r in merged.values() if "speed_1m" in r
+                    )
+                    have_main = sum(
+                        1 for r in merged.values() if "main_inflow" in r
+                    )
+                    if (
+                        len(merged) >= len(wanted)
+                        and have_detail >= len(wanted) - 10
+                        and have_speed_1m >= len(wanted) - 10
+                        and have_main >= len(wanted) - 10
+                    ):
+                        break
+        except OSError as exc:
+            raise ProtocolError(f"板块查询网络错误: {exc}") from exc
+        return [merged[code] for code in wanted_codes if code in merged]
+
+    def hot_boards_sorted(
+        self,
+        sort_by: int,
+        *,
+        codes: list[str] | None = None,
+        sort_dir: str = "D",
+        sort_begin: int = 0,
+        sort_count: int = 26,
+        timeout: float = 15.0,
+    ) -> list[dict]:
+        """热点板块表头排序，返回按列排序后的 (code, value) 记录。
+
+        ``sort_by`` 取值见 :data:`HOT_SORT_BY_*`。服务端响应 ``method=sort``
+        + hd3.1 表（dt5 代码 + **dt<SortBy>** 排序字段值，SortBy 即响应第二
+        字段的 dt 编号）：
+        - ``HOT_SORT_BY_CHG``(199112) → dt200 涨跌幅（ZHANGDIEFU）
+        - ``HOT_SORT_BY_SPEED_1M``(527527) → dt167 1分钟涨速（onerise）
+        - ``HOT_SORT_BY_MAIN_INFLOW``(592890) → dt250 主力净流入
+        - ``HOT_SORT_BY_LIMIT_UP``(271) → dt15 涨停数
+        - ``HOT_SORT_BY_UP_COUNT``(38)/``HOT_SORT_BY_DOWN_COUNT``(39)
+          → dt38/dt39 涨跌家数
+
+        Returns:
+            list[dict]，按排序序，每条含 ``code`` + ``value``（排序字段
+            THS float 值，语义随 sort_by：涨跌幅/涨速为百分比，主力为元，
+            涨停/涨跌家为个数）+ ``dt<SortBy>`` 原始键。
+        """
+        if codes is None:
+            codes = list(load_board_full_codes())
+        request = build_board_hot_sort_query(
+            codes,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            sort_begin=sort_begin,
+            sort_count=sort_count,
+            level2=self._is_level2(),
+        )
+        records = self._request(
+            request,
+            parsers=(parse_board_hot_sort_response,),
+            timeout=timeout,
+            accept=lambda records: bool(records),
+        )
+        return [
+            {
+                "code": str(record.get("code", "")),
+                "value": record.get("value"),
+                **{
+                    key: value
+                    for key, value in record.items()
+                    if key.startswith("dt")
+                },
+            }
+            for record in records
+            if record.get("code")
         ]
 
     def _request_full_quotes(

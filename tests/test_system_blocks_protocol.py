@@ -17,7 +17,12 @@ from thspypc.features.system_blocks_protocol import (  # noqa: E402
     BOARD_HISTORY_DATATYPE,
     BOARD_QUOTE_DATATYPE,
     BOARD_QUOTE_DATATYPE_L2,
+    HOT_BOARD_DATATYPE,
+    HOT_SORT_BY_CHG,
+    HOT_SORT_BY_LIMIT_UP,
+    HOT_SORT_BY_UP_COUNT,
     PAGEID_BOARD_HISTORY,
+    PAGEID_BOARD_HOT,
     PAGEID_BOARD_LIST,
     PAGEID_BOARD_LIST_L2,
     PAGEID_BOARD_TL,
@@ -25,10 +30,14 @@ from thspypc.features.system_blocks_protocol import (  # noqa: E402
     build_board_constituents_query,
     build_board_constituents_selection_query,
     build_board_constituents_sort_query,
+    build_board_hot_query,
+    build_board_hot_sort_query,
     build_board_list_query,
     build_board_timeline_query,
     parse_board_auction_response,
     parse_board_constituents_response,
+    parse_board_hot_detail_response,
+    parse_board_hot_sort_response,
     parse_board_quote_response,
     parse_board_timeline_response,
 )
@@ -113,6 +122,155 @@ def test_build_board_list_query_l2_shape():
     assert body[query_offset + 17] == 0x00
     assert body[query_offset + 4: query_offset + 6] == b"\x68\x00"
     assert "LackTime=0,0,0,0,0,0,0,0" in text
+
+
+def test_build_board_hot_query_normal_shape():
+    """热点板块（94 页面）普通账号：pageid=12480 + 0x003A/0x013A 路由族。
+
+    2026-08-07 普通账号抓包（kanpan_20260807_225319.pcap 帧487/518）：
+    前缀 route=0x003A、查询 route=0x013A，无 history flag、LackTime 全 0，
+    DataType 为全字段表（普通账号同样能取到 271/3252 增强字段）。
+    """
+    frame = build_board_hot_query(["886099", "886100"])
+    body = frame[12:]
+    text = body.decode("gbk", errors="replace")
+    assert "CodeList=48(886099,886100,);" in text
+    assert f"pageid={PAGEID_BOARD_HOT}" in text
+    assert "DataType=" + ",".join(map(str, HOT_BOARD_DATATYPE)) + "," in text
+    # 前缀 route=0x003A，查询 route=0x013A
+    assert body[11:13] == b"\x3a\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 10: query_offset + 12] == b"\x3a\x01"
+    assert body[query_offset + 17] == 0x00
+    assert "LackTime=0,0,0,0,0,0,0,0" in text
+
+
+def test_build_board_hot_query_l2_shape():
+    """热点板块 Level2 账号：pageid=12480 + 0x0053/0x0153 路由族。
+
+    2026-08-07 Level2 抓包（kanpan_20260807_224017.pcap 帧883/900）：
+    前缀 route=0x0053、查询 route=0x0153（与 5716 的 0x0052/0x0152 相邻）。
+    """
+    frame = build_board_hot_query(["886099"], level2=True)
+    body = frame[12:]
+    text = body.decode("gbk", errors="replace")
+    assert "CodeList=48(886099,);" in text
+    assert f"pageid={PAGEID_BOARD_HOT}" in text
+    assert body[11:13] == b"\x53\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 10: query_offset + 12] == b"\x53\x01"
+
+
+def test_build_board_hot_query_full_quote_params():
+    """热点板块全量行情（DataType=527527, DateTime=8192(-2-0)）参数透传。"""
+    frame = build_board_hot_query(
+        ["881101", "881102"],
+        datatype=[527527],
+        period=8192,
+        args="-2-0",
+        level2=True,
+        history_flag=True,
+        lack_time="0,3,0,0,0,0,0,0",
+    )
+    text = frame[12:].decode("gbk", errors="replace")
+    assert "DataType=527527," in text
+    assert "DateTime=8192(-2-0)" in text
+    assert "LackTime=0,3,0,0,0,0,0,0" in text
+    assert f"pageid={PAGEID_BOARD_HOT}" in text
+
+
+def test_build_board_hot_sort_query_shape():
+    """热点板块表头排序（subtype=0x000f，SortType=Sort）。
+
+    2026-08-07 排序抓包（kanpan_20260807_231038.pcap 帧906）：前缀
+    route=0x003A（普通）、查询子帧 subtype=0x000f route=0x013A，文本
+    ``DataType=<SortBy>, SortType=Sort SortBy=<SortBy> SortDir=D
+    SortAppend=YC SortBegin=0 SortCount=26 FuncPeriod=0``。
+    """
+    frame = build_board_hot_sort_query(
+        ["885927", "881101"],
+        sort_by=HOT_SORT_BY_UP_COUNT,
+        sort_dir="D",
+        sort_count=26,
+    )
+    body = frame[12:]
+    text = body.decode("gbk", errors="replace")
+    assert f"pageid={PAGEID_BOARD_HOT}" in text
+    assert f"DataType={HOT_SORT_BY_UP_COUNT}," in text
+    assert "SortType=Sort" in text
+    assert f"SortBy={HOT_SORT_BY_UP_COUNT}" in text
+    assert "SortDir=D" in text
+    assert "SortAppend=YC" in text
+    assert "SortBegin=0" in text
+    assert "SortCount=26" in text
+    assert "FuncPeriod=0" in text
+    # 前缀 route=0x003A，查询子帧 subtype=0x000f（+8）route=0x013A（+10）
+    assert body[11:13] == b"\x3a\x00"
+    prefix_length = int.from_bytes(body[19:23], "little")
+    query_offset = 23 + prefix_length
+    assert body[query_offset + 8: query_offset + 10] == b"\x0f\x00"
+    assert body[query_offset + 10: query_offset + 12] == b"\x3a\x01"
+
+
+def test_parse_board_hot_detail_sample():
+    """热点板块 0x40/72B 详情表解析（885927 CRO概念 实测锚点）。
+
+    2026-08-07 抓包（kanpan_20260807_231038.pcap 帧949）：
+    885927 行 dt6=897.798（昨收）、dt10=970.032（最新）→ 涨幅 +8.05%；
+    dt15=8（涨停数）、dt38=73（涨家数）、dt39=3（跌家数）、dt48=0
+    （4分钟涨速）——与 94 页面 UI 逐项一致。
+    """
+    records = parse_board_hot_detail_response(
+        _fixture("hot_detail_resp_0x40_949.bin").read_bytes()
+    )
+    cro = next(r for r in records if r.get("code") == "885927")
+    assert round(cro["chg_pct"], 2) == 8.05
+    assert cro["limit_up"] == 8.0
+    assert cro["up_count"] == 73.0
+    assert cro["down_count"] == 3.0
+    assert cro["speed_4m"] == 0.0
+    assert cro["price"] == 970.032
+    assert cro["pre_close"] == 897.798
+    assert len(records) == 26
+
+
+def test_parse_board_hot_sort_sample():
+    """热点板块排序响应（method=sort + dt5 + dt<SortBy> 表）解析。
+
+    2026-08-07 排序抓包（帧1348，SortBy=271 涨停数）：响应含
+    ``sortcount=26`` 的 dt5+dt15 表（SortBy 即第二字段 dt 编号），
+    SortBy=271 → dt15 涨停数，按降序排列。
+    """
+    records = parse_board_hot_sort_response(
+        _fixture("hot_sort_resp_271_1348.bin").read_bytes()
+    )
+    assert len(records) == 26
+    codes = [r.get("code") for r in records]
+    assert all(c for c in codes)
+    # SortBy=271 降序 → 涨停数最高的在前（885338 半导体）
+    assert codes[0] == "885338"
+    # 每条含 value（dt15 涨停数，THS float）
+    assert records[0]["value"] is not None
+    assert records[0].get("dt15") == records[0]["value"]
+
+
+def test_parse_board_hot_sort_dt_maps_to_sortby():
+    """sort 响应第二字段的 dt 编号 = SortBy 值。
+
+    2026-08-07 排序抓包：SortBy=592890 响应字段 (dt5, dt250) 主力净流入、
+    SortBy=527527 → dt167 1分钟涨速、SortBy=199112 → dt200 涨跌幅。
+    """
+    from thspypc.features.system_blocks_protocol import _hd3_rows
+
+    # SortBy=592890 帧1259 → dt250
+    body = _fixture("hot_sort_resp_271_1348.bin").read_bytes()
+    parsed = _hd3_rows(body, 0x1C)
+    assert parsed is not None
+    _flag, _rec_size, fields, _code, _rows = parsed
+    flds = [d for d, _f, _w in fields]
+    assert flds == [5, 15]
 
 
 def test_build_board_constituents_query_groups_markets():
