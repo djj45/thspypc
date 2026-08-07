@@ -89,19 +89,21 @@ def _snapshot_push(
     *,
     market_flag=0x11,
     code=b"603118",
-    price=16220,
+    price_raw=0xC0057E40,  # ths_float → 36.00
     volume=300,
-    tick_seq=0x80,
+    direction=1,
+    seq=36954662,
 ):
+    """Build a synthetic 71B tick push frame matching 2026-08-07 capture layout."""
     body = bytearray(71)
     body[0] = 0x09
-    body[14] = 0x80
+    body[1:4] = b"\x7b\xd0\x01"
     body[28] = market_flag
     body[29:35] = code
-    body[39] = tick_seq
-    struct.pack_into("<H", body, 58, price)
-    struct.pack_into("<H", body, 62, volume)
-    body[70] = 0x7D
+    struct.pack_into("<I", body, 39, seq)
+    struct.pack_into("<I", body, 47, price_raw)
+    struct.pack_into("<H", body, 51, volume)
+    body[55] = direction
     return bytes(body)
 
 
@@ -109,14 +111,15 @@ def test_snapshot_push_parser_contract():
     body = _snapshot_push()
 
     assert snapshot_protocol.is_snapshot_push(body)
-    assert snapshot_protocol.parse_snapshot_push(body) == {
-        "code": "603118",
-        "market": "SH",
-        "price": 16.22,
-        "volume": 300,
-        "tick_seq": 0x80,
-        "raw_len": 71,
-    }
+    result = snapshot_protocol.parse_snapshot_push(body)
+    assert result is not None
+    assert result["code"] == "603118"
+    assert result["market"] == "SH"
+    assert result["price"] == 36.0
+    assert result["volume"] == 300
+    assert result["direction"] == 1
+    assert result["seq"] == 36954662
+    assert result["raw_len"] == 71
 
 
 def test_snapshot_push_parser_preserves_sz_and_unknown_market_flags():

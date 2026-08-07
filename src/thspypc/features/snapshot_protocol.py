@@ -4,6 +4,7 @@ from __future__ import annotations
 import struct
 
 from ..codecs.framing import encode_frame
+from ..codecs.numeric import decode_ths_float
 
 
 SNAPSHOT_PAGEID = 4214
@@ -103,7 +104,22 @@ def build_snapshot_subscribe(
 
 
 def parse_snapshot_push(body: bytes) -> dict | None:
-    """Parse the verified 71-byte Level2 tick snapshot variant."""
+    """Parse the 71-byte Level2 tick-by-tick push frame.
+
+    2026-08-07 盘中抓包破译（002384 东山精密 ~197 元对照确认）::
+
+        [0]     0x09            帧类型标记
+        [1-4]   09 7b d0 01     魔数（推送帧头）
+        [28]    市场标记         0x11=沪 0x21=深
+        [29-34] ASCII 代码       6 位股票代码
+        [39-42] u32 LE           序号（递增）
+        [47-50] ths_float        **成交价格**
+        [51-52] u16 LE           **成交量（股）**
+        [55]    1/5              **方向**（1=主动买 5=主动卖）
+        [59-62] u32 LE           被动方序号
+
+    帧间隔平均 0.11 秒（真逐笔），非定时快照。
+    """
     if not is_snapshot_push(body):
         return None
 
@@ -119,19 +135,20 @@ def parse_snapshot_push(body: bytes) -> dict | None:
     return {
         "code": code,
         "market": market,
-        "price": struct.unpack("<H", body[58:60])[0] / 1000.0,
-        "volume": struct.unpack("<H", body[62:64])[0],
-        "tick_seq": body[39],
+        "price": decode_ths_float(struct.unpack("<I", body[47:51])[0]),
+        "volume": struct.unpack("<H", body[51:53])[0],
+        "direction": body[55],
+        "seq": struct.unpack("<I", body[39:43])[0],
         "raw_len": len(body),
     }
 
 
 def is_snapshot_push(body: bytes) -> bool:
-    """Return whether ``body`` matches the verified 71-byte push shape."""
+    """Return whether ``body`` matches the 71-byte tick push shape."""
     return (
         len(body) == 71
         and body[0] == 0x09
-        and body[14] == 0x80
+        and body[1:4] == b"\x7b\xd0\x01"
         and all(0x30 <= value <= 0x39 for value in body[29:35])
     )
 
