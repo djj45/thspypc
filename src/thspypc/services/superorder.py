@@ -14,7 +14,9 @@ from ..errors import (
 )
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.superorder_protocol import (
+    build_snapshot_replay_query,
     build_superorder_query,
+    parse_snapshot_replay_response,
     parse_superorder_response,
 )
 from ..models import AccountKind, Capability, Support
@@ -156,6 +158,95 @@ class SuperorderService:
             return records
         if saw_frame:
             raise ProtocolError("收到 7169 逐笔帧但无法解析")
+        return []
+
+    def snapshot_replay(
+        self,
+        code: str,
+        *,
+        market: int,
+        timeout: float = 30.0,
+    ) -> list[dict]:
+        """请求并解析 4096 盘口快照回放（pageid=4260，超级盘口分时曲线）。
+
+        返回全天每 ~3 秒一个完整盘口快照（~4927 点），每条记录含十档买卖价量。
+        响应是标准 hd1.0 行主序（flag=0x00FE），非 BitRLE。
+
+        Args:
+            code: 股票代码（如 ``"000938"``）。
+            market: 市场码（17=沪, 33=深）。
+            timeout: 单次 read_frame 超时（秒）。全天数据 ~500KB，需较长超时。
+        """
+        profile = self._connections.profile
+        if profile.kind is AccountKind.STANDARD:
+            raise CapabilityUnavailableError(
+                Capability.L2_TIMELINE,
+                "snapshot_replay",
+            )
+        if profile.kind is AccountKind.UNKNOWN:
+            raise UnsupportedAccountFeatureError(
+                "snapshot_replay",
+                profile.kind,
+                "账号类型未知，不能推断 L2 通道",
+            )
+
+        role = _superorder_l2_role(market)
+        connection = self._connections.acquire(
+            role,
+            capability=Capability.L2_TIMELINE,
+        )
+        if self._subscriptions is not None:
+            self._subscriptions.ensure_registered(
+                connection,
+                code,
+                market=market,
+                timeout=min(timeout, 5.0),
+            )
+
+        request = build_snapshot_replay_query(code, market=market)
+        records: list[dict] = []
+        saw_frame = False
+
+        with connection.request(request, timeout=timeout) as sock:
+            for _ in range(self._max_frames):
+                try:
+                    response = self._read_frame(sock)
+                except socket.timeout:
+                    if records:
+                        break
+                    raise
+                except ValueError:
+                    recv = getattr(sock, "recv", None)
+                    if recv is not None:
+                        try:
+                            recv(8192)
+                        except OSError as exc:
+                            raise ConnectionError("连接已关闭") from exc
+                    if records:
+                        break
+                    continue
+
+                if response.startswith(b"\x0a") or b"hd1.0" in response:
+                    parsed = parse_snapshot_replay_response(response)
+                    if parsed:
+                        records.extend(parsed)
+                        sock.settimeout(2.0)
+                        saw_frame = True
+                        continue
+                    if b"hd1.0" in response:
+                        saw_frame = True
+                if records:
+                    break
+
+        if records:
+            if self._evidence is not None:
+                self._evidence.record_feature(
+                    Capability.L2_TIMELINE,
+                    Support.YES,
+                )
+            return records
+        if saw_frame:
+            raise ProtocolError("收到 4096 盘口快照帧但无法解析")
         return []
 
 

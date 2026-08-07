@@ -814,6 +814,61 @@ class ServiceFacade:
         combined = datetime.combine(_date.today(), value)
         return int(combined.timestamp())
 
+    def snapshot_replay(
+        self,
+        code: str,
+        *,
+        market: int = 0,
+        timeout: float = 30.0,
+    ) -> list[dict]:
+        """查盘口快照回放（period=4096，超级盘口分时曲线）。
+
+        返回全天每 ~3 秒一个完整盘口快照（~4927 点），每条含十档买卖价量。
+        **仅 Level2 账号可用**。走对应市场的 Level2 连接（pageid=4260）。
+
+        Args:
+            code: 股票代码（如 ``"000938"``、``"603118"``）。
+            market: 市场码（0=按代码前缀自动推断）。
+            timeout: 单次 read_frame 超时（秒）。全天数据 ~500KB，默认 30s。
+
+        Returns:
+            盘口快照记录列表，每条 ``{time, ts, price, dt24-35(五档),
+            dt102-125(六~十档), ...}``，按时间正序。
+
+        Raises:
+            CapabilityUnavailableError: 普通账号无 L2 通道。
+            ChannelUnavailableError: 后台快照线程正在占用 4214 连接。
+        """
+        from ..errors import ChannelUnavailableError
+
+        if market == 0:
+            market = self._market_for_code(code)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._superorder_service.snapshot_replay(
+                code,
+                market=market,
+                timeout=timeout,
+            ),
+        )
+
     def closing_auction(
         self,
         code: str,
