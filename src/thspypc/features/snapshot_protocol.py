@@ -153,6 +153,94 @@ def is_snapshot_push(body: bytes) -> bool:
     )
 
 
+# ── 549B 十档盘口推送（2026-08-07 盘中破译）──
+# magic = 09 7b d0 0f，含完整十档买卖价量。
+# 布局（相对帧起点）：
+#   [1:5]   magic 7b d0 0f 7f
+#   [28]    市场标记 0x21=深 0x11=沪
+#   [29:35] ASCII 代码
+#   [51:67] 昨收/开盘/最高/最低/现价 (5×4B ths_float)
+#   [67:95] 成交量/额等
+#   [95:143] 买1买2买3 卖1卖2卖3 (6对×8B: 4B ths_float价 + 4B u32量)
+#   [143:147] 4B 间隔
+#   [147:179] 买4 卖4 买5 卖5 (4对×8B)
+#   [179:195] 16B 间隔块
+#   [195:267] 买6-买10 卖6-卖10 (10对×8B)
+_DEPTH_PUSH_MAGIC = b"\x7b\xd0\x0f"
+
+
+def is_depth_push(body: bytes) -> bool:
+    """Return whether ``body`` matches the ~549B ten-level depth push shape."""
+    return (
+        len(body) >= 300
+        and body[0] == 0x09
+        and body[1:4] == _DEPTH_PUSH_MAGIC
+        and all(0x30 <= value <= 0x39 for value in body[45:51])
+    )
+
+
+def parse_depth_push(body: bytes) -> dict | None:
+    """Parse the ~549B ten-level depth push frame.
+
+    2026-08-07 盘中破译（002384 东山精密 ~200 元对照确认）。
+    含完整十档买卖价量 + 昨收/开盘/最高/最低/现价。
+    """
+    if not is_depth_push(body):
+        return None
+
+    code = body[45:51].decode("ascii")
+    market_flag = body[44]
+    market = (
+        "SH" if market_flag == 0x11
+        else "SZ" if market_flag == 0x21
+        else f"?{market_flag:#x}"
+    )
+
+    def _f(off):
+        return decode_ths_float(struct.unpack("<I", body[off:off + 4])[0])
+
+    def _u32(off):
+        return struct.unpack("<I", body[off:off + 4])[0]
+
+    # 十档：价量对，4B gap 后再继续
+    def _pair(off):
+        return round(_f(off), 3), _u32(off + 4)
+
+    # 前 3 档买卖 (6对 @95-142)
+    pairs = []
+    off = 95
+    for _ in range(6):
+        pairs.append(_pair(off))
+        off += 8
+    off += 4  # 4B 间隔 @143
+    # 买4 卖4 买5 卖5 (4对 @147-178)
+    for _ in range(4):
+        pairs.append(_pair(off))
+        off += 8
+    off += 16  # 16B 间隔块 @179-194
+    # 买6-买10 卖6-卖10 (10对 @195-266)
+    for _ in range(10):
+        if off + 8 > len(body):
+            break
+        pairs.append(_pair(off))
+        off += 8
+
+    return {
+        "code": code,
+        "market": market,
+        "price": _f(67),       # 现价
+        "prev_close": _f(51),  # 昨收
+        "open": _f(55),        # 开盘
+        "high": _f(59),        # 最高
+        "low": _f(63),         # 最低
+        # 十档：买1-买5 价/量, 卖1-卖5 价/量, 买6-买10, 卖6-卖10
+        # pairs 顺序: 买1买2买3卖1卖2卖3 买4卖4买5卖5 买6卖6买7卖7买8卖8买9卖9买10卖10
+        "bids": [pairs[i] for i in [0, 1, 2, 6, 8, 10, 12, 14, 16, 18] if i < len(pairs)],
+        "asks": [pairs[i] for i in [3, 4, 5, 7, 9, 11, 13, 15, 17, 19] if i < len(pairs)],
+        "raw_len": len(body),
+    }
+
+
 __all__ = [
     "MARKET_SNAPSHOT_DATATYPE",
     "MARKET_SNAPSHOT_MARKETS",
@@ -164,4 +252,6 @@ __all__ = [
     "build_snapshot_subscribe",
     "is_snapshot_push",
     "parse_snapshot_push",
+    "is_depth_push",
+    "parse_depth_push",
 ]
