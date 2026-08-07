@@ -1366,6 +1366,15 @@ class ServiceFacade:
         """取某代码的最新现价（snapshot_subscribe 后由推送线程更新）。"""
         return self._latest_price.get(code)
 
+    def latest_depth(self, code: str) -> dict | None:
+        """取某代码的最新十档盘口（549B 推送解析结果）。
+
+        返回 ``parse_depth_push`` 的 dict（含 price/prev_close/open/high/low/
+        bids[10]/asks[10]），或 None。需先 ``snapshot_subscribe`` 且盘中
+        服务器推送了 549B 十档帧。
+        """
+        return self._latest_depth.get(code)
+
     def stop_snapshot(self) -> None:
         """停止分时推送读取线程，关闭沪深两条 L2 推送连接（disconnect 时自动调用）。"""
         self._connection_runtime.stop_snapshot()

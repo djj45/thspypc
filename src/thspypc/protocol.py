@@ -133,7 +133,9 @@ from .features.snapshot_protocol import (
     SNAPSHOT_SUBTYPE,
     build_market_snapshot_query,
     build_snapshot_subscribe,
+    is_depth_push,
     is_snapshot_push,
+    parse_depth_push,
     parse_snapshot_push,
 )
 from .features.superorder_protocol import (

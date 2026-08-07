@@ -317,6 +317,10 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
     def _latest_price(self):
         return self._connection_runtime.latest_prices
 
+    @property
+    def _latest_depth(self):
+        return self._connection_runtime.latest_depth
+
     def configure_service_context(
         self,
         profile: AccountProfile | None = None,

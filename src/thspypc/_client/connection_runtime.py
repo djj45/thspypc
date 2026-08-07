@@ -288,6 +288,7 @@ class ConnectionRuntime:
         self.snapshot_codes: set[str] = set()
         self.snapshot_callback = None
         self.latest_prices: dict[str, float] = {}
+        self.latest_depth: dict[str, dict] = {}
 
     def start_heartbeat(self) -> None:
         if not self.enable_heartbeat:
@@ -348,10 +349,14 @@ class ConnectionRuntime:
         read_frame: Callable[[Any], bytes] | None = None,
         is_snapshot_push: Callable[[bytes], bool] | None = None,
         parse_snapshot_push: Callable[[bytes], dict | None] | None = None,
+        is_depth_push: Callable[[bytes], bool] | None = None,
+        parse_depth_push: Callable[[bytes], dict | None] | None = None,
     ) -> None:
         import select
         from ..protocol import (
+            is_depth_push as default_is_depth_push,
             is_snapshot_push as default_is_snapshot_push,
+            parse_depth_push as default_parse_depth_push,
             parse_snapshot_push as default_parse_snapshot_push,
             read_frame as default_read_frame,
         )
@@ -359,6 +364,8 @@ class ConnectionRuntime:
         read = read_frame or default_read_frame
         matches = is_snapshot_push or default_is_snapshot_push
         parse = parse_snapshot_push or default_parse_snapshot_push
+        depth_matches = is_depth_push or default_is_depth_push
+        depth_parse = parse_depth_push or default_parse_depth_push
         while not self.snapshot_stop.is_set():
             with self._push_lock:
                 socket_items = [
@@ -397,19 +404,26 @@ class ConnectionRuntime:
                         body = read(sock)
                     except (socket.timeout, OSError, ValueError):
                         continue
-                if not matches(body):
+                # 优先匹配 71B 逐笔；否则尝试 549B 十档盘口推送
+                if matches(body):
+                    record = parse(body)
+                elif depth_matches(body):
+                    record = depth_parse(body)
+                else:
                     continue
-                record = parse(body)
                 if record is None:
                     continue
                 self.latest_prices[record["code"]] = record["price"]
+                # 549B 十档帧含完整买卖盘，存入 latest_depth 供查询
+                if "bids" in record:
+                    self.latest_depth[record["code"]] = record
                 if self.snapshot_callback is not None:
                     try:
                         self.snapshot_callback(
                             record["code"],
                             record["market"],
                             record["price"],
-                            record["volume"],
+                            record.get("volume", 0),
                         )
                     except Exception as exc:
                         logger.warning("snapshot 回调异常: %s", exc)
