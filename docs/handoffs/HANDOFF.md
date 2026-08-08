@@ -71,11 +71,11 @@
   名称获取有两条路径（2026-07-19 确认 dt55 = 名称字段，mac 版字段表 `55: '名称'`）：
   - **路径 A（已可用）**：`list_quotes(codes, datatype=[..., 55])` 批量查，响应 dt55 含 GBK 名称
     （实测 600000→浦发银行、600519→贵州茅台）。慢（7000 只要 ~250 批）。
-  - **?? B?????2026-08-08?**?????? `0x001c StockNameVer` ????
-    ?`MarketCode=16;144;208;` + `StockNameVer=;;`?pageid ??? 5716/392??????????
-    `name_16_16` ??????level2 515KB / ?? 860KB????? 33k-57k ????
-    ?? `docs/investigations/NAME_16_16_MEMORY_DUMP_PROGRESS.md` ? 13 ??
-    ? Python ?????`fetch_stock_names_full()`????????? stockname ???
+  - **路径 B（已解决，2026-08-08）**：冷启动后走 `0x001c StockNameVer` 二进制帧
+    （`MarketCode=16;144;208;` + `StockNameVer=;;`，pageid 按账号 5716/392）。服务器按市场组回
+    `name_16_16` 全量压缩帧（level2 515KB / 普通 860KB），解码后 33k-57k 条名称；
+    详见 `docs/investigations/NAME_16_16_MEMORY_DUMP_PROGRESS.md` 第 13 节。
+    纯 Python 网络实现：`fetch_stock_names_full()`，跨平台不依赖本地 stockname 文件。
     但字节被位平面转置破坏），格式未破解。hexin 落盘格式见
     `C:/同花顺软件/同花顺/stockname/stockname_<市场>_0.txt`（`<代码>=<名称>|<别名>@<标志>`）。
 - **实测**（2026-07-19）：活网 5.7s 拿到 7422 条代码；离线 pcap 解出 7526 条

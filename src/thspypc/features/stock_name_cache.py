@@ -114,8 +114,20 @@ def build_version_value(
     (base/real/history). The response only exposes one ConfigVer per segment,
     so the same list is repeated to keep the wire format compatible.
     """
+    def segment_key(segment: str) -> tuple:
+        prefix, _, suffix = segment.partition("_")
+        try:
+            prefix_num = int(prefix)
+        except ValueError:
+            prefix_num = prefix
+        try:
+            suffix_num = int(suffix)
+        except ValueError:
+            suffix_num = suffix
+        return (prefix_num, suffix_num)
+
     group = []
-    for segment in sorted(config_vers):
+    for segment in sorted(config_vers, key=segment_key):
         group.append(
             f"^bname_{segment}^B^r^nConfigVer^e{config_vers[segment]}^r^n"
         )

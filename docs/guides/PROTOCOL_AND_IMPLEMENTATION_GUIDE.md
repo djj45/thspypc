@@ -664,33 +664,28 @@ JSON 根为 `CloseAuction`；解析别名为 `dt10=newprice`、`lead_price=leadp
 
 ---
 
-## 11b. Stock-name full sync domains (2026-08-08)
+## 11b. 股票名称全量同步的服务器分组（2026-08-08）
 
-Full stock-name download is triggered with the binary `0x001c StockNameVer`
-frame (`MarketCode=...` + `StockNameVer=;;`) on a fresh 123ths.com session.
-Domain depends on account kind:
+全量名称下载用二进制 `0x001c StockNameVer` 帧（`MarketCode=...` + `StockNameVer=;;`）
+在新建的 123ths.com 会话上触发，域名按账号类型分组：
 
-| Account | MarketCode group | pageid | Domain |
+| 账号/市场 | MarketCode 组 | pageid | 域名 |
 |---|---|---|---|
 | level2 | 16;144;208 | 5716 | `shlv2.123ths.com` |
-| standard | 32;208 | 392 | `main.123ths.com` |
-| any | 32 | 5716/392 | `szlv2.123ths.com` |
-| any | 96;128;88;216;48 | - | `fu4.123ths.com` |
-| any | 176;112 / 168;184;200 | - | `hkus.123ths.com` |
-| any | 120;104 | - | `ifindhq.123ths.com` |
-| any | 64 | - | `fu2.123ths.com` |
-| any | UNS/UHI | - | `usotc.123ths.com` |
+| 普通 | 32;208 | 392 | `main.123ths.com` |
+| 任意 | 32 | 5716/392 | `szlv2.123ths.com` |
+| 任意 | 96;128;88;216;48 | - | `fu4.123ths.com` |
+| 任意 | 176;112 / 168;184;200 | - | `hkus.123ths.com` |
+| 任意 | 120;104 | - | `ifindhq.123ths.com` |
+| 任意 | 64 | - | `fu2.123ths.com` |
+| 任意 | UNS/UHI | - | `usotc.123ths.com` |
 
-Implementation: `features/stock_name_bootstrap.py` embeds the captured
-bootstrap templates; `services/stock_name.py::download_full_stock_names`
-opens a fresh socket, logs in, replays the bootstrap, sends the trigger, and
-decodes `name_16_16`. Public entry: `THSClient.fetch_stock_names_full()`. After a full download,
-per-segment ConfigVer + names are cached to `~/.thspypc/stockname/` and
-reported on the next call; a silent server means the cache is current. Reporting a real old ConfigVer
-(e.g. 20260306) makes the server return only the changed segments with their
-new ConfigVer; fabricated versions are ignored.
-
-
+实现：`features/stock_name_bootstrap.py` 固化引导模板；
+`services/stock_name.py::download_full_stock_names` 开新 socket 登录、重放引导、
+发触发帧并解码 `name_16_16`。公开入口：`THSClient.fetch_stock_names_full()`。
+全量下载后每段 ConfigVer + 名称缓存到 `~/.thspypc/stockname/`，下次上报缓存版本；
+服务器静默表示缓存已最新。上报真实旧 ConfigVer（如 20260306）会触发服务器只回
+变化的段及新 ConfigVer；编造版本会被忽略。
 
 ## 12. K线：日K / 周K / 月K / 分钟K（`kline`）
 

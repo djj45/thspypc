@@ -276,131 +276,77 @@ session vtable 实测：
 - `captures_live/name_dynamic_20260808_1949/headless5_stdout.txt`
 - `captures_live/name_dynamic_20260808_1949/headless3_stack_stdout.txt`
 
-## 13. Resolution: name_16_16 is the cmd=0x0a outer LZ, not a second layer (2026-08-08)
+## 13. 结论：name_16_16 就是 cmd=0x0a 外层 LZ，17B 记录是压缩源（2026-08-08）
 
-### 13.1 Key finding
+### 13.1 关键结论
 
-The "17-byte block encoding" observed in the memory dump is actually the byte
-layout of the outer LZ compressed stream. The real decoder is the already
-ported `normalize_8901_response` (hexin.exe RVA `0xf74260`).
+name_16_16 的“17B 块状编码”不是第二层编码，而是外层 LZ 压缩流的字节分布。
+真正的解码器就是已移植的 `normalize_8901_response`（hexin.exe RVA 0xf74260）。
 
-- A raw response frame body starts with `0x0a`, followed by a BE32 output
-  length, the `0x1600` frame header, `MarketCode=16\x00\r\n`,
-  `[name_16_16]\r\n`, and the compressed stream.
-- `normalize_8901_response(body)` expands it into the plaintext frame
-  (`00 16 ff 0f ... MarketCode=16\r\n[name_16_16]\r\nConfigVer=...`).
-- The on-disk `stockname_16_0_full.txt` is that output with the `0x1600`
-  header and `MarketCode=16\r\n` removed, and with the `\r\n\r\n`
-  between the eight segments collapsed to `\r\n`.
+- 原始响应帧体以 `0x0a` 开头：`0x0a` + BE32 输出长度 + `0x1600` 帧头 +
+  `MarketCode=16\x00\r\n` + `[name_16_16]\r\n` + 压缩流。
+- `normalize_8901_response(body)` 解出的正是带 0x1600 头的明文帧。
+- 磁盘文件 `stockname_16_0_full.txt` = 解压输出去掉 0x1600 头 + `MarketCode=16\r\n`，
+  并把 8 个段之间的 `\r\n\r\n` 压成 `\r\n`。
 
-### 13.2 Verification
+### 13.2 100% 验证
 
-Reconstructing the 10:57 full frame from `name16_cipher_mem.bin` (fixed
-header + `MarketCode=16\x00\r\n` + cipher, length `0x00174828`) and running
-`normalize_8901_response` yields output that, after collapsing segment blank
-lines, matches `stockname_16_0_full.txt` byte-for-byte for the full file
-(0 mismatches).
+用 10:57 同版本内存密文重建完整压缩源（固定头 + `MarketCode=16\x00\r\n` +
+`name16_cipher_mem.bin`，长度字段 0x00174828），`normalize_8901_response` 解压后
+去掉段间空行，与 `stockname_16_0_full.txt` **逐字节 0 差异**（前 762738 B）。
 
-Unicorn native emulation of the same image at `0xf74260` (image base
-`0xa50000`; malloc/free/memcpy RVAs `0x15e2ba2`/`0x15e10d9`/`0x15d1290`)
-matches the Python port byte-for-byte except for tail padding at offset
-1,602,587 on the 10:38 frame.
+Unicorn 原生模拟同一镜像的 `0xf74260`（base 0xa50000，malloc/free/memcpy RVA
+0x15e2ba2/0x15e10d9/0x15d1290），与 Python 端口逐字节对比：10:38 帧只在输出尾
+1602587 处有填充差异，正文一致。10:38 与 10:57 在解压后第 652 字节起内容不同，
+是两轮抓包快照不同，不是解码 bug。
 
-The 10:38 `upstockname_new_stream46_server.bin` differs from the 10:57 disk
-file starting at decoded byte 652 (`|000028@s` vs `|00002|` plus source bytes
-leaking through). Native emulation reproduces the same divergence, so that is
-a content/version difference between captures, not a decoder bug.
+### 13.3 活网抓包
 
-### 13.3 Live capture
+2026-08-08 10:38 冷启动 pcap 中包含真实 `name_16_16` 响应（362,635B 压缩帧），
+`decode_name_frame` 解出 1,155 条、`skipped=[]`；765B 的 `name_168_16` 帧也解出
+13 条。
 
-The 2026-08-08 10:38 cold-start pcap
-(`captures_live/upstockname_capture_20260808_103542.pcap`) contains the real
-server response for `name_16_16` (one 362,635-byte compressed frame on stream
-`8.134.115.123:8901`). Feeding that exact frame to `decode_name_frame` yields
-1,155 names with `skipped=[]`; the 765-byte `name_168_16` frame also decodes
-(13 names). That snapshot differs from the 10:57 disk file at decoded byte 652
-(see 13.2), so the count is lower than the 10:57 reconstruction.
+### 13.4 代码落地
 
-### 13.5 Two-capture comparison (2026-08-08 21:43/21:44)
+- `decode_name_frame` 先调 `normalize_8901_response`，再按 `[name_16_*]` 段解析
+  GBK 文本；`name_16_16` 不再被当作未解块状段跳过。
+- 验证：10:57 重建帧可解出 `600000=浦发银行`、`1A0001=上证指数`，`skipped=[]`，
+  names > 20000。
+- 相关测试：`tests/test_stock_name_protocol.py::test_captured_a_share_compressed_stream_decodes_names`。
 
-Two cold-start captures were taken on the same account:
+### 13.5 两次冷启动对比（21:43 / 21:44）
 
-- `upstockname_capture_20260808_214322.pcap` (normal, cache kept): the client
-  sent a 0x001c StockNameVer frame with `MarketCode=16;144;208;` and explicit
-  `name_16_16..23` ConfigVer values. The server returned NO `name_16_16`
-  response.
-- `upstockname_capture_20260808_214435.pcap` (cache deleted): the same frame
-  with `StockNameVer=;;`. The server returned one 515,526-byte compressed
-  `name_16_16` frame ~47ms later.
+- 正常启动：0x001c 帧带 16_* 的 ConfigVer，服务器不回 `name_16_16`。
+- 删文件启动：0x001c 帧 `StockNameVer=;;`，服务器回 515,526B `name_16_16`，
+  解出 33,619 条。
+- `build_stock_name_ver_frame()` 逐字节复刻删文件启动的请求帧（有回归测试）。
 
-`decode_name_frame` on the 515,526-byte frame yields 33,619 unique names,
-`skipped=[]` (`600000=...`, `601318=...`, `1A0001=...` all decode).
+活网重放（成功）：新开裸 socket 连 `shlv2.123ths.com`（122.9.115.201），用同一
+passport 登录（VerifyCode=0），重放删缓存引导（每帧 `encode_frame(body) + b"\n"`），
+约 50ms 后回 515,526B `name_16_16`，解出 33,619 条。可复现脚本：
+`tests/probe_stockname_full.py`。
 
-`build_stock_name_ver_frame()` in `stock_name_protocol.py` reproduces the
-deleted-cache request byte-for-byte (regression test compares against
-`captures_live/stockname_ver_deleted_214435.bin`).
+### 13.6 域名映射与跨平台实现
 
-Live replay (working): opening a fresh raw socket to
-`shlv2.123ths.com:8901` (e.g. 122.9.115.201), logging in with the same
-passport (VerifyCode=0), then replaying the 48-frame deleted-cache bootstrap
-(each `encode_frame(body) + b"\n"`) returns the 515,526-byte `name_16_16`
-frame in ~50ms. `decode_name_frame` yields 33,619 unique names, `skipped=[]`.
-The trigger only works when the 0x001c `StockNameVer=;;` frame is sent on a
-fresh shlv2 session with the full bootstrap; sending it on thspypc's existing
-MAIN socket is ignored. Repeatable probe: `tests/probe_shlv2_stockname.py`.
-
-### 13.6 Domain mapping and cross-platform implementation (2026-08-08)
-
-The full name download is triggered on a fresh 123ths.com session with the
-`0x001c StockNameVer=;;` frame. Which domain depends on the account kind:
-
-| Account | A-share name group | Domain | Trigger frame | Response |
+| 账号 | A股名称组 | 域名 | 触发帧 | 响应 |
 |---|---|---|---|---|
-| level2 | 16;144;208 (pageid 5716) | `shlv2.123ths.com` | `MarketCode=16;144;208; StockNameVer=;;` | 515,526B -> 33,619 names |
-| standard | 32;208 (pageid 392) | `main.123ths.com` | `MarketCode=32;208; StockNameVer=;;` | 860,896B -> 57,135 names |
+| level2 | 16;144;208 (pageid 5716) | `shlv2.123ths.com` | `MarketCode=16;144;208; StockNameVer=;;` | 515,526B -> 33,619 条 |
+| 普通 | 32;208 (pageid 392) | `main.123ths.com` | `MarketCode=32;208; StockNameVer=;;` | 860,896B -> 57,135 条 |
 
-Other market groups use `szlv2` (32), `fu4` (96/128/88/216/48),
-`hkus` (176/112, 168/184/200), `ifindhq` (120/104), `fu2` (64),
-`usotc` (UNS/UHI). All are `*.123ths.com:8901`.
+其他市场组：`szlv2`（32）、`fu4`（96/128/88/216/48）、`hkus`（176/112、168/184/200）、
+`ifindhq`（120/104）、`fu2`（64）、`usotc`（UNS/UHI），均为 `*.123ths.com:8901`。
 
-Implementation (`src/thspypc/features/stock_name_bootstrap.py` + `services/stock_name.py`):
-- `LEVEL2_BOOTSTRAP_FRAMES` / `STANDARD_BOOTSTRAP_FRAMES` embed the captured
-  cold-start bootstrap (login excluded) as protocol constants.
-- `download_full_stock_names(login_body, account_kind=...)` resolves the
-  domain, opens a fresh socket, logs in, replays the bootstrap, sends the
-  trigger, and decodes `name_16_16`.
-- `ServiceFacade.fetch_stock_names_full()` wires it with the current passport;
-  `load_hexin_names()` (Windows stockname file reader) was removed.
+实现：`features/stock_name_bootstrap.py` 固化引导模板；
+`services/stock_name.py::download_full_stock_names` 开新 socket 登录、重放引导、
+发触发帧并解码；`ServiceFacade.fetch_stock_names_full()` 用当前 passport 接入；
+已删除 `load_hexin_names`（Windows stockname 文件读取）。
 
-Cache management mirrors hexin: after a full download the per-segment
-ConfigVer and names are saved to `~/.thspypc/stockname/stockname_<kind>_0.txt`
-(`features/stock_name_cache.py`). The next `fetch_stock_names_full` reports
-those ConfigVer values in the 0x001c frame instead of `;;`; when the server is
-already current it stays silent and the cached names are returned. Partial
-incremental responses are merged into the cache instead of replacing it.
+缓存管理：全量下载后把每段 ConfigVer + 名称存到 `~/.thspypc/stockname/`，下次上报
+缓存 ConfigVer；服务器静默时直接用缓存；增量响应合并名称并按段合并 ConfigVer。
 
-### 13.7 Old-version experiment (2026-08-08 22:22)
+### 13.7 旧版本实验（22:22）
 
-Replacing the local stockname files with the historical 2026-03-06 files and
-cold-starting hexin produced a 0x001c frame reporting the REAL old ConfigVer
-(`20260306_...` for 16_16..16_23 and 144_*). The server responded with a
-451,275-byte `name_16_16` frame that decodes to only the CHANGED segments
-(16_16..16_19, 7,786 names) with ConfigVer already bumped to the current
-`20260807_...`. Segments whose version did not change are omitted.
-
-A fabricated old version (`20200101_1`) did NOT trigger any name response on
-shlv2; the server only honors real historical ConfigVer values.
-
-Cache implication: report the cached per-segment ConfigVer; when the server
-returns a partial segment update, merge the names and merge the new ConfigVer
-per segment (do not replace the whole version table).
-
-### 13.4 Code change
-
-
-- `src/thspypc/features/stock_name_protocol.py::decode_name_frame` now calls
-  `normalize_8901_response` first and parses `name_16_*` sections as GBK text;
-  `name_16_16` is no longer skipped as an unresolved block segment.
-- Verified on the reconstructed 10:57 frame: `600000=...` and `1A0001=...`
-  decode, `skipped=[]`, and more than 20000 unique names are returned.
-- Regression test: `tests/test_stock_name_protocol.py::test_captured_a_share_compressed_stream_decodes_names`.
+把本地 stockname 换成 2026-03-06 历史文件冷启动，客户端上报真实旧 ConfigVer
+（16_*、144_* 为 `20260306_...`），服务器回 451,275B `name_16_16`。用 222248
+引导模板重放可稳定复现；用编造的旧版本（`20200101_1`）服务器不回。缓存策略：
+上报缓存 ConfigVer，收到分段增量时合并名称并逐段更新 ConfigVer，不整表覆盖。

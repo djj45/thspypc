@@ -859,57 +859,44 @@ thsdk JSON、DMP、Unicorn 和加载映像只用于开发验证。生产库应�
 变成可回归的工程问题。
 
 
-## 22. Case study: name_16_16, why the known 0x0a framing was missed
+## 22. 复盘：name_16_16，为什么一直没认出它就是已知的 0x0a 外层帧
 
-### 22.1 Symptom
+### 22.1 现象
 
-The A-share stock-name download (`name_16_16`) looked like a custom
-"17-byte block encoding": `[ctrl][16B]` groups, where `ctrl=0x00` behaved as
-16 literal bytes and `ctrl!=0` seemed to hide match tokens. Many simple LZ /
-bitmask / RLE models were fitted and falsified over weeks.
+A 股名称下载（`name_16_16`）看起来像“17 字节块状编码”：`[ctrl][16B]`，
+`ctrl=0x00` 像 16 字节字面量，`ctrl!=0` 似乎藏着匹配 token。几周内试了各种
+LZ/位掩码/RLE 模型都推不出来。
 
-### 22.2 Actual structure
+### 22.2 真实结构
 
-The payload is the standard 8901 outer serialization:
+它就是标准 8901 外层序列化：
 
 ```text
-0x0a                       <- compressed marker (same as every cmd=0x0a frame)
-BE32 uncompressed length
-0x1600 frame header
+0x0a                       <- 压缩标记（和所有 cmd=0x0a 帧相同）
+BE32 解压后长度
+0x1600 帧头
 MarketCode=16\x00\r\n
 [name_16_16]\r\n
-<compressed source>        <- the "17-byte blocks" are literally these bytes
+<压缩源>                    <- 所谓“17B 块”就是这些字节
 ```
 
-`normalize_8901_response` (port of hexin RVA `0xf74260`, already used for
-8901 timelines) decodes it to the plaintext file byte-for-byte. There is no
-second codec.
+`normalize_8901_response`（hexin RVA 0xf74260 的移植，8901 分时已经在用）解出来
+就是明文文件，逐字节一致。没有第二个解码器。
 
-### 22.3 Why it took so long
+### 22.3 为什么拖了这么久
 
-1. The captured stream was analyzed as an already-extracted "name frame"
-   without first checking the `fd` envelope, the `0x0a` cmd byte, or the BE32
-   length. The same LZ was already ported for other 8901 features, but the
-   sample was labeled "block encoding", so nobody ran the known normalizer on
-   it.
-2. The first three records (`ctrl=0x00`) coincidentally look like literals,
-   which anchored the wrong mental model. Later records are compressed bytes
-   whose control bits just happen to line up into 17-byte groups.
-3. The memory "cipher" dump is the compressed source, not a second encoding;
-   treating it as an independent format forced invented token semantics.
-4. Same-version verification only became possible after reconstructing the
-   full frame from the cipher + fixed header. Cross-capture differences
-   (10:38 vs 10:57) were mistaken for decoder bugs until Unicorn native
-   emulation proved both decoded identically.
+1. 把抓包当“已提取的名称帧”分析，没有先看 fd 信封、`0x0a` cmd、BE32 长度；
+   同一个 LZ 已经在其他 8901 功能里移植过，但样本被标成“块状编码”，没人拿
+   已知的 `normalize_8901_response` 去跑一遍。
+2. 前三条记录 `ctrl=0x00` 恰好像字面量，锚定了错误心智模型；后面记录只是压缩
+   字节，控制位刚好凑成 17 字节一组。
+3. 内存“密文”其实是压缩源，不是第二层编码；把它当独立格式去发明 token 语义。
+4. 同版本验证要等重建完整帧（密文 + 固定头）才能做；跨抓包差异（10:38 vs
+   10:57）被误判成解码 bug，直到 Unicorn 原生模拟证明两边解出来一样。
 
-### 22.4 Lessons
+### 22.4 教训
 
-- Before inventing a new codec, check whether the input is still inside a
-  known outer layer. For any 8901 payload beginning with `0x0a`, run
-  `normalize_8901_response` first; recognizable text coming out means the
-  mystery was the outer layer, not the inner format.
-- Fixed-size "record" grouping is a red herring when the stream is
-  variable-length compressed. Fit the decompressor first, then decide whether
-  a record structure exists.
-- Keep same-version cipher/plaintext pairs as oracle and use Unicorn native
-  emulation to separate decoder bugs from capture version differences.
+- 发明新 codec 之前，先确认输入是否还在已知外层里。凡是 8901 payload 以
+  `0x0a` 开头，先跑 `normalize_8901_response`；解出可读文本就说明谜题在外层。
+- 变长压缩流里看到“定长记录分组”是红鲱鱼，先解压再谈记录结构。
+- 保留同版本密文/明文对做 oracle，用 Unicorn 原生模拟区分解码 bug 与版本差异。

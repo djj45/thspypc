@@ -10,6 +10,7 @@ from ..codecs.framing import encode_frame, read_frame
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.stock_name_bootstrap import (
     LEVEL2_BOOTSTRAP_FRAMES,
+    LEVEL2_VERSIONED_BOOTSTRAP_FRAMES,
     STANDARD_BOOTSTRAP_FRAMES,
     STOCK_NAME_DOMAINS,
     STOCK_NAME_PREFERRED_IPS,
@@ -97,7 +98,13 @@ def download_full_stock_names(
             stock_name_ver=build_version_value(cached_config_vers, markets),
             pageid=pageid,
         )
-        bootstrap = list(bootstrap[:-1]) + [trigger]
+        versioned = (
+            LEVEL2_VERSIONED_BOOTSTRAP_FRAMES
+            if key == "level2"
+            else None
+        )
+        base = versioned if versioned else bootstrap
+        bootstrap = list(base[:-1]) + [trigger]
     else:
         bootstrap = list(bootstrap)
 
