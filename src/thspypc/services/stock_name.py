@@ -301,6 +301,47 @@ def download_full_stock_names(
                 pass
 
 
+def download_all_stock_names(
+    login_body: bytes,
+    account_kind: AccountKind = AccountKind.LEVEL2,
+    *,
+    timeout: float = 45.0,
+    settle_timeout: float = 3.0,
+) -> dict:
+    """Download every market group's names (external manual entry).
+
+    Iterates the account-specific 123ths market groups and merges their
+    ``[name_*]`` segments into one result, using per-group txt caches
+    (``~/.thspypc/stockname/``). Call this after login to refresh the full
+    stock-name list.
+    """
+    key = (
+        account_kind.value
+        if isinstance(account_kind, AccountKind)
+        else "standard"
+    )
+    groups = STOCK_NAME_GROUPS.get(key, STOCK_NAME_GROUPS["standard"])
+    result = {
+        "names": {},
+        "by_segment": {},
+        "skipped": [],
+        "segments": [],
+    }
+    for group_key in groups:
+        part = download_stock_name_group(
+            login_body,
+            group_key,
+            timeout=timeout,
+            settle_timeout=settle_timeout,
+            cache_path=str(group_cache_path(group_key)),
+        )
+        result["names"].update(part["names"])
+        result["by_segment"].update(part["by_segment"])
+        result["skipped"].extend(part["skipped"])
+        result["segments"].extend(part["segments"])
+    return result
+
+
 class StockNameService:
     """Fetch currently available upstockname increments on MAIN."""
 
@@ -383,4 +424,10 @@ class StockNameService:
         return result
 
 
-__all__ = ["StockNameService", "download_full_stock_names", "empty_name_result"]
+__all__ = [
+    "StockNameService",
+    "download_all_stock_names",
+    "download_full_stock_names",
+    "download_stock_name_group",
+    "empty_name_result",
+]

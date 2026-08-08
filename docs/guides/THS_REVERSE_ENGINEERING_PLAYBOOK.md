@@ -859,6 +859,46 @@ thsdk JSON、DMP、Unicorn 和加载映像只用于开发验证。生产库应�
 变成可回归的工程问题。
 
 
+## 21b. 动态附加绕过反调试（2026-08-08 实测可用）
+
+同花顺 hexin.exe 有严格反调试，但 x32dbg headless + ScyllaHide 可以稳定附加
+运行中的进程。今天（2026-08-08）用这套流程抓到了 名称帧 socket→解码 的完整
+调用链。
+
+### 工具与关键配置
+
+- x32dbg headless：`D:\software\x64dbg\release\x32\headless.exe`
+- ScyllaHide：`D:\software\x64dbg\release\x32\plugins\ScyllaHideX64DBGPlugin.dp32`
+- 必须改 `scylla_hide.ini` 里 `VMProtect x86/x64` profile 的 `BreakOnTLS=0`，
+  否则 headless 会卡在 TLS 回调上。
+- 附加命令：
+
+```text
+headless.exe -pid <pid> -userdir <dir> -plugin <dp32> ^
+  -c 'RedirectLog "<log>"' -cf <script.txt>
+```
+
+### headless 脚本注意事项
+
+- 断点脚本用 `bp base+<rva>` + `bplog ...` + `run` 推进。
+- `k` 命令无效，抓调用栈用 `printstack`。
+- `bpcmd` 报 “Not enough arguments”，不要用；改为
+  `run; printstack; log ...; run`。
+- `bpcond` 的字符串函数条件在 headless 打印时可用，但第一次暂停实际上发生在
+  后续 `bpcond=0` 断点之前，所以脚本里第一个停点不要给条件，设 `bpcond ..., 1`。
+- 附加后进程会停在暂停态：驱动脚本保持 stdin 打开，检测到 `[STATE] paused` 就
+  自动写 `run` 继续。
+
+### 可复用驱动
+
+`tests/headless_name16_capture.py`：spawn headless、保持 stdin、附加后对 paused
+自动补 `run`。断点脚本示例：`D:\software\x64dbg\name16_headless_capture*.txt`。
+
+### 运行时地址换算
+
+`mod.main()=0x00510000`，运行时地址 = `0x00510000 + rva`。Ghidra 分析用加载镜像
+`hexin.loaded.bin`（image base `0xa50000`）。
+
 ## 22. 复盘：name_16_16，为什么一直没认出它就是已知的 0x0a 外层帧
 
 ### 22.1 现象
