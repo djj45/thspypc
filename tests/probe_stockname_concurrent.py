@@ -17,7 +17,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-
 def load_dotenv(path: Path) -> None:
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -27,59 +26,27 @@ def load_dotenv(path: Path) -> None:
         if key.strip() and key.strip() not in os.environ:
             os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
-
-def resolve_ips(domain: str) -> list[str]:
-    try:
-        return sorted(
-            {a[4][0] for a in socket.getaddrinfo(domain, 8901, socket.AF_INET)}
-        )
-    except OSError:
-        return []
-
-
 def login_one(login_body: bytes, domain: str) -> tuple[str, socket.socket]:
-    from thspypc.codecs.framing import encode_frame, read_frame
-
-    ips = resolve_ips(domain)
-    last_err = None
-    for ip in ips:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
-        try:
-            s.connect((ip, 8901))
-            s.sendall(encode_frame(login_body) + b"\n")
-            s.settimeout(3.0)
-            end = time.time() + 3
-            while time.time() < end:
-                try:
-                    reply = read_frame(s)
-                except socket.timeout:
-                    break
-                except (OSError, ValueError):
-                    break
-                if reply and b"VerifyCode=0" in reply:
-                    return ip, s
-        except OSError as exc:
-            last_err = exc
-        try:
-            s.close()
-        except OSError:
-            pass
-    raise RuntimeError(f"login failed for {domain}: {last_err}")
-
+    from thspypc.testing import login_socket_for_domains
+    try:
+        host, sock = login_socket_for_domains(
+            login_body, [domain], overall_timeout=8.0
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"login failed for {domain}: {exc}") from exc
+    return host, sock
 
 def main() -> int:
     load_dotenv(ROOT / ".env")
-    from thspypc import THSClient
     from thspypc.features.stock_name_bootstrap import STOCK_NAME_GROUPS, build_group_frames, stock_name_group
     from thspypc.features.stock_name_protocol import decode_name_frame
     from thspypc.codecs.framing import encode_frame, read_frame
     from thspypc.protocol import build_heartbeat_8901
-
-    client = THSClient(os.environ["THS_USERNAME"], os.environ["THS_PASSWORD"])
-    res = client.connect()
-    if not res.success:
-        print("login failed", res.error, res.detail)
+    from thspypc.testing import get_client
+    try:
+        client = get_client(ROOT / ".env")
+    except RuntimeError as exc:
+        print("login failed:", exc)
         return 1
     material = client._auth_service.require_current()
     login_body = client._auth_service.login_body_for_passport(material.passport64)
@@ -174,7 +141,6 @@ def main() -> int:
             pass
     client.disconnect()
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

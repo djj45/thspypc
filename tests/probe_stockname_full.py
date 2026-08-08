@@ -16,12 +16,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
 
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -34,7 +32,6 @@ def load_dotenv(path: Path) -> None:
         key = key.strip()
         if key and key not in os.environ:
             os.environ[key] = value.strip().strip('"').strip("'")
-
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -53,7 +50,6 @@ def main() -> int:
     args = parser.parse_args()
 
     load_dotenv(ROOT / args.env)
-    from thspypc import THSClient
     from thspypc.codecs.framing import encode_frame, read_frame
     from thspypc.features.stock_name_protocol import decode_name_frame
 
@@ -62,28 +58,14 @@ def main() -> int:
     if not user or not pwd:
         print(f"set THS_USERNAME/THS_PASSWORD in {args.env}")
         return 1
-
-    client = THSClient(user, pwd)
-    res = client.connect()
-    if not res.success:
-        print("login failed", res.error, res.detail)
+    from thspypc.testing import get_client
+    try:
+        client = get_client(ROOT / args.env)
+    except RuntimeError as exc:
+        print("login failed:", exc)
         return 1
     material = client._auth_service.require_current()
     login_body = client._auth_service.login_body_for_passport(material.passport64)
-
-    ips = sorted(
-        {
-            addr[4][0]
-            for addr in socket.getaddrinfo(
-                args.domain, 8901, socket.AF_INET
-            )
-        }
-    )
-    target = ips[0] if ips else None
-    if target is None:
-        print("no ip for", args.domain)
-        return 1
-    print("domain:", args.domain, "ips:", ips, "using:", target)
 
     bootstrap_file = ROOT / "captures_live" / args.bootstrap
     if not bootstrap_file.exists():
@@ -93,6 +75,15 @@ def main() -> int:
         bytes.fromhex(item)
         for item in json.loads(bootstrap_file.read_text(encoding="utf-8"))
     ]
+    from thspypc.testing import login_socket_for_domains
+    try:
+        host, sock = login_socket_for_domains(
+            login_body, [args.domain], overall_timeout=8.0
+        )
+    except RuntimeError as exc:
+        print("login failed:", exc)
+        return 1
+    print("domain:", args.domain, "logged in via:", host)
 
     if args.fake_version:
         from thspypc.features.stock_name_cache import (
@@ -131,27 +122,7 @@ def main() -> int:
         ]
         print("fake version value:", version_value[:160])
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
     try:
-        sock.connect((target, 8901))
-        sock.sendall(encode_frame(login_body) + b"\n")
-        sock.settimeout(6.0)
-        login_ok = False
-        deadline = time.time() + 6
-        while time.time() < deadline:
-            try:
-                reply = read_frame(sock)
-            except socket.timeout:
-                break
-            except (OSError, ValueError):
-                break
-            if reply and b"VerifyCode=0" in reply:
-                login_ok = True
-                break
-        print("login VerifyCode=0:", login_ok)
-        if not login_ok:
-            return 1
 
         for index, body in enumerate(bodies):
             sock.sendall(encode_frame(body) + b"\n")
@@ -190,7 +161,6 @@ def main() -> int:
         except OSError:
             pass
         client.disconnect()
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -33,7 +33,7 @@ from ..features.stock_name_protocol import (
 )
 from ..models import AccountKind, Capability
 from ..protocol import build_heartbeat_8901
-
+from ..testing import LoginFailed, login_socket
 
 FrameReader = Callable[[SocketLike], bytes]
 Clock = Callable[[], float]
@@ -57,7 +57,6 @@ _IFINDH_104_STALE_VERSION_VALUE = (
     "^bname_104_110^B^r^nConfigVer^e20260807_2709822740^r^n;;"
 )
 
-
 def empty_name_result() -> dict:
     return {
         "names": {},
@@ -66,34 +65,20 @@ def empty_name_result() -> dict:
         "segments": [],
     }
 
-
 def _connect_and_login(login_body: bytes, ips: list[str]):
-    """Try each resolved IP until VerifyCode=0; return socket or None."""
-    for target in ips:
-        candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        candidate.settimeout(3.0)
-        try:
-            candidate.connect((target, 8901))
-            candidate.sendall(encode_frame(login_body) + b"\n")
-            candidate.settimeout(3.0)
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                try:
-                    reply = read_frame(candidate)
-                except socket.timeout:
-                    break
-                except (OSError, ValueError):
-                    break
-                if reply and b"VerifyCode=0" in reply:
-                    return candidate
-        except OSError:
-            pass
-        try:
-            candidate.close()
-        except OSError:
-            pass
-    return None
-
+    """Open one robust 8901 session across every resolved IP."""
+    try:
+        _host, sock = login_socket(
+            login_body,
+            ips,
+            probe_timeout=1.0,
+            login_timeout=3.0,
+            overall_timeout=6.0,
+            max_concurrent=min(7, len(ips) or 1),
+        )
+        return sock
+    except LoginFailed:
+        return None
 
 def _resolve_ips(domain: str) -> list[str]:
     try:
@@ -105,7 +90,6 @@ def _resolve_ips(domain: str) -> list[str]:
         )
     except OSError:
         return []
-
 
 def _send_frame(
     sock: socket.socket,
@@ -123,14 +107,12 @@ def _send_frame(
     else:
         sock.sendall(payload)
 
-
 def _login_one(login_body: bytes, group_key: str) -> socket.socket | None:
     domain = stock_name_group(group_key)["domain"]
     ips = _resolve_ips(domain)
     if not ips:
         return None
     return _connect_and_login(login_body, ips)
-
 
 def _login_sessions(
     login_body: bytes,
@@ -153,7 +135,6 @@ def _login_sessions(
                 sessions[group_key] = (sock, threading.Lock())
     return sessions
 
-
 def _start_heartbeat(sock: socket.socket, lock: threading.Lock) -> threading.Event:
     stop = threading.Event()
 
@@ -172,7 +153,6 @@ def _start_heartbeat(sock: socket.socket, lock: threading.Lock) -> threading.Eve
         daemon=True,
     ).start()
     return stop
-
 
 def _collect_group(
     sock: socket.socket,
@@ -255,7 +235,6 @@ def _collect_group(
         save_name_cache(result["names"], config_vers, cache_path)
     return result
 
-
 def download_stock_name_group(
     login_body: bytes,
     group_key: str,
@@ -286,7 +265,6 @@ def download_stock_name_group(
             sock.close()
         except OSError:
             pass
-
 
 def download_full_stock_names(
     login_body: bytes,
@@ -343,36 +321,8 @@ def download_full_stock_names(
     else:
         bootstrap = list(bootstrap)
 
-    sock = None
-    login_ok = False
-    for target in ips:
-        candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        candidate.settimeout(3.0)
-        try:
-            candidate.connect((target, 8901))
-            candidate.sendall(encode_frame(login_body) + b"\n")
-            candidate.settimeout(3.0)
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                try:
-                    reply = read_frame(candidate)
-                except socket.timeout:
-                    break
-                except (OSError, ValueError):
-                    break
-                if reply and b"VerifyCode=0" in reply:
-                    login_ok = True
-                    sock = candidate
-                    break
-        except OSError:
-            pass
-        if login_ok:
-            break
-        try:
-            candidate.close()
-        except OSError:
-            pass
-    if sock is None or not login_ok:
+    sock = _connect_and_login(login_body, ips)
+    if sock is None:
         return empty_name_result()
 
     try:
@@ -423,7 +373,6 @@ def download_full_stock_names(
                 sock.close()
             except OSError:
                 pass
-
 
 def download_all_stock_names(
     login_body: bytes,
@@ -484,7 +433,6 @@ def download_all_stock_names(
                 sock.close()
             except OSError:
                 pass
-
 
 class StockNameService:
     """Fetch currently available upstockname increments on MAIN."""
@@ -566,7 +514,6 @@ class StockNameService:
         if self._evidence is not None and result["segments"]:
             self._evidence.record_main_ready()
         return result
-
 
 __all__ = [
     "StockNameService",
