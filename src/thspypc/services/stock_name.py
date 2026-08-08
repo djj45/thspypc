@@ -6,17 +6,35 @@ import time
 from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
-from ..codecs.framing import read_frame
+from ..codecs.framing import encode_frame, read_frame
 from ..features.account_profile import AccountEvidenceRecorder
+from ..features.stock_name_bootstrap import (
+    LEVEL2_BOOTSTRAP_FRAMES,
+    STANDARD_BOOTSTRAP_FRAMES,
+    STOCK_NAME_DOMAINS,
+    STOCK_NAME_PREFERRED_IPS,
+)
+from ..features.stock_name_cache import (
+    build_version_value,
+    extract_config_vers,
+    load_name_cache,
+    save_name_cache,
+)
 from ..features.stock_name_protocol import (
+    build_stock_name_ver_frame,
     build_upstockname_request,
     decode_name_frame,
 )
-from ..models import Capability
+from ..models import AccountKind, Capability
 
 
 FrameReader = Callable[[SocketLike], bytes]
 Clock = Callable[[], float]
+
+_NAME_GROUPS = {
+    "level2": ("16;144;208;", 5716),
+    "standard": ("32;208;", 392),
+}
 
 
 def empty_name_result() -> dict:
@@ -26,6 +44,129 @@ def empty_name_result() -> dict:
         "skipped": [],
         "segments": [],
     }
+
+
+def download_full_stock_names(
+    login_body: bytes,
+    *,
+    account_kind: AccountKind = AccountKind.STANDARD,
+    timeout: float = 45.0,
+    preferred_ip: str | None = None,
+    cache_path: str | None = None,
+) -> dict:
+    """Download the full name_16_16 list over a fresh 123ths.com session.
+
+    Opens a new socket to the account-specific domain (shlv2 for level2,
+    main for standard), logs in with ``login_body``, replays the captured
+    cold-start bootstrap ending in the ``0x001c StockNameVer=;;`` trigger,
+    then decodes the name_16_16 response. Pure Python/TCP, no Windows client
+    files required.
+
+    Returns the same dict shape as :func:`decode_name_frame`; empty result on
+    failure.
+    """
+    key = account_kind.value if isinstance(account_kind, AccountKind) else "standard"
+    domain = STOCK_NAME_DOMAINS.get(key, "main.123ths.com")
+    bootstrap = (
+        LEVEL2_BOOTSTRAP_FRAMES if key == "level2" else STANDARD_BOOTSTRAP_FRAMES
+    )
+    fallback_ip = STOCK_NAME_PREFERRED_IPS.get(key)
+
+    try:
+        ips = sorted(
+            {
+                addr[4][0]
+                for addr in socket.getaddrinfo(domain, 8901, socket.AF_INET)
+            }
+        )
+    except OSError:
+        ips = []
+    target = preferred_ip or fallback_ip
+    if target not in ips:
+        target = ips[0] if ips else None
+    if target is None:
+        return empty_name_result()
+
+    cached = load_name_cache(cache_path) if cache_path else None
+    cached_config_vers = cached[0] if cached else {}
+    cached_names = cached[1] if cached else {}
+    markets, pageid = _NAME_GROUPS.get(key, ("16;144;208;", 5716))
+    if cached_config_vers:
+        trigger = build_stock_name_ver_frame(
+            markets=markets,
+            stock_name_ver=build_version_value(cached_config_vers, markets),
+            pageid=pageid,
+        )
+        bootstrap = list(bootstrap[:-1]) + [trigger]
+    else:
+        bootstrap = list(bootstrap)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    try:
+        sock.connect((target, 8901))
+        sock.sendall(encode_frame(login_body) + b"\n")
+        sock.settimeout(6.0)
+        deadline = time.time() + 6
+        login_ok = False
+        while time.time() < deadline:
+            try:
+                reply = read_frame(sock)
+            except socket.timeout:
+                break
+            except (OSError, ValueError):
+                break
+            if reply and b"VerifyCode=0" in reply:
+                login_ok = True
+                break
+        if not login_ok:
+            return empty_name_result()
+
+        for index, body in enumerate(bootstrap):
+            sock.sendall(encode_frame(body) + b"\n")
+            if index % 4 == 0:
+                time.sleep(0.05)
+
+        sock.settimeout(3.0)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                item = read_frame(sock)
+            except socket.timeout:
+                continue
+            except (OSError, ValueError):
+                break
+            if not item:
+                continue
+            if b"[name_16_16]" in item:
+                result = decode_name_frame(item)
+                if cache_path:
+                    response_vers = extract_config_vers(item)
+                    config_vers = dict(cached_config_vers)
+                    config_vers.update(response_vers)
+                    if cached_names:
+                        merged = dict(cached_names)
+                        merged.update(result["names"])
+                        save_name_cache(merged, config_vers, cache_path)
+                        result["names"] = merged
+                    else:
+                        save_name_cache(result["names"], config_vers, cache_path)
+                return result
+        if cached_names:
+            return {
+                "names": cached_names,
+                "by_segment": {},
+                "skipped": [],
+                "segments": [],
+            }
+        return empty_name_result()
+    except OSError:
+        return empty_name_result()
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 class StockNameService:
@@ -110,4 +251,4 @@ class StockNameService:
         return result
 
 
-__all__ = ["StockNameService", "empty_name_result"]
+__all__ = ["StockNameService", "download_full_stock_names", "empty_name_result"]

@@ -4,9 +4,14 @@ from __future__ import annotations
 import logging
 import re
 
+from ..codecs.compression import normalize_8901_response
+from ..codecs.framing import encode_frame
+
 
 logger = logging.getLogger(__name__)
 
+# Legacy fallback for raw, non-normalized streams. After normalize_8901_response,
+# name_16_* A-share sections are plain GBK text and parse normally.
 BLOCK_ENCODED_SEGMENTS = {"16_16", "168_16"}
 
 
@@ -26,6 +31,33 @@ def build_upstockname_request(
         f"pageid={pageid}\n"
     )
     return b"\x09" + body.encode("gbk")
+
+
+def build_stock_name_ver_frame(
+    markets: str = "16;144;208;",
+    stock_name_ver: str = ";;",
+    pageid: int = 5716,
+) -> bytes:
+    """Build the framed 0x001c StockNameVer request used by name sync.
+
+    Byte-for-byte match with the hexin cold-start frame that triggered the
+    full ``name_16_16`` download on 2026-08-08 (deleted-cache capture): a
+    23-byte binary header with a LE32 text length at offset 19, followed by
+    ``MarketCode=...\r\nStockNameVer=...\r\npageid=...\r``. Sending
+    ``StockNameVer=;;`` makes the server treat market 16 as unversioned and
+    return the full compressed name list.
+    """
+    text = (
+        f"MarketCode={markets}\r\n"
+        f"StockNameVer={stock_name_ver}\r\n"
+        f"pageid={pageid}\r"
+    ).encode("gbk")
+    header = (
+        b"\x09\x00\x16\x00\x00\x00\x00\x12\x00\x1c"
+        + b"\x00" * 9
+        + (len(text) + 1).to_bytes(4, "little")
+    )
+    return encode_frame(header + text)
 
 
 def _iter_name_segments(body: bytes):
@@ -114,7 +146,13 @@ def _is_block_encoded(segment_data: bytes) -> bool:
 
 
 def decode_name_frame(body: bytes) -> dict:
-    """Decode text sections and report unresolved block-encoded sections."""
+    """Decode text sections and report unresolved block-encoded sections.
+
+    ``cmd=0x0a`` responses are LZ-expanded first (``name_16_*`` A-share
+    streams arrive compressed); already-plaintext bodies pass through
+    unchanged.
+    """
+    body = normalize_8901_response(body)
     result = {
         "names": {},
         "by_segment": {},
@@ -123,17 +161,24 @@ def decode_name_frame(body: bytes) -> dict:
     }
     for segment_name, data_start, data_end in _iter_name_segments(body):
         segment_data = body[data_start:data_end]
-        base_name = (
-            segment_name.split("_")[0]
-            if "_" in segment_name
-            else segment_name
-        )
-        is_block = (
-            segment_name in BLOCK_ENCODED_SEGMENTS
-            or base_name in ("16", "168")
-            or _is_block_encoded(segment_data)
-        )
-        if is_block:
+        segment_names = _parse_name_text(segment_data)
+        if segment_names:
+            result["by_segment"][segment_name] = segment_names
+            result["names"].update(segment_names)
+            result["segments"].append(
+                (segment_name, len(segment_data), "text")
+            )
+            logger.debug(
+                "decode_name_frame: parsed text section [%s] -> %d names",
+                segment_name,
+                len(segment_names),
+            )
+            continue
+
+        # Raw/legacy streams can still carry undecoded block payloads.
+        if segment_name in BLOCK_ENCODED_SEGMENTS or _is_block_encoded(
+            segment_data
+        ):
             result["skipped"].append(segment_name)
             result["segments"].append(
                 (segment_name, len(segment_data), "block")
@@ -145,16 +190,9 @@ def decode_name_frame(body: bytes) -> dict:
             )
             continue
 
-        segment_names = _parse_name_text(segment_data)
-        result["by_segment"][segment_name] = segment_names
-        result["names"].update(segment_names)
+        result["by_segment"][segment_name] = {}
         result["segments"].append(
             (segment_name, len(segment_data), "text")
-        )
-        logger.debug(
-            "decode_name_frame: parsed text section [%s] -> %d names",
-            segment_name,
-            len(segment_names),
         )
     return result
 
@@ -163,6 +201,7 @@ _BLOCK_ENCODED_SEGMENTS = BLOCK_ENCODED_SEGMENTS
 
 __all__ = [
     "BLOCK_ENCODED_SEGMENTS",
+    "build_stock_name_ver_frame",
     "build_upstockname_request",
     "decode_name_frame",
 ]

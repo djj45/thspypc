@@ -664,6 +664,34 @@ JSON 根为 `CloseAuction`；解析别名为 `dt10=newprice`、`lead_price=leadp
 
 ---
 
+## 11b. Stock-name full sync domains (2026-08-08)
+
+Full stock-name download is triggered with the binary `0x001c StockNameVer`
+frame (`MarketCode=...` + `StockNameVer=;;`) on a fresh 123ths.com session.
+Domain depends on account kind:
+
+| Account | MarketCode group | pageid | Domain |
+|---|---|---|---|
+| level2 | 16;144;208 | 5716 | `shlv2.123ths.com` |
+| standard | 32;208 | 392 | `main.123ths.com` |
+| any | 32 | 5716/392 | `szlv2.123ths.com` |
+| any | 96;128;88;216;48 | - | `fu4.123ths.com` |
+| any | 176;112 / 168;184;200 | - | `hkus.123ths.com` |
+| any | 120;104 | - | `ifindhq.123ths.com` |
+| any | 64 | - | `fu2.123ths.com` |
+| any | UNS/UHI | - | `usotc.123ths.com` |
+
+Implementation: `features/stock_name_bootstrap.py` embeds the captured
+bootstrap templates; `services/stock_name.py::download_full_stock_names`
+opens a fresh socket, logs in, replays the bootstrap, sends the trigger, and
+decodes `name_16_16`. Public entry: `THSClient.fetch_stock_names_full()`. After a full download,
+per-segment ConfigVer + names are cached to `~/.thspypc/stockname/` and
+reported on the next call; a silent server means the cache is current. Reporting a real old ConfigVer
+(e.g. 20260306) makes the server return only the changed segments with their
+new ConfigVer; fabricated versions are ignored.
+
+
+
 ## 12. K线：日K / 周K / 月K / 分钟K（`kline`）
 
 客户端入口：`client.kline(code, period=..., count=..., anchor=...)`，周期名支持

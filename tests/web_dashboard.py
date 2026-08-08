@@ -446,7 +446,7 @@ def load_env():
                 os.environ[k] = v.strip().strip('"').strip("'")
 
 
-def preload_names() -> dict[str, str]:
+def preload_names(client=None) -> dict[str, str]:
     """启动时预加载股票名称映射（code→中文名）。
 
     **只用 load_hexin_names**（读同花顺本地 stockname 文件，全品种 ~5.8万条：
@@ -458,7 +458,7 @@ def preload_names() -> dict[str, str]:
     """
     name_map: dict[str, str] = {}
     try:
-        name_map = THSClient.load_hexin_names()
+        name_map = client.fetch_stock_names_full()["names"] if client else {}
         logger.info("load_hexin_names: %d 条", len(name_map))
     except Exception as e:
         logger.warning("load_hexin_names 失败（名称将为空）: %s", e)
@@ -503,7 +503,7 @@ def main():
 
     # 预加载股票名称（纯读同花顺本地文件，零网络、不破坏主连接）
     print("预加载股票名称...")
-    DashboardHandler._name_map = preload_names()
+    DashboardHandler._name_map = preload_names(client)
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)
     print(f"\n📊 行情校验看板已启动: http://127.0.0.1:{args.port}")

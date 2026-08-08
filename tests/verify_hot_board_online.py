@@ -93,6 +93,17 @@ def main() -> int:
     print(f"  返回 {len(boards)} 个板块, 耗时 {time.time() - t0:.2f}s")
     _print_boards(boards)
 
+    _section("1b. hot_boards(全量后过滤, 含 1m速/主力)")
+    try:
+        full_boards = client.hot_boards(None, timeout=60.0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  !! hot_boards(None) 失败: {exc}")
+        full_boards = []
+    by_code = {str(b.get("code")): b for b in full_boards}
+    anchor = [by_code[c] for c in codes if c in by_code]
+    print(f"  返回 {len(full_boards)} 个板块, 过滤到 {len(anchor)} 个锚点")
+    _print_boards(anchor)
+
     _section("2. hot_boards_sorted(涨停数 SortBy=271 降序)")
     try:
         rows = client.hot_boards_sorted(271, timeout=50.0)

@@ -31,40 +31,6 @@ DATA_DIR = os.path.join(_MODULE_DIR, "..", "..", "data")
 ANCHORS_PATH = os.path.join(DATA_DIR, "hfd1_0_name_anchors.json")
 ORACLE_PATH = os.path.join(DATA_DIR, "oracle_code_names.json")
 
-# hexin 缓存路径
-_HEXIN_CACHE_DIRS = [
-    r"C:\同花顺软件\同花顺\stockname",
-    r"c:\同花顺软件\同花顺\stockname",
-]
-
-
-def _load_hexin_names() -> dict[str, str]:
-    """从 hexin 本地缓存加载名称。"""
-    base = None
-    for d in _HEXIN_CACHE_DIRS:
-        if os.path.isdir(d):
-            base = d
-            break
-    if not base:
-        return {}
-    names = {}
-    for fn in sorted(os.listdir(base)):
-        if fn.startswith("stockname_") and fn.endswith("_0.txt"):
-            try:
-                data = open(os.path.join(base, fn), "rb").read()
-                if data[:3] == b"\xef\xbb\xbf":
-                    data = data[3:]
-                for line in data.decode("gbk", errors="replace").splitlines():
-                    line = line.strip()
-                    if "=" not in line:
-                        continue
-                    code, rest = line.split("=", 1)
-                    name = rest.split("|")[0].strip()
-                    if code and name and len(name) >= 2:
-                        names[name] = code
-            except Exception:
-                pass
-    return names
 
 
 def _load_oracle() -> dict[str, str]:
@@ -76,21 +42,23 @@ def _load_oracle() -> dict[str, str]:
     return {o["name"]: o["code"] for o in oracle if "name" in o}
 
 
-def _build_name_code_map() -> dict[str, str]:
-    """构建 {名称: code} 映射，优先 oracle 后回退 hexin 缓存。"""
+def _build_name_code_map(
+    names: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build {name: code}, preferring the oracle file then network names."""
     name_map = {}
-    # 优先 oracle
     if os.path.exists(ORACLE_PATH):
         name_map.update(_load_oracle())
-    # 补充 hexin 缓存
-    hexin = _load_hexin_names()
-    for name, code in hexin.items():
-        if name not in name_map:
+    for code, name in (names or {}).items():
+        if name and name not in name_map:
             name_map[name] = code
     return name_map
 
 
-def parse_hfd1_response(raw: bytes) -> list[dict]:
+def parse_hfd1_response(
+    raw: bytes,
+    names: dict[str, str] | None = None,
+) -> list[dict]:
     """解析 hfd1.0 响应，返回全市场记录列表。
 
     策略：
@@ -100,7 +68,7 @@ def parse_hfd1_response(raw: bytes) -> list[dict]:
 
     返回每条记录含 code, name, 及可能的 price/change_pct/high/low/open/amount/volume。
     """
-    name_map = _build_name_code_map()
+    name_map = _build_name_code_map(names)
     
     # Step 1: 从锚点文件加载已验证记录
     anchored: set[int] = set()

@@ -24,37 +24,28 @@ ORACLE_PATH = os.path.join(DATA_DIR, "oracle_code_names.json")
 
 
 def load_hexin_all_names() -> dict[str, str]:
-    """加载同花顺全部本地名称缓存，返回 {code: name}。"""
-    base = r"C:\同花顺软件\同花顺\stockname"
-    if not os.path.isdir(base):
-        # 备选路径
-        alt = r"c:\同花顺软件\同花顺\stockname"
-        if os.path.isdir(alt):
-            base = alt
-        else:
-            print(f"✗ 找不到 stockname 目录: {base}")
+    """Fetch all names over the network (cross-platform, no Windows files)."""
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(env_path):
+        for line in open(env_path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() and k.strip() not in os.environ:
+                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+    user = os.environ.get("THS_USERNAME", "").strip()
+    pwd = os.environ.get("THS_PASSWORD", "").strip()
+    if not user or not pwd:
+        print("set THS_USERNAME/THS_PASSWORD in .env")
+        return {}
+    client = THSClient(user, pwd)
+    try:
+        if not client.connect().success:
             return {}
-    all_names: dict[str, str] = {}
-    for fn in sorted(os.listdir(base)):
-        if fn.startswith("stockname_") and fn.endswith("_0.txt"):
-            fp = os.path.join(base, fn)
-            try:
-                data = open(fp, "rb").read()
-                # 跳过 BOM
-                if data[:3] == b"\xef\xbb\xbf":
-                    data = data[3:]
-                text = data.decode("gbk", errors="replace")
-                for line in text.splitlines():
-                    line = line.strip()
-                    if not line or "=" not in line:
-                        continue
-                    code, rest = line.split("=", 1)
-                    name = rest.split("|")[0].strip()
-                    if code and name:
-                        all_names[code] = name
-            except Exception as e:
-                print(f"  跳过 {fn}: {e}")
-    return all_names
+        return client.fetch_stock_names_full()["names"]
+    finally:
+        client.disconnect()
 
 
 def name_to_gbk(name: str) -> bytes:

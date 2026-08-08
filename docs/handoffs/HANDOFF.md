@@ -71,11 +71,11 @@
   名称获取有两条路径（2026-07-19 确认 dt55 = 名称字段，mac 版字段表 `55: '名称'`）：
   - **路径 A（已可用）**：`list_quotes(codes, datatype=[..., 55])` 批量查，响应 dt55 含 GBK 名称
     （实测 600000→浦发银行、600519→贵州茅台）。慢（7000 只要 ~250 批）。
-  - **路径 B（待逆向）**：`method=upstockname market=URS StockNameVer=;;` 全量同步。
-    请求格式已对齐 hexin（字节级一致），但单独发服务器不响应；
-    追加在 stock_list 重放序列末尾能收到 1 个名称帧（4862B，样本存
-    `captures_live/upstockname_name_frame_sample.bin`）。
-    该帧是**混合文本+位平面编码**（骨架可读 `[name_16_16]\nConfigVer=...\n600000=浦发银行|...`，
+  - **?? B?????2026-08-08?**?????? `0x001c StockNameVer` ????
+    ?`MarketCode=16;144;208;` + `StockNameVer=;;`?pageid ??? 5716/392??????????
+    `name_16_16` ??????level2 515KB / ?? 860KB????? 33k-57k ????
+    ?? `docs/investigations/NAME_16_16_MEMORY_DUMP_PROGRESS.md` ? 13 ??
+    ? Python ?????`fetch_stock_names_full()`????????? stockname ???
     但字节被位平面转置破坏），格式未破解。hexin 落盘格式见
     `C:/同花顺软件/同花顺/stockname/stockname_<市场>_0.txt`（`<代码>=<名称>|<别名>@<标志>`）。
 - **实测**（2026-07-19）：活网 5.7s 拿到 7422 条代码；离线 pcap 解出 7526 条

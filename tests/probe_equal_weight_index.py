@@ -55,21 +55,13 @@ def infer_market(code: str) -> int | None:
     return None
 
 
-def load_codes_from_stockname() -> dict[int, list[str]]:
-    """从本地同花顺 stockname 文件构建 A 股代码表。"""
-    stockname_dir = pathlib.Path(r"D:\同花顺软件\同花顺\stockname")
+def load_codes_from_stockname(names: dict[str, str]) -> dict[int, list[str]]:
+    """Build the A-share code table from network-fetched names."""
     codes: dict[int, set[str]] = {17: set(), 33: set(), 151: set()}
-    pat = re.compile(r"(\d{6})=")
-    for f in stockname_dir.glob("stockname_*.txt"):
-        try:
-            text = f.read_text(encoding="gbk", errors="replace")
-        except OSError:
-            continue
-        for m in pat.finditer(text):
-            code = m.group(1)
-            mkt = infer_market(code)
-            if mkt is not None:
-                codes[mkt].add(code)
+    for code in names:
+        mkt = infer_market(code)
+        if mkt is not None:
+            codes[mkt].add(code)
     return {k: sorted(v) for k, v in codes.items()}
 
 
@@ -94,7 +86,7 @@ def main() -> int:
     print(f"  登录成功 {result.server}")
 
     print("从本地 stockname 构建 A 股代码表 ...", flush=True)
-    by_market = load_codes_from_stockname()
+    by_market = load_codes_from_stockname(client.fetch_stock_names_full()["names"])
     sh_codes = by_market[17]
     print(f"  沪A(mkt=17): {len(sh_codes)} | 深A(mkt=33): {len(by_market[33])} "
           f"| 北交所(mkt=151): {len(by_market[151])}")

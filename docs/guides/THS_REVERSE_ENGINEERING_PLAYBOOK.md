@@ -857,3 +857,59 @@ thsdk JSON、DMP、Unicorn 和加载映像只用于开发验证。生产库应�
 
 只要每一层都有独立 oracle，复杂的随机变体、保护壳和状态压缩最终都会从“猜谜”
 变成可回归的工程问题。
+
+
+## 22. Case study: name_16_16, why the known 0x0a framing was missed
+
+### 22.1 Symptom
+
+The A-share stock-name download (`name_16_16`) looked like a custom
+"17-byte block encoding": `[ctrl][16B]` groups, where `ctrl=0x00` behaved as
+16 literal bytes and `ctrl!=0` seemed to hide match tokens. Many simple LZ /
+bitmask / RLE models were fitted and falsified over weeks.
+
+### 22.2 Actual structure
+
+The payload is the standard 8901 outer serialization:
+
+```text
+0x0a                       <- compressed marker (same as every cmd=0x0a frame)
+BE32 uncompressed length
+0x1600 frame header
+MarketCode=16\x00\r\n
+[name_16_16]\r\n
+<compressed source>        <- the "17-byte blocks" are literally these bytes
+```
+
+`normalize_8901_response` (port of hexin RVA `0xf74260`, already used for
+8901 timelines) decodes it to the plaintext file byte-for-byte. There is no
+second codec.
+
+### 22.3 Why it took so long
+
+1. The captured stream was analyzed as an already-extracted "name frame"
+   without first checking the `fd` envelope, the `0x0a` cmd byte, or the BE32
+   length. The same LZ was already ported for other 8901 features, but the
+   sample was labeled "block encoding", so nobody ran the known normalizer on
+   it.
+2. The first three records (`ctrl=0x00`) coincidentally look like literals,
+   which anchored the wrong mental model. Later records are compressed bytes
+   whose control bits just happen to line up into 17-byte groups.
+3. The memory "cipher" dump is the compressed source, not a second encoding;
+   treating it as an independent format forced invented token semantics.
+4. Same-version verification only became possible after reconstructing the
+   full frame from the cipher + fixed header. Cross-capture differences
+   (10:38 vs 10:57) were mistaken for decoder bugs until Unicorn native
+   emulation proved both decoded identically.
+
+### 22.4 Lessons
+
+- Before inventing a new codec, check whether the input is still inside a
+  known outer layer. For any 8901 payload beginning with `0x0a`, run
+  `normalize_8901_response` first; recognizable text coming out means the
+  mystery was the outer layer, not the inner format.
+- Fixed-size "record" grouping is a red herring when the stream is
+  variable-length compressed. Fit the decompressor first, then decide whether
+  a record structure exists.
+- Keep same-version cipher/plaintext pairs as oracle and use Unicorn native
+  emulation to separate decoder bugs from capture version differences.

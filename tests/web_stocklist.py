@@ -480,7 +480,7 @@ def main():
     # 这里需要稳定的 code+name A 股集合；本地缓存无需占用 MAIN 连接，
     # 且名称覆盖更全。stock_list 已改为无订阅副作用的单请求。
     # 本地缓存含沪深北+基金+指数，过滤后得到 5500+ 沪深 A 股。
-    names = THSClient.load_hexin_names()
+    names = client.fetch_stock_names_full()["names"]
     a_codes = []
     for code, name in names.items():
         mkt = market_from_code(code)

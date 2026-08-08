@@ -13,6 +13,8 @@ from ..features.superorder_protocol import (
     SNAPSHOT_REPLAY_PAGEID,
 )
 from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
+from ..features.stock_name_cache import default_cache_path
+from ..services.stock_name import download_full_stock_names
 from ..transport import ConnectionRole
 from .stock_cache import (
     default_stock_cache_path,
@@ -169,18 +171,18 @@ class ServiceFacade:
     ) -> dict:
         """通过 upstockname 协议从服务器获取股票名称（探索性能力）。
 
-        ⚠ **默认名称源是** :meth:`load_hexin_names`（同花顺本地缓存，瞬时、稳定、
-        覆盖沪深北 A 股）。本方法仅作探索性补充——且对主用途（A 股名称）无增益：
-        thspypc 拿到的增量帧恰好是未解的 ``name_16_16`` 块状段。
-
-        发送 ``method=upstockname`` 请求，解析响应中的 ``[name_<MARKET>]`` 段。
+        **Full names come from** :meth:`fetch_stock_names_full` (network, cross-platform).
+        This incremental method is a secondary path for markets not covered by full sync.
+        It sends ``method=upstockname`` and parses ``[name_<MARKET>]`` sections.
+        The A-share ``name_16_16`` section is decoded by the same 0x0a LZ normalizer;
+        see docs/investigations/NAME_16_16_MEMORY_DUMP_PROGRESS.md section 13.
         纯文本段（外汇/期货/北交所/外盘等）直接解出；块状自定义编码段
         （沪深 A 股 ``name_16_16``）当前跳过（编码未逆向，简单模型已穷举证伪，见
         :func:`thspypc.protocol.decode_name_frame` 与
         docs/handoffs/HANDOFF.md §6a/§6b）。
 
         服务器按账号追踪名称版本，thspypc 账号通常只能拿到**增量**（~12 条），
-        全量需 hexin 客户端冷启动触发。本方法适合补充 :meth:`load_hexin_names`
+        全量需 hexin 客户端冷启动触发。本方法适合补充 :meth:`fetch_stock_names_full`
         覆盖不到的市场（外盘/期货）。
 
         Args:
@@ -218,76 +220,34 @@ class ServiceFacade:
         )
         return result
 
-    @staticmethod
-    def load_hexin_names(
-        stockname_dir: str | None = None,
-    ) -> dict[str, str]:
-        """从同花顺本地缓存加载股票代码→名称映射（**默认名称源**）。
+    def fetch_stock_names_full(self, timeout: float = 45.0) -> dict:
+        """Download the full stock-name list over a fresh 123ths.com session.
 
-        这是获取 A 股名称的推荐方式——瞬时、稳定、零网络依赖，覆盖沪深北交易所。
-        相比网络协议 :meth:`fetch_stock_names`（块状段未解、只能拿增量），本方法
-        是主用途的首选。
-
-        读取 ``<hexin_dir>/stockname/stockname_*_0.txt`` 文件，
-        解析 ``CODE=NAME|ALIAS@FLAG`` 格式。仅保留 6 位数字代码。
-
-        Args:
-            stockname_dir: stockname 目录路径。为 None 时自动探测常见安装位置：
-                ``C:/同花顺软件/同花顺/stockname/``。
+        Cross-platform, pure TCP: logs in to the account-specific domain
+        (``shlv2.123ths.com`` for level2, ``main.123ths.com`` for standard),
+        replays the captured cold-start bootstrap, sends the ``0x001c
+        StockNameVer=;;`` trigger, and decodes the full ``name_16_16``
+        response. No Windows hexin stockname files are read.
 
         Returns:
-            dict[str, str]，键为 6 位数字代码（如 "600000"），值为中文名称（如 "浦发银行"）。
-            约 8000+ 条（覆盖沪深北交易所）。
+            :func:`decode_name_frame` result dict; empty names on failure.
         """
-        if stockname_dir is None:
-            # 自动探测常见安装路径
-            candidates = [
-                r"C:\同花顺软件\同花顺\stockname",
-                r"D:\同花顺软件\同花顺\stockname",
-                os.path.expandvars(r"%LOCALAPPDATA%\同花顺\stockname"),
-                os.path.expandvars(r"%APPDATA%\同花顺\stockname"),
-            ]
-            for c in candidates:
-                if os.path.isdir(c):
-                    stockname_dir = c
-                    break
-        if not stockname_dir or not os.path.isdir(stockname_dir):
-            logger.warning("load_hexin_names: stockname 目录不存在，返回空映射。"
-                           "请安装同花顺 PC 客户端或手动指定 --stockname-dir")
-            return {}
-
-        names: dict[str, str] = {}
-        for fname in sorted(os.listdir(stockname_dir)):
-            # 只读 _0.txt 基础文件（_1.txt 是增量，.base 是备份）
-            if not (fname.endswith("_0.txt") and fname.startswith("stockname_")):
-                continue
-            fpath = os.path.join(stockname_dir, fname)
-            try:
-                with open(fpath, "rb") as f:
-                    raw = f.read()
-            except OSError:
-                continue
-            try:
-                text = raw.decode("gbk", errors="replace")
-            except UnicodeDecodeError:
-                continue
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("[") or line.startswith("ConfigVer"):
-                    continue
-                if "=" not in line:
-                    continue
-                code, _, rest = line.partition("=")
-                # 只取 6 位纯数字代码（A 股/北交所/新三板）
-                if not (code.isdigit() and len(code) == 6):
-                    continue
-                name = rest.split("|")[0].split("@")[0].strip()
-                if name:
-                    names[code] = name
-
-        logger.info("load_hexin_names: 从 %s 加载 %d 条名称",
-                    stockname_dir, len(names))
-        return names
+        material = self._auth_service.require_current()
+        login_body = self._auth_service.login_body_for_passport(material.passport64)
+        account_kind = self.observed_account_profile.kind
+        result = download_full_stock_names(
+            login_body,
+            account_kind=account_kind,
+            timeout=timeout,
+            cache_path=str(default_cache_path(account_kind)),
+        )
+        logger.info(
+            "fetch_stock_names_full(account=%s): %d names, %d skipped",
+            account_kind.value,
+            len(result["names"]),
+            len(result["skipped"]),
+        )
+        return result
 
     def list_quotes(
         self,
@@ -1221,10 +1181,7 @@ class ServiceFacade:
             ),
         )
         if with_names and stocks:
-            stockname_dir = (
-                with_names if isinstance(with_names, str) else None
-            )
-            name_map = self.load_hexin_names(stockname_dir)
+            name_map = self.fetch_stock_names_full()["names"]
             for stock in stocks:
                 name = name_map.get(stock["code"], "")
                 if name:
@@ -1246,8 +1203,8 @@ class ServiceFacade:
             timeout: 收尾读取的总时长（秒）。请求后服务器陆续推送，需等全量帧到达。
             with_names: 是否填充中文名称。
                 - False: 不填名称（默认，快）
-                - True: 自动从同花顺本地缓存加载名称（需安装同花顺 PC 客户端）
-                - str: 指定 stockname 目录路径
+                - True: fetch names via 123ths network sync (cross-platform)
+                - str: ignored (names are network-backed)
 
         Returns:
             list[dict]，每项 ``{"code": "600000", "name": "浦发银行"}``。
@@ -1263,10 +1220,7 @@ class ServiceFacade:
             lambda: self._stock_list_service.full_list(timeout=timeout),
         )
         if with_names and stocks:
-            stockname_dir = (
-                with_names if isinstance(with_names, str) else None
-            )
-            name_map = self.load_hexin_names(stockname_dir)
+            name_map = self.fetch_stock_names_full()["names"]
             for stock in stocks:
                 name = name_map.get(stock["code"], "")
                 if name:

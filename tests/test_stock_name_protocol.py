@@ -8,6 +8,7 @@ import pytest
 import thspypc.protocol as protocol
 from thspypc.features import stock_name_protocol
 from thspypc.features.stock_name_protocol import (
+    build_stock_name_ver_frame,
     build_upstockname_request,
     decode_name_frame,
 )
@@ -86,6 +87,104 @@ def test_captured_text_stream_preserves_known_result():
     assert "AUDUSD" in result["names"]
     assert result["segments"][0] == ("96_96", 21, "text")
     assert result["segments"][-1] == ("48_49", 47011, "text")
+
+
+def test_captured_a_share_compressed_stream_decodes_names():
+    cipher = (
+        Path(__file__).parents[1]
+        / "captures_live"
+        / "name_dump_20260808_105709"
+        / "name16_cipher_mem.bin"
+    )
+    if not cipher.exists():
+        pytest.skip("optional captured A-share compressed stream is unavailable")
+
+    data = cipher.read_bytes()
+    frame_header = bytes.fromhex(
+        "0016ff0fda49121c013681d991a3260b0f0000"
+    )
+    body = (
+        b"\x0a"
+        + (0x00174828).to_bytes(4, "big")
+        + frame_header
+        + b"MarketCode=16\x00\r\n"
+        + data
+    )
+
+    result = decode_name_frame(body)
+
+    assert result["names"]["600000"].encode("gbk") == bytes.fromhex("c6d6b7a2d2f8d0d0")
+    assert result["names"]["1A0001"].encode("gbk") == bytes.fromhex("c9cfd6a4d6b8cafd")
+    assert result["skipped"] == []
+    assert len(result["names"]) > 20000
+
+
+def test_stock_name_cache_roundtrip_and_version_value(tmp_path):
+    from thspypc.features.stock_name_cache import (
+        build_version_value,
+        extract_config_vers,
+        load_name_cache,
+        save_name_cache,
+    )
+
+    names = {"600000": "????", "000001": "????"}
+    config_vers = {"16_16": "20260807_1", "16_19": "20260807_2"}
+    path = tmp_path / "stockname_test_0.txt"
+    save_name_cache(names, config_vers, path)
+
+    loaded = load_name_cache(path)
+    assert loaded is not None
+    loaded_vers, loaded_names = loaded
+    assert loaded_vers == config_vers
+    assert loaded_names["600000"] == "????"
+    assert loaded_names["000001"] == "????"
+
+    value = build_version_value(config_vers, "16;144;208;")
+    assert value.count("^bname_16_16^B") == 3
+    assert "^r^nConfigVer^e20260807_1^r^n" in value
+
+    frame = b"[name_16_16]\r\nConfigVer=20260807_1\r\n600000=test\r\n"
+    assert extract_config_vers(frame) == {"16_16": "20260807_1"}
+
+
+def test_stock_name_bootstrap_templates_match_captures():
+    from thspypc.features.stock_name_bootstrap import (
+        LEVEL2_BOOTSTRAP_FRAMES,
+        STANDARD_BOOTSTRAP_FRAMES,
+        STOCK_NAME_DOMAINS,
+    )
+
+    assert len(LEVEL2_BOOTSTRAP_FRAMES) == 48
+    assert len(STANDARD_BOOTSTRAP_FRAMES) == 102
+    assert STOCK_NAME_DOMAINS["level2"] == "shlv2.123ths.com"
+    assert STOCK_NAME_DOMAINS["standard"] == "main.123ths.com"
+
+    trigger = LEVEL2_BOOTSTRAP_FRAMES[-1]
+    assert trigger[:23].hex().startswith("0900160000000012001c")
+    assert b"MarketCode=16" in trigger
+    assert b"StockNameVer=;;" in trigger
+
+    standard_trigger = STANDARD_BOOTSTRAP_FRAMES[-1]
+    assert b"MarketCode=32" in standard_trigger
+    assert b"StockNameVer=;;" in standard_trigger
+
+
+def test_stock_name_ver_frame_matches_deleted_cache_capture():
+    sample = (
+        Path(__file__).parents[1]
+        / "captures_live"
+        / "stockname_ver_deleted_214435.bin"
+    )
+    if not sample.exists():
+        pytest.skip("optional deleted-cache StockNameVer capture is unavailable")
+
+    frame = build_stock_name_ver_frame(
+        markets="16;144;208;",
+        stock_name_ver=";;",
+        pageid=5716,
+    )
+
+    assert frame == sample.read_bytes()
 
 
 def test_captured_a_share_block_stream_stays_explicitly_skipped():

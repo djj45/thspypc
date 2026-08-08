@@ -190,7 +190,7 @@ def main():
         return 1
     print(f"  连接 A: {r.server}")
     oracle: list[dict] = []
-    names_cache = THSClient.load_hexin_names()
+    names_cache = client_a.fetch_stock_names_full()["names"]
     if do_sh:
         sh_codes = sorted(c for c in names_cache if c.startswith("6"))[:count]
         print(f"  沪市: 查前 {len(sh_codes)} 只（取自本地缓存）...")

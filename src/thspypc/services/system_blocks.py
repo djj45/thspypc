@@ -626,8 +626,19 @@ class BoardService:
             history_flag=False,
             lack_time="0,0,0,0,0,0,0,0",
         )
+        inflow_request = build_board_hot_query(
+            codes,
+            level2=level2,
+            datatype=[592890],
+            period=0,
+            args="0-0",
+            history_flag=False,
+            lack_time="0,0,0,0,0,0,0,0",
+        )
         return self._request_hot_full(
-            (detail_request, full_request), codes, timeout=timeout
+            (detail_request, full_request, inflow_request),
+            codes,
+            timeout=timeout,
         )
 
     def _request_hot_full(
@@ -683,10 +694,10 @@ class BoardService:
                         1 for r in merged.values() if "up_count" in r
                     )
                     have_speed_1m = sum(
-                        1 for r in merged.values() if "speed_1m" in r
+                        1 for r in merged.values() if "dt167" in r
                     )
                     have_main = sum(
-                        1 for r in merged.values() if "main_inflow" in r
+                        1 for r in merged.values() if "dt250" in r
                     )
                     if (
                         len(merged) >= len(wanted)
