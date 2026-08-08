@@ -61,6 +61,14 @@ def _build_frames(entries: list[dict]) -> tuple[bytes, ...]:
                     for sub in entry["subs"]
                 )
             )
+        elif entry["kind"] == "upstockname":
+            text = (
+                "instid=65536\nmethod=upstockname\n"
+                f"market={entry['market']}\nStockNameVer=;;\n"
+                "prototype=kvproto\n"
+                f"pageid={entry['pageid']}\n"
+            ).encode()
+            frames.append(b"\x09" + text[:-1])
         else:
             frames.append(base64.b64decode(entry["body_b64"]))
     return tuple(frames)
@@ -71,6 +79,24 @@ def _load_templates() -> dict:
 
 
 _TEMPLATES = _load_templates()
+_GROUPS_PATH = Path(__file__).with_name("stock_name_groups_data.json")
+_GROUPS = json.loads(_GROUPS_PATH.read_text(encoding="utf-8"))
+
+
+def build_group_frames(group_key: str) -> tuple[bytes, ...]:
+    """Build the captured cold-start frames for one market group."""
+    return _build_frames(_GROUPS[group_key]["frames"])
+
+
+def stock_name_group(group_key: str) -> dict:
+    """Return (domain, markets, pageid) metadata for a market group."""
+    entry = _GROUPS[group_key]
+    return {
+        "domain": entry["domain"],
+        "markets": entry["markets"],
+        "pageid": entry["pageid"],
+    }
+
 
 LEVEL2_BOOTSTRAP_FRAMES = _build_frames(_TEMPLATES["level2_plain"])
 LEVEL2_VERSIONED_BOOTSTRAP_FRAMES = _build_frames(
@@ -83,9 +109,20 @@ STOCK_NAME_DOMAINS = {
     "standard": "main.123ths.com",
 }
 
+STOCK_NAME_GROUPS = {
+    "level2": [
+        "level2_16", "level2_32", "fu4_96", "hkus_176",
+        "hkus_168", "ifindhq_120", "fu2_64", "usotc_UNS",
+    ],
+    "standard": ["standard_16"],
+}
+
 __all__ = [
     "LEVEL2_BOOTSTRAP_FRAMES",
     "LEVEL2_VERSIONED_BOOTSTRAP_FRAMES",
     "STANDARD_BOOTSTRAP_FRAMES",
     "STOCK_NAME_DOMAINS",
+    "STOCK_NAME_GROUPS",
+    "build_group_frames",
+    "stock_name_group",
 ]

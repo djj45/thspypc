@@ -28,6 +28,10 @@ def default_cache_path(account_kind) -> Path:
     return default_cache_root() / f"stockname_{key}_0.txt"
 
 
+def group_cache_path(group_key: str) -> Path:
+    return default_cache_root() / f"stockname_{group_key}_0.txt"
+
+
 def extract_config_vers(frame_body: bytes) -> dict[str, str]:
     """Extract {segment: ConfigVer} from a full name_16_16 response frame."""
     from ..codecs.compression import normalize_8901_response
@@ -140,6 +144,7 @@ __all__ = [
     "default_cache_path",
     "default_cache_root",
     "extract_config_vers",
+    "group_cache_path",
     "load_name_cache",
     "save_name_cache",
 ]

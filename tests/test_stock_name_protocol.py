@@ -119,6 +119,23 @@ def test_captured_a_share_compressed_stream_decodes_names():
     assert len(result["names"]) > 20000
 
 
+def test_stock_name_groups_metadata():
+    from thspypc.features.stock_name_bootstrap import (
+        LEVEL2_BOOTSTRAP_FRAMES,
+        STOCK_NAME_GROUPS,
+        build_group_frames,
+        stock_name_group,
+    )
+
+    assert build_group_frames("level2_16") == LEVEL2_BOOTSTRAP_FRAMES
+    meta = stock_name_group("fu4_96")
+    assert meta["domain"] == "fu4.123ths.com"
+    assert "48" in meta["markets"]
+    assert len(build_group_frames("fu4_96")) == 153
+    assert "level2_32" in STOCK_NAME_GROUPS["level2"]
+    assert "standard_16" in STOCK_NAME_GROUPS["standard"]
+
+
 def test_stock_name_cache_roundtrip_and_version_value(tmp_path):
     from thspypc.features.stock_name_cache import (
         build_version_value,

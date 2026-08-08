@@ -13,10 +13,14 @@ from ..features.stock_name_bootstrap import (
     LEVEL2_VERSIONED_BOOTSTRAP_FRAMES,
     STANDARD_BOOTSTRAP_FRAMES,
     STOCK_NAME_DOMAINS,
+    STOCK_NAME_GROUPS,
+    build_group_frames,
+    stock_name_group,
 )
 from ..features.stock_name_cache import (
     build_version_value,
     extract_config_vers,
+    group_cache_path,
     load_name_cache,
     save_name_cache,
 )
@@ -44,6 +48,121 @@ def empty_name_result() -> dict:
         "skipped": [],
         "segments": [],
     }
+
+
+def _connect_and_login(login_body: bytes, ips: list[str]):
+    """Try each resolved IP until VerifyCode=0; return socket or None."""
+    for target in ips:
+        candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        candidate.settimeout(3.0)
+        try:
+            candidate.connect((target, 8901))
+            candidate.sendall(encode_frame(login_body) + b"\n")
+            candidate.settimeout(3.0)
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    reply = read_frame(candidate)
+                except socket.timeout:
+                    break
+                except (OSError, ValueError):
+                    break
+                if reply and b"VerifyCode=0" in reply:
+                    return candidate
+        except OSError:
+            pass
+        try:
+            candidate.close()
+        except OSError:
+            pass
+    return None
+
+
+def download_stock_name_group(
+    login_body: bytes,
+    group_key: str,
+    *,
+    timeout: float = 45.0,
+    settle_timeout: float = 3.0,
+    cache_path: str | None = None,
+) -> dict:
+    """Download one market group's names over a fresh 123ths session.
+
+    Replays the captured cold-start frames for the group (``StockNameVer=;;``
+    full download), merges every ``[name_*]`` frame received, and stores the
+    group cache. Pure Python/TCP, no Windows client files.
+    """
+    if group_key == "standard_16":
+        domain = "main.123ths.com"
+        markets = "32;208;"
+        pageid = 392
+        bootstrap = list(STANDARD_BOOTSTRAP_FRAMES)
+    else:
+        meta = stock_name_group(group_key)
+        domain = meta["domain"]
+        markets = meta["markets"]
+        pageid = meta["pageid"]
+        bootstrap = list(build_group_frames(group_key))
+
+    try:
+        ips = sorted(
+            {
+                addr[4][0]
+                for addr in socket.getaddrinfo(domain, 8901, socket.AF_INET)
+            }
+        )
+    except OSError:
+        ips = []
+    sock = _connect_and_login(login_body, ips) if ips else None
+    if sock is None:
+        return empty_name_result()
+
+    cached = load_name_cache(cache_path) if cache_path else None
+    cached_names = cached[1] if cached else {}
+    cached_vers = cached[0] if cached else {}
+
+    result: dict = {
+        "names": dict(cached_names),
+        "by_segment": {},
+        "skipped": [],
+        "segments": [],
+    }
+    config_vers: dict[str, str] = dict(cached_vers)
+    try:
+        for index, body in enumerate(bootstrap):
+            sock.sendall(encode_frame(body) + b"\n")
+            if index % 4 == 0:
+                time.sleep(0.05)
+        sock.settimeout(3.0)
+        deadline = time.time() + timeout
+        last_name_at = time.time()
+        while time.time() < deadline:
+            try:
+                item = read_frame(sock)
+            except socket.timeout:
+                if result["names"] and time.time() - last_name_at >= settle_timeout:
+                    break
+                continue
+            except (OSError, ValueError):
+                break
+            if not item:
+                continue
+            if b"[name_" in item:
+                decoded = decode_name_frame(item)
+                result["names"].update(decoded["names"])
+                result["by_segment"].update(decoded["by_segment"])
+                result["skipped"].extend(decoded["skipped"])
+                result["segments"].extend(decoded["segments"])
+                config_vers.update(extract_config_vers(item))
+                last_name_at = time.time()
+        if cache_path and config_vers:
+            save_name_cache(result["names"], config_vers, cache_path)
+        return result
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def download_full_stock_names(

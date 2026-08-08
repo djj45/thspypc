@@ -336,7 +336,7 @@ passport 登录（VerifyCode=0），重放删缓存引导（每帧 `encode_frame
 其他市场组：`szlv2`（32）、`fu4`（96/128/88/216/48）、`hkus`（176/112、168/184/200）、
 `ifindhq`（120/104）、`fu2`（64）、`usotc`（UNS/UHI），均为 `*.123ths.com:8901`。
 
-实现：`features/stock_name_bootstrap.py` 用结构化模板 + 构造器生成引导帧（`stock_name_bootstrap_data.json`），不再内嵌 hex；
+实现：`features/stock_name_bootstrap.py` 用结构化模板 + 构造器生成引导帧（`stock_name_bootstrap_data.json` + `stock_name_groups_data.json`），不再内嵌 hex；全市场组下载入口 `THSClient.fetch_all_stock_names()`，名称统一落 txt 缓存 `~/.thspypc/stockname/stockname_<组>_0.txt`；`board_codes.json` 已删除，513 个板块代码固化为 `system_blocks_protocol._BOARD_FULL_CODES` 常量；
 `services/stock_name.py::download_full_stock_names` 开新 socket 登录、重放引导、
 发触发帧并解码；`ServiceFacade.fetch_stock_names_full()` 用当前 passport 接入；
 已删除 `load_hexin_names`（Windows stockname 文件读取）。

@@ -13,8 +13,12 @@ from ..features.superorder_protocol import (
     SNAPSHOT_REPLAY_PAGEID,
 )
 from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
-from ..features.stock_name_cache import default_cache_path
-from ..services.stock_name import download_full_stock_names
+from ..features.stock_name_bootstrap import STOCK_NAME_GROUPS
+from ..features.stock_name_cache import default_cache_path, group_cache_path
+from ..services.stock_name import (
+    download_full_stock_names,
+    download_stock_name_group,
+)
 from ..transport import ConnectionRole
 from .stock_cache import (
     default_stock_cache_path,
@@ -217,6 +221,52 @@ class ServiceFacade:
             market,
             len(result["names"]),
             len(result["skipped"]),
+        )
+        return result
+
+    def fetch_all_stock_names(
+        self,
+        timeout: float = 45.0,
+        settle_timeout: float = 3.0,
+    ) -> dict:
+        """Download every market group's names (full stockname replacement).
+
+        Iterates the account-specific 123ths market groups (16/32/96/128/88/
+        216/48/144/176/112/168/184/200/120/104/64 + outer markets), downloads
+        each group's ``[name_*]`` segments over a fresh socket, and merges
+        them with per-group caches. Cross-platform, no Windows client files.
+        """
+        material = self._auth_service.require_current()
+        login_body = self._auth_service.login_body_for_passport(material.passport64)
+        account_kind = self.observed_account_profile.kind
+        key = (
+            account_kind.value
+            if account_kind.value in STOCK_NAME_GROUPS
+            else "standard"
+        )
+        result = {
+            "names": {},
+            "by_segment": {},
+            "skipped": [],
+            "segments": [],
+        }
+        for group_key in STOCK_NAME_GROUPS[key]:
+            part = download_stock_name_group(
+                login_body,
+                group_key,
+                timeout=timeout,
+                settle_timeout=settle_timeout,
+                cache_path=str(group_cache_path(group_key)),
+            )
+            result["names"].update(part["names"])
+            result["by_segment"].update(part["by_segment"])
+            result["skipped"].extend(part["skipped"])
+            result["segments"].extend(part["segments"])
+        logger.info(
+            "fetch_all_stock_names(account=%s): %d names, %d segments",
+            account_kind.value,
+            len(result["names"]),
+            len(result["segments"]),
         )
         return result
 
