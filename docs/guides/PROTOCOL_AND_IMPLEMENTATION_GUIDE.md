@@ -137,9 +137,10 @@ fetch_rsa_pubkey()          # 取 RSA 公钥
    Passport64=<HTTP 鉴权所得>
    ```
 
-4. 响应为文本字段（`parse_login_response`）：`VerifyCode=0` 成功；`-1` 多为同 IP 短时重复
-   登录的会话冲突（level2 单点登录），换 IP 即恢复，不是封禁；连续 5 个 IP `-1` 提前放弃并
-   返回 `session_conflict`。
+4. 响应为文本字段（`parse_login_response`）：`VerifyCode=0` 成功；`-1` 有两类独立原因：
+   login 帧内容问题（sk/sv、动态 check 字节，见 HANDOFF §2）与同账号短时串行重登的会话冲突
+   （level2 单点登录）。后者用并发登录 + 长连接心跳解决（见 4.5），换 IP 可临时恢复，不是封禁；
+   连续 5 个 IP `-1` 提前放弃并返回 `session_conflict`。
 5. **板块通道（fu4）登录壳走身份回退链**：`_open_board_channel` 对每个 IP 按
    `BOARD → STANDARD → MANUAL` 顺序尝试（2026-08-01 实测 L2 三种壳都接受；普通账号偶发对
    `__manual`/无用户名壳回 `PromptText=-6`，`thsuser` 壳通过）。真实客户端抓包的 BOARD 壳
@@ -164,6 +165,20 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 - 能力证据写入 `AccountEvidenceRecorder`，路由 profile 随证据升级。
 - 连接治理：`connect_main` 距上次成功 <20s 且连接存活时直接复用；K线失败 IP 进黑名单；
   L2 连接建立时会短暂占用主连接（`_drop_main`），故竞价/分时脚本期间不同时跑其他查询。
+
+### 4.5 多会话并发登录与长连接（名称同步，2026-08-08）
+
+全市场组名称同步如果逐组“登录一次 → 下载 → 断开 → 再登录”，会被同花顺按同账号短时
+重复登录拒绝（`VerifyCode=-1`）。真实客户端冷启动的做法是**一次并发登录所有市场连接，
+之后保持长连接并每 3s 心跳复用**。
+
+- 实测：8 组（shlv2/szlv2/fu4/hkus×2/ifindhq/fu2/usotc）并发登录约 3.2s 全部成功；
+  长连接 + 心跳 8s 后仍可用；同一账号串行重登则出现 `-1`。
+- 实现：`services/stock_name.py::download_all_stock_names` 用 `ThreadPoolExecutor`
+  并发登录每组的 `*.123ths.com:8901`，每个 socket 配发送锁 + 3s 心跳线程，然后逐组
+  重放引导、解码 `[name_*]` 段并写 `~/.thspypc/stockname/` 缓存。
+- 单组入口 `download_stock_name_group` 保留，适合低频手动验证；批量刷新请走
+  `THSClient.fetch_all_stock_names()`。
 
 ---
 
@@ -686,6 +701,16 @@ JSON 根为 `CloseAuction`；解析别名为 `dt10=newprice`、`lead_price=leadp
 全量下载后每段 ConfigVer + 名称缓存到 `~/.thspypc/stockname/`，下次上报缓存版本；
 服务器静默表示缓存已最新。上报真实旧 ConfigVer（如 20260306）会触发服务器只回
 变化的段及新 ConfigVer；编造版本会被忽略。
+
+全市场组批量刷新走 `THSClient.fetch_all_stock_names()`（`download_all_stock_names`）：
+一次并发登录所有组并保持长连接 + 3s 心跳，避免串行重登触发 `VerifyCode=-1`（见 4.5）。
+
+`ifindhq` 的 120/104 组特殊：`StockNameVer=;;` 不回名称；2026-08-09 抓包确认
+真实客户端用 `MarketCode=104;` 加上 104_* 段 ConfigVer 触发，服务器才回
+`[name_120_120]` / `[name_104_104]`。内容为 iFinD 指数/债券名称，对应 Windows
+端 `stockname_120_0.txt` / `stockname_120_1.txt`，不是 A 股股票名，非核心。
+响应是 `0x0a` 压缩帧，读帧后必须先用 `decode_name_frame` 解码，不能按原始
+`[name_` 字符串过滤。
 
 ## 12. K线：日K / 周K / 月K / 分钟K（`kline`）
 

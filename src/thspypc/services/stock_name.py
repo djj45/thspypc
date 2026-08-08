@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import socket
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
-from ..codecs.framing import encode_frame, read_frame
+from ..codecs.framing import FRAME_MAGIC, encode_frame, read_frame
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.stock_name_bootstrap import (
     LEVEL2_BOOTSTRAP_FRAMES,
@@ -30,6 +32,7 @@ from ..features.stock_name_protocol import (
     decode_name_frame,
 )
 from ..models import AccountKind, Capability
+from ..protocol import build_heartbeat_8901
 
 
 FrameReader = Callable[[SocketLike], bytes]
@@ -39,6 +42,20 @@ _NAME_GROUPS = {
     "level2": ("16;144;208;", 5716),
     "standard": ("32;208;", 392),
 }
+
+# The 120/104 market ignores StockNameVer=;;. The 2026-08-09 00:07:56
+# capture shows hexin triggers it with MarketCode=104; plus the real 104_*
+# ConfigVer list; the server then returns both [name_120_120] and
+# [name_104_104]. These versions are real but stale, so the same value is
+# reused to force a full refresh of the small (~30KB) group.
+_IFINDH_104_STALE_VERSION_VALUE = (
+    "^bname_104_104^B^r^nConfigVer^e20260807_3540849890^r^n"
+    "^bname_104_106^B^r^nConfigVer^e20260807_3788050668^r^n"
+    "^bname_104_107^B^r^nConfigVer^e20260807_2431211407^r^n"
+    "^bname_104_108^B^r^nConfigVer^e20260807_4002580065^r^n"
+    "^bname_104_109^B^r^nConfigVer^e20260807_795885416^r^n"
+    "^bname_104_110^B^r^nConfigVer^e20260807_2709822740^r^n;;"
+)
 
 
 def empty_name_result() -> dict:
@@ -78,42 +95,114 @@ def _connect_and_login(login_body: bytes, ips: list[str]):
     return None
 
 
-def download_stock_name_group(
-    login_body: bytes,
-    group_key: str,
-    *,
-    timeout: float = 45.0,
-    settle_timeout: float = 3.0,
-    cache_path: str | None = None,
-) -> dict:
-    """Download one market group's names over a fresh 123ths session.
-
-    Replays the captured cold-start frames for the group (``StockNameVer=;;``
-    full download), merges every ``[name_*]`` frame received, and stores the
-    group cache. Pure Python/TCP, no Windows client files.
-    """
-    meta = stock_name_group(group_key)
-    domain = meta["domain"]
-    markets = meta["markets"]
-    pageid = meta["pageid"]
-    bootstrap = list(build_group_frames(group_key))
-
+def _resolve_ips(domain: str) -> list[str]:
     try:
-        ips = sorted(
+        return sorted(
             {
                 addr[4][0]
                 for addr in socket.getaddrinfo(domain, 8901, socket.AF_INET)
             }
         )
     except OSError:
-        ips = []
-    sock = _connect_and_login(login_body, ips) if ips else None
-    if sock is None:
-        return empty_name_result()
+        return []
+
+
+def _send_frame(
+    sock: socket.socket,
+    body: bytes,
+    lock: threading.Lock | None = None,
+) -> None:
+    """Send a raw bootstrap body, or a pre-framed 0x001c trigger as-is."""
+    if body.startswith(FRAME_MAGIC):
+        payload = body + b"\n"
+    else:
+        payload = encode_frame(body) + b"\n"
+    if lock is not None:
+        with lock:
+            sock.sendall(payload)
+    else:
+        sock.sendall(payload)
+
+
+def _login_one(login_body: bytes, group_key: str) -> socket.socket | None:
+    domain = stock_name_group(group_key)["domain"]
+    ips = _resolve_ips(domain)
+    if not ips:
+        return None
+    return _connect_and_login(login_body, ips)
+
+
+def _login_sessions(
+    login_body: bytes,
+    groups: list[str],
+) -> dict[str, tuple[socket.socket, threading.Lock]]:
+    """Log in to every market group concurrently (hexin cold-start style)."""
+    sessions: dict[str, tuple[socket.socket, threading.Lock]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(groups))) as pool:
+        futures = {
+            pool.submit(_login_one, login_body, group_key): group_key
+            for group_key in groups
+        }
+        for future in as_completed(futures):
+            group_key = futures[future]
+            try:
+                sock = future.result()
+            except Exception:
+                sock = None
+            if sock is not None:
+                sessions[group_key] = (sock, threading.Lock())
+    return sessions
+
+
+def _start_heartbeat(sock: socket.socket, lock: threading.Lock) -> threading.Event:
+    stop = threading.Event()
+
+    def beat() -> None:
+        seq = 0
+        while not stop.wait(3.0):
+            try:
+                _send_frame(sock, build_heartbeat_8901(seq), lock)
+                seq += 1
+            except OSError:
+                return
+
+    threading.Thread(
+        target=beat,
+        name=f"stockname-heartbeat-{id(sock)}",
+        daemon=True,
+    ).start()
+    return stop
+
+
+def _collect_group(
+    sock: socket.socket,
+    group_key: str,
+    *,
+    timeout: float = 45.0,
+    settle_timeout: float = 3.0,
+    no_name_timeout: float = 20.0,
+    cache_path: str | None = None,
+    send_lock: threading.Lock | None = None,
+) -> dict:
+    """Replay one market group's bootstrap on an already-logged-in socket."""
+    meta = stock_name_group(group_key)
+    markets = meta["markets"]
+    pageid = meta["pageid"]
+    bootstrap = list(build_group_frames(group_key))
 
     cached = load_name_cache(cache_path) if cache_path else None
     cached_names = cached[1] if cached else {}
     cached_vers = cached[0] if cached else {}
+
+    # ifindhq 120/104 ignores StockNameVer=;;; hexin triggers it through
+    # MarketCode=104; plus the real 104_* ConfigVer list (2026-08-09 capture).
+    if "ifindhq" in group_key:
+        trigger = build_stock_name_ver_frame(
+            markets="104;",
+            stock_name_ver=_IFINDH_104_STALE_VERSION_VALUE,
+            pageid=pageid,
+        )
+        bootstrap = bootstrap[:-1] + [trigger]
 
     result: dict = {
         "names": dict(cached_names),
@@ -122,36 +211,76 @@ def download_stock_name_group(
         "segments": [],
     }
     config_vers: dict[str, str] = dict(cached_vers)
-    try:
-        for index, body in enumerate(bootstrap):
-            sock.sendall(encode_frame(body) + b"\n")
-            if index % 4 == 0:
-                time.sleep(0.05)
-        sock.settimeout(3.0)
-        deadline = time.time() + timeout
-        last_name_at = time.time()
-        while time.time() < deadline:
-            try:
-                item = read_frame(sock)
-            except socket.timeout:
-                if result["names"] and time.time() - last_name_at >= settle_timeout:
-                    break
-                continue
-            except (OSError, ValueError):
+    for index, body in enumerate(bootstrap):
+        _send_frame(sock, body, send_lock)
+        if index % 4 == 0:
+            time.sleep(0.05)
+
+    sock.settimeout(3.0)
+    deadline = time.time() + timeout
+    last_name_at = time.time()
+    last_activity_at = time.time()
+    while time.time() < deadline:
+        try:
+            item = read_frame(sock)
+        except socket.timeout:
+            if result["names"] and time.time() - last_name_at >= settle_timeout:
                 break
-            if not item:
-                continue
-            if b"[name_" in item:
-                decoded = decode_name_frame(item)
-                result["names"].update(decoded["names"])
-                result["by_segment"].update(decoded["by_segment"])
-                result["skipped"].extend(decoded["skipped"])
-                result["segments"].extend(decoded["segments"])
-                config_vers.update(extract_config_vers(item))
-                last_name_at = time.time()
-        if cache_path and config_vers:
-            save_name_cache(result["names"], config_vers, cache_path)
-        return result
+            if (
+                not result["names"]
+                and time.time() - last_activity_at >= no_name_timeout
+            ):
+                break
+            continue
+        except (OSError, ValueError):
+            break
+        if not item:
+            continue
+        last_activity_at = time.time()
+        decoded = decode_name_frame(item)
+        if decoded["names"] or decoded["segments"]:
+            result["names"].update(decoded["names"])
+            result["by_segment"].update(decoded["by_segment"])
+            result["skipped"].extend(decoded["skipped"])
+            result["segments"].extend(decoded["segments"])
+            config_vers.update(extract_config_vers(item))
+            last_name_at = time.time()
+        elif (
+            not result["names"]
+            and time.time() - last_activity_at >= no_name_timeout
+        ):
+            break
+
+    if cache_path and config_vers:
+        save_name_cache(result["names"], config_vers, cache_path)
+    return result
+
+
+def download_stock_name_group(
+    login_body: bytes,
+    group_key: str,
+    *,
+    timeout: float = 45.0,
+    settle_timeout: float = 3.0,
+    no_name_timeout: float = 20.0,
+    cache_path: str | None = None,
+) -> dict:
+    """Download one market group's names over a fresh 123ths session."""
+    meta = stock_name_group(group_key)
+    domain = meta["domain"]
+    ips = _resolve_ips(domain)
+    sock = _connect_and_login(login_body, ips) if ips else None
+    if sock is None:
+        return empty_name_result()
+    try:
+        return _collect_group(
+            sock,
+            group_key,
+            timeout=timeout,
+            settle_timeout=settle_timeout,
+            no_name_timeout=no_name_timeout,
+            cache_path=cache_path,
+        )
     finally:
         try:
             sock.close()
@@ -248,7 +377,7 @@ def download_full_stock_names(
 
     try:
         for index, body in enumerate(bootstrap):
-            sock.sendall(encode_frame(body) + b"\n")
+            _send_frame(sock, body)
             if index % 4 == 0:
                 time.sleep(0.05)
 
@@ -263,8 +392,9 @@ def download_full_stock_names(
                 break
             if not item:
                 continue
-            if b"[name_16_16]" in item:
-                result = decode_name_frame(item)
+            decoded = decode_name_frame(item)
+            if "16_16" in decoded["by_segment"]:
+                result = decoded
                 if cache_path:
                     response_vers = extract_config_vers(item)
                     config_vers = dict(cached_config_vers)
@@ -301,13 +431,14 @@ def download_all_stock_names(
     *,
     timeout: float = 45.0,
     settle_timeout: float = 3.0,
+    no_name_timeout: float = 20.0,
 ) -> dict:
     """Download every market group's names (external manual entry).
 
-    Iterates the account-specific 123ths market groups and merges their
-    ``[name_*]`` segments into one result, using per-group txt caches
-    (``~/.thspypc/stockname/``). Call this after login to refresh the full
-    stock-name list.
+    Logs into all account-specific 123ths market groups concurrently (one
+    socket per group), keeps the sessions alive with 3s 8901 heartbeats, then
+    replays each group's bootstrap and merges every ``[name_*]`` segment.
+    Per-group txt caches live under ``~/.thspypc/stockname/``.
     """
     key = (
         account_kind.value
@@ -321,19 +452,38 @@ def download_all_stock_names(
         "skipped": [],
         "segments": [],
     }
-    for group_key in groups:
-        part = download_stock_name_group(
-            login_body,
-            group_key,
-            timeout=timeout,
-            settle_timeout=settle_timeout,
-            cache_path=str(group_cache_path(group_key)),
-        )
-        result["names"].update(part["names"])
-        result["by_segment"].update(part["by_segment"])
-        result["skipped"].extend(part["skipped"])
-        result["segments"].extend(part["segments"])
-    return result
+    sessions = _login_sessions(login_body, groups)
+    heartbeats: list[tuple[threading.Event, socket.socket]] = []
+    try:
+        for group_key, (sock, lock) in sessions.items():
+            heartbeats.append((_start_heartbeat(sock, lock), sock))
+        for group_key in groups:
+            session = sessions.get(group_key)
+            if session is None:
+                continue
+            sock, lock = session
+            part = _collect_group(
+                sock,
+                group_key,
+                timeout=timeout,
+                settle_timeout=settle_timeout,
+                no_name_timeout=no_name_timeout,
+                cache_path=str(group_cache_path(group_key)),
+                send_lock=lock,
+            )
+            result["names"].update(part["names"])
+            result["by_segment"].update(part["by_segment"])
+            result["skipped"].extend(part["skipped"])
+            result["segments"].extend(part["segments"])
+        return result
+    finally:
+        for stop, _sock in heartbeats:
+            stop.set()
+        for sock, _lock in sessions.values():
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 class StockNameService:

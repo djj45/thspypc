@@ -231,11 +231,11 @@ class ServiceFacade:
     ) -> dict:
         """Download every market group's names (full stockname replacement).
 
-        Iterates the account-specific 123ths market groups (16/32/96/128/88/
-        216/48/144/176/112/168/184/200/120/104/64 + outer markets), downloads
-        each group's ``[name_*]`` segments over a fresh socket, and merges
-        them with per-group txt caches. Cross-platform, no Windows client
-        files. Call after login to refresh the full stock-name list.
+        Logs into all account-specific 123ths market groups concurrently
+        (one socket per group), keeps the sessions alive with 3s heartbeats,
+        then replays each group's bootstrap and merges ``[name_*]`` segments
+        with per-group txt caches. Cross-platform, no Windows client files.
+        Call after login to refresh the full stock-name list.
         """
         material = self._auth_service.require_current()
         login_body = self._auth_service.login_body_for_passport(material.passport64)

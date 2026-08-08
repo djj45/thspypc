@@ -349,3 +349,19 @@ passport 登录（VerifyCode=0），重放删缓存引导（每帧 `encode_frame
 （16_*、144_* 为 `20260306_...`），服务器回 451,275B `name_16_16`。用 222248
 引导模板重放可稳定复现；用编造的旧版本（`20200101_1`）服务器不回。缓存策略：
 上报缓存 ConfigVer，收到分段增量时合并名称并逐段更新 ConfigVer，不整表覆盖。
+
+### 13.8 ifindhq_120 排查与全组并发下载（2026-08-08）
+
+- 对应文件：Windows 端 `stockname_120_0.txt`（base，801 条，段 `[name_120_120]`，
+  ConfigVer=20260121_867205387）与 `stockname_120_1.txt`（增量 54 条，
+  ConfigVer=20260306_3838994613）；服务器还会回 `[name_104_104]`。
+- `StockNameVer=;;` 对 120/104 不返回名称（214435/215908 仅 `CodeListSize=0`）；
+  2026-08-09 00:07:56 抓包确认真实客户端用 `MarketCode=104;` + 104_* ConfigVer
+  触发，服务器才回约 30KB 压缩响应（含 `[name_120_120]` 与 `[name_104_104]`）。
+- 响应是 `0x0a` 压缩帧，不能用“原始 body 含 `[name_`”做过滤；
+  `_collect_group` 已改为对每帧先 `decode_name_frame` 再合并（2026-08-09 修复）。
+- 内容是 iFinD 指数/债券名称（企债指数、中证指数、申万行业指数等），不是 A 股股票名，
+  非核心。代码用 `_IFINDH_104_STALE_VERSION_VALUE` 尝试拉取；服务器限流时该组可能为空，
+  不影响 A 股主名称列表。
+- `download_all_stock_names` 已改为一次并发登录所有组并保持长连接 + 3s 心跳
+  （见 PROTOCOL 指南 4.5），避免串行重登触发 `VerifyCode=-1`。
