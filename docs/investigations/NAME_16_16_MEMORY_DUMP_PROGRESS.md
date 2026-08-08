@@ -296,8 +296,7 @@ name_16_16 的“17B 块状编码”不是第二层编码，而是外层 LZ 压�
 去掉段间空行，与 `stockname_16_0_full.txt` **逐字节 0 差异**（前 762738 B）。
 
 Unicorn 原生模拟同一镜像的 `0xf74260`（base 0xa50000，malloc/free/memcpy RVA
-0x15e2ba2/0x15e10d9/0x15d1290），与 Python 端口逐字节对比：10:38 帧只在输出尾
-1602587 处有填充差异，正文一致。10:38 与 10:57 在解压后第 652 字节起内容不同，
+0x15e2ba2/0x15e10d9/0x15d1290），与 Python 端口逐字节对比：10:38 帧只在输出末尾（第 1602587 字节处）有填充差异，正文一致。10:38 与 10:57 在解压后第 652 字节起内容不同，
 是两轮抓包快照不同，不是解码 bug。
 
 ### 13.3 活网抓包
@@ -311,7 +310,7 @@ Unicorn 原生模拟同一镜像的 `0xf74260`（base 0xa50000，malloc/free/mem
 - `decode_name_frame` 先调 `normalize_8901_response`，再按 `[name_16_*]` 段解析
   GBK 文本；`name_16_16` 不再被当作未解块状段跳过。
 - 验证：10:57 重建帧可解出 `600000=浦发银行`、`1A0001=上证指数`，`skipped=[]`，
-  names > 20000。
+  名称数超过 20000。
 - 相关测试：`tests/test_stock_name_protocol.py::test_captured_a_share_compressed_stream_decodes_names`。
 
 ### 13.5 两次冷启动对比（21:43 / 21:44）

@@ -862,7 +862,7 @@ thsdk JSON、DMP、Unicorn 和加载映像只用于开发验证。生产库应�
 ## 21b. 动态附加绕过反调试（2026-08-08 实测可用）
 
 同花顺 hexin.exe 有严格反调试，但 x32dbg headless + ScyllaHide 可以稳定附加
-运行中的进程。今天（2026-08-08）用这套流程抓到了 名称帧 socket→解码 的完整
+运行中的进程。今天（2026-08-08）用这套流程抓到了从 socket 收包到名称帧解码的完整
 调用链。
 
 ### 工具与关键配置
@@ -891,8 +891,8 @@ headless.exe -pid <pid> -userdir <dir> -plugin <dp32> ^
 
 ### 可复用驱动
 
-`tests/headless_name16_capture.py`：spawn headless、保持 stdin、附加后对 paused
-自动补 `run`。断点脚本示例：`D:\software\x64dbg\name16_headless_capture*.txt`。
+`tests/headless_name16_capture.py`：启动 headless、保持 stdin，附加后检测到
+`paused` 自动补发 `run`。断点脚本示例：`D:\software\x64dbg\name16_headless_capture*.txt`。
 
 ### 运行时地址换算
 
@@ -915,9 +915,11 @@ token。我们花了几周，把常见的 LZ、位掩码、RLE 模型都试了�
 0x0a                       <- 压缩标记（和所有 cmd=0x0a 帧相同）
 BE32 解压后长度
 0x1600 帧头
-MarketCode=16 
+MarketCode=16 
 
-[name_16_16]
+
+[name_16_16]
+
 
 <压缩源>                    <- 所谓“17B 块”就是这些字节
 ```
