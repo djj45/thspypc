@@ -220,6 +220,8 @@ STOCK_NAME_DOMAINS = {
     "standard": "main.123ths.com",
 }
 
+# 优先候选 IP（2026-08-08 实测可触发全量/增量的服务器），
+# 仅作 DNS 解析失败或轮询时的优先项，非唯一连接地址。
 STOCK_NAME_PREFERRED_IPS = {
     "level2": "122.9.115.201",
     "standard": "139.9.188.254",

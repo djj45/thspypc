@@ -84,7 +84,7 @@ def download_full_stock_names(
         ips = []
     target = preferred_ip or fallback_ip
     if target not in ips:
-        target = ips[0] if ips else None
+        target = ips[0] if ips else target
     if target is None:
         return empty_name_result()
 
