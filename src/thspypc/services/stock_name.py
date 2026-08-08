@@ -92,17 +92,11 @@ def download_stock_name_group(
     full download), merges every ``[name_*]`` frame received, and stores the
     group cache. Pure Python/TCP, no Windows client files.
     """
-    if group_key == "standard_16":
-        domain = "main.123ths.com"
-        markets = "32;208;"
-        pageid = 392
-        bootstrap = list(STANDARD_BOOTSTRAP_FRAMES)
-    else:
-        meta = stock_name_group(group_key)
-        domain = meta["domain"]
-        markets = meta["markets"]
-        pageid = meta["pageid"]
-        bootstrap = list(build_group_frames(group_key))
+    meta = stock_name_group(group_key)
+    domain = meta["domain"]
+    markets = meta["markets"]
+    pageid = meta["pageid"]
+    bootstrap = list(build_group_frames(group_key))
 
     try:
         ips = sorted(

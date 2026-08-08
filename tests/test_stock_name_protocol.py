@@ -132,8 +132,10 @@ def test_stock_name_groups_metadata():
     assert meta["domain"] == "fu4.123ths.com"
     assert "48" in meta["markets"]
     assert len(build_group_frames("fu4_96")) == 153
+    assert len(build_group_frames("standard_32")) == 102
     assert "level2_32" in STOCK_NAME_GROUPS["level2"]
-    assert "standard_16" in STOCK_NAME_GROUPS["standard"]
+    assert "standard_32" in STOCK_NAME_GROUPS["standard"]
+    assert stock_name_group("standard_32")["domain"] == "main.123ths.com"
 
 
 def test_stock_name_cache_roundtrip_and_version_value(tmp_path):

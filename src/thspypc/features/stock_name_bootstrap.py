@@ -114,7 +114,10 @@ STOCK_NAME_GROUPS = {
         "level2_16", "level2_32", "fu4_96", "hkus_176",
         "hkus_168", "ifindhq_120", "fu2_64", "usotc_UNS",
     ],
-    "standard": ["standard_16"],
+    "standard": [
+        "standard_32", "standard_hkus_176", "standard_fu4_96",
+        "standard_ifindhq_120", "standard_fu2_64", "standard_usotc_UNS",
+    ],
 }
 
 __all__ = [
