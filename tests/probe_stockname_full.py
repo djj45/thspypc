@@ -8,7 +8,7 @@ StockNameVer=;; trigger), and decodes the name_16_16 response.
 Usage:
     uv run python tests/probe_stockname_full.py
     uv run python tests/probe_stockname_full.py --env .env.normal \
-        --domain main.123ths.com --prefer-ip 139.9.188.254 \
+        --domain main.123ths.com \
         --bootstrap bootstrap_normal_215908_frames.json
 """
 from __future__ import annotations
@@ -40,7 +40,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default=".env")
     parser.add_argument("--domain", default="shlv2.123ths.com")
-    parser.add_argument("--prefer-ip", default="122.9.115.201")
     parser.add_argument(
         "--bootstrap", default="bootstrap_214435_frames.json"
     )
@@ -80,11 +79,7 @@ def main() -> int:
             )
         }
     )
-    target = (
-        args.prefer_ip
-        if args.prefer_ip in ips
-        else (ips[0] if ips else None)
-    )
+    target = ips[0] if ips else None
     if target is None:
         print("no ip for", args.domain)
         return 1

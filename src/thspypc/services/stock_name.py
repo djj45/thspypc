@@ -13,7 +13,6 @@ from ..features.stock_name_bootstrap import (
     LEVEL2_VERSIONED_BOOTSTRAP_FRAMES,
     STANDARD_BOOTSTRAP_FRAMES,
     STOCK_NAME_DOMAINS,
-    STOCK_NAME_PREFERRED_IPS,
 )
 from ..features.stock_name_cache import (
     build_version_value,
@@ -52,7 +51,6 @@ def download_full_stock_names(
     *,
     account_kind: AccountKind = AccountKind.STANDARD,
     timeout: float = 45.0,
-    preferred_ip: str | None = None,
     cache_path: str | None = None,
 ) -> dict:
     """Download the full name_16_16 list over a fresh 123ths.com session.
@@ -71,8 +69,6 @@ def download_full_stock_names(
     bootstrap = (
         LEVEL2_BOOTSTRAP_FRAMES if key == "level2" else STANDARD_BOOTSTRAP_FRAMES
     )
-    fallback_ip = STOCK_NAME_PREFERRED_IPS.get(key)
-
     try:
         ips = sorted(
             {
@@ -82,10 +78,7 @@ def download_full_stock_names(
         )
     except OSError:
         ips = []
-    target = preferred_ip or fallback_ip
-    if target not in ips:
-        target = ips[0] if ips else target
-    if target is None:
+    if not ips:
         return empty_name_result()
 
     cached = load_name_cache(cache_path) if cache_path else None
@@ -108,27 +101,39 @@ def download_full_stock_names(
     else:
         bootstrap = list(bootstrap)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
-    try:
-        sock.connect((target, 8901))
-        sock.sendall(encode_frame(login_body) + b"\n")
-        sock.settimeout(6.0)
-        deadline = time.time() + 6
-        login_ok = False
-        while time.time() < deadline:
-            try:
-                reply = read_frame(sock)
-            except socket.timeout:
-                break
-            except (OSError, ValueError):
-                break
-            if reply and b"VerifyCode=0" in reply:
-                login_ok = True
-                break
-        if not login_ok:
-            return empty_name_result()
+    sock = None
+    login_ok = False
+    for target in ips:
+        candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        candidate.settimeout(3.0)
+        try:
+            candidate.connect((target, 8901))
+            candidate.sendall(encode_frame(login_body) + b"\n")
+            candidate.settimeout(3.0)
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    reply = read_frame(candidate)
+                except socket.timeout:
+                    break
+                except (OSError, ValueError):
+                    break
+                if reply and b"VerifyCode=0" in reply:
+                    login_ok = True
+                    sock = candidate
+                    break
+        except OSError:
+            pass
+        if login_ok:
+            break
+        try:
+            candidate.close()
+        except OSError:
+            pass
+    if sock is None or not login_ok:
+        return empty_name_result()
 
+    try:
         for index, body in enumerate(bootstrap):
             sock.sendall(encode_frame(body) + b"\n")
             if index % 4 == 0:
@@ -170,10 +175,11 @@ def download_full_stock_names(
     except OSError:
         return empty_name_result()
     finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 class StockNameService:

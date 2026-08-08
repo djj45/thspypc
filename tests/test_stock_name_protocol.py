@@ -147,14 +147,18 @@ def test_stock_name_cache_roundtrip_and_version_value(tmp_path):
     assert extract_config_vers(frame) == {"16_16": "20260807_1"}
 
 
-def test_stock_name_bootstrap_templates_match_captures():
+def test_stock_name_bootstrap_templates_match_captures(tmp_path):
+    import json
+
     from thspypc.features.stock_name_bootstrap import (
         LEVEL2_BOOTSTRAP_FRAMES,
+        LEVEL2_VERSIONED_BOOTSTRAP_FRAMES,
         STANDARD_BOOTSTRAP_FRAMES,
         STOCK_NAME_DOMAINS,
     )
 
     assert len(LEVEL2_BOOTSTRAP_FRAMES) == 48
+    assert len(LEVEL2_VERSIONED_BOOTSTRAP_FRAMES) == 44
     assert len(STANDARD_BOOTSTRAP_FRAMES) == 102
     assert STOCK_NAME_DOMAINS["level2"] == "shlv2.123ths.com"
     assert STOCK_NAME_DOMAINS["standard"] == "main.123ths.com"
@@ -167,6 +171,23 @@ def test_stock_name_bootstrap_templates_match_captures():
     standard_trigger = STANDARD_BOOTSTRAP_FRAMES[-1]
     assert b"MarketCode=32" in standard_trigger
     assert b"StockNameVer=;;" in standard_trigger
+
+    # Optional byte-for-byte regression against captured templates.
+    pairs = [
+        ("LEVEL2_BOOTSTRAP_FRAMES", "bootstrap_214435_frames.json", LEVEL2_BOOTSTRAP_FRAMES),
+        ("LEVEL2_VERSIONED_BOOTSTRAP_FRAMES", "bootstrap_oldver_222248_frames.json", LEVEL2_VERSIONED_BOOTSTRAP_FRAMES),
+        ("STANDARD_BOOTSTRAP_FRAMES", "bootstrap_normal_215908_frames.json", STANDARD_BOOTSTRAP_FRAMES),
+    ]
+    for name, fname, frames in pairs:
+        path = Path(__file__).parents[1] / "captures_live" / fname
+        if not path.exists():
+            continue
+        captured = [
+            bytes.fromhex(item)
+            for item in json.loads(path.read_text(encoding="utf-8"))
+        ]
+        assert frames == tuple(captured), name
+
 
 
 def test_stock_name_ver_frame_matches_deleted_cache_capture():
