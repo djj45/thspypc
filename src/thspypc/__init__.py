@@ -87,6 +87,9 @@ from .protocol import (
 
     # 股票列表（全市场代码表）
     build_full_stock_list_query, build_stock_list_query,
+    build_dde_query, parse_dde_response,
+    DDE_PAGEID, DDE_STANDARD_ROUTE, DDE_LEVEL2_ROUTE,
+    DDE_STANDARD_MARKETS, DDE_LEVEL2_MARKETS, DDE_RESPONSE_FIELDS,
     parse_stock_list_response, STOCK_LIST_DATATYPE,
     build_init_query, parse_init_response,
     # 短线精灵（异动）
@@ -154,6 +157,9 @@ __all__ = [
     "build_market_snapshot_query", "MARKET_SNAPSHOT_MARKETS", "MARKET_SNAPSHOT_DATATYPE",
     "parse_hfd1_response",
     "build_full_stock_list_query", "build_stock_list_query",
+    "build_dde_query", "parse_dde_response",
+    "DDE_PAGEID", "DDE_STANDARD_ROUTE", "DDE_LEVEL2_ROUTE",
+    "DDE_STANDARD_MARKETS", "DDE_LEVEL2_MARKETS", "DDE_RESPONSE_FIELDS",
     "parse_stock_list_response", "STOCK_LIST_DATATYPE",
     "build_init_query", "parse_init_response",
     "build_qurealorder_query", "parse_qurealorder_response", "read_frame_realorder",

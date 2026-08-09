@@ -12,6 +12,7 @@ from ..codecs.compression import (
 )
 from ..codecs.framing import encode_frame
 from ..codecs.hd import _parse_hd_field_table, parse_hd3_response
+from ..codecs.numeric import decode_ths_float
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,26 @@ SORT_BY_VALUES = {
     "主力净流入": {"sort_by": 592890, "verified": True},
     "竞价金额": {"sort_by": 68758, "verified": True},
     "竞价涨幅": {"sort_by": 68762, "verified": True},
+}
+
+DDE_PAGEID = 10723
+DDE_STANDARD_ROUTE = 0x0148
+DDE_LEVEL2_ROUTE = 0x0149
+DDE_STANDARD_MARKETS = (17, 22, 33)
+DDE_LEVEL2_MARKETS = (
+    (17, 22),
+    (33,),
+)
+# DDE responses use compact one-byte field ids.  dt200 is overloaded, so the
+# originating SortBy must remain part of the public result.
+DDE_RESPONSE_FIELDS = {
+    592888: 248,
+    592889: 249,
+    592890: 250,
+    199112: 200,
+    19: 19,
+    48: 48,
+    1968584: 200,
 }
 
 INIT_C_MODULES = "MEQT"
@@ -94,6 +115,7 @@ def build_stock_list_query(
     sort_dir: str = "D",
     pageid: int = 1334,
     seq: int = 0x0025,
+    route: int = 0x0156,
 ) -> bytes:
     """Build a DataType=199112 sorted stock-list page request."""
     if datatype is None:
@@ -114,9 +136,39 @@ def build_stock_list_query(
     header[1:5] = b"\x00\x16\x00\x00"
     struct.pack_into("<H", header, 5, seq & 0xFFFF)
     header[7:11] = b"\x12\x00\x0f\x00"
-    header[11:13] = b"\x56\x01"
+    struct.pack_into("<H", header, 11, route & 0xFFFF)
     struct.pack_into("<H", header, 19, len(text) + 1)
     return encode_frame(bytes(header) + text)
+
+
+def build_dde_query(
+    *,
+    markets: tuple[int, ...] = DDE_STANDARD_MARKETS,
+    sort_by: int = 592888,
+    sort_dir: str = "D",
+    sort_begin: int = 0,
+    sort_count: int = 58,
+    level2: bool = False,
+    seq: int = 0x0025,
+) -> bytes:
+    """Build the ranking request used by the desktop DDE page."""
+    direction = sort_dir.upper()
+    if direction not in {"A", "D"}:
+        raise ValueError("sort_dir must be 'A' or 'D'")
+    if sort_begin < 0 or sort_count <= 0:
+        raise ValueError("DDE pagination values must be positive")
+    route = DDE_LEVEL2_ROUTE if level2 else DDE_STANDARD_ROUTE
+    return build_stock_list_query(
+        markets=markets,
+        sort_begin=sort_begin,
+        sort_count=sort_count,
+        datatype=[sort_by],
+        sort_by=sort_by,
+        sort_dir=direction,
+        pageid=DDE_PAGEID,
+        seq=seq,
+        route=route,
+    )
 
 
 def build_full_stock_list_query(
@@ -173,6 +225,35 @@ def parse_stock_list_response(body: bytes) -> dict:
     if not stocks:
         stocks = _parse_stock_list_hd10_variant(body)
     result["stocks"] = stocks
+    return result
+
+
+def parse_dde_response(body: bytes, *, sort_by: int = 592888) -> dict:
+    """Parse one DDE ranking page while preserving its numeric sort value."""
+    result = parse_stock_list_response(body)
+    records = _parse_stock_list_hd31_records(body)
+    response_field = DDE_RESPONSE_FIELDS.get(sort_by, sort_by & 0xFF)
+    value_key = f"dt{response_field}"
+    rows = []
+    for record in records:
+        code = record.get("code", "")
+        if not code:
+            continue
+        rows.append(
+            {
+                "code": code,
+                "name": "",
+                "market": record.get("market", 0),
+                "value": record.get(value_key),
+                "sort_by": sort_by,
+                "response_field": response_field,
+            }
+        )
+    result["rows"] = rows
+    result["response_field"] = response_field
+    result["has_value_field"] = any(
+        value_key in record for record in records
+    )
     return result
 
 
@@ -324,8 +405,8 @@ def parse_stock_list_replay(data: bytes) -> tuple[bytes, ...]:
     return tuple(segments)
 
 
-def _parse_stock_list_hd31_variant(body: bytes) -> list[dict]:
-    """Parse the 16-bit-count hd3.1 BitRLE stock-list variant."""
+def _parse_stock_list_hd31_records(body: bytes) -> list[dict]:
+    """Decode all fields in the 16-bit-count hd3.1 stock-list variant."""
     marker = body.find(b"hd3.1\x00")
     if marker < 0:
         return []
@@ -371,35 +452,52 @@ def _parse_stock_list_hd31_variant(body: bytes) -> list[dict]:
         record_count,
     )
 
-    code_offset = 0
-    for datatype, _format, width in fields:
-        if datatype == 5:
-            break
-        code_offset += width
-    else:
-        code_offset = 0
-
-    stocks = []
+    decoded = []
     for index in range(record_count):
         row = records[
             index * record_size : (index + 1) * record_size
         ]
         if len(row) < record_size:
             break
-        market = row[code_offset]
-        code_bytes = row[code_offset + 1 : code_offset + 7]
-        if len(code_bytes) != 6 or not all(
-            48 <= value <= 57 for value in code_bytes
-        ):
-            continue
-        stocks.append(
-            {
-                "code": code_bytes.decode("ascii"),
-                "name": "",
-                "market": market,
-            }
-        )
-    return stocks
+        record: dict = {}
+        offset = 0
+        for datatype, field_format, width in fields:
+            chunk = row[offset : offset + width]
+            offset += width
+            if len(chunk) < width:
+                break
+            if datatype == 5 and width >= 7:
+                code_bytes = chunk[1:7]
+                if all(48 <= value <= 57 for value in code_bytes):
+                    record["code"] = code_bytes.decode("ascii")
+                    record["market"] = chunk[0]
+                continue
+            if width == 4:
+                raw_value = struct.unpack("<I", chunk)[0]
+                record[f"dt{datatype}_raw"] = raw_value
+                record[f"dt{datatype}"] = (
+                    None
+                    if raw_value == 0xFFFFFFFF
+                    else decode_ths_float(raw_value)
+                )
+            else:
+                record[f"dt{datatype}_raw"] = chunk
+            record[f"dt{datatype}_format"] = field_format
+        if record.get("code"):
+            decoded.append(record)
+    return decoded
+
+
+def _parse_stock_list_hd31_variant(body: bytes) -> list[dict]:
+    """Parse stock identities from the 16-bit-count hd3.1 variant."""
+    return [
+        {
+            "code": record["code"],
+            "name": "",
+            "market": record.get("market", 0),
+        }
+        for record in _parse_stock_list_hd31_records(body)
+    ]
 
 
 def _parse_stock_list_hd10_variant(body: bytes) -> list[dict]:
@@ -448,6 +546,12 @@ def _parse_stock_list_hd10_variant(body: bytes) -> list[dict]:
 
 
 __all__ = [
+    "DDE_LEVEL2_MARKETS",
+    "DDE_LEVEL2_ROUTE",
+    "DDE_PAGEID",
+    "DDE_RESPONSE_FIELDS",
+    "DDE_STANDARD_MARKETS",
+    "DDE_STANDARD_ROUTE",
     "FULL_STOCK_LIST_MARKETS",
     "INIT_C_MODULES",
     "INIT_MARKET_CODE",
@@ -456,9 +560,11 @@ __all__ = [
     "STOCK_LIST_DATATYPE",
     "STOCK_LIST_MARKETS",
     "build_init_query",
+    "build_dde_query",
     "build_full_stock_list_query",
     "build_stock_list_query",
     "parse_init_response",
+    "parse_dde_response",
     "parse_stock_list_replay",
     "parse_stock_list_response",
 ]

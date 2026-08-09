@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import socket
+import struct
+import threading
 import time
 from collections.abc import Callable
 
@@ -10,12 +12,16 @@ from ..codecs.framing import read_frame
 from ..errors import ProtocolError
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.stock_list_protocol import (
+    DDE_LEVEL2_MARKETS,
+    DDE_STANDARD_MARKETS,
+    build_dde_query,
     build_full_stock_list_query,
     build_stock_list_query,
+    parse_dde_response,
     parse_init_response,
     parse_stock_list_response,
 )
-from ..models import Capability
+from ..models import AccountKind, Capability, Support
 
 
 FrameReader = Callable[[SocketLike], bytes]
@@ -46,6 +52,15 @@ class StockListService:
         self._replay_segments = replay_segments
         self._clock = clock
         self._sleep = sleep
+        self._dde_sequence = 0x6000
+        self._dde_sequence_lock = threading.Lock()
+
+    def _next_dde_sequence(self) -> int:
+        with self._dde_sequence_lock:
+            self._dde_sequence = (self._dde_sequence + 1) & 0xFFFF
+            if self._dde_sequence == 0:
+                self._dde_sequence = 1
+            return self._dde_sequence
 
     def _get_request_segments(self) -> tuple[bytes, ...]:
         if self._replay_segments is not None:
@@ -127,6 +142,140 @@ class StockListService:
 
         return stocks
 
+    def dde_ranked(
+        self,
+        *,
+        count: int = 58,
+        timeout: float = 10.0,
+        sort_by: int = 592888,
+        sort_dir: str = "D",
+        max_pages: int = 120,
+    ) -> list[dict]:
+        """Fetch the pageid=10723 DDE table for standard or Level2 accounts."""
+        if count <= 0 or max_pages <= 0:
+            return []
+        direction = sort_dir.upper()
+        if direction not in {"A", "D"}:
+            raise ValueError("sort_dir must be 'A' or 'D'")
+
+        if self._connections.profile.kind is AccountKind.LEVEL2:
+            page_count = max(58, count)
+            pages = [
+                self._dde_page(
+                    role=role,
+                    markets=markets,
+                    count=page_count,
+                    begin=0,
+                    sort_by=sort_by,
+                    sort_dir=direction,
+                    timeout=timeout,
+                    level2=True,
+                    capability=Capability.L2_MARKET_ACCESS,
+                )
+                for role, markets in (
+                    (ConnectionRole.SH_L2, DDE_LEVEL2_MARKETS[0]),
+                    (ConnectionRole.SZ_L2, DDE_LEVEL2_MARKETS[1]),
+                )
+            ]
+            rows = _merge_dde_rows(
+                [row for page in pages for row in page["rows"]],
+                sort_dir=direction,
+            )
+            if self._evidence is not None and rows:
+                self._evidence.record_l2_init(Support.YES)
+            return rows[:count]
+
+        rows: list[dict] = []
+        seen_codes: set[str] = set()
+        begin = 0
+        total = 0
+        for _page in range(max_pages):
+            page = self._dde_page(
+                role=ConnectionRole.MAIN,
+                markets=DDE_STANDARD_MARKETS,
+                count=58,
+                begin=begin,
+                sort_by=sort_by,
+                sort_dir=direction,
+                timeout=timeout,
+                level2=False,
+                capability=Capability.BASIC_QUOTE,
+            )
+            if not total:
+                total = page["sort_total"]
+            for row in page["rows"]:
+                code = row["code"]
+                if code not in seen_codes:
+                    seen_codes.add(code)
+                    rows.append(row)
+            data_count = page["sort_data_count"]
+            if len(rows) >= count or data_count == 0:
+                break
+            if total and begin + data_count >= total:
+                break
+            begin += data_count
+
+        if self._evidence is not None and rows:
+            self._evidence.record_main_ready()
+        return rows[:count]
+
+    def _dde_page(
+        self,
+        *,
+        role: ConnectionRole,
+        markets: tuple[int, ...],
+        count: int,
+        begin: int,
+        sort_by: int,
+        sort_dir: str,
+        timeout: float,
+        level2: bool,
+        capability: Capability,
+    ) -> dict:
+        connection = self._connections.acquire(role, capability=capability)
+        sequence = self._next_dde_sequence()
+        request = build_dde_query(
+            markets=markets,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            sort_begin=begin,
+            sort_count=count,
+            level2=level2,
+            seq=sequence,
+        )
+        saw_data = False
+        with connection.request(request, timeout=timeout) as sock:
+            # Fresh L2 connections can still have a burst of initialization
+            # responses queued ahead of this request.  Sequence matching keeps
+            # them safe to skip, while the larger bound prevents a valid DDE
+            # response from being abandoned after the legacy eight-frame cap.
+            for _ in range(max(self._max_frames, 64)):
+                try:
+                    response = self._read_frame(sock)
+                except socket.timeout:
+                    break
+                if (
+                    len(response) < 7
+                    or struct.unpack_from("<H", response, 5)[0] != sequence
+                ):
+                    continue
+                if b"SortTotal" not in response:
+                    continue
+                page = parse_dde_response(response, sort_by=sort_by)
+                if page["sort_data_count"] == 0:
+                    return page
+                saw_data = True
+                if page["rows"] and page["has_value_field"]:
+                    if level2 and sort_by == 592888:
+                        for row in page["rows"]:
+                            value = row.get("value")
+                            if value is not None:
+                                row["value"] = value / 100_000_000
+                    return page
+        if saw_data:
+            raise ProtocolError("received DDE ranking data but parsing failed")
+        raise ProtocolError("DDE ranking response timed out")
+
     def full_list(
         self,
         *,
@@ -206,6 +355,26 @@ class StockListService:
         if self._evidence is not None and best_stocks:
             self._evidence.record_main_ready()
         return best_stocks
+
+
+def _merge_dde_rows(rows: list[dict], *, sort_dir: str) -> list[dict]:
+    """Globally merge the independently sorted SH and SZ Level2 pages."""
+    unique: dict[str, dict] = {}
+    for row in rows:
+        unique.setdefault(row["code"], row)
+
+    def key(row: dict) -> tuple:
+        value = row.get("value")
+        if value is None:
+            return (1, 0.0, row["code"])
+        numeric = float(value)
+        return (
+            0,
+            -numeric if sort_dir == "D" else numeric,
+            row["code"],
+        )
+
+    return sorted(unique.values(), key=key)
 
 
 __all__ = ["StockListService"]

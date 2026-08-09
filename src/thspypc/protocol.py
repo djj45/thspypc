@@ -148,6 +148,12 @@ from .features.superorder_protocol import (
     parse_superorder_response,
 )
 from .features.stock_list_protocol import (
+    DDE_LEVEL2_MARKETS,
+    DDE_LEVEL2_ROUTE,
+    DDE_PAGEID,
+    DDE_RESPONSE_FIELDS,
+    DDE_STANDARD_MARKETS,
+    DDE_STANDARD_ROUTE,
     FULL_STOCK_LIST_MARKETS,
     INIT_C_MODULES,
     INIT_MARKET_CODE,
@@ -158,10 +164,12 @@ from .features.stock_list_protocol import (
     _dt5_market,
     _parse_stock_list_hd10_variant,
     _parse_stock_list_hd31_variant,
+    build_dde_query,
     build_init_query,
     build_full_stock_list_query,
     build_stock_list_query,
     parse_init_response,
+    parse_dde_response,
     parse_stock_list_replay,
     parse_stock_list_response,
 )

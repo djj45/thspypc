@@ -1158,6 +1158,50 @@ class ServiceFacade:
                         pass
         raise RuntimeError(f"history_timeline {code} {date} 重试 {retries} 次仍失败: {last_err}")
 
+    def dde_rank(
+        self,
+        count: int = 58,
+        timeout: float = 10.0,
+        with_names: bool | str = False,
+        sort_by: int = 592888,
+        sort_dir: str = "D",
+        max_pages: int = 120,
+    ) -> list[dict]:
+        """Return the desktop DDE page ranking (pageid=10723).
+
+        Standard accounts use the combined MAIN request.  Level2 accounts use
+        the captured SH/SZ split routes and the two server rankings are merged
+        globally by their decoded numeric value.
+
+        Each row contains ``code``, ``market``, ``value``, ``sort_by`` and
+        ``response_field``.  Verified DDE sort keys are 592888 (default main
+        force), 592890 (main-force net inflow), plus the captured table keys
+        199112, 19, 48 and 1968584.
+        """
+        self._ensure_main_connection()
+        capability = (
+            Capability.L2_MARKET_ACCESS
+            if self.observed_account_profile.kind is AccountKind.LEVEL2
+            else Capability.BASIC_QUOTE
+        )
+        rows = self._run_default_service(
+            (capability,),
+            lambda: self._stock_list_service.dde_ranked(
+                count=count,
+                timeout=timeout,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+                max_pages=max_pages,
+            ),
+        )
+        if with_names and rows:
+            name_map = self.fetch_stock_names_full()["names"]
+            for row in rows:
+                name = name_map.get(row["code"], "")
+                if name:
+                    row["name"] = name
+        return rows
+
     def stock_list_hot(
         self,
         count: int = 29,
