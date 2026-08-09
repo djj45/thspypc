@@ -102,8 +102,207 @@ SNAPSHOT_REPLAY_DATATYPE = [
 SNAPSHOT_REPLAY_COMPANION_DATATYPE = [7, 10, 2419, 2420, 6, 45, 402, 619]
 _SNAPSHOT_REPLAY_ROUTE = 0x0158
 
+# 买一/卖一委托队列（Level2 超级盘口）。7173=买一，7174=卖一；请求只取
+# DataType=10。历史日仍发 -1-0，但必须先在同一条连接上用 4096 建立 4417
+# 上下文；目前只确认服务端保留最近一个交易日。
+ORDER_QUEUE_BUY_PERIOD = 7173
+ORDER_QUEUE_SELL_PERIOD = 7174
+ORDER_QUEUE_DATATYPE = [10]
+ORDER_QUEUE_PAGEID = 4214
+ORDER_QUEUE_HIST_PAGEID = 4417
+ORDER_QUEUE_FLAG = 0x002A
+ORDER_QUEUE_RECORD_SIZE = 4
+ORDER_QUEUE_FIELD_COUNT = 1
+
 # 外层请求路由标记（2026-08-05 抓包确认，0x02FC = 小端 fc 02；区别于 auction 的 0x01FC）
 _SUPERORDER_ROUTE = b"\xfc\x02"
+
+
+def build_order_queue_query(
+    code: str,
+    market: int = 33,
+    *,
+    side: str = "buy",
+    pageid: int = ORDER_QUEUE_PAGEID,
+    seq: int = 0,
+    inner_seq: int = 0x09A0,
+) -> bytes:
+    """构造买一/卖一委托队列请求（7173/7174，Level2 专属）。
+
+    ``side="buy"`` 使用 7173，``side="sell"`` 使用 7174。历史日期不能写入
+    本请求；调用方须先在同一连接请求 4417@4096 建立日期上下文，再以
+    ``pageid=4417`` 发本请求。
+    """
+    if side not in ("buy", "sell"):
+        raise ValueError("side 必须是 'buy' 或 'sell'")
+    if not code or not code.isascii() or not code.isalnum():
+        raise ValueError(f"非法证券代码: {code!r}")
+    if pageid not in (ORDER_QUEUE_PAGEID, 4260, ORDER_QUEUE_HIST_PAGEID):
+        raise ValueError(f"不支持的委托队列 pageid: {pageid}")
+
+    period = (
+        ORDER_QUEUE_BUY_PERIOD
+        if side == "buy"
+        else ORDER_QUEUE_SELL_PERIOD
+    )
+    target = f"{market}({code},);"
+    outer_text = (
+        f"CodeList={target}\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    inner_text = (
+        f"CodeList={target}\r\n"
+        "DataType=10,\r\n"
+        f"DateTime={period}(-1-0)\r\n"
+        "LackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r\n"
+    ).encode("gbk")
+
+    # 抓包形态：帧级 cmd=0x09；outer route=0x02fc，只携带 CodeList/pageid；
+    # inner route=0x01fc，携带 DataType/DateTime/LackTime。
+    outer_header = bytearray(23)
+    outer_header[0] = 0x09
+    outer_header[1:5] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", outer_header, 5, seq & 0xFFFF)
+    outer_header[7:11] = b"\x12\x00\x02\x00"
+    outer_header[11:13] = b"\xfc\x02"
+    struct.pack_into("<I", outer_header, 19, len(outer_text))
+
+    inner_header = bytearray(22)
+    inner_header[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", inner_header, 4, inner_seq & 0xFFFF)
+    inner_header[6:10] = b"\x12\x00\x09\x00"
+    inner_header[10:12] = b"\xfc\x01"
+    inner_header[12:14] = b"\x00\x00"
+    inner_header[14:16] = b"\x40\x00"
+    inner_header[16:18] = b"\x05\x1c"
+    struct.pack_into("<I", inner_header, 18, len(inner_text))
+    return encode_frame(
+        bytes(outer_header)
+        + outer_text
+        + bytes(inner_header)
+        + inner_text
+    )
+
+
+def parse_order_queue_response(
+    body: bytes,
+    *,
+    side: str,
+) -> dict | None:
+    """解析 7173/7174 委托队列响应；ACK/空队列返回 ``None``。
+
+    ``entries`` 只包含客户端展示窗口中的委托（通常最多 50 笔），不等于该价位
+    全部委托。``total_order_count`` 是该价位总笔数；``meta_value`` 是响应壳中的
+    原始辅助值（与 4096 的 dt123/dt125 对齐），暂不赋予“总量”语义。
+    """
+    if side not in ("buy", "sell"):
+        raise ValueError("side 必须是 'buy' 或 'sell'")
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("order queue normalization failed: %s", exc)
+            return None
+
+    pos = 0
+    while True:
+        marker = body.find(b"hd1.0", pos)
+        if marker < 0:
+            return None
+        pos = marker + 6
+        base = marker + 6
+        if base + 14 > len(body):
+            continue
+        record_count, flag, record_size, field_count = struct.unpack_from(
+            "<IHHH", body, base
+        )
+        if (
+            flag != ORDER_QUEUE_FLAG
+            or record_size != ORDER_QUEUE_RECORD_SIZE
+            or field_count != ORDER_QUEUE_FIELD_COUNT
+        ):
+            continue
+        field_off = base + 10
+        if field_off + 4 > len(body):
+            continue
+        dt, fmt, _flags, width = body[field_off : field_off + 4]
+        if (dt, fmt, width) != (56, 0x30, 4):
+            continue
+
+        # 壳长不是稳定常量，用市场字节 + 证券代码定位。0x11=沪，0x21=深。
+        shell_start = field_off + 4
+        shell_end = min(shell_start + 120, len(body) - 42)
+        code_pos = None
+        for candidate in range(shell_start, max(shell_start, shell_end) + 1):
+            if body[candidate] not in (0x11, 0x21):
+                continue
+            label = body[candidate + 1 : candidate + 7]
+            if len(label) == 6 and all(
+                48 <= value <= 57 or 65 <= value <= 90
+                for value in label
+            ):
+                code_pos = candidate
+                break
+        if code_pos is None or code_pos + 42 > len(body):
+            continue
+
+        ts = struct.unpack_from("<I", body, code_pos + 18)[0]
+        price_raw = struct.unpack_from("<I", body, code_pos + 22)[0]
+        meta_value = struct.unpack_from("<I", body, code_pos + 26)[0]
+        display_limit = body[code_pos + 32]
+        subtype = body[code_pos + 33]
+        total_order_count = struct.unpack_from("<H", body, code_pos + 34)[0]
+        marker_value = struct.unpack_from("<H", body, code_pos + 38)[0]
+        if subtype != 16 or marker_value != 0x0101:
+            continue
+
+        data_off = code_pos + 42
+        next_table = body.find(b"hd1.0", data_off)
+        data_end = next_table if next_table >= 0 else len(body)
+        available = max(0, (data_end - data_off) // 4)
+        visible_count = min(display_limit, available)
+        entries = []
+        for index in range(visible_count):
+            raw = struct.unpack_from("<I", body, data_off + index * 4)[0]
+            shares = raw & 0x07FFFFFF
+            entries.append({
+                "index": index + 1,
+                "raw": raw,
+                "shares": shares,
+                "hands": (shares + 50) // 100,
+                "is_major": bool(raw & 0x08000000),
+            })
+        major_entries = [entry for entry in entries if entry["is_major"]]
+        major_shares = sum(entry["shares"] for entry in major_entries)
+        try:
+            time_value = datetime.fromtimestamp(ts)
+        except (OSError, ValueError, OverflowError):
+            time_value = None
+        code = body[code_pos + 1 : code_pos + 7].decode("ascii")
+        return {
+            "code": code,
+            "market_marker": body[code_pos],
+            "side": side,
+            "period": (
+                ORDER_QUEUE_BUY_PERIOD
+                if side == "buy"
+                else ORDER_QUEUE_SELL_PERIOD
+            ),
+            "time": time_value,
+            "ts": ts,
+            "price": round(decode_ths_float(price_raw), 3),
+            "price_raw": price_raw,
+            "meta_value": meta_value,
+            "display_limit": display_limit,
+            "total_order_count": total_order_count,
+            "visible_count": len(entries),
+            "truncated": total_order_count > len(entries),
+            "entries": entries,
+            "visible_major_order_count": len(major_entries),
+            "visible_major_shares": major_shares,
+            "visible_major_hands": major_shares / 100.0,
+            "record_count": record_count,
+        }
 
 
 def build_superorder_query(
@@ -689,8 +888,18 @@ __all__ = [
     "SNAPSHOT_REPLAY_INDEX_RECORD_SIZE",
     "SNAPSHOT_REPLAY_INDEX_FIELD_COUNT",
     "SNAPSHOT_REPLAY_INDEX_PAGEID",
+    "ORDER_QUEUE_BUY_PERIOD",
+    "ORDER_QUEUE_SELL_PERIOD",
+    "ORDER_QUEUE_DATATYPE",
+    "ORDER_QUEUE_PAGEID",
+    "ORDER_QUEUE_HIST_PAGEID",
+    "ORDER_QUEUE_FLAG",
+    "ORDER_QUEUE_RECORD_SIZE",
+    "ORDER_QUEUE_FIELD_COUNT",
     "build_superorder_query",
     "parse_superorder_response",
     "build_snapshot_replay_query",
     "parse_snapshot_replay_response",
+    "build_order_queue_query",
+    "parse_order_queue_response",
 ]

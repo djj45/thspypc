@@ -282,6 +282,140 @@ def test_protocol_reexports_superorder():
     assert protocol.SUPERORDER_PERIOD == 7169
 
 
+# ────────────────── 7173/7174 委托队列 ──────────────────
+
+def _build_order_queue_frame(
+    *,
+    side: str,
+    code: str,
+    market_marker: int,
+    values: list[int],
+    total_order_count: int,
+    meta_value: int,
+) -> bytes:
+    field_table = bytes((56, 0x30, 0, 4))
+    shell = bytearray(42)
+    shell[0] = market_marker
+    shell[1:7] = code.encode("ascii")
+    struct.pack_into("<I", shell, 18, 1786112984)
+    struct.pack_into("<I", shell, 22, 0x9000076C)  # 190.0
+    struct.pack_into("<I", shell, 26, meta_value)
+    shell[32] = 50
+    shell[33] = 16
+    struct.pack_into("<H", shell, 34, total_order_count)
+    struct.pack_into("<H", shell, 38, 0x0101)
+    rows = b"".join(struct.pack("<I", value) for value in values)
+    return (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", len(values) + 6, 0x002A, 4, 1)
+        + field_table
+        + b"\x00\x00\x00\x00"
+        + bytes(shell)
+        + rows
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "period"),
+    [("buy", 7173), ("sell", 7174)],
+)
+def test_build_order_queue_query_structure(side, period):
+    frame = superorder_protocol.build_order_queue_query(
+        "688693",
+        market=17,
+        side=side,
+        pageid=4417,
+        seq=0,
+        inner_seq=0x09A0,
+    )
+    assert int(frame[4:12], 16) == len(frame) - 12
+    assert len(frame[12:]) == 178
+    assert frame[12] == 0x09
+    assert frame[23:25] == b"\xfc\x02"
+    assert b"CodeList=17(688693,);" in frame
+    assert b"DataType=10," in frame
+    assert f"DateTime={period}(-1-0)".encode() in frame
+    assert b"pageid=4417" in frame
+
+
+def test_parse_buy_order_queue_and_major_marks():
+    values = [
+        1100,
+        0x08000000 | 9900,
+        400,
+        0x08000000 | 99800,
+        500,
+        0x08000000 | 8393,
+        0x08000000 | 5000,
+    ]
+    body = _build_order_queue_frame(
+        side="buy",
+        code="688693",
+        market_marker=0x11,
+        values=values,
+        total_order_count=700,
+        meta_value=1_152_067,
+    )
+    result = superorder_protocol.parse_order_queue_response(body, side="buy")
+    assert result is not None
+    assert result["code"] == "688693"
+    assert result["period"] == 7173
+    assert result["price"] == 190.0
+    assert result["total_order_count"] == 700
+    assert result["visible_count"] == 7
+    assert result["truncated"] is True
+    assert [entry["hands"] for entry in result["entries"]] == [
+        11, 99, 4, 998, 5, 84, 50,
+    ]
+    assert result["visible_major_order_count"] == 4
+    assert result["visible_major_shares"] == 123_093
+    assert result["visible_major_hands"] == 1230.93
+
+
+def test_parse_sell_order_queue_and_empty_ack():
+    values = [824_200, 500, 4_100, 0x08000000 | 314_700]
+    body = _build_order_queue_frame(
+        side="sell",
+        code="000779",
+        market_marker=0x21,
+        values=values,
+        total_order_count=7756,
+        meta_value=16_322_619,
+    )
+    result = superorder_protocol.parse_order_queue_response(body, side="sell")
+    assert result is not None
+    assert result["period"] == 7174
+    assert result["meta_value"] == 16_322_619
+    assert [entry["hands"] for entry in result["entries"]] == [8242, 5, 41, 3147]
+    assert result["visible_major_order_count"] == 1
+    assert superorder_protocol.parse_order_queue_response(
+        b"CodeListSize=1",
+        side="buy",
+    ) is None
+
+
+def test_parse_single_visible_order_queue_entry():
+    body = _build_order_queue_frame(
+        side="buy",
+        code="688693",
+        market_marker=0x11,
+        values=[1234],
+        total_order_count=1,
+        meta_value=0,
+    )
+    result = superorder_protocol.parse_order_queue_response(body, side="buy")
+    assert result is not None
+    assert result["visible_count"] == 1
+    assert result["entries"][0]["shares"] == 1234
+
+
+def test_protocol_reexports_order_queue():
+    assert protocol.build_order_queue_query is superorder_protocol.build_order_queue_query
+    assert protocol.parse_order_queue_response is superorder_protocol.parse_order_queue_response
+    assert protocol.ORDER_QUEUE_BUY_PERIOD == 7173
+    assert protocol.ORDER_QUEUE_SELL_PERIOD == 7174
+
+
 # ────────────────── 4096 盘口快照回放（超级盘口分时曲线）──────────────────
 
 def test_build_snapshot_replay_query_4417_matches_capture_fixture():

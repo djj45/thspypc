@@ -14,11 +14,17 @@ from ..errors import (
 )
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.superorder_protocol import (
+    ORDER_QUEUE_BUY_PERIOD,
+    ORDER_QUEUE_HIST_PAGEID,
+    ORDER_QUEUE_PAGEID,
+    ORDER_QUEUE_SELL_PERIOD,
     SNAPSHOT_REPLAY_HIST_PAGEID,
     SNAPSHOT_REPLAY_INDEX_PAGEID,
     SNAPSHOT_REPLAY_PAGEID,
+    build_order_queue_query,
     build_snapshot_replay_query,
     build_superorder_query,
+    parse_order_queue_response,
     parse_snapshot_replay_response,
     parse_superorder_response,
 )
@@ -277,6 +283,196 @@ class SuperorderService:
         if saw_frame:
             raise ProtocolError("收到 4096 盘口快照帧但无法解析")
         return []
+
+    def order_queue(
+        self,
+        code: str,
+        *,
+        side: str,
+        market: int,
+        context_start_ts: int = 0,
+        context_end_ts: int = 0,
+        timeout: float = 12.0,
+    ) -> dict:
+        """请求买一/卖一委托队列（7173/7174，Level2 专属）。
+
+        传入历史上下文区间时，先在同一 ConnectionManager 管理的市场 L2 连接上
+        请求 4417@4096，再发队列请求。目前服务端只确认最近一个交易日可用。
+        """
+        if context_start_ts or context_end_ts:
+            self.snapshot_replay(
+                code,
+                market=market,
+                start_ts=context_start_ts,
+                end_ts=context_end_ts,
+                pageid=SNAPSHOT_REPLAY_HIST_PAGEID,
+                timeout=max(timeout, 30.0),
+            )
+            pageid = ORDER_QUEUE_HIST_PAGEID
+        else:
+            pageid = ORDER_QUEUE_PAGEID
+        return self._order_queue_one(
+            code,
+            side=side,
+            market=market,
+            pageid=pageid,
+            timeout=timeout,
+        )
+
+    def order_queues(
+        self,
+        code: str,
+        *,
+        market: int,
+        context_start_ts: int = 0,
+        context_end_ts: int = 0,
+        timeout: float = 12.0,
+    ) -> dict[str, dict]:
+        """一次建立上下文并依次返回买一、卖一委托队列。"""
+        if context_start_ts or context_end_ts:
+            snapshots = self.snapshot_replay(
+                code,
+                market=market,
+                start_ts=context_start_ts,
+                end_ts=context_end_ts,
+                pageid=SNAPSHOT_REPLAY_HIST_PAGEID,
+                timeout=max(timeout, 30.0),
+            )
+            pageid = ORDER_QUEUE_HIST_PAGEID
+        else:
+            snapshots = []
+            pageid = ORDER_QUEUE_PAGEID
+
+        result = {
+            side: self._order_queue_one(
+                code,
+                side=side,
+                market=market,
+                pageid=pageid,
+                timeout=timeout,
+            )
+            for side in ("buy", "sell")
+        }
+        if snapshots:
+            latest = snapshots[-1]
+            # 4096 的买一/卖一总量分别是 dt25/dt31；用于补齐界面顶栏数据。
+            for side, dt_key in (("buy", "dt25"), ("sell", "dt31")):
+                raw_total = latest.get(dt_key)
+                if raw_total is None:
+                    continue
+                total_shares = int(round(float(raw_total)))
+                queue = result[side]
+                queue["total_shares"] = total_shares
+                queue["total_hands"] = (total_shares + 50) // 100
+                count = queue.get("total_order_count", 0)
+                if count:
+                    queue["average_hands"] = total_shares / 100.0 / count
+        return result
+
+    def _order_queue_one(
+        self,
+        code: str,
+        *,
+        side: str,
+        market: int,
+        pageid: int,
+        timeout: float,
+    ) -> dict:
+        if side not in ("buy", "sell"):
+            raise ValueError("side 必须是 'buy' 或 'sell'")
+        profile = self._connections.profile
+        if profile.kind is AccountKind.STANDARD:
+            raise CapabilityUnavailableError(
+                Capability.L2_TIMELINE,
+                "order_queue",
+            )
+        if profile.kind is AccountKind.UNKNOWN:
+            raise UnsupportedAccountFeatureError(
+                "order_queue",
+                profile.kind,
+                "账号类型未知，不能推断 Level2 委托队列权限",
+            )
+
+        role = _superorder_l2_role(market)
+        connection = self._connections.acquire(
+            role,
+            capability=Capability.L2_TIMELINE,
+        )
+        if self._subscriptions is not None:
+            self._subscriptions.ensure_registered(
+                connection,
+                code,
+                market=market,
+                timeout=min(timeout, 5.0),
+            )
+        request = build_order_queue_query(
+            code,
+            market=market,
+            side=side,
+            pageid=pageid,
+        )
+        with connection.request(request, timeout=timeout) as sock:
+            for _ in range(self._max_frames):
+                try:
+                    response = self._read_frame(sock)
+                except socket.timeout:
+                    break
+                except ValueError:
+                    recv = getattr(sock, "recv", None)
+                    if recv is not None:
+                        try:
+                            recv(8192)
+                        except OSError as exc:
+                            raise ConnectionError("连接已关闭") from exc
+                    continue
+                parsed = parse_order_queue_response(response, side=side)
+                if parsed is not None:
+                    if self._evidence is not None:
+                        self._evidence.record_feature(
+                            Capability.L2_TIMELINE,
+                            Support.YES,
+                        )
+                    parsed["pageid"] = pageid
+                    parsed["empty"] = False
+                    return parsed
+                if b"CodeListSize=" in response:
+                    if self._evidence is not None:
+                        self._evidence.record_feature(
+                            Capability.L2_TIMELINE,
+                            Support.YES,
+                        )
+                    return {
+                        "code": code,
+                        "side": side,
+                        "period": (
+                            ORDER_QUEUE_BUY_PERIOD
+                            if side == "buy"
+                            else ORDER_QUEUE_SELL_PERIOD
+                        ),
+                        "pageid": pageid,
+                        "empty": True,
+                        "entries": [],
+                        "visible_count": 0,
+                        "visible_major_order_count": 0,
+                        "visible_major_shares": 0,
+                        "visible_major_hands": 0.0,
+                    }
+        return {
+            "code": code,
+            "side": side,
+            "period": (
+                ORDER_QUEUE_BUY_PERIOD
+                if side == "buy"
+                else ORDER_QUEUE_SELL_PERIOD
+            ),
+            "pageid": pageid,
+            "empty": True,
+            "entries": [],
+            "visible_count": 0,
+            "visible_major_order_count": 0,
+            "visible_major_shares": 0,
+            "visible_major_hands": 0.0,
+        }
 
 
 __all__ = ["SuperorderService"]

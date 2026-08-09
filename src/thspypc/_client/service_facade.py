@@ -890,6 +890,113 @@ class ServiceFacade:
             ),
         )
 
+    @staticmethod
+    def _order_queue_context(trade_date) -> tuple[int, int]:
+        """把历史交易日转换成 4417@4096 的全天上下文区间。"""
+        if trade_date is None:
+            return 0, 0
+        value = trade_date
+        if isinstance(value, str):
+            value = date_type.fromisoformat(value)
+        if isinstance(value, datetime):
+            value = value.date()
+        if not isinstance(value, date_type):
+            raise TypeError("trade_date 必须是 date/datetime/'YYYY-MM-DD'/None")
+        start = datetime.combine(value, datetime.min.time()).replace(
+            hour=9,
+            minute=10,
+        )
+        end = datetime.combine(value, datetime.min.time()).replace(
+            hour=15,
+            minute=1,
+        )
+        return int(start.timestamp()), int(end.timestamp())
+
+    def order_queue(
+        self,
+        code: str,
+        side: str = "buy",
+        *,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+    ) -> dict:
+        """查买一或卖一委托队列（7173/7174，Level2 专属）。
+
+        ``side='buy'`` 查 7173 买一队列，``side='sell'`` 查 7174 卖一队列。
+        传 ``trade_date`` 时先在同一市场 L2 连接用 4096 建立 4417 历史上下文。
+        当前仅确认最近一个交易日有队列数据，更早日期可能返回空队列。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        context_start, context_end = self._order_queue_context(trade_date)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._superorder_service.order_queue(
+                code,
+                side=side,
+                market=market,
+                context_start_ts=context_start,
+                context_end_ts=context_end,
+                timeout=timeout,
+            ),
+        )
+
+    def order_queues(
+        self,
+        code: str,
+        *,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+    ) -> dict[str, dict]:
+        """查买一和卖一队列；历史调用只建立一次 4096/4417 上下文。"""
+        if market == 0:
+            market = self._market_for_code(code)
+        context_start, context_end = self._order_queue_context(trade_date)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._superorder_service.order_queues(
+                code,
+                market=market,
+                context_start_ts=context_start,
+                context_end_ts=context_end,
+                timeout=timeout,
+            ),
+        )
+
     def closing_auction(
         self,
         code: str,

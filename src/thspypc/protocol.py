@@ -137,6 +137,14 @@ from .features.snapshot_protocol import (
     parse_snapshot_push,
 )
 from .features.superorder_protocol import (
+    ORDER_QUEUE_BUY_PERIOD,
+    ORDER_QUEUE_DATATYPE,
+    ORDER_QUEUE_FIELD_COUNT,
+    ORDER_QUEUE_FLAG,
+    ORDER_QUEUE_HIST_PAGEID,
+    ORDER_QUEUE_PAGEID,
+    ORDER_QUEUE_RECORD_SIZE,
+    ORDER_QUEUE_SELL_PERIOD,
     SUPERORDER_DATATYPE,
     SUPERORDER_FIELD_COUNT,
     SUPERORDER_FLAG,
@@ -144,7 +152,9 @@ from .features.superorder_protocol import (
     SUPERORDER_PERIOD,
     SUPERORDER_RECORD_SIZE,
     SUPERORDER_SUPER_PAGEID,
+    build_order_queue_query,
     build_superorder_query,
+    parse_order_queue_response,
     parse_superorder_response,
 )
 from .features.stock_list_protocol import (
