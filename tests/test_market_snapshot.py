@@ -50,8 +50,7 @@ def test_offline():
     print(f"  响应大小: {len(raw):,}B")
     print(f"  解析耗时: {elapsed*1000:.1f}ms")
     print(f"  记录数: {len(records)}")
-    n_price = sum(1 for r in records if r.get("price"))
-    print(f"  含价格: {n_price}/{len(records)}")
+    print("  字段: code/name（请求 DataType=[5],[55]，不含行情数值）")
 
     # 前缀分布
     prefixes = {}
@@ -64,7 +63,7 @@ def test_offline():
     # 前 10 条
     print(f"\n  前 10 条:")
     for r in records[:10]:
-        print(f"    {r['code']:>8s} {r['name']:12s}  price={r.get('price', 'N/A')}")
+        print(f"    {r['code']:>8s} {r['name']:12s}")
     return True
 
 
@@ -99,7 +98,7 @@ def test_live():
         codes_300 = sum(1 for r in recs if r["code"].startswith("3"))
         print(f"  沪A(6xx): {codes_600}, 深A(000): {codes_000}, 创业板(3xx): {codes_300}")
         for r in recs[:5]:
-            print(f"    {r['code']:>8s} {r['name']:12s}  price={r.get('price', 'N/A')}")
+            print(f"    {r['code']:>8s} {r['name']:12s}")
     else:
         print("  （当前 host 不支持 hfd1.0；用 market_snapshot_with_quotes 走 list_quotes 兜底）")
 

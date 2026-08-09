@@ -157,3 +157,8 @@ def test_captured_hfd1_snapshot_contract():
         "910005",
         "835185",
     ]
+    quote_fields = {
+        "price", "change_pct", "high", "low", "open",
+        "amount", "volume", "prev_close",
+    }
+    assert all(not quote_fields.intersection(record) for record in records)

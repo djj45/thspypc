@@ -19,11 +19,22 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from capstone import CS_ARCH_X86, CS_MODE_32, Cs
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+try:
+    from capstone import CS_ARCH_X86, CS_MODE_32, Cs
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+except ModuleNotFoundError:
+    CS_ARCH_X86 = CS_MODE_32 = Cs = None
+    X86_OP_IMM = X86_OP_MEM = None
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
+
+
+def _require_capstone() -> None:
+    if Cs is None:
+        raise RuntimeError(
+            "this operation requires the optional 'capstone' package"
+        )
 
 
 @dataclass(frozen=True)
@@ -156,6 +167,7 @@ def direct_xrefs(
     immediates: set[int],
     all_executable: bool,
 ) -> list[tuple[int, str, str, str]]:
+    _require_capstone()
     decoder = Cs(CS_ARCH_X86, CS_MODE_32)
     decoder.detail = True
     decoder.skipdata = True
@@ -203,6 +215,7 @@ def byte_comparisons(
     if not 0 <= value <= 0xFF:
         raise ValueError(f"byte comparison value is out of range: 0x{value:x}")
 
+    _require_capstone()
     decoder = Cs(CS_ARCH_X86, CS_MODE_32)
     decoder.detail = True
     references: list[tuple[int, str, str, str]] = []
@@ -248,6 +261,7 @@ def disassemble_window(image: Image, rva: int, size: int) -> None:
     if rva < 0 or rva >= len(image.data):
         raise ValueError(f"disassembly RVA is outside the image: 0x{rva:x}")
     end = min(rva + size, len(image.data))
+    _require_capstone()
     decoder = Cs(CS_ARCH_X86, CS_MODE_32)
     decoder.skipdata = True
     for instruction in decoder.disasm(

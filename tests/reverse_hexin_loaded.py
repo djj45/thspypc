@@ -1,7 +1,7 @@
 """针对 hexin.loaded.bin（UPX 解包后的内存 dump）的静态 RE 辅助工具。
 
 该 dump 由 reverse_hexin_minidump.py extract-module 生成，关键性质是
-**RVA == 文件偏移**、image_base=0xd50000。因此标准的 pefile 节映射不适用，
+**RVA == 文件偏移**；image_base 从加载映像 PE 头读取。因此标准的 pefile 节映射不适用，
 本工具用 reverse_hlib_memory.parse_image 解析节，并在此前提下做：
 
 - RTTI 类名 → CompleteObjectLocator → vtable → 构造函数引用；
@@ -18,8 +18,6 @@ import argparse
 import struct
 import sys
 from pathlib import Path
-
-from capstone import CS_ARCH_X86, CS_MODE_32, Cs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reverse_hlib_memory import parse_image  # noqa: E402
@@ -133,6 +131,12 @@ def find_code_refs(data: bytes, image_base: int, target_rva: int) -> list[dict]:
 
 
 def disasm(data: bytes, image_base: int, rva: int, size: int = 0x80) -> list[str]:
+    try:
+        from capstone import CS_ARCH_X86, CS_MODE_32, Cs
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "--disasm-rva requires the optional 'capstone' package"
+        ) from exc
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
     code = data[rva : rva + size]

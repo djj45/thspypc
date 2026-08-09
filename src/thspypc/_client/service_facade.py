@@ -1266,15 +1266,15 @@ class ServiceFacade:
         markets: list[int] | None = None,
         timeout: float = 10.0,
     ) -> list[dict]:
-        """全市场行情快照：一个请求拿沪市全市场 code+name（~0.13s）。
+        """全市场代码名称快照：一个请求拿沪市全市场 code+name（~0.13s）。
 
         在 :meth:`connect` 建立的**主连接**上发 hfd1.0 空括号请求
         （``CodeList=16();17();...``），服务器一次性返回整个市场的股票代码和
         名称。相比 :meth:`list_quotes` 逐批查询（~250 请求），本方法只需 1 个请求，
         速度提升 2~3 个数量级。
 
-        ⚠️ **数值字段（price/change_pct 等）当前为近似值**，通过 THS float 扫描
-        推断，准确度有限。对于准确行情请用 :meth:`list_quotes`（或
+        当前请求固定使用 ``DataType=[5],[55]``，响应不含 price/change_pct 等
+        行情字段。对于准确行情请用 :meth:`list_quotes`（或
         :meth:`market_snapshot_with_quotes` 的混合方案）。
 
         ⚠️ 当前连接的服务器 host **可能不支持 hfd1.0**（集群中仅部分 host 支持）。
@@ -1288,7 +1288,7 @@ class ServiceFacade:
             timeout: 单次 read_frame 超时（秒）。
 
         Returns:
-            list[dict]，每项 ``{"code", "name", "price", "change_pct", ...}``，
+            list[dict]，每项含 ``code``、``name`` 和名称原始偏移，
             约 1200+ 条（当前锚点覆盖率）。host 不支持或超时返回 []。
 
         Raises:
