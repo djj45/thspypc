@@ -9,6 +9,9 @@
 | [`THS_REVERSE_ENGINEERING_PLAYBOOK.md`](guides/THS_REVERSE_ENGINEERING_PLAYBOOK.md) | 同花顺协议逆向方法论与实战复盘：分层判定、语料设计、镜像重建、Unicorn oracle、回归验收 | 做任何逆向前先读 |
 | [`PROTOCOL_AND_IMPLEMENTATION_GUIDE.md`](guides/PROTOCOL_AND_IMPLEMENTATION_GUIDE.md) | 行情协议与 thspypc 实现指南：登录、请求构造、响应解析、系统板块、代码地图 | 理解项目实现时首选 |
 | [`CAPTURE.md`](guides/CAPTURE.md) | 同花顺 PC 抓包操作手册：工具位置、网卡选择、脚本 | 需要抓包时查阅 |
+| [`DDE.md`](guides/DDE.md) | DDE 排名页协议与 `dde_rank()` 交付边界 | 做 DDE 前端或排名查询时查阅 |
+| [`ORDER_QUEUE.md`](guides/ORDER_QUEUE.md) | Level2 买一/卖一委托队列 7173/7174 语义与 API | 做委托队列相关功能时查阅 |
+| [`WEB_API.md`](guides/WEB_API.md) | FastAPI 单用户 REST 服务启动、接口与错误约定 | 使用/扩展 Web API 时查阅 |
 | [`x32dbg_变体A调试手册.md`](guides/x32dbg_变体A调试手册.md) | x32dbg 动态调试操作手册（name_16_16 块状编码、断点、dump） | 需要动态调试 hexin.exe 时查阅 |
 
 ## 二、架构解析（长期有效）`docs/architecture/`
@@ -37,6 +40,7 @@
 | [`HISTORY_TIMELINE_OMISSION_STEP2_RE.md`](investigations/HISTORY_TIMELINE_OMISSION_STEP2_RE.md) | 第 2 步：官方客户端逆向定位（核心结论已撤回） |
 | [`HISTORY_TIMELINE_OMISSION_CORRECTION_HANDOFF.md`](investigations/HISTORY_TIMELINE_OMISSION_CORRECTION_HANDOFF.md) | 分支错位更正：撤回 STEP2 的 esi==1 结论 |
 | [`HISTORY_TIMELINE_OMISSION_INVESTIGATION_UPDATE.md`](investigations/HISTORY_TIMELINE_OMISSION_INVESTIGATION_UPDATE.md) | Unicorn 执行校验与变长结构更正（当前最新结论） |
+| [`NAME_16_16_MEMORY_DUMP_PROGRESS.md`](investigations/NAME_16_16_MEMORY_DUMP_PROGRESS.md) | 股票名称 `name_16_16` 内存/网络全量同步逆向 |
 | [`POSTMORTEM_CONSTITUENT_20260801.md`](investigations/POSTMORTEM_CONSTITUENT_20260801.md) | 成分股空列表故障复盘：直接机制、根因与五条长期有效的排查教训 |
 
 ## 五、交接记录（会话流水）`docs/handoffs/`

@@ -505,29 +505,6 @@ def build_board_stockname_query(
     return b"\x09" + register_sub + name_sub
 
 
-def build_board_bootstrap(
-    level2: bool,
-    *,
-    stocklink_ver: str | None = None,
-    stock_name_ver: str = ";;",
-) -> list[bytes]:
-    """兼容接口：返回按抓包顺序展开的板块通道核心引导帧。
-
-    真客户端并非在 login 后一次性突发所有帧，而是分三阶段发送；连接代码应使用
-    :func:`build_board_bootstrap_stages` 保留阶段边界。分类表和 StockNameVer 是
-    页面加载后的数据请求，不是激活板块行情通道的前置条件，因此不混入核心引导。
-    """
-    del stock_name_ver  # 旧签名兼容；核心引导不需要名称表请求
-    return [
-        frame
-        for stage in build_board_bootstrap_stages(
-            level2,
-            stocklink_ver=stocklink_ver,
-        )
-        for frame in stage
-    ]
-
-
 def build_board_bootstrap_stages(
     level2: bool,
     *,

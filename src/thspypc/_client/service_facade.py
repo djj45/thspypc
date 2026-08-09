@@ -576,8 +576,6 @@ class ServiceFacade:
         code: str,
         market: int = 0,
         timeout: float = 12.0,
-        skip_init: bool = False,
-        use_main_ip: bool = False,
         prev_close: float | None = None,
     ) -> list[dict]:
         """查当日分时图（含指数白线及领先线）。
@@ -602,10 +600,6 @@ class ServiceFacade:
         """
         from ..errors import ChannelUnavailableError
 
-        if skip_init or use_main_ip:
-            raise ValueError(
-                "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
-            )
         if market == 0:
             market = self._market_for_code(code)
         if self._auth is None and self._service_connections is None:
@@ -654,8 +648,6 @@ class ServiceFacade:
         market: int = 0,
         trade_date=None,
         timeout: float = 12.0,
-        skip_init: bool = False,
-        use_main_ip: bool = False,
     ) -> list[dict]:
         """查集合竞价（9:15-9:25 每 9 秒一次虚拟撮合：撮合价/累计量/未匹配量）。
 
@@ -689,10 +681,6 @@ class ServiceFacade:
         """
         from ..errors import ChannelUnavailableError
 
-        if skip_init or use_main_ip:
-            raise ValueError(
-                "skip_init/use_main_ip 仅用于已移除的 legacy 诊断路径"
-            )
         if market == 0:
             market = self._market_for_code(code)
         if self._auth is None and self._service_connections is None:

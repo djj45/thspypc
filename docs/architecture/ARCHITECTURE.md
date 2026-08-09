@@ -13,12 +13,15 @@ THSClient                         公开门面与兼容入口
     ├── ConnectionRuntime         心跳、推送 reader 与关闭顺序
     ├── MarketSession             8901 同步请求生命周期
     ├── BlockManager              自定义板块/自选股 HTTP 能力
-    ├── 4214 manual connections   沪深 L2 分时与竞价
+    ├── L2 1334/4214 connections 沪深 L2 分时、竞价与推送
     └── 9601 realorder            异动历史与实时推送
 
-protocol.py                       请求构造、响应解析、数值/压缩编解码
-parse_hfd1.py                     全市场快照解码
-qr_login.py                       二维码和凭证缓存
+features/                        各业务纯协议 builder/parser
+services/                        能力校验、连接选择与完整业务工作流
+codecs/                          帧、压缩、hd1/hd3、数值编码
+protocol.py                      历史 API 兼容导出 + HTTP 鉴权/主机解析
+parse_hfd1.py                    全市场快照解码
+qr_login.py                      二维码和凭证缓存
 ```
 
 `THSClient` 保留对象构造、HTTP 鉴权、服务组合及旧入口兼容；底层登录建连位于
@@ -149,14 +152,16 @@ features → codecs
 ### 鉴权与连接生命周期
 
 `AuthService` 只负责通过 HTTP 生成不可变的 `AuthMaterial`。一次材料包含
-`Passport64`、登录 profile 和 generation，可供多个连接角色复用，但不代表任一
-TCP socket 已登录。
+`Passport64`、登录 profile 和 generation。它可作为首次登录阶段的并发候选票据，
+但任一 8901 host 返回 `VerifyCode=0` 后该票据即视为已消费；后续需要新连接时
+必须重新 HTTP 鉴权，不能拿同一票据再登录另一台服务器（见 `AGENTS.md`）。
 
 - `THSClient.authenticate()`：只获取或刷新 `AuthMaterial`，不连接行情服务器。
-- `THSClient.connect_main()`：按需连接 `ifindhq`，在 MAIN socket 上执行
+- `THSClient.connect_main()`：按需连接 `main.123ths.com`（缺失时回退
+  `ifindhq.123ths.com`），在 MAIN socket 上执行
   `login -> 标准 init`；`connect()` 是其兼容入口。
 - `SH_L2` / `SZ_L2`：首次 Level2 请求时分别连接 `shlv2` / `szlv2`，在各自
-  socket 上执行 `__manual login -> 市场 init`。
+  socket 上执行 `thsuser` 标准行情登录壳 -> 市场 init。
 - `REALORDER`：首次 9601 请求时建立并登录独立连接。
 
 每个角色都独立拥有 TCP 登录态、init 状态、读写锁和重连策略。普通账号支持应通过

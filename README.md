@@ -18,8 +18,8 @@
 - **个股列表行情查询**（`list_quotes`）：hd1.0/hd3.1 响应解析，纯 Python 移植
   hexin.exe 真实机器码（BitRLE 解码 + 位平面转置），无 unicorn 依赖。实测解出
   600056 等股票的 现价/昨收/开盘/涨幅/竞价金额
-- **个股五档盘口**（`depth_quote`）：买卖各五档价格/挂单量、档位金额以及
-  涨跌停封单额。注意当前是五档快照，不是 Level2 十档。
+- **个股五档/十档盘口**（`depth_quote`）：买卖各五档价格/挂单量、档位金额以及
+  涨跌停封单额。Level2 账号可用 `ten_levels=True` 请求十档，普通账号五档即完整复刻。
 - **全市场股票列表**（`stock_list`）：MAIN 单请求拉取全市场代码表，无需抓包重放
   全部代码（约7500+条），hd3.1 BitRLE 解码，自动翻页
 - **热门股排序查询**（`stock_list_hot`）：DataType=199112 排序查询（同花顺打开 A 股
@@ -34,10 +34,10 @@
   订阅 + pushrealorder 推送接收。盘中 ~500-800 帧/分钟，异动代码/金额/涨幅/方向
   普通账号支持 23 类基础异动；Level2 “全选”共 53 类（额外 30 类盘口/挂撤单
   等高级异动）。通道可用、基础异动集和 Level2 高级异动集分别建模。
-- **K线查询**（`kline`）：日/周/月/5分/15分/30分/60分K线，hd3.1 flag=0x0042/0x0046
+- **K线查询**（`kline`）：1分/5分/15分/30分/60分/日/周/月/季/年K线，hd3.1 flag=0x0042/0x0046
   响应解析，连接复用（一次 connect 查多只多周期）。
 - **沪深分时查询**（`timeline`）：当日逐点分时（现价/量/额/均价，241 根）。
-  普通账号走 MAIN `pageid=9354`，Level2 账号走 `pageid=4214`。
+  普通账号走 MAIN `pageid=9355`，Level2 账号走 `pageid=1334`。
 - **历史分时**（`history_timeline`）：普通账号走 MAIN `pageid=9355` 的基础
   七字段响应，Level2 保留 `pageid=4417` 大单字段路径。
 - **早盘/尾盘竞价**（`auction` / `closing_auction`）：分别覆盖 9:15-9:25 与
@@ -45,6 +45,22 @@
   ★ **沪深分服**：shlv2（沪）/szlv2（深）是两套独立 L2 服务器（IP 0 重叠），
   按股票市场选对应 IP + 配套 init MarketCode（沪 16;144 / 深 32）。
   ★ **后台预热**：首次建好某市连接后异步预热另一市，跨市切换 0.44s（复刻 hexin 秒加载）。
+- **全市场快照**（`market_snapshot` / `market_snapshot_with_quotes`）：沪市 hfd1.0
+  空括号单请求，配合 stock_list + list_quotes 混合方案覆盖全市场。
+- **系统板块与板块行情**（`system_blocks` / `board_*`）：行业/概念板块发现、成分股、
+  板块指数行情/分时/竞价，板块通道走 fu4，成分股走股票行情网关。
+- **板块统计**（`board_stats_*` / `board_calcext`）：9601 statscalc 独立统计节点 +
+  calcext 扩展计算。
+- **逐笔成交与超级盘口**（`superorder` / `snapshot_replay`）：7169 逐笔成交回放、
+  4096 盘口快照回放，沪深通用。
+- **买一/卖一委托队列**（`order_queue` / `order_queues`）：7173/7174 Level2 专属，
+  历史队列需先用 4096 建立 4417 上下文。
+- **DDE 排名 API**（`dde_rank`）：pageid=10723 排序请求，普通 MAIN / Level2
+  沪深合并排序。
+- **股票名称全量同步**（`fetch_all_stock_names`）：按服务器分组并发登录拉取
+  `name_16_16`，无需安装客户端。
+- **逐 tick 快照与十档推送底层**（`snapshot_subscribe` / `latest_depth`）：4214 实时
+  快照已可用；549B 十档推送 parser/缓存已接入，专用流式 API 尚待收口。
 
 ## 代码架构
 
@@ -106,7 +122,7 @@ THSClient
 - 只有明确为 `YES` 的能力才会进入对应专用通道；`NO` 和 `UNKNOWN` 会在创建连接
   前返回明确错误，避免普通账号误走 Level2 请求。
 
-2026-07-29 普通账号冷启动抓包已确认 MAIN 登录，以及日 K、9354 当日分时、
+2026-07-29 普通账号冷启动抓包已确认 MAIN 登录，以及日 K、9355 当日分时、
 9355 历史分时、早盘竞价和尾盘竞价的沪深请求/响应。普通账号只返回基础字段；
 代码不会伪造 Level2 大单字段。9601 的基础 23 类异动也已单独建模。
 
@@ -247,7 +263,8 @@ with THSClient("账号", "密码") as client:
 ## 个股五档盘口（`depth_quote`）
 
 `depth_quote` 复用登录后的 8901 长连接，自动按代码推断沪深市场。盘后仍可取
-服务器保存的最后一份盘口快照：
+服务器保存的最后一份盘口快照。Level2 账号传 `ten_levels=True` 时按市场走
+shlv2/szlv2 请求十档，普通账号请求十档会返回权限错误：
 
 ```python
 with THSClient("账号", "密码") as client:
@@ -259,8 +276,9 @@ with THSClient("账号", "密码") as client:
     print("封单额:", depth.get("seal_amount"))
 ```
 
-返回的 `buy`/`sell` 各包含最多五档。`seal_amount` 单位为元；正常交易状态为
-`0.0`，涨停或跌停时分别按买一或卖一的价格与挂单量计算。
+返回的 `buy`/`sell` 各包含最多五档（`ten_levels=True` 时最多十档）。
+`seal_amount` 单位为元；正常交易状态为 `0.0`，涨停或跌停时分别按买一或卖一
+的价格与挂单量计算。
 
 ## 全市场股票列表（`stock_list`）
 
@@ -278,7 +296,8 @@ with THSClient("账号", "密码") as client:
     recs = client.list_quotes(codes, market=17)
 ```
 
-**机制**：在 `ifindhq.123ths.com:8901` 的已登录 MAIN 连接上发送一个
+**机制**：在 `main.123ths.com`（旧 passport 缺失时回退 `ifindhq.123ths.com`）
+的已登录 MAIN 连接上发送一个
 `DataType=[5],[55]` 空代码组请求，触发服务器返回全量 hd3.1 代码表。
 线上报文共 147 字节；逐帧 A/B 已确认旧抓包序列的其余 153 帧均不需要。
 服务器角色、权限和完整最小请求见
@@ -582,24 +601,28 @@ uv pip install qrcode
 thspypc/
 ├── pyproject.toml
 ├── src/thspypc/
-│   ├── __init__.py     # 包入口
-│   ├── protocol.py     # 帧编解码 + HTTP 鉴权 + generate_imei/mac64 + 行情查询
-│   │                   #   （list_quote）+ 短线精灵（qurealorder）
-│   ├── blocks.py       # 自定义板块/自选股管理（HTTPS，移植自 thspy）
-│   ├── qr_login.py     # 二维码扫码登录 + 凭证缓存（save/load_credentials）
-│   └── client.py       # THSClient：connect() / connect_with_qrcode() / connect_cached()
-│                        #   / connect_with_passport64() / list_quotes()
-│                        #   / blocks 门面方法 / dxjl_*（短线精灵）
+│   ├── __init__.py             # 包入口
+│   ├── client.py               # THSClient 公开门面与旧调用兼容
+│   ├── _client/                # 连接原语、服务门面、股票代码缓存
+│   ├── _transport/             # 按角色管理的 socket、会话和请求锁
+│   ├── codecs/                 # 帧、压缩、hd1/hd3、数值编码
+│   ├── features/               # 各业务纯协议 builder/parser
+│   ├── services/               # 能力校验、连接选择与完整业务工作流
+│   ├── protocol.py             # 历史 API 兼容导出 + HTTP 鉴权/主机解析
+│   ├── transport.py            # 旧 transport API 兼容导出
+│   ├── blocks.py               # 自定义板块/自选股管理（HTTPS）
+│   ├── qr_login.py             # 二维码扫码登录 + 凭证缓存
+│   ├── parse_hfd1.py           # hfd1.0 名称锚点解析
+│   ├── testing.py              # 测试/诊断脚本并发登录与客户端复用 helper
+│   └── server/                 # FastAPI 单用户 REST 接口
 └── tests/
-    ├── test_login.py           # 账号密码端到端测试
-    ├── test_qr_login.py        # 二维码扫码端到端测试
-    ├── test_list_quotes.py     # 个股列表行情测试（--offline 离线 / 默认活网）
-    ├── test_blocks.py          # 自定义板块/自选股测试
-    ├── test_dxjl.py            # 短线精灵（异动）测试
-    ├── test_push.py            # 短线精灵实时推送测试（框架就绪待调试）
-    ├── test_heartbeat.py       # 心跳保活测试（静置后连接仍可用）
-    ├── diag_fresh_passport.py  # 抓包提取 hexin Passport64 + 行情验证（调试用）
-    └── compare_remember.py     # 「30天免登录」勾选/不勾选对比工具
+    ├── test_*.py               # pytest 离线/在线回归
+    ├── verify_*.py             # 活网验证脚本
+    ├── capture_*.py            # 抓包工具
+    ├── probe_*/analyze_*/_*    # 一次性逆向与诊断脚本
+    ├── archive/                # 已完成使命的历史诊断脚本
+    ├── fixtures/               # 脱敏协议样本
+    └── native/                 # 逆向辅助 C/C++ harness
 ```
 
 ## 已知限制

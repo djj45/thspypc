@@ -3,9 +3,10 @@
 > 目标：读这一份文档就能理解 thspypc 如何登录、如何向哪台服务器发送什么请求、如何解析响应，
 > 以及各功能在源码里的位置，无需再逐行翻源码。需要精确到字节时，再按“代码地图”进入对应文件。
 >
-> 适用范围：A 股（沪深北）免费 PC 行情。日期基准：2026-08-06，协议以同花顺 PC 客户端抓包逆向为准。
+> 适用范围：A 股（沪深北）免费 PC 行情。日期基准：2026-08-09，协议以同花顺 PC 客户端抓包逆向为准。
 > 2026-08-06 增补：买卖力量字段（dt14/dt15）、北交所（BSE）分时协议（pageid 10443/11695）、main.123ths.com 网关发现。
 > 2026-08-01 增补：系统板块（行业/概念板块指数、成分股）通道与协议、历史分时 packed-date 游标修正。
+> 2026-08-09 增补：DDE 排名 API、7173/7174 委托队列、十档盘口实时推送收口计划。
 
 ---
 
@@ -19,7 +20,7 @@ flowchart LR
     B --> B1[MAIN 普通行情]
     B --> B2[shlv2 沪市 L2]
     B --> B3[szlv2 深市 L2]
-    B1 --> C[普通: 9354 当日分时 / 9355 日K·历史分时 / 竞价 / 列表]
+    B1 --> C[普通: 9355 当日分时·日K·历史分时 / 竞价 / 列表]
     B2 --> D[L2: 1334 分时·日K·竞价 / 4214 十档·逐笔 / 4417 历史]
     B3 --> E[同左，深市]
     B --> B4[REALORDER 9601 异动订阅/推送]
@@ -216,18 +217,18 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 
 | 业务 | 账号 | pageid | period | DataType | 连接 | 响应 |
 |---|---|---|---|---|---|---|
-| 当日分时 | 普通 | 9354 | 8192(0-0) | 10 字段 | MAIN | hd3.1 241 行 |
-| 当日分时 | L2 | 4214 | 8192(0-0) | 31 字段 + 基准指数 | shlv2/szlv2 | hd3.1 |
-| 指数当日分时 | 普通/L2 | 9354 / 4214 | 8192(0-0) | 含 10、40 的指数字段表 | main/shlv2/szlv2 | hd3.1 0x3E/0x86/0x9E |
+| 当日分时 | 普通 | 9355 | 8192(0-0) | 10 字段 | MAIN | hd3.1 241 行 |
+| 当日分时 | L2 | 1334 | 8192(0-0) | 31 字段 + 基准指数 | shlv2/szlv2 | hd3.1 |
+| 指数当日分时 | 普通/L2 | 9355 / 1334 | 8192(0-0) | 含 10、40 的指数字段表 | main/shlv2/szlv2 | hd3.1 0x3E/0x86/0x9E |
 | 历史分时 | 普通 | 9355 | 8192(bar起-止) | 18 字段 | MAIN | hd1.0 7 字段表 |
 | 历史分时 | L2 | 4417 | 8192(bar起-止) | 26 字段 | shlv2/szlv2 | hd1.0 23 字段表 |
 | 指数历史分时 | 普通/L2 | 77 | 8192(bar起-止) | 13,19,40,10,23,22,6 | main/shlv2/szlv2 | hd1.0 0x42 |
 | 指数早盘竞价 | 当天 | 6240 | T_URL | JSON | main/shlv2/szlv2 | `Auction` |
 | 指数尾盘竞价 | 当天且仅三大指数 | 6240 | T_URL | JSON | main/shlv2/szlv2 | `CloseAuction` |
 | 早盘竞价 | 普通 | 9354 当日 / 9355 历史 | 7176 / 6144 | 10,27,33,49 | MAIN | hd1.0 |
-| 早盘竞价 | L2 | 4214 当日 / 4417 历史 | 7176 / 6144 | 10,27,33,49 | shlv2/szlv2 | hd1.0 |
+| 早盘竞价 | L2 | 1334 当日 / 4417 历史 | 7176 / 6144 | 10,27,33,49 | shlv2/szlv2 | hd1.0 |
 | 尾盘竞价 | 普通 | 9354 当日 / 9355 历史 | 7424 | 10,49,287 | MAIN | hd1.0/hd3.1 |
-| 尾盘竞价 | L2 | 4214 当日 / 4417 历史 | 7424 | 10,49,287 | shlv2/szlv2 | hd1.0（历史）/ hd3.1（当日） |
+| 尾盘竞价 | L2 | 1334 当日 / 4417 历史 | 7424 | 10,49,287 | shlv2/szlv2 | hd1.0（历史）/ hd3.1（当日） |
 | 日K | 任意 | 9355 | 0x4000(-count-0) | 7,8,9,11,13,19 | MAIN | hd3.1 |
 | 周K | 任意 | 9355 | 0x5001(-count-0) | 同左 | MAIN | hd3.1 |
 | 月K | 任意 | 9355 | 0x6001(-count-0) | 同左 | MAIN | hd3.1 |
@@ -777,12 +778,12 @@ pageid=9355                             # 普通账号；Level2 账号=1334
 
 | 方法 | 底层 |
 |---|---|
-| `timeline(code, market, prev_close)` | 个股/指数：普通→9354 / L2→4214；指数额外还原黄线 |
+| `timeline(code, market, prev_close)` | 个股/指数：普通→9355 / L2→1334；指数额外还原黄线 |
 | `history_timeline(code, date, market, prev_close)` | 个股：普通→9355 / L2→4417；指数→77 并还原黄线 |
-| `auction(code, trade_date)` | 个股→9354/9355/4214/4417；指数当天→6240 T_URL |
-| `closing_auction(code, trade_date)` | 个股→9354/9355/4214/4417；三大指数当天→6240 T_URL |
+| `auction(code, trade_date)` | 个股→9354/9355/1334/4417；指数当天→6240 T_URL |
+| `closing_auction(code, trade_date)` | 个股→9354/9355/1334/4417；三大指数当天→6240 T_URL |
 | `intraday(code, trade_date)` | 个股三段合并；历史指数仅盘中，记录均加 `phase` 标签 |
-| `kline(code, period)` | MAIN 9355，日/周/月/分钟 |
+| `kline(code, period)` | MAIN 9355，1分/5/15/30/60分/日/周/月/季/年 |
 | `board_quotes / board_timeline / board_auction / board_constituents` | 板块指数与成分股（见 11 节） |
 | `list_quotes / market_snapshot` | MAIN 批量行情（非本文范围） |
 | `stock_list / stock_list_hot` | MAIN 股票列表与排序榜（非本文范围） |
@@ -834,24 +835,35 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
 | 文件 | 职责 |
 |---|---|
 | `src/thspypc/client.py` | `THSClient` 门面、连接治理、`_run_default_service`、K线周期映射 |
-| `src/thspypc/protocol.py` | HTTP 鉴权、login/init/heartbeat 帧、8901 压缩入口、公共常量 |
+| `src/thspypc/protocol.py` | 历史兼容 re-export；HTTP 鉴权、主机解析、heartbeat 等仍保留在这里 |
 | `src/thspypc/features/auth_protocol.py` | login 帧构造（thsuser/__manual）、login 响应解析 |
 | `src/thspypc/features/timeline_protocol.py` | 当日分时请求 + hd3.1 解析；指数 dt40 有符号解码与黄线还原；买卖力量 flag (0x005e/0x0066/0x0046/0x006e) |
 | `src/thspypc/features/history_timeline_protocol.py` | 个股 9355/4417、指数 77 历史分时请求 + hd1.0 解析、bar 游标编码；北交所分时 builder (10443/11695) |
 | `src/thspypc/features/auction_protocol.py` | 个股竞价表与指数 6240 T_URL builder/parser（Auction/CloseAuction） |
 | `src/thspypc/features/kline_protocol.py` | K线请求构造 + hd3.1 BitRLE 解析 |
+| `src/thspypc/features/quote_protocol.py` | list_quotes 五档/十档盘口 builder/parser |
+| `src/thspypc/features/stock_list_protocol.py` | 全市场代码表、init、排序榜、DDE builder/parser |
+| `src/thspypc/features/snapshot_protocol.py` | 4214/5716 快照订阅、71B/549B 推送解析 |
+| `src/thspypc/features/superorder_protocol.py` | 7169 逐笔回放、4096 超级盘口回放、7173/7174 委托队列 |
+| `src/thspypc/features/board_stats_protocol.py` | 9601 statscalc / calcext builder/parser |
+| `src/thspypc/features/realorder_protocol.py` | 9601 qurealorder / subrealorder / pushrealorder |
+| `src/thspypc/features/stock_name_protocol.py` + `stock_name_bootstrap.py` | name_16_16 解码、分组模板与引导帧 |
 | `src/thspypc/features/system_blocks.py` | 本地 block_hq 缓存解析（离线 oracle：板块树/概念/行业） |
 | `src/thspypc/features/system_blocks_protocol.py` | 板块通道引导 + 板块指数/成分股 builder/parser（0x130/0x64/0x42/0x32） |
 | `src/thspypc/features/account_profile.py` | 账号类型判定、能力证据沉淀 |
 | `src/thspypc/services/timeline.py` | 分时 plan 选择、读帧循环、L2 订阅前置 |
 | `src/thspypc/services/auction.py` | 个股竞价、历史 L2 三条 bundle、指数当天 T_URL 上下文/尾盘 bundle |
 | `src/thspypc/services/kline.py` | K线服务（MAIN 锁 + 多帧收集） |
+| `src/thspypc/services/quote.py` / `stock_list.py` / `market_snapshot.py` | 批量行情、代码表/排序/DDE、hfd1.0 快照工作流 |
+| `src/thspypc/services/superorder.py` / `realorder.py` / `board_stats.py` / `stock_name.py` | 逐笔回放/队列、异动、板块统计、名称同步服务 |
 | `src/thspypc/services/system_blocks.py` | `BoardService` 四接口 + `SystemBlocksService`（本地缓存门面） |
 | `src/thspypc/services/subscription.py` | 4214 订阅注册/保活 |
 | `src/thspypc/_transport/` | ConnectionRole/Spec/Manager、MarketSession（单飞锁） |
 | `src/thspypc/_transport/tracing.py` | 逐帧收发转储（`THS_FRAME_DUMP_DIR`：C2S/S2C 原始字节 + 逐帧 hex/文本） |
 | `src/thspypc/_client/connection_primitives.py` | TCP login/init、并发测速与登录、L2 手动连接、fu4 板块通道/成分连接建连（身份回退链） |
 | `src/thspypc/_client/service_facade.py` | `timeline/history_timeline/auction/closing_auction/intraday/kline` 门面 |
+| `src/thspypc/_client/stock_cache.py` / `src/thspypc/testing.py` | 股票代码缓存 / 测试脚本并发登录与客户端复用 |
+| `src/thspypc/server/` | FastAPI 单用户 REST 接口（`ThsRuntime` + `create_app`） |
 | `src/thspypc/codecs/` | framing（FDF）、hd 字段表、numeric（THS float）、compression（8901 LZ77 / BitRLE） |
 | `docs/architecture/SERVER_MATRIX.md` | 服务器域名/权限/路由详细矩阵 |
 | `docs/handoffs/*.md` | 各协议逆向证据链（竞价、分时、推送、历史分时、系统板块） |
@@ -912,12 +924,13 @@ thspypc 默认 80（适用个股市场）；查板块异动（market=48）建议
 
 ## 17. 看盘界面协议缺口（2026-08-05 抓包）
 
-对照同花顺 PC 看盘主界面布局抓包（`tests/capture_kanpan.py`），记录 thspypc 未实现的协议。
+对照同花顺 PC 看盘主界面布局抓包（`tests/capture_kanpan.py`），记录 thspypc
+看盘协议现状（已实现查询与剩余缺口）。
 完整抓包结论见 `docs/handoffs/HANDOFF_KANPAN_CAPTURE_20260805.md`。
 
-### 17.1 盘口逐笔协议（未实现，复杂，P2-R&D）
+### 17.1 盘口逐笔/委托队列（7169/7173/7174/4096 已实现；71B 推送调研中）
 
-Level2 账号在盘口/逐笔区用了未实现的 period。**2026-08-05 盘后两轮 `capture_superorder.py`
+Level2 账号在盘口/逐笔区使用以下 period。**2026-08-05 盘后两轮 `capture_superorder.py`
 抓包（带秒表逐操作对齐，深市 000938）钉死了触发时机**，修正了此前若干误判。
 完整结论见 `HANDOFF_KANPAN_CAPTURE_20260805.md` §H。
 
@@ -927,7 +940,7 @@ Level2 账号在盘口/逐笔区用了未实现的 period。**2026-08-05 盘后�
 |---|---|
 | 冷启动进看盘 | pageid=5716 基础订阅 |
 | 打开股票（看盘页面） | pageid=1334 全套（**含 16384 日K，默认加载**，非用户主动切） |
-| 进入 L2 分时通道 | pageid=4214 分时全套 |
+| 进入 L2 分时通道 | pageid=1334 分时全套 |
 | 进入逐笔成交面板 | `4214 DT=7173(-1) + 7169(-27)` 初始 |
 | **逐笔成交翻页** | `4214 DT=7169(<unix区间>)` 区间滚动（从 15:00 往前滚）★ |
 | **打开超级盘口** | **pageid=4260 全套**（7174/7173/7169/4096/7424/7176 成组） |
@@ -952,8 +965,9 @@ Level2 账号在盘口/逐笔区用了未实现的 period。**2026-08-05 盘后�
 > 000779 跌停卖队列与客户端截图逐项确认。队列高位 `0x08000000` 是主力单标记；
 > 详情与 API 见 `docs/guides/ORDER_QUEUE.md`。历史队列目前只确认最近一个交易日。
 
-> 请求构造与竞价/分时同族（route=0x02FC）。逐笔回放单帧
-> 440KB+，变长字段，`HANDOFF_SUPERORDER_20260726` 的 fmt 子标记 22/34 未破译。暂不实现。
+> 请求构造与竞价/分时同族（route=0x02FC）。7169 逐笔回放已由 `superorder()` 实现
+> （normalize 后定长 32B/行，4214/4260 两通道同构）；71B 盘中逐笔推送的稳定触发
+> 条件仍在调研。`HANDOFF_SUPERORDER_20260726` 的 fmt 子标记 22/34 未破译。
 > 2026-08-05 盘后新增**深市 000938 样本**（`superorder_20260805_195859_resp_stream1.bin`），
 > 与沪市 603118 对照完成字段表破译。详见 `HANDOFF_KANPAN_CAPTURE_20260805.md` §H。
 
