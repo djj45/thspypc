@@ -1,0 +1,4 @@
+# Preserve captured BlockUpdate cache bytes exactly. Line-ending normalization
+# changes the CRC32 recorded in each version manifest.
+tests/fixtures/blockupdate/**/_entries binary
+tests/fixtures/blockupdate/**/*.ini binary
