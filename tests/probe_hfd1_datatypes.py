@@ -120,10 +120,16 @@ def main() -> int:
         "--host",
         help="directly test one 8901 host using the same get_client AuthService passport",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--quote-only",
         action="store_true",
         help="skip the historical [5,55] control request",
+    )
+    mode.add_argument(
+        "--code-only",
+        action="store_true",
+        help="send only the historical pageid=5716 [5,55] control request",
     )
     args = parser.parse_args()
     markets = [int(value) for value in args.markets.split(",") if value.strip()]
@@ -133,7 +139,8 @@ def main() -> int:
     variants = []
     if not args.quote_only:
         variants.append(("code_name", CODE_NAME_DATATYPES))
-    variants.append(("quotes", QUOTE_DATATYPES))
+    if not args.code_only:
+        variants.append(("quotes", QUOTE_DATATYPES))
 
     direct_sock: socket.socket | None = None
     try:
