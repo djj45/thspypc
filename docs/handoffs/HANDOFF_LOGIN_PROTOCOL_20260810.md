@@ -75,20 +75,85 @@ login body 结构：
 ### check 字节公式
 
 ```
-check = (len(fixed) + 13) & 0xFF
+check = (len(fixed) + K) & 0xFF
 ```
 
-其中 `fixed` = `Ask=login` 开头到 `Passport64=`（不含值）的 GBK 编码字节数。
+其中 `fixed` = `Ask=login` 开头到 `Passport64=`（不含值）的 GBK 编码字节数，
+`K` 是一个随 hexin 客户端版本变化的常数（**不是固定值**）。
 
 实测验证（2026-08-10 hexin 8 帧抓包）：
 
-| 身份 | fixed 长度 | check 字节 | 公式验证 |
+| 身份 | fixed 长度 | check 字节 | K 值 |
 |---|---|---|---|
-| MAIN（带 UserName）| 203B | `0xD8` | `(203+13)&0xFF = 216 = 0xD8` ✓ |
-| L2/fu4（无 UserName）| 169B | `0xB6` | `(169+13)&0xFF = 182 = 0xB6` ✓ |
+| MAIN（带 UserName）| 203B | `0xD8` | K=13 |
+| L2/fu4（无 UserName）| 169B | `0xB6` | K=13 |
 
-> **旧公式 `(len+1)&0xFF` 是错的。** 它在 ifindhq（宽松）上能过，但 main/shlv2/szlv2/fu4
-> 等严格服务器返回 -1 或直接 FIN。
+> ⚠️ **K 值会随 hexin 版本更新变化，不是协议常数。** 历史抓包证据：
+>
+> | 时间段 | hexin 的 K | thspypc 的 K | 说明 |
+> |---|---|---|---|
+> | 08-05 ~ 08-10 | **1** | 1 | `(len+1)&0xFF`，严格服务器当时宽容接受 |
+> | **08-11** | **13** | 13 | hexin 客户端更新，K 从 1 变成 13 |
+>
+> 严格服务器（main/shlv2/szlv2/fu4）从 8/10 起只接受 hexin 当前版本发的 K 值。
+> 当前代码硬编码 `K=13`；如果未来 hexin 再次更新改了 K，需要重新抓包确认新值。
+>
+> 另有一种 `0x07` 尾帧变体（offset 14 = `0x07` 而非 `0x09`），使用完全不同的
+> check 算法（`(len+141)&0xFF`），出现在部分历史 pcap 中，当前不影响 thspypc。
+
+### K 值来源逆向调查（2026-08-11 静态分析）
+
+为确认 K 是固定常数还是运行时状态，用 `hexin_20260809_prelist.loaded.bin`（从
+8/9 minidump 提取的 hexin.exe 加载映像，image base `0xa50000`）做了静态逆向。
+
+**已排除的可能性：**
+
+| 假设 | 排除证据 |
+|---|---|
+| K 硬编码在 hexin.exe 里 | exe 文件 SHA 不变（6/1 编译），但 K 从 1 变 13 |
+| K 是 signature 的函数 | 8/11 所有帧不同 signature，K 全是 13 |
+| K 是 passport 字段的函数 | passport 54 字段无值=13 的（signlength=1558，1558%256=22≠13） |
+| login body 模板是 GBK 静态字符串 | `Ask=login`/`C-Version=`/`Passport64=` 的 GBK 版在映像里不存在，只有 UTF-16 版（`0x24d91xx` 区域）→ 运行时动态转码 |
+| login 构造用直接寻址 | `zh_CN.GBK`（VA `0x24d9140`）无直接 push/mov 代码引用，只有数据区结构体引用（`0x2869170`）→ 用间接寻址（结构体指针表） |
+
+**定位到的相关地址（image base `0xa50000`）：**
+
+```
+UTF-16 常量区 0x24d9100~0x24d9260:
+  0x24d911c  "thsuser"          （STANDARD 用户名）
+  0x24d9124  "__manual"         （MANUAL 用户名）
+  0x24d9140  "zh_CN.GBK"        （帧头编码标记）
+  0x24d914c  "Password"
+  0x24d9158  "VerifyType"
+  0x24d9164  "Mac64"
+  0x24d916c  "C-SupportPushVer"
+  0x24d9180  "C-SupReqDataVer"
+  0x24d9190  "C-SupPushDataVer"
+  0x24d91a4  "VerifyCode"
+
+结构体模板 0x2869100~0x28691f0:
+  含上述字符串指针 + magic 0x19930522（hexin 协议版本标记）
+  login body 构造函数通过此结构体的间接寻址引用字段名
+
+代码引用:
+  thsuser getter  VA 0x22eb970（mov eax, 0x24d911c; jmp）
+    → 短函数（26B），只返回 "thsuser" 指针，不含 check 计算
+```
+
+**结论：K 是运行时全局状态，不在 exe 静态代码里。**
+
+最可能的来源（静态无法区分，需动态追踪）：
+1. **服务端 init 配置帧**——登录后第一个 init 响应里的某个字段
+2. **hexin 启动配置**——从服务端拉的某个版本/配置项
+3. **本地缓存文件**——StockLink.ini 或类似配置
+
+**后续确认路径（如 -1 回归时）：**
+
+- **快速方案**（推荐）：抓一次 hexin 包，`(check - len(fixed)) % 256` 即新 K 值
+- **彻底方案**：用 x32dbg headless + ScyllaHide（playbook §21b）附加 hexin，
+  从 `thsuser` getter `0x22eb970` 往上追调用者，定位 login body 构造函数，
+  在 check 计算处下断点，追踪读取的全局变量地址 → 确认来源
+- **离线方案**：抓完整 hexin 登录流程（含 init 响应），在 init 配置帧里找值=K 的字段
 
 ## 五处协议修正（全部 2026-08-10 确认并修复）
 

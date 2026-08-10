@@ -217,7 +217,7 @@ def build_login_body(
                 "\n".join(f"{key}={value}" for key, value in fields)
                 + "\nPassport64="
             ).encode("gbk")
-            suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])
+            suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])  # K=13, 同上
         else:
             fixed = (
                 "Ask=login\n"
@@ -256,6 +256,9 @@ def build_login_body(
     if identity is not LoginIdentity.BOARD:
         suffix = profile.login_header_suffix
     if suffix is None:
+        # K=13 随 hexin 版本变化（08-05~08-10 是 K=1，08-11 起 K=13）。
+        # 严格服务器只接受 hexin 当前版本的 K 值；如未来 hexin 更新导致
+        # VerifyCode=-1 回归，需重新抓包确认新 K 值。
         suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])
     prefix = (
         b"\x09\x41\x09\x00"
