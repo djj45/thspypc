@@ -1,23 +1,38 @@
-"""Low-level 8901 login helpers for test/diagnostic scripts.
+"""Helpers for test/diagnostic scripts: login, env loading, trade calendar.
 
-Tests must not hand-roll a serial ``for ip in ips: connect(...)`` loop. A
-single unreachable DNS batch can turn a 3s timeout into minutes. These
-helpers mirror hexin's own strategy: resolve every candidate domain, probe
-TCP reachability in parallel, then log in concurrently to the fastest hosts
-and keep the first ``VerifyCode=0`` socket.
+登录 helper（遵守 AGENTS.md 登录规则）:
+- ``load_env()``              — 从 .env 加载 THS_USERNAME/THS_PASSWORD
+- ``resolve_ips()``           — 并发 DNS 解析，返回去重 IPv4 列表
+- ``probe_hosts()``           — 并发 TCP 测速，返回可达 IP（最快优先）
+- ``login_socket()``          — 并发竞速登录，保留首个 VerifyCode=0 的 socket
+- ``login_socket_for_domains()`` — resolve + login_socket 的组合
+- ``get_client()``            — 复用已认证的 THSClient（不重复登录）
+- ``get_login_body()``        — 从缓存 client 拿当前 passport 的 login body
+- ``close_all_clients()``     — 断开并清空所有缓存 client
 
-The same process should also reuse one authenticated ``THSClient`` instead
-of creating a fresh client and logging in again on every script round.
+禁止手写串行 ``for ip in ips: connect(...)``——一批不可达 IP 会逐个等 3 秒。
+这些 helper 复刻 hexin 策略：解析全部候选域名、并发测速、并发登录最快节点、
+保留首个 ``VerifyCode=0`` 的连接。
+
+A 股交易日历:
+- ``latest_trade_date()`` — 返回当前时刻对应的最新交易日（9:15 分界）
+  数据源优先级：a-trade-calendar 包 CSV（可选依赖，纯本地含节假日）
+  > 深交所 API（运行时联网）> 跳周末兜底。
 """
 from __future__ import annotations
 
+import datetime as _dt
+import json
 import logging
 import os
+import random
 import socket
 import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from .codecs.framing import encode_frame, read_frame
 from .protocol import MARKET_PORT
@@ -271,3 +286,129 @@ def close_all_clients() -> None:
             except Exception:
                 pass
         _clients.clear()
+
+
+# ── A 股交易日历 ──
+# 数据源优先级：
+#   1. a-trade-calendar 包的 CSV（纯本地，标准库 csv 读取，不走 pandas）
+#   2. 深交所官网 API（按月缓存）
+#   3. 跳周末粗略判断（不识别节假日）
+
+_trade_days_cache: list[_dt.date] | None = None
+
+
+def _load_trade_days() -> list[_dt.date]:
+    """加载完整交易日列表（升序），结果缓存。
+
+    优先从 a-trade-calendar 包读 CSV（不经 pandas），失败则用深交所 API。
+    """
+    global _trade_days_cache
+    if _trade_days_cache is not None:
+        return _trade_days_cache
+
+    days = _load_trade_days_from_csv()
+    source = "a-trade-calendar CSV"
+    if days is None:
+        days = _load_trade_days_from_api()
+        source = "深交所 API"
+    if not days:
+        return []  # 调用方走 fallback
+
+    _trade_days_cache = days
+    logger.debug("交易日历加载 %d 天 (%s~%s) 来源=%s",
+                 len(days), days[0], days[-1], source)
+    return days
+
+
+def _load_trade_days_from_csv() -> list[_dt.date] | None:
+    """从 a-trade-calendar 包读 CSV（标准库 csv，不走 pandas）。"""
+    import csv
+
+    # 尝试直接定位包内的 CSV 文件（不经 pandas / 不触发 updater 联网）
+    for candidate in (
+        "a_trade_calendar/a_trade_calendar.csv",
+        "a_trade_calendar.csv",
+    ):
+        try:
+            import importlib
+            pkg = importlib.import_module("a_trade_calendar")
+            pkg_dir = os.path.dirname(pkg.__file__)
+        except Exception:  # noqa: BLE001
+            return None
+        csv_path = os.path.join(pkg_dir, "a_trade_calendar.csv")
+        if os.path.isfile(csv_path):
+            break
+    else:
+        return None
+
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header (dt)
+            days = []
+            for row in reader:
+                if row and row[0].strip():
+                    days.append(_dt.date.fromisoformat(row[0].strip()))
+        return sorted(days) if days else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_trade_days_from_api() -> list[_dt.date]:
+    """从深交所官网拉当月+上月交易日（回退数据源）。"""
+    today = _dt.date.today()
+    days: list[_dt.date] = []
+    for offset in (0, -1):  # 当月 + 上月
+        d = today.replace(day=1)
+        for _ in range(-offset):
+            d = d - _dt.timedelta(days=1)
+        days.extend(_fetch_month_from_api(d.year, d.month))
+    return sorted(set(days))
+
+
+def _fetch_month_from_api(year: int, month: int) -> list[_dt.date]:
+    """从深交所 API 拉一个月的交易日（无缓存，供 _load_trade_days_from_api 用）。"""
+    key = f"{year:04d}-{month:02d}"
+    params = urlencode({"month": key, "random": random.random()})
+    req = Request(
+        f"https://www.szse.cn/api/report/exchange/onepersistenthour/monthList?{params}",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.szse.cn/"},
+    )
+    with urlopen(req, timeout=5) as resp:
+        data = json.load(resp)
+    return [
+        _dt.date.fromisoformat(d["jyrq"])
+        for d in data.get("data", [])
+        if d.get("jybz") == "1"
+    ]
+
+
+def latest_trade_date(now: _dt.datetime | None = None) -> _dt.date:
+    """返回当前时刻对应的最新 A 股交易日。
+
+    - 交易日 9:15（含）后 → 当天
+    - 交易日 9:15 前 / 周末 / 节假日 → 上一个最近的交易日
+
+    数据源优先级：a-trade-calendar 包 CSV（纯本地）> 深交所 API > 跳周末。
+    """
+    now = now or _dt.datetime.now()
+    today = now.date()
+    cutoff = today if now.time() >= _dt.time(9, 15) else today - _dt.timedelta(days=1)
+
+    try:
+        days = _load_trade_days()
+        eligible = [d for d in days if d <= cutoff]
+        if eligible:
+            return eligible[-1]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("交易日历不可用，退化到跳周末: %s", exc)
+
+    # fallback：只跳周末，不识别节假日
+    d = cutoff
+    while d.weekday() >= 5:  # 周六=5 周日=6
+        d -= _dt.timedelta(days=1)
+    return d
+    d = today if now.time() >= _dt.time(9, 15) else today - _dt.timedelta(days=1)
+    while d.weekday() >= 5:  # 周六=5 周日=6
+        d -= _dt.timedelta(days=1)
+    return d

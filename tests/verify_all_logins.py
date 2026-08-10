@@ -111,17 +111,19 @@ def main() -> int:
             _record("REALORDER", False, f"异常: {result}")
 
         # ── BOARD（BOARD 身份, fu4:8901）──────────────────────
-        # board_timeline 盘后返回 0 点（accept 只接受当日数据，盘后服务器
-        # 返回的是上一交易日 → accept 拒绝 → 读满 timeout 返回空）。这不代表
-        # 登录失败——VerifyCode=0 已在上游 INFO 日志确认。交易时段会秒回数据。
-        print("\n[BOARD] board_timeline → fu4.123ths.com:8901", flush=True)
+        # 用 latest_trade_date() 传明确日期，避免盘后 accept 判据日期不匹配
+        # 导致读满 timeout 返回空（verify_all_logins 只验登录不依赖数据量）。
+        from thspypc.testing import latest_trade_date
+        trade_date = latest_trade_date()
+        print(f"\n[BOARD] board_timeline({trade_date}) → fu4.123ths.com:8901",
+              flush=True)
         ok, result, dt = _safe_call(
-            "BOARD", lambda: client.board_timeline("881121", timeout=15.0)
+            "BOARD",
+            lambda: client.board_timeline("881121", date=trade_date, timeout=15.0),
         )
         if ok:
             _record("BOARD", True,
-                    f"VerifyCode=0 分时点={len(result)} "
-                    f"{'(盘后空数据正常)' if not result else ''} {dt:.1f}s")
+                    f"VerifyCode=0 分时点={len(result)} {dt:.1f}s")
         else:
             _record("BOARD", False, f"异常: {result}")
 

@@ -374,6 +374,17 @@ UploadSelfStock/signlength），保留含 sk/sv 的 **44 个身份/会话字段*
 - `tests/capture_login_compare.py`（抓 hexin 8901 login 帧 4 维度对比）
 - `tests/verify_all_logins.py`（全 7 类服务器登录冒烟验证）
 - `tests/verify_order_details_online.py`（L2 4214 挂单撤单端到端）
+- `thspypc.testing.latest_trade_date()`（盘后/周末也能返回最近交易日，供 `board_timeline`
+  等需要明确日期的查询用）
+
+`latest_trade_date()` 的交易日历数据源按优先级自动选择：
+1. **a-trade-calendar 包**（`pip install a-trade-calendar`，纯本地 CSV，含法定节假日，
+   数据覆盖 2005-2027，import 时自动联网更新）。**可选依赖**——thspypc 不强制安装。
+2. **深交所官网 API**（`szse.cn`，运行时联网，按月缓存）。a-trade-calendar 未安装时自动使用。
+3. **跳周末**（不识别节假日）。前两者都不可用时兜底。
+
+> `latest_trade_date()` 有 9:15 分界（交易日 9:15 后返回当天，9:15 前/周末/节假日返回
+> 上一个交易日），a-trade-calendar 自带的 `get_latest_trade_date()` 没有这个分界。
 
 ### 解码链（纯 Python，无 unicorn 依赖）
 
