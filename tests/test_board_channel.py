@@ -60,9 +60,9 @@ def _normal_login() -> bytes:
 
 
 def test_board_login_l2_no_username_matches_capture():
-    """L2 板块 login：无 UserName/Password，suffix=计算 check+09（抓包 aa 09）。"""
+    """L2 板块 login：无 UserName/Password，suffix=计算 check+09（抓包 b6 09）。"""
     body = _l2_login()
-    assert body[:15] == b"\x09\x41\x09\x00" + b"zh_CN.GBK" + b"\xaa\x09"
+    assert body[:15] == b"\x09\x41\x09\x00" + b"zh_CN.GBK" + b"\xb6\x09"
     text = body.decode("gbk", "replace")
     assert text.startswith("\tA\t\x00zh_CN.GBK�\tAsk=login")
     assert "UserName=" not in text

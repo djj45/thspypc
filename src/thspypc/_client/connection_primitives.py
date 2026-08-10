@@ -607,8 +607,9 @@ class ConnectionPrimitives:
         """打开一条独立的沪市或深市 L2 8901 连接。
 
         复用当前 HTTP AuthMaterial 的 Passport64/Mac64；不要求 MAIN 已连接。
-        兼容方法名沿用 ``manual``，但生产 login 帧按 2026-07-29 PC 抓包使用
-        ``UserName=thsuser`` 标准行情登录壳；Level2 权限来自 passport 和业务证据。
+        兼容方法名沿用 ``manual``。生产 login 帧使用 ``LoginIdentity.L2``
+        （无 UserName/Password 的 7 字段壳，2026-08-10 hexin 抓包字节级确认）；
+        Level2 权限来自 passport 和业务证据。
         登录后默认发 init 激活行情通道（``skip_init=False``）。
 
         ★ **按沪深选 L2 服务器**（2026-07-24 实测突破）：shlv2/szlv2 是两套独立
@@ -736,7 +737,7 @@ class ConnectionPrimitives:
             return None
         login_body = self._auth_service.login_body_for_passport(
             passport64,
-            LoginIdentity.STANDARD,
+            LoginIdentity.L2,
         )
         try:
             sock.sendall(encode_frame(login_body) + b"\n")

@@ -88,48 +88,30 @@
 
 ⚠️ **非交易日可用**：实测 8901 协议层不约束代码表查询（周日可登录、可发请求）。
 
-### 2. Passport64 生成 + login 帧校验字节（✅ 2026-07-23 完整逆向，登录打通）
+### 2. Passport64 生成 + login 帧校验字节（✅ 2026-08-10 字节级重逆向）
 
-login 失败有两个独立根因，都已修复（2026-07-23 三变体实测 + cli_ticker 活网验证 VerifyCode=0）：
+> **完整结论见** [`HANDOFF_LOGIN_PROTOCOL_20260810.md`](HANDOFF_LOGIN_PROTOCOL_20260810.md)。
+> 下面的 2026-07-23 旧分析已被 2026-08-10 的 hexin 抓包推翻（hexin 现在发 44 字段长
+> passport，不是旧记的 20 字段短 passport；check 公式是 `+13` 不是 `+1`；account_type
+> 是 `C8` 不是 `BE`；尾部是 `\x00` 不是空格）。
 
-**根因 1：sk/sv 必须保留（PromptText=-6 的真凶）**
+**2026-08-10 五处修正**（全部 hexin 8 帧字节级确认，7/7 服务器 VerifyCode=0）：
 
-抓包发现 hexin **发送**的 Passport64 只有 20 字段（1124/1130 字符），不含 sk/sv/userflag/
-level2 的明文。曾误判为"thspypc 也该过滤这些"，但三变体实测推翻：
-- 20 字段（过滤 sk/sv）→ **VerifyCode=-1, PromptText=-6**（会话密钥缺失）
-- 43 字段（含 sk/sv）→ **VerifyCode=0** ✅
-- 53 字段（全不过滤）→ **VerifyCode=0** ✅
+1. **account_type[0]** `0xBE→0xC8`（hexin MAIN+L2+fu4 8/8 帧一致）
+2. **passport 尾部** `0x20→0x00`（hexin = `\r\n\x00`）
+3. **check 字节公式** `(len+1)&0xFF → (len+13)&0xFF`（通用 fallback + BOARD 分支）
+4. **新增 `LoginIdentity.L2`**：L2 push 通道（shlv2/szlv2）用无 UserName 的 7 字段壳
+5. **BOARD(fu4) check** 同样 `+1→+13`
 
-原因：hexin 不发 sk/sv **明文**，但它的 head128 用自有算法把 sk/sv 编码进了 signature。
-thspypc 的 head128 移植自 thspy Mac 版（`_sig_to_nibbles`），没有编码 sk/sv，因此**必须
-保留 sk/sv 明文字段**作为补偿。README 表 3"必须保留 sk/sv"的结论一直是对的。
+旧结论中仍然成立的部分：
+- **sk/sv 必须保留**：thspypc 的 head128（移植自 thspy Mac 版 `signature_to_nibbles`）
+  没有把 sk/sv 编码进 signature，必须保留 sk/sv 明文。`PASSPORT_DROP_FIELDS` 只丢 10 个
+  路由字段，保留 44 字段（含 sk/sv），和 hexin 一致。
+- **校验字节错误 → 0 字节 FIN**：check 字节算错时严格服务器直接断连。
+- **-1 不是连接频率问题**：-1 纯粹是 login 帧内容问题，连接治理是好实践但不是防 -1 的手段。
 
-**结论**：`_PASSPORT_DROP_FIELDS` 只过滤 10 个路由字段（M_hq/M_hqdns/M_wg/M_zx/UpdateSvr/
-download/Foss_url/DownloadSelfStock/UploadSelfStock/signlength），保留含 sk/sv 的 43 字段
-（2304 字符）。
-
-**根因 2：login 帧校验字节是动态的（0 字节 FIN 的真凶）**
-
-`build_login_body_pc` 的帧头 `\t A \t \x00 zh_CN.GBK <校验字节> \t` 里，校验字节**不是
-固定 0xaa**，而是动态计算（抓包 14 帧逆向确认）：
-```
-校验字节 = (固定文本长度 + 1) & 0xFF
-固定文本 = "Ask=login\n...Passport64="（不含 Passport64 值）
-```
-thspypc 不带 UserName → 固定文本 169B → 校验字节 0xaa；hexin 带 UserName → 209B → 0xd2。
-校验字节错误 → 服务器 0 字节 FIN 直接断连（连错误码都不给）。
-
-**完整诊断过程**（供后续排查参考）：
-1. `tests/capture_login_compare.py` —— 抓 hexin 8901 login 帧，4 维度对比（IP/login字段/
-   VerifyCode/thspypc 对照）。发现同账号反复登录退出 hexin 毫无问题（21+14 帧 VerifyCode
-   全 0），证明 -1 不是账号限流/连接频率。
-2. `tests/compare_login_frame_bytes.py` —— 逐字节对比 login 帧，定位到 offset 13 校验字节
-   差异（hexin=0xd2 thspypc=0xaa），逆向出动态计算公式。
-3. `tests/test_passport_variants.py` —— 三变体（20/43/53 字段）实测，确认 sk/sv 必须保留。
-4. 修复后 cli_ticker 活网验证 VerifyCode=0，行情显示正常。
-
-⚠️ **§7a 的"连接频率导致 -1"分析是错的**——-1/-6 纯粹是 login 帧内容问题（校验字节 +
-sk/sv），与连接频率无关。连接治理（冷却复用/长连接）仍是好实践，但不是防 -1 的手段。
+诊断工具：`tests/capture_login_compare.py`（抓包）、`tests/verify_all_logins.py`（全服务器
+登录冒烟）、`tests/verify_order_details_online.py`（L2 4214 挂单撤单端到端）。
 
 ### 3. 自定义板块管理（移植自 thspy）
 

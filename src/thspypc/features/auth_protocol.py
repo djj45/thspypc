@@ -13,6 +13,7 @@ class LoginIdentity(str, Enum):
     STANDARD = "standard"
     MANUAL = "manual"
     BOARD = "board"
+    L2 = "l2"
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ PC_LEVEL2_LOGIN_PROFILE = LoginProtocolProfile(
     http_version="9.60.20.0031",
     tcp_version="E029.60.20.0031",
     qsid="6800",
-    account_type=bytes((0xBE, 0x06, 0x06, 0x80, 0x00)),
+    account_type=bytes((0xC8, 0x06, 0x06, 0x80, 0x00)),
     supports_manual_identity=True,
     standard_username="thsuser",
     standard_password="thsuser",
@@ -148,7 +149,7 @@ def build_passport64(
         .strip()
         not in PASSPORT_DROP_FIELDS
     ]
-    payload = head128 + prefix_5b + b"\r\n".join(fields) + b"\r\n "
+    payload = head128 + prefix_5b + b"\r\n".join(fields) + b"\r\n\x00"
     return base64.b64encode(payload).decode()
 
 
@@ -177,6 +178,23 @@ def build_login_body(
             "C-SupPushDataVer=hq6.0\n"
             "Passport64="
         ).encode("gbk")
+    elif identity is LoginIdentity.L2:
+        # L2 push 通道（shlv2/szlv2）的 login 壳：2026-08-10 hexin 抓包字节级确认。
+        # 无 UserName/Password，7 字段 + Passport64，与 BOARD+supports_manual_identity
+        # 结构相同但走 L2 行情服务器（非 fu4）。check 走通用 fallback（+13）。
+        fields = [
+            ("Ask", "login"),
+            ("C-Version", profile.tcp_version),
+            ("VerifyType", "1"),
+            ("Mac64", mac_b64),
+            ("C-SupportPushVer", "1.0"),
+            ("C-SupReqDataVer", "hq6.0"),
+            ("C-SupPushDataVer", "hq6.0"),
+        ]
+        fixed = (
+            "\n".join(f"{key}={value}" for key, value in fields)
+            + "\nPassport64="
+        ).encode("gbk")
     elif identity is LoginIdentity.BOARD:
         # 板块专用通道（fu4 服务器）的 login 壳，2026-08-01 双账号抓包字节级确认：
         #   - Level2 账号（PC_LEVEL2，supports_manual_identity=True）：
@@ -199,7 +217,7 @@ def build_login_body(
                 "\n".join(f"{key}={value}" for key, value in fields)
                 + "\nPassport64="
             ).encode("gbk")
-            suffix = bytes([(len(fixed) + 1) & 0xFF, 0x09])
+            suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])
         else:
             fixed = (
                 "Ask=login\n"
@@ -238,7 +256,7 @@ def build_login_body(
     if identity is not LoginIdentity.BOARD:
         suffix = profile.login_header_suffix
     if suffix is None:
-        suffix = bytes([(len(fixed) + 1) & 0xFF, 0x09])
+        suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])
     prefix = (
         b"\x09\x41\x09\x00"
         + b"zh_CN.GBK"

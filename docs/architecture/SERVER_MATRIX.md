@@ -44,9 +44,9 @@ pageid=5716
 |---|---|---|---|---|
 | HTTP 鉴权 | `auth.10jqka.com.cn:80` | HTTP 三步鉴权 | 有效账号、密码或扫码凭据 | 获取 passport、signature、`M_hqdns` |
 | MAIN | `main.123ths.com:8901`（优先）/ `ifindhq.123ths.com:8901`（兼容回退） | 普通登录；`VerifyCode=0` 后发送标准 MAIN init，不发送 `__manual` L2 init | `BASIC_QUOTE` / `BASIC_TIMELINE` / `BASIC_HISTORY_TIMELINE` / `BASIC_AUCTION` | 日 K、9355 当日分时与历史分时、早盘/尾盘竞价、股票列表、排序榜、DDE 与批量行情 |
-| SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + 标准行情登录壳（`thsuser`）；init `MarketCode=16;144;` | Level2 账号，且 `L2_MARKET_ACCESS` 已有成功证据；具体功能还分别受 `L2_TIMELINE`、`L2_AUCTION`、`L2_SNAPSHOT_PUSH`、`L2_HISTORY_TIMELINE` 控制 | 沪市 L2 分时（1334）、日 K、竞价、快照推送、历史分时、十档、逐笔回放与委托队列 |
-| SZ_L2 | `szlv2.123ths.com:8901` | Level2 passport + 标准行情登录壳（`thsuser`）；init `MarketCode=32;` | 同 SH_L2 | 深市 L2 分时（1334）、日 K、竞价、快照推送、历史分时、十档、逐笔回放与委托队列 |
-| BOARD | `fu4.123ths.com:8901`（从 `M_hqdns` 解析） | 板块通道 login 身份按账号 profile 分支（Level2 用 UserName/Password，普通账号 `__manual`）；`MarketCode=96;128;88;216;48;` + subreal 注册 | `BASIC_QUOTE`（板块指数走该角色门控） | 板块指数列表/行情/分时/竞价（`board_quotes` / `board_timeline` / `board_auction`） |
+| SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + `LoginIdentity.L2`（无 UserName/Password 的 7 字段壳，2026-08-10 抓包确认）；init `MarketCode=16;144;` | Level2 账号，且 `L2_MARKET_ACCESS` 已有成功证据；具体功能还分别受 `L2_TIMELINE`、`L2_AUCTION`、`L2_SNAPSHOT_PUSH`、`L2_HISTORY_TIMELINE` 控制 | 沪市 L2 分时（1334）、日 K、竞价、快照推送、历史分时、十档、逐笔回放与委托队列 |
+| SZ_L2 | `szlv2.123ths.com:8901` | Level2 passport + `LoginIdentity.L2`（无 UserName/Password 的 7 字段壳）；init `MarketCode=32;` | 同 SH_L2 | 深市 L2 分时（1334）、日 K、竞价、快照推送、历史分时、十档、逐笔回放与委托队列 |
+| BOARD | `fu4.123ths.com:8901`（从 `M_hqdns` 解析） | 板块通道 `LoginIdentity.BOARD`：Level2 账号无 UserName/Password，普通账号 `UserName=__manual`（2026-08-10 抓包纠正）；`MarketCode=96;128;88;216;48;` + subreal 注册 | `BASIC_QUOTE`（板块指数走该角色门控） | 板块指数列表/行情/分时/竞价（`board_quotes` / `board_timeline` / `board_auction`） |
 | BOARD_CONSTITUENT_SH / SZ | 沪 `shlv2` 或 `main` / 深 `szlv2`（股票行情网关，不走 fu4） | 普通 `thsuser` / L2 `__manual` 独立成分连接，MKT_INIT 用股票市场集 | 普通：`BASIC_QUOTE`；L2：显式 `L2_MARKET_ACCESS` | 按板块查成分股（`board_constituents`） |
 | REALORDER | 固定 seed/default `106.14.65.90:9601`；官方客户端可缓存动态首选物理节点 | 独立 9601 登录 | 通道权限 `REALORDER` 独立于 Level2；异动类别再细分为普通账号基础 23 类和 Level2 额外 30 类 | `qurealorder` 历史异动、`subrealorder` 实时异动订阅、`pushrealorder` 接收、`calcext` 单股/单板块扩展计算（与 qurealorder 共享 socket） |
 | BOARD_STATS | 独立统计节点 `8.132.233.77:9601`（抓包快照，不在 DNS/passport，客户端缓存发现；可用 `THSPYPC_STATSCALC_HOST` 覆盖） | 独立 9601 PC 登录（passport64 + `VerifyCode=0`） | `BASIC_QUOTE` | `statscalc` 板块批量统计（区间涨跌幅/涨速聚合、涨跌停统计，hd1.0 表） |

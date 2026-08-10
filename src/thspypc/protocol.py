@@ -132,16 +132,23 @@ from .features.snapshot_protocol import (
     SNAPSHOT_SUBTYPE,
     build_market_snapshot_query,
     build_snapshot_subscribe,
+    is_auction_cancel_push,
     is_auction_depth_push,
     is_depth_push,
     is_snapshot_push,
     is_stock_depth_envelope,
     parse_auction_depth_push,
+    parse_auction_cancel_push,
     parse_depth_push,
     parse_depth_push_records,
     parse_snapshot_push,
 )
 from .features.superorder_protocol import (
+    BUY_CANCEL_PERIOD,
+    CANCEL_DETAIL_DATATYPE,
+    CANCEL_DETAIL_FIELD_COUNT,
+    CANCEL_DETAIL_FLAG,
+    CANCEL_DETAIL_RECORD_SIZE,
     ORDER_QUEUE_BUY_PERIOD,
     ORDER_QUEUE_DATATYPE,
     ORDER_QUEUE_FIELD_COUNT,
@@ -150,6 +157,12 @@ from .features.superorder_protocol import (
     ORDER_QUEUE_PAGEID,
     ORDER_QUEUE_RECORD_SIZE,
     ORDER_QUEUE_SELL_PERIOD,
+    ORDER_DETAIL_DATATYPE,
+    ORDER_DETAIL_FIELD_COUNT,
+    ORDER_DETAIL_FLAG,
+    ORDER_DETAIL_PERIOD,
+    ORDER_DETAIL_RECORD_SIZE,
+    SELL_CANCEL_PERIOD,
     SUPERORDER_DATATYPE,
     SUPERORDER_FIELD_COUNT,
     SUPERORDER_FLAG,
@@ -157,8 +170,10 @@ from .features.superorder_protocol import (
     SUPERORDER_PERIOD,
     SUPERORDER_RECORD_SIZE,
     SUPERORDER_SUPER_PAGEID,
+    build_order_detail_query,
     build_order_queue_query,
     build_superorder_query,
+    parse_order_detail_response,
     parse_order_queue_response,
     parse_superorder_response,
 )
@@ -571,9 +586,10 @@ C_VERSION_PC = DEFAULT_LOGIN_PROTOCOL_PROFILE.tcp_version
 QSID = DEFAULT_LOGIN_PROTOCOL_PROFILE.qsid
 
 # head128 的账号类型标签（5 字节前缀）。
-# Mac 版 (thspy): 44 04 2d 80 00；PC 免费版实测: be 06 06 80 00。
-# 用 Mac 值时服务器返回 PromptText=-300（head128 校验失败）；
-# 改 PC 值后通过 head128 校验。
+# Mac 版 (thspy): 44 04 2d 80 00；PC Level2 抓包实测: c8 06 06 80 00
+# （2026-08-10 hexin 8 帧 MAIN+L2 逐字节确认，8/8 一致）。
+# 旧值 be 06 06 80 00 只被宽松的 ifindhq 接受，main/shlv2/szlv2 等严格
+# 服务器校验 head128 时返回 VerifyCode=-1。
 ACCOUNT_TYPE = DEFAULT_LOGIN_PROTOCOL_PROFILE.account_type
 
 

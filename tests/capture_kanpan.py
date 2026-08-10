@@ -79,7 +79,7 @@ from thspypc.protocol import (  # noqa: E402
 
 # ── Wireshark 路径探测（与 capture_system_blocks.py 一致）──
 WS_CANDIDATES = [
-    r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark",
+    r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark",
     r"C:\Program Files\Wireshark",
@@ -509,6 +509,21 @@ def identify_frame(body: bytes) -> dict:
         else:
             info["status"] = "unknown"
             info["label"] = f"新 pageid={pid}（未知协议，需逆向）"
+        if pid == "4214":
+            period_labels = {
+                "7169": "逐笔成交回放",
+                "7170": "买撤全量明细",
+                "7171": "卖撤全量明细",
+                "7173": "买一委托队列",
+                "7174": "卖一委托队列",
+                "7175": "挂单全量明细",
+            }
+            if info["period"] in period_labels:
+                info["status"] = "ok"
+                info["label"] = (
+                    f"4214 {period_labels[info['period']]}"
+                    f"(period={info['period']})"
+                )
         info["area"] = _pageid_to_area(pid, info)
     else:
         # 有子帧头但无 pageid 文本 —— 可能是新协议
@@ -531,7 +546,7 @@ def _pageid_to_area(pid: str, info: dict) -> str:
     if pid in ("9354", "4214", "77", "6240"):  # 分时
         period = info.get("period", "")
         # 4214 period 7169 = 逐笔回放 → 盘口 E；8192=分时 → C
-        if period == "7169":
+        if period in ("7169", "7170", "7171", "7173", "7174", "7175"):
             return "E"
         return "C"
     if pid == "9355":                    # K线/历史分时
@@ -810,7 +825,10 @@ def _section_gaps(client_frames, server_frames, account: str, pcap_path: str):
     queue_hits = []
     for fr, t, dip, dport, stream, body in client_frames:
         text = body.decode("gbk", errors="replace")
-        if re.search(r"(queue|队列|挂单明细|委托明细|买卖力|买卖盘明细)", text):
+        if (
+            re.search(r"(queue|队列|挂单明细|委托明细|买卖力|买卖盘明细)", text)
+            or re.search(r"DateTime=(7170|7171|7173|7174|7175)\(", text)
+        ):
             queue_hits.append((fr, dip, stream, text[:80]))
     if queue_hits:
         print(f"\n  【3e】委托队列/挂单明细线索：{len(queue_hits)} 帧")

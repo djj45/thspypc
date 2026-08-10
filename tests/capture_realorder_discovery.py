@@ -47,8 +47,7 @@ DEFAULT_PCAP = CAPTURE_DIR / "realorder_discovery.pcapng"
 
 WIRESHARK_CANDIDATES = (
     Path(
-        r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable"
-        r"\Wireshark\App"
+        r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App"
     ),
     Path(r"C:\Program Files\Wireshark"),
 )

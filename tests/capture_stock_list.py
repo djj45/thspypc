@@ -26,7 +26,7 @@ import subprocess
 import sys
 from collections import OrderedDict, defaultdict
 
-WS = r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark"
+WS = r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"
 DUMPCAP = os.path.join(WS, "dumpcap.exe")
 TSHARK = os.path.join(WS, "tshark.exe")
 PCAP_DIR = os.path.join(os.path.dirname(__file__), "..", "captures_live")

@@ -43,7 +43,7 @@ import sys
 WS_CANDIDATES = [
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark",
-    r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark",
+    r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"C:\Program Files\Wireshark",
     r"D:\Program Files\Wireshark",
 ]

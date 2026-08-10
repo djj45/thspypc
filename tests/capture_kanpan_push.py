@@ -60,9 +60,11 @@ from thspypc.features.realorder_protocol import (  # noqa: E402
     parse_pushrealorder_response,
 )
 from thspypc.features.snapshot_protocol import (  # noqa: E402
+    is_auction_cancel_push,
     is_depth_push,
     is_snapshot_push,
     is_stock_depth_envelope,
+    parse_auction_cancel_push,
     parse_depth_push_records,
     parse_snapshot_push,
 )
@@ -73,7 +75,7 @@ from thspypc.features.index_push_protocol import (  # noqa: E402
 
 # ── Wireshark 路径探测 ──
 WS_CANDIDATES = [
-    r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark",
+    r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark",
     r"C:\Program Files\Wireshark",
@@ -271,6 +273,7 @@ def classify_server_frame(body, srcport):
     kind:
       - "index_push": 09 7b d0 0f 指数实时推送（五大指数点位）
       - "snapshot4214": 71 字节 L2 逐笔推送
+      - "auction_cancel": 71 字节集合竞价买撤/卖撤推送
       - "auction_depth": 集合竞价三行虚拟盘口
       - "depth4214": 连续竞价十档盘口
       - "pushrealorder": 9601 短线精灵实时异动推送
@@ -287,6 +290,9 @@ def classify_server_frame(body, srcport):
     if is_snapshot_push(body):
         parsed = parse_snapshot_push(body)
         return ("snapshot4214", parsed or {})
+    if is_auction_cancel_push(body):
+        parsed = parse_auction_cancel_push(body)
+        return ("auction_cancel", parsed or {})
     # 个股 0x0f7f 必须先于指数 0x0f 分类；两者共享外层魔数。
     if is_depth_push(body):
         records = parse_depth_push_records(body)
@@ -395,6 +401,7 @@ def analyze(pcap_path):
     kind_labels = {
         "index_push": "★ 指数实时推送（五大指数点位）",
         "snapshot4214": "★ 4214 逐笔推送（71B/0x7f）",
+        "auction_cancel": "★ 集合竞价撤单推送（71B/0x60）",
         "auction_depth": "★ 集合竞价三行盘口推送（0x0f7f）",
         "depth4214": "★ 连续竞价十档盘口推送（0x0f7f）",
         "depth_unknown": "股票盘口未知变长布局（0x0f7f）",
@@ -409,7 +416,8 @@ def analyze(pcap_path):
         label = kind_labels.get(kind, kind)
         print(f"  {label}: {cnt} 帧, {kind_bytes[kind]:,}B")
     if not any(kind_counter.get(kind) for kind in (
-        "snapshot4214", "auction_depth", "depth4214", "pushrealorder"
+        "snapshot4214", "auction_cancel", "auction_depth", "depth4214",
+        "pushrealorder",
     )):
         print("  ⚠ 未抓到 4214/pushrealorder 推送——可能没在看盘界面/没开 L2/盘外")
 
@@ -418,7 +426,8 @@ def analyze(pcap_path):
     print("【2】推送节奏（5s 桶，看 snapshot4214/pushrealorder 是否持续推送）")
     print(f"{'='*64}")
     push_kinds = {
-        "index_push", "snapshot4214", "auction_depth", "depth4214", "pushrealorder"
+        "index_push", "snapshot4214", "auction_cancel", "auction_depth",
+        "depth4214", "pushrealorder",
     }
     buckets: dict[int, Counter] = defaultdict(Counter)
     for t, kind, detail, body, srcport in classified:
@@ -427,11 +436,15 @@ def analyze(pcap_path):
     if not any(any(buckets[b][k] for k in push_kinds) for b in buckets):
         print("  ✗ 全程无指数/4214/pushrealorder 推送")
     else:
-        print(f"  {'时间':>8s}  index  tick  auction  depth  pushreal  hd31  hd10  其他")
+        print(
+            f"  {'时间':>8s}  index  tick  cancel  auction  depth  "
+            "pushreal  hd31  hd10  其他"
+        )
         for b in sorted(buckets):
             c = buckets[b]
             idx = c.get("index_push", 0)
             snap = c.get("snapshot4214", 0)
+            cancel = c.get("auction_cancel", 0)
             auction = c.get("auction_depth", 0)
             depth = c.get("depth4214", 0)
             dxjl = c.get("pushrealorder", 0)
@@ -439,11 +452,15 @@ def analyze(pcap_path):
             h10 = c.get("hd10_table", 0)
             oth = sum(v for k, v in c.items()
                       if k not in push_kinds and k not in ("hd31_table", "hd10_table"))
-            mark = " ←推送" if snap or auction or depth or dxjl or idx else ""
+            mark = (
+                " ←推送"
+                if snap or cancel or auction or depth or dxjl or idx
+                else ""
+            )
             print(
                 f"  {b*5:3d}-{b*5+5:3d}s  {idx:5d}  {snap:4d}  "
-                f"{auction:7d}  {depth:5d}  {dxjl:8d}  {h31:4d}  {h10:4d}  "
-                f"{oth:4d}{mark}"
+                f"{cancel:6d}  {auction:7d}  {depth:5d}  {dxjl:8d}  "
+                f"{h31:4d}  {h10:4d}  {oth:4d}{mark}"
             )
 
     # ── 报告 3：客户端静默期的服务端推送（真·主动推送）──
@@ -572,8 +589,8 @@ def _dump_samples(classified, pcap_path):
     samples: dict[str, list[bytes]] = defaultdict(list)
     for t, kind, detail, body, srcport in classified:
         if kind in (
-            "snapshot4214", "auction_depth", "depth4214", "depth_unknown",
-            "pushrealorder", "subreal_ack"
+            "snapshot4214", "auction_cancel", "auction_depth", "depth4214",
+            "depth_unknown", "pushrealorder", "subreal_ack",
         ) and body:
             if len(samples[kind]) < 50:
                 samples[kind].append(body)

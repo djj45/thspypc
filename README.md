@@ -215,7 +215,7 @@ imei 逆向过程见 `ths/HANDOFF_IMEI.md`（通过 hexin 内存 patch 捕获 MD
 | 1 | mainverify 参数 | `product=同花顺Mac至尊版` `qsid=7004` `version=macpro_3.5.2` | `product=E02` `securities=同花顺统一版` `qsid=6800` `version=9.60.20.0031` | passport 身份是 Mac，被 PC 网关拒（-6:） |
 | 2 | mainverify 的 imei | MAC 地址字符串的 base64 | **32 字符十六进制设备 ID**（`MD5(MAC+"0"*30)`） | passport 设备绑定错误 |
 | 3 | passport 字段截断 | 截断到 `userflag=`（丢 bind/sk/sv） | **不截断**，保留全部字段 | 丢失会话密钥 sk/sv，服务器拒（-6:） |
-| 4 | head128 ACCOUNT_TYPE | `44 04 2d 80 00` | `be 06 06 80 00` | head128 校验失败（-300:） |
+| 4 | head128 ACCOUNT_TYPE | `44 04 2d 80 00` | `c8 06 06 80 00`（Level2，2026-08-10 抓包确认）/ `e8 04 06 80 00`（免费版） | head128 校验失败（-300:）；旧值 `be` 只被宽松的 ifindhq 接受 |
 
 ## 个股列表行情查询（`list_quotes`）
 
@@ -347,27 +347,33 @@ sz = [s["code"] for s in stocks if s["market"] == 33]   # 深市，直接喂 lis
 
 ### Passport64 生成 + login 帧校验（已复刻 hexin，无需抓包）
 
-`build_passport64` 自动从服务端返回的 `passport_bytes`（53 字段）里**过滤掉 10 个路由
+> 完整字节级逆向见 [`docs/handoffs/HANDOFF_LOGIN_PROTOCOL_20260810.md`](docs/handoffs/HANDOFF_LOGIN_PROTOCOL_20260810.md)。
+
+`build_passport64` 自动从服务端返回的 `passport_bytes`（54 字段）里**过滤掉 10 个路由
 字段**（M_hq/M_hqdns/M_wg/M_zx/UpdateSvr/download/Foss_url/DownloadSelfStock/
-UploadSelfStock/signlength），保留含 sk/sv 的 **43 个身份/会话字段**（2304 字符）。
+UploadSelfStock/signlength），保留含 sk/sv 的 **44 个身份/会话字段**（~2320 字符）。
+44 字段集和 hexin 抓包完全一致（2026-08-10 逐字段值对比确认）。
 
-`build_login_body_pc` 的帧头校验字节**动态计算**（非固定值）：
-`check = (固定文本长度 + 1) & 0xFF`，其中固定文本 = `Ask=login\n...Passport64=`。
+`build_login_body`（`features/auth_protocol.py`）的帧头校验字节**动态计算**：
+`check = (len(fixed) + 13) & 0xFF`，其中 fixed = `Ask=login\n...Passport64=`（不含值）。
 
-> **login 失败的两个独立根因**（2026-07-23 完整逆向 + 三变体实测）：
-> - **0 字节 FIN**：校验字节错（曾硬编码 0xaa）。修为动态计算后解决。
-> - **PromptText=-6**：sk/sv 被误过滤。抓包显示 hexin 不发 sk/sv 明文，但它的 head128
->   把 sk/sv 编码进了 signature；thspypc 的 head128（移植自 thspy Mac 版）没这能力，
->   故**必须保留 sk/sv 明文字段**。回退过滤到 10 字段后解决。
-> - 两者都修后 VerifyCode=0，cli_ticker 活网验证通过。
+**2026-08-10 五处协议修正**（hexin 8 帧字节级确认，7/7 服务器 VerifyCode=0）：
+- account_type `0xBE→0xC8`（旧值只被宽松的 ifindhq 接受，严格服务器拒）
+- passport 尾部 `0x20→0x00`
+- check 公式 `(len+1)&0xFF → (len+13)&0xFF`
+- 新增 `LoginIdentity.L2`：L2 push 通道（shlv2/szlv2）用无 UserName 的 7 字段壳
+- BOARD(fu4) check 同样 `+1→+13`
+
+> **sk/sv 必须保留**：thspypc 的 head128（移植自 thspy Mac 版 `signature_to_nibbles`）
+> 没有把 sk/sv 编码进 signature，必须保留 sk/sv 明文字段作为补偿。
 
 `THSClient.connect()`（账号密码 HTTP 鉴权）已内置，直接可用，无需抓包。
 `connect_with_passport64()` 仍保留，用于直接传入外部 Passport64（如抓包调试）。
 
 诊断工具：
 - `tests/capture_login_compare.py`（抓 hexin 8901 login 帧 4 维度对比）
-- `tests/compare_login_frame_bytes.py`（逐字节对比，定位校验字节差异）
-- `tests/test_passport_variants.py`（三变体实测字段集，定位 sk/sv 缺失）
+- `tests/verify_all_logins.py`（全 7 类服务器登录冒烟验证）
+- `tests/verify_order_details_online.py`（L2 4214 挂单撤单端到端）
 
 ### 解码链（纯 Python，无 unicorn 依赖）
 

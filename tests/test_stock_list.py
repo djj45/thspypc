@@ -33,7 +33,7 @@ from thspypc import THSClient, parse_init_response
 
 # cold_start.pcap 是 thspy 项目里的 Windows 冷启动抓包（含 dc=7526 全量帧）
 COLD_START_PCAP = r"D:\code\thspy\captures\cold_start.pcap"
-TSHARK = r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark\tshark.exe"
+TSHARK = r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark\tshark.exe"
 FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
 
 

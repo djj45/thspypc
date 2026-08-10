@@ -44,11 +44,12 @@ def test_level2_standard_and_manual_login_frame_bytes():
 
     assert len(standard) == 282
     assert hashlib.sha256(standard).hexdigest() == (
-        "21f723611f7682a9b47bca7419630fc3"
-        "e96f7f8e6aaa3c6514688fe9f7271f08"
+        "62c3138f4c418e466eb9ade102ce3ef8"
+        "52530241cd00788d01504d1b19ada06e"
     )
     assert b"UserName=thsuser\nPassword=thsuser\n" in standard
     assert len(manual) == 288
     assert hashlib.sha256(manual).hexdigest() == (
-        "913835f0f6369da6c2ef63345b6f988037e7256c4ca020ada71c929775aec294"
+        "0083c97726421118ec4a3459bef7e55"
+        "247c6ca2ab437af93856b442a4f4bec26"
     )

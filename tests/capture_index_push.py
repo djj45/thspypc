@@ -57,7 +57,7 @@ DEFAULT_CODES = ("1A0001", "399001")
 MAX_FRAME_SIZE = 32 * 1024 * 1024
 
 WIRESHARK_DIRS = (
-    Path(r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark"),
+    Path(r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"),
     Path(r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"),
     Path(r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark"),
     Path(r"C:\Program Files\Wireshark"),

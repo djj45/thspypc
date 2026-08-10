@@ -54,7 +54,7 @@ from thspypc.protocol import decode_ths_float  # noqa: E402
 
 # ── Wireshark 路径探测（与 capture_system_blocks.py 相同候选）──
 WS_CANDIDATES = [
-    r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark",
+    r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark",
     r"C:\Program Files\Wireshark",
