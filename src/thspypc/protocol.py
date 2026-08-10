@@ -38,6 +38,7 @@ from .codecs.hd import (
     parse_hd3_response,
 )
 from .codecs.numeric import _FLOAT_TABLE, decode_ths_float
+from .codecs.quote_stream import QuoteStreamNormalizer, normalize_stock_depth_push
 from .features.auth_protocol import DEFAULT_LOGIN_PROTOCOL_PROFILE
 from .features.auction_protocol import (
     AUCTION_DATATYPE,
@@ -131,9 +132,13 @@ from .features.snapshot_protocol import (
     SNAPSHOT_SUBTYPE,
     build_market_snapshot_query,
     build_snapshot_subscribe,
+    is_auction_depth_push,
     is_depth_push,
     is_snapshot_push,
+    is_stock_depth_envelope,
+    parse_auction_depth_push,
     parse_depth_push,
+    parse_depth_push_records,
     parse_snapshot_push,
 )
 from .features.superorder_protocol import (

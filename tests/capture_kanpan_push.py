@@ -7,8 +7,8 @@
 ``capture_kanpan.py`` 是请求中心（分类客户端请求，找未实现协议），但**不解析服务端
 推送帧**。本脚本补这个缺口，专门抓「看盘界面保持不动时，服务端持续推送的实时数据」：
 
-  - **8901 pageid=4214 L2 十档盘口逐 tick 推送**（71 字节定长帧，含现价/成交量/
-    tick 序号）—— 盘口面板的生命线，盘中持续推送
+  - **8901 pageid=4214 L2 逐笔推送**（71 字节 ``0x7f`` 帧）
+  - **8901 ``0x0f7f`` 盘口推送**（竞价三行变长布局 / 连续竞价十档布局）
   - **9601 pushrealorder 短线精灵实时异动推送**（含异动类型/金额/涨跌幅）—— 短线
     精灵面板的生命线，盘中等秒级推送
   - **8901 subreal 订阅注册**（URS/UCT/UNX/UCX/UME + 1341/5716/392）—— 触发板块/
@@ -43,7 +43,6 @@ import argparse
 import datetime
 import os
 import re
-import struct
 import subprocess
 import sys
 import time
@@ -58,12 +57,13 @@ except (AttributeError, ValueError):
     pass
 
 from thspypc.features.realorder_protocol import (  # noqa: E402
-    ANOMALY_BYTE_MAP,
-    ANOMALY_MAP_DXJL,
     parse_pushrealorder_response,
 )
 from thspypc.features.snapshot_protocol import (  # noqa: E402
+    is_depth_push,
     is_snapshot_push,
+    is_stock_depth_envelope,
+    parse_depth_push_records,
     parse_snapshot_push,
 )
 from thspypc.features.index_push_protocol import (  # noqa: E402
@@ -270,7 +270,9 @@ def classify_server_frame(body, srcport):
 
     kind:
       - "index_push": 09 7b d0 0f 指数实时推送（五大指数点位）
-      - "snapshot4214": 71 字节 L2 十档逐 tick 推送
+      - "snapshot4214": 71 字节 L2 逐笔推送
+      - "auction_depth": 集合竞价三行虚拟盘口
+      - "depth4214": 连续竞价十档盘口
       - "pushrealorder": 9601 短线精灵实时异动推送
       - "subreal_ack": subreal 订阅回执（8901）
       - "hd31_table": hd3.1 表响应（板块行情/成分股等周期推送）
@@ -281,16 +283,29 @@ def classify_server_frame(body, srcport):
     # 心跳
     if len(body) <= 5 and (body[:1] == b"\x09" or body[-1:] == b"\x07"):
         return ("heartbeat", {})
+    # 4214 逐笔推送（71 字节 0x7f 定长；0x60 是另一种竞价委托布局）
+    if is_snapshot_push(body):
+        parsed = parse_snapshot_push(body)
+        return ("snapshot4214", parsed or {})
+    # 个股 0x0f7f 必须先于指数 0x0f 分类；两者共享外层魔数。
+    if is_depth_push(body):
+        records = parse_depth_push_records(body)
+        if records:
+            parsed = dict(records[0])
+            if len(records) > 1:
+                parsed["records"] = records
+            kind = "auction_depth" if parsed.get("phase") == "auction" else "depth4214"
+            return (kind, parsed)
+    # 同一股票外层下还有紧凑/合并记录；未验证布局不得套固定十档偏移，
+    # 也不能继续落入共享魔数的指数分类。
+    if is_stock_depth_envelope(body):
+        return ("depth_unknown", {"len": len(body)})
     # 指数实时推送（09 7b d0 0f 帧）
     if is_index_push(body):
         parsed = parse_index_push(body)
         if parsed:
             return ("index_push", parsed)
         return ("index_push", {"len": len(body)})
-    # 4214 十档逐 tick 推送（71 字节定长）
-    if is_snapshot_push(body):
-        parsed = parse_snapshot_push(body)
-        return ("snapshot4214", parsed or {})
     # 9601 pushrealorder 短线精灵实时异动
     if b"pushrealorder" in body:
         records = parse_pushrealorder_response(body)
@@ -379,7 +394,10 @@ def analyze(pcap_path):
 
     kind_labels = {
         "index_push": "★ 指数实时推送（五大指数点位）",
-        "snapshot4214": "★ 4214 十档逐 tick 推送（盘口）",
+        "snapshot4214": "★ 4214 逐笔推送（71B/0x7f）",
+        "auction_depth": "★ 集合竞价三行盘口推送（0x0f7f）",
+        "depth4214": "★ 连续竞价十档盘口推送（0x0f7f）",
+        "depth_unknown": "股票盘口未知变长布局（0x0f7f）",
         "pushrealorder": "★ pushrealorder 短线精灵实时异动",
         "subreal_ack": "subreal 订阅回执",
         "hd31_table": "hd3.1 表（板块/成分股周期推送）",
@@ -390,14 +408,18 @@ def analyze(pcap_path):
     for kind, cnt in kind_counter.most_common():
         label = kind_labels.get(kind, kind)
         print(f"  {label}: {cnt} 帧, {kind_bytes[kind]:,}B")
-    if not kind_counter.get("snapshot4214") and not kind_counter.get("pushrealorder"):
+    if not any(kind_counter.get(kind) for kind in (
+        "snapshot4214", "auction_depth", "depth4214", "pushrealorder"
+    )):
         print("  ⚠ 未抓到 4214/pushrealorder 推送——可能没在看盘界面/没开 L2/盘外")
 
     # ── 报告 2：推送节奏（逐秒桶）──
     print(f"\n{'='*64}")
     print("【2】推送节奏（5s 桶，看 snapshot4214/pushrealorder 是否持续推送）")
     print(f"{'='*64}")
-    push_kinds = {"index_push", "snapshot4214", "pushrealorder"}
+    push_kinds = {
+        "index_push", "snapshot4214", "auction_depth", "depth4214", "pushrealorder"
+    }
     buckets: dict[int, Counter] = defaultdict(Counter)
     for t, kind, detail, body, srcport in classified:
         b = int(t // 5)
@@ -405,18 +427,24 @@ def analyze(pcap_path):
     if not any(any(buckets[b][k] for k in push_kinds) for b in buckets):
         print("  ✗ 全程无指数/4214/pushrealorder 推送")
     else:
-        print(f"  {'时间':>8s}  index  4214  pushreal  hd31  hd10  其他")
+        print(f"  {'时间':>8s}  index  tick  auction  depth  pushreal  hd31  hd10  其他")
         for b in sorted(buckets):
             c = buckets[b]
             idx = c.get("index_push", 0)
             snap = c.get("snapshot4214", 0)
+            auction = c.get("auction_depth", 0)
+            depth = c.get("depth4214", 0)
             dxjl = c.get("pushrealorder", 0)
             h31 = c.get("hd31_table", 0)
             h10 = c.get("hd10_table", 0)
             oth = sum(v for k, v in c.items()
                       if k not in push_kinds and k not in ("hd31_table", "hd10_table"))
-            mark = " ←推送" if snap or dxjl or idx else ""
-            print(f"  {b*5:3d}-{b*5+5:3d}s  {idx:5d}  {snap:4d}  {dxjl:8d}  {h31:4d}  {h10:4d}  {oth:4d}{mark}")
+            mark = " ←推送" if snap or auction or depth or dxjl or idx else ""
+            print(
+                f"  {b*5:3d}-{b*5+5:3d}s  {idx:5d}  {snap:4d}  "
+                f"{auction:7d}  {depth:5d}  {dxjl:8d}  {h31:4d}  {h10:4d}  "
+                f"{oth:4d}{mark}"
+            )
 
     # ── 报告 3：客户端静默期的服务端推送（真·主动推送）──
     print(f"\n{'='*64}")
@@ -466,21 +494,43 @@ def analyze(pcap_path):
     snapshots = [(t, detail) for t, kind, detail, body, srcport in classified
                  if kind == "snapshot4214" and detail]
     print(f"\n{'='*64}")
-    print("【5】4214 十档逐 tick 推送解码示例（前 10 条）")
+    print("【5】4214 逐笔与盘口推送解码示例")
     print(f"{'='*64}")
     if not snapshots:
-        print("  ✗ 未抓到 4214 推送（需要 L2 账号 + 在看盘界面打开活跃股）")
+        print("  未抓到 71B/0x7f 逐笔推送。")
     else:
         codes_seen = Counter()
         for t, d in snapshots:
             codes_seen[d.get("code", "?")] += 1
         print(f"  共 {len(snapshots)} 帧，涉及代码: "
               f"{', '.join(f'{c}×{n}' for c, n in codes_seen.most_common(5))}")
-        print(f"  示例（前 10 条）：")
+        print("  示例（前 10 条）：")
         for t, d in snapshots[:10]:
             print(f"    [{t:6.1f}s] {d.get('market','?')} {d.get('code','?')} "
                   f"价 {d.get('price',0):.3f} 量 {d.get('volume',0)} "
-                  f"tick {d.get('tick_seq','?')}")
+                  f"tick {d.get('seq','?')}")
+
+    auction_depth = [
+        (t, detail) for t, kind, detail, body, srcport in classified
+        if kind == "auction_depth" and detail
+    ]
+    continuous_depth = [
+        (t, detail) for t, kind, detail, body, srcport in classified
+        if kind == "depth4214" and detail
+    ]
+    print(f"\n  竞价三行盘口：{len(auction_depth)} 帧")
+    for t, d in auction_depth[:5]:
+        print(
+            f"    [{t:6.1f}s] {d['market']} {d['code']} 撮合价={d['auction_price']:.3f} "
+            f"撮合量={d['matched_volume']} 未匹配={d['imbalance_side']}:{d['imbalance_volume']}"
+        )
+    print(f"  连续竞价十档盘口：{len(continuous_depth)} 帧")
+    for t, d in continuous_depth[:3]:
+        print(
+            f"    [{t:6.1f}s] {d['market']} {d['code']} 最新={d['price']:.3f} "
+            f"买一={d['bids'][0] if d['bids'] else None} "
+            f"卖一={d['asks'][0] if d['asks'] else None}"
+        )
 
     # ── 报告 6：pushrealorder 推送解码示例 ──
     dxjl = [(t, detail) for t, kind, detail, body, srcport in classified
@@ -521,7 +571,10 @@ def _dump_samples(classified, pcap_path):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     samples: dict[str, list[bytes]] = defaultdict(list)
     for t, kind, detail, body, srcport in classified:
-        if kind in ("snapshot4214", "pushrealorder", "subreal_ack") and body:
+        if kind in (
+            "snapshot4214", "auction_depth", "depth4214", "depth_unknown",
+            "pushrealorder", "subreal_ack"
+        ) and body:
             if len(samples[kind]) < 50:
                 samples[kind].append(body)
     if not samples:
@@ -544,7 +597,7 @@ DEPTH_WINDOW = 2.0  # 锚点前后 ±2s 的帧都收集（十档同一秒通常�
 
 
 def _collect_depth_anchor_frames(pcap_path, anchor_times, window):
-    """收集每个锚点时刻 ±window 内的 snapshot4214 推送帧。
+    """收集每个锚点时刻 ±window 内的竞价/十档盘口推送帧。
 
     返回 [{anchor_t, frames: [{t, hex, len, detail}]}]
     """
@@ -556,7 +609,7 @@ def _collect_depth_anchor_frames(pcap_path, anchor_times, window):
             if abs(t - at) > window:
                 continue
             kind, detail = classify_server_frame(body, srcport)
-            if kind != "snapshot4214":
+            if kind not in ("auction_depth", "depth4214"):
                 continue
             nearby.append({
                 "t": round(t, 3),
@@ -619,12 +672,11 @@ def capture_depth_anchor(iface, code, duration, pcap_path):
     )
     start = time.time()
 
-    print(f"\n抓包已启动。现在去同花顺看盘口！")
-    print(f"（看到 ★ 提示就截图，脚本不会暂停等你）")
+    print("\n抓包已启动。现在去同花顺看盘口！")
+    print("（看到 ★ 提示就截图，脚本不会暂停等你）")
     print("-" * 64)
 
     # 在锚点时刻提示截图（不阻塞）
-    anchors_done = 0
     for i, at in enumerate(DEPTH_ANCHOR_TIMES, 1):
         # 等到锚点时刻
         while True:
@@ -639,11 +691,10 @@ def capture_depth_anchor(iface, code, duration, pcap_path):
         elapsed = time.time() - start
         print(f"\n★ [t={elapsed:.1f}s] 第 {i} 张截图！"
               f"→ captures_live/depth_shot_{code}_{i}.png")
-        anchors_done = i
         # 不阻塞，继续等下一锚点
 
     # 等剩余抓包时间结束
-    print(f"\n锚点提示完毕，等待抓包完成...")
+    print("\n锚点提示完毕，等待抓包完成...")
     deadline = start + duration + 15
     while proc.poll() is None and time.time() < deadline:
         time.sleep(1)
@@ -684,7 +735,7 @@ def capture_depth_anchor(iface, code, duration, pcap_path):
     Path(json_path).write_text(
         json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(f"\n锚点推送帧统计：")
+    print("\n锚点推送帧统计：")
     for i, a in enumerate(anchors, 1):
         shot = f"depth_shot_{code}_{i}.png"
         shot_exists = os.path.exists(os.path.join(PCAP_DIR, shot))
@@ -699,7 +750,7 @@ def capture_depth_anchor(iface, code, duration, pcap_path):
 
     print(f"\n对照数据已存档：{json_path}")
     print(f"pcap：{pcap_path}")
-    print(f"\n下一步：")
+    print("\n下一步：")
     print(f"  1. 确认截图已存到 captures_live/depth_shot_{code}_1/2/3.png")
     print(f"  2. 运行: py tests/analyze_depth_push.py \"{json_path}\"")
 

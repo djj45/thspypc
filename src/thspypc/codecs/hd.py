@@ -52,7 +52,7 @@ def _parse_hd_records(
             offset += width
             if len(chunk) < width:
                 break
-            if dt == 5:
+            if dt == 5 and width >= 7 and chunk[1:7].isdigit():
                 code = (
                     chunk[1 : 1 + 6]
                     .split(b"\x00")[0]

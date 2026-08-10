@@ -80,7 +80,10 @@ from .protocol import (
     INDEX_AUCTION_PAGEID, INDEX_CLOSING_AUCTION_CODES,
     # 实时分时推送（pageid=4214 逐 tick 快照，现价随成交跳动）
     build_snapshot_subscribe, parse_snapshot_push, is_snapshot_push,
-    parse_depth_push, is_depth_push,
+    is_stock_depth_envelope,
+    parse_auction_depth_push, is_auction_depth_push,
+    QuoteStreamNormalizer, normalize_stock_depth_push,
+    parse_depth_push, parse_depth_push_records, is_depth_push,
     SNAPSHOT_PAGEID, SNAPSHOT_DATATYPE,
     # 全市场快照（空括号单请求，hfd1.0 格式）
     build_market_snapshot_query, MARKET_SNAPSHOT_MARKETS, MARKET_SNAPSHOT_DATATYPE,
@@ -136,7 +139,10 @@ __all__ = [
     "parse_index_timeline_response", "enrich_index_lead_line",
     "INDEX_TIMELINE_FLAGS", "INDEX_TIMELINE_MARKETS",
     "build_snapshot_subscribe", "parse_snapshot_push", "is_snapshot_push",
-    "parse_depth_push", "is_depth_push",
+    "is_stock_depth_envelope",
+    "parse_auction_depth_push", "is_auction_depth_push",
+    "QuoteStreamNormalizer", "normalize_stock_depth_push",
+    "parse_depth_push", "parse_depth_push_records", "is_depth_push",
     "SNAPSHOT_PAGEID", "SNAPSHOT_DATATYPE",
     "build_history_timeline_query", "build_normal_history_timeline_query",
     "build_index_history_timeline_query",
