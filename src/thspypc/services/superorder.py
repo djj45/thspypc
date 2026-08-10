@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import struct
 from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
@@ -14,16 +15,27 @@ from ..errors import (
 )
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.superorder_protocol import (
+    BUY_CANCEL_PERIOD,
+    CANCEL_DETAIL_FIELD_COUNT,
+    CANCEL_DETAIL_FLAG,
+    CANCEL_DETAIL_RECORD_SIZE,
     ORDER_QUEUE_BUY_PERIOD,
     ORDER_QUEUE_HIST_PAGEID,
     ORDER_QUEUE_PAGEID,
     ORDER_QUEUE_SELL_PERIOD,
+    ORDER_DETAIL_PERIOD,
+    ORDER_DETAIL_FIELD_COUNT,
+    ORDER_DETAIL_FLAG,
+    ORDER_DETAIL_RECORD_SIZE,
+    SELL_CANCEL_PERIOD,
     SNAPSHOT_REPLAY_HIST_PAGEID,
     SNAPSHOT_REPLAY_INDEX_PAGEID,
     SNAPSHOT_REPLAY_PAGEID,
+    build_order_detail_query,
     build_order_queue_query,
     build_snapshot_replay_query,
     build_superorder_query,
+    parse_order_detail_response,
     parse_order_queue_response,
     parse_snapshot_replay_response,
     parse_superorder_response,
@@ -33,6 +45,46 @@ from .subscription import L2SubscriptionCoordinator
 
 logger = logging.getLogger(__name__)
 FrameReader = Callable[[SocketLike], bytes]
+
+
+def _repair_order_detail_tail(sock, body: bytes, *, period: int) -> bytes:
+    """补读 7175/7170/7171 明文表落在 declared frame 外的末字节。"""
+    if body.startswith(b"\x0a"):
+        return body
+    marker = body.find(b"hd1.0\x00")
+    if marker < 0 or marker + 16 > len(body):
+        return body
+    row_count, flag, row_size, field_count = struct.unpack_from(
+        "<IHHH", body, marker + 6
+    )
+    expected_layout = (
+        (ORDER_DETAIL_FLAG, ORDER_DETAIL_RECORD_SIZE, ORDER_DETAIL_FIELD_COUNT)
+        if period == ORDER_DETAIL_PERIOD
+        else (CANCEL_DETAIL_FLAG, CANCEL_DETAIL_RECORD_SIZE, CANCEL_DETAIL_FIELD_COUNT)
+    )
+    if (flag, row_size, field_count) != expected_layout:
+        return body
+    field_end = marker + 16 + field_count * 4
+    search_end = min(field_end + 120, len(body) - 7)
+    code_pos = None
+    for candidate in range(field_end, search_end + 1):
+        if body[candidate] not in (0x11, 0x21):
+            continue
+        code = body[candidate + 1 : candidate + 7]
+        if len(code) == 6 and code.isalnum():
+            code_pos = candidate
+            break
+    if code_pos is None:
+        return body
+    expected_end = code_pos + 18 + row_count * row_size
+    if expected_end != len(body) + 1:
+        return body
+    try:
+        sock.settimeout(1.0)
+        tail = sock.recv(1)
+    except OSError:
+        return body
+    return body + tail if tail else body
 
 
 def _superorder_l2_role(market: int) -> ConnectionRole:
@@ -282,6 +334,150 @@ class SuperorderService:
             return records
         if saw_frame:
             raise ProtocolError("收到 4096 盘口快照帧但无法解析")
+        return []
+
+    def order_details(
+        self,
+        code: str,
+        *,
+        market: int,
+        start_ts: int = -29,
+        end_ts: int = 0,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Return full submitted-order, buy-cancel and sell-cancel details.
+
+        The three 4214 feeds are queried on the same market Level2 connection.
+        Cancellation rows are linked back to their original 7175 order through
+        ``dt37 == dt1`` whenever that order is present in the requested range.
+        """
+        orders = self._order_detail_one(
+            code,
+            market=market,
+            period=ORDER_DETAIL_PERIOD,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            timeout=timeout,
+        )
+        buy_cancels = self._order_detail_one(
+            code,
+            market=market,
+            period=BUY_CANCEL_PERIOD,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            timeout=timeout,
+        )
+        sell_cancels = self._order_detail_one(
+            code,
+            market=market,
+            period=SELL_CANCEL_PERIOD,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            timeout=timeout,
+        )
+
+        by_id = {row["order_id"]: row for row in orders}
+        for cancel in buy_cancels + sell_cancels:
+            original = by_id.get(cancel["order_id"])
+            cancel["linked_order"] = original is not None
+            if original is not None:
+                cancel["original_kind_raw"] = original["kind_raw"]
+                cancel["link_exact"] = (
+                    original["placed_ts"] == cancel["placed_ts"]
+                    and original["price_raw"] == cancel["price_raw"]
+                    and original["volume"] == cancel["volume"]
+                )
+
+        events = orders + buy_cancels + sell_cancels
+        events.sort(
+            key=lambda row: (
+                row.get("ts", 0),
+                0 if row.get("event") == "order" else 1,
+                row.get("order_id", 0),
+            )
+        )
+        return {
+            "code": code,
+            "market": market,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "orders": orders,
+            "buy_cancels": buy_cancels,
+            "sell_cancels": sell_cancels,
+            "events": events,
+        }
+
+    def _order_detail_one(
+        self,
+        code: str,
+        *,
+        market: int,
+        period: int,
+        start_ts: int,
+        end_ts: int,
+        timeout: float,
+    ) -> list[dict]:
+        profile = self._connections.profile
+        if profile.kind is AccountKind.STANDARD:
+            raise CapabilityUnavailableError(
+                Capability.L2_TIMELINE,
+                "order_details",
+            )
+        if profile.kind is AccountKind.UNKNOWN:
+            raise UnsupportedAccountFeatureError(
+                "order_details",
+                profile.kind,
+                "账号类型未知，不能推断 Level2 挂单/撤单明细权限",
+            )
+
+        role = _superorder_l2_role(market)
+        connection = self._connections.acquire(
+            role,
+            capability=Capability.L2_TIMELINE,
+        )
+        if self._subscriptions is not None:
+            self._subscriptions.ensure_registered(
+                connection,
+                code,
+                market=market,
+                timeout=min(timeout, 5.0),
+            )
+        request = build_order_detail_query(
+            code,
+            market=market,
+            period=period,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        with connection.request(request, timeout=timeout) as sock:
+            for _ in range(self._max_frames):
+                try:
+                    response = self._read_frame(sock)
+                except socket.timeout:
+                    break
+                except ValueError:
+                    recv = getattr(sock, "recv", None)
+                    if recv is not None:
+                        try:
+                            recv(8192)
+                        except OSError as exc:
+                            raise ConnectionError("连接已关闭") from exc
+                    continue
+                response = _repair_order_detail_tail(
+                    sock,
+                    response,
+                    period=period,
+                )
+                parsed = parse_order_detail_response(response, period=period)
+                if parsed:
+                    if self._evidence is not None:
+                        self._evidence.record_feature(
+                            Capability.L2_TIMELINE,
+                            Support.YES,
+                        )
+                    return parsed
+                if b"CodeListSize=" in response:
+                    return []
         return []
 
     def order_queue(

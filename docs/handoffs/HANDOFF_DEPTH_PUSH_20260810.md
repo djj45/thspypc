@@ -15,6 +15,8 @@
   泛化抓包重新破译。
 - 非竞价 `0x0f7f` 的紧凑/合并记录已通过 normalizer 展开；完整帧不再落入
   `depth_unknown`。
+- 71B `0x01/0x60` 已与客户端挂单/撤单界面逐条对齐：它是集合竞价撤单推送，
+  `0x08=买撤`、`0x0c=卖撤`，并包含挂单时间、撤单时间、价格、数量和辅助 ID。
 - 今天没有抓到真正的指数 `Auction` 请求/响应。明天需要在 09:15-09:25 打开指数
   竞价页面，触发 `pageid=6240 + T_URL=/quote/auction/...`。
 
@@ -38,7 +40,7 @@ captures_live/kanpan_push_20260810_091444.pcap
 | 标准 550B 十档 | 1,554 | 09:30 后出现，代码偏移固定为 45 |
 | `index_push` | 1,614 | 普通指数行情推送，不等于指数 Auction 序列 |
 | `pushrealorder` | 8,915 | 短线精灵实时异动 |
-| 71B `0x01/0x60` | 171 | 只在 002428、09:18:56-09:19:48 出现，语义未完全闭环 |
+| 71B `0x01/0x60` | 171 | 002428 集合竞价撤单；`0x08=买撤`、`0x0c=卖撤` |
 | 71B `0x01/0x7f` | 0 | 本次抓包没有出现已知逐笔格式 |
 
 早期的固定偏移分类只确认了 1,554 帧 `C=45,len=550` 和 69 帧
@@ -105,7 +107,58 @@ captures_live/kanpan_push_20260810_091444.pcap
 这解释了 UI 行顺序变化：卖方占优显示卖一、卖二、买一；买方占优显示买一、买二、
 卖一。
 
+## 71B 集合竞价撤单推送
+
+子类型 `09 7b d0 01 60` 与普通逐笔成交的 `... 7f` 不同。2026-08-10 的 171 帧均为
+`002428`，通过客户端挂单/撤单列表的撤单时刻、存续时长、价格和手数逐条对齐：
+
+| 偏移 | 含义 |
+|---|---|
+| `[5]` | `0x08=买撤`，`0x0c=卖撤` |
+| `[28] + [29:35]` | 外层市场和代码 |
+| `[39:43]` | 推送序号 |
+| `[43] + [44:50]` | 事件市场和代码，与外层一致 |
+| `[50:54]` | 原委托 Unix 时间戳 |
+| `[54:58]` | 撤单 Unix 时间戳 |
+| `[58:62]` | 撤单价格（THS float） |
+| `[62:66]` | 撤单数量（股） |
+| `[66:70]` | 辅助 ID；当前 UI 不显示，精确语义暂不命名为委托 ID |
+| `[70]` | 结束符 `0x7d` |
+
+客户端“买撤/卖撤”旁的 `30s`、`1m`、`4m` 等文字就是
+`撤单时间 - 原委托时间`。生产 API `parse_auction_cancel_push()` 同时返回时间戳、
+`datetime`、`lifetime_seconds`、股数和手数。
+
 ## 代码状态
+
+## 盘后补抓：4214 挂单/撤单全量明细
+
+样本：`captures_live/kanpan_20260810_201539.pcap`，客户端依次打开哈药股份
+`600664` 和云南锗业 `002428`。虽然抓包发生在收盘后、没有实时 `0x60` 推送，
+但完整包含客户端回查当日挂撤列表的请求和响应。
+
+请求与响应映射已经按同一连接的先后顺序及 UI 真值闭合：
+
+| period | DataType | 响应表 | 语义 |
+|---|---|---|---|
+| 7175 | 10,12,13 | `flag=0x003a, hs=20, fc=5` | 全部挂单；`dt12 & 0xff`：1=买、2=卖 |
+| 7170 | 13,20,37,82 | `flag=0x0042, hs=31, fc=7` | 买撤 |
+| 7171 | 13,20,37,82 | `flag=0x0042, hs=31, fc=7` | 卖撤 |
+
+撤单行字段为：`dt1=撤单流水号`、`dt5=代码`、`dt56=原挂单时间`、
+`dt82=撤单时间`、`dt20=价格`、`dt13=数量(股)`、`dt37=原委托号`。
+因此客户端时间旁的 `57s / 3m` 可直接按 `dt82 - dt56` 得到；`dt37` 能回连
+7175 的 `dt1`，本包中回连记录的挂单时间、价格和数量逐项一致。
+
+生产实现新增：
+
+- `build_order_detail_query()` / `parse_order_detail_response()`；
+- `THSClient.order_details()`，依次查询 7175、7170、7171，返回 `orders`、
+  `buy_cancels`、`sell_cancels` 和按事件时间合并的 `events`；
+- `tests/capture_kanpan.py` 能直接识别上述三个 period，不再把它们报告为“没有挂单明细”。
+
+对 `002428` 的真实包离线验收：请求体三路均与客户端逐字节一致；绝对区间响应解析出
+6,762 条挂单，已捕获分页合计 224 条买撤和 30 条卖撤。
 
 本轮修改：
 
@@ -116,6 +169,7 @@ captures_live/kanpan_push_20260810_091444.pcap
   - 支持帧头 `record_kind=5` 的 166/167/186B 扩展上下文。
 - `src/thspypc/features/snapshot_protocol.py`
   - `is_snapshot_push()` 严格要求 71B 子类型 `0x7f`，不再误收 `0x60`；
+  - 新增 `is_auction_cancel_push()` / `parse_auction_cancel_push()`，解析 71B 竞价撤单；
   - 新增 `is_stock_depth_envelope()`，用于隔离股票未知布局与指数推送；
   - 新增 `is_auction_depth_push()` / `parse_auction_depth_push()`；
   - 新增 `parse_depth_push_records()`，完整返回合并帧中的所有股票；
@@ -125,22 +179,19 @@ captures_live/kanpan_push_20260810_091444.pcap
   - 重导出竞价盘口解析 API。
 - `tests/capture_kanpan_push.py`
   - 个股盘口优先于共享魔数的指数分类；
-  - 分开统计 `auction_depth`、`depth4214`、`depth_unknown` 和 71B 逐笔。
+  - 分开统计 `auction_cancel`、`auction_depth`、`depth4214`、`depth_unknown` 和 71B 逐笔。
 - `tests/test_snapshot_protocol.py`
   - 增加卖方占优、买方占优、变长偏移、连续十档兼容和未知布局拒绝测试；
-  - 加载 `tests/fixtures/depth_push/` 的五条真实抓包帧；C51/C57 的标准化结果
+  - 加载 `tests/fixtures/depth_push/` 的七条真实抓包帧；C51/C57 的标准化结果
     通过长度和 SHA-256 锁定，并已逐字节对照 native normalizer。
 
 验证结果：
 
 ```text
-定向：83 passed
-全量：490 passed, 17 skipped, 1 failed
-Ruff（本次逻辑文件）：All checks passed
+定向 test_snapshot_protocol.py：33 passed
+全量：501 passed, 19 skipped
+compileall / git diff --check：通过
 ```
-
-全量唯一失败为 `tests/test_market_snapshot_service.py::test_captured_hfd1_snapshot_contract`：
-本地缺少被 `.gitignore` 忽略的 `data/hfd1_0_response.bin`，与本次推送修改无关。
 
 ## 今天建议项完成情况
 
@@ -148,8 +199,8 @@ Ruff（本次逻辑文件）：All checks passed
    只剩 3 条无结束符的截断输入；不再用固定偏移制造异常价格。
 2. **已完成——补真实帧最小回归夹具**：已加入卖方占优竞价、买方占优竞价和
    标准 550B 连续十档各一帧，并记录来源时间、长度和 SHA-256。
-3. **决定 71B `0x60` 优先级**：已知价格约在 offset 58、数量在 62、辅助 ID 在 66，
-   但买卖方向未闭环。它不是当前已知 `0x7f` 逐笔，暂时保持拒绝解析是正确做法。
+3. **已完成——71B `0x60` 竞价撤单**：客户端真值确认 `0x08=买撤`、`0x0c=卖撤`；
+   原委托时间、撤单时间、价格、数量、辅助 ID 均已解析，并加入买卖两侧真实帧回归。
 
 ## 是否还要抓十档盘口
 
@@ -158,7 +209,7 @@ Ruff（本次逻辑文件）：All checks passed
 
 只有以下目标才值得另抓：
 
-- 要闭环 71B `0x60` 的买卖方向时，选一只活跃股，并同时保留逐笔委托 UI 真值；
+- 要验证其他市场或证券类型的 71B `0x60` 是否沿用相同布局时，保留撤单 UI 真值；
 - 要验收生产订阅 API 时，沪深各一只股票，验证换股、退订、断线和 socket 生命周期；
 - 发现某个具体证券类型的十档仍异常时，做带超级盘口截图锚点的定向抓包。
 

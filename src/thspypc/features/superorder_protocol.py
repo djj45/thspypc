@@ -114,6 +114,38 @@ ORDER_QUEUE_FLAG = 0x002A
 ORDER_QUEUE_RECORD_SIZE = 4
 ORDER_QUEUE_FIELD_COUNT = 1
 
+# 看盘页“挂单/撤单”全量明细（2026-08-10 客户端抓包 + UI 真值对齐）。
+# 7175 返回所有挂单；7170/7171 分别返回买撤/卖撤，并通过 dt37 回连
+# 7175 的 dt1 原委托号。撤单存续秒数 = dt82 - dt56。
+ORDER_DETAIL_PERIOD = 7175
+BUY_CANCEL_PERIOD = 7170
+SELL_CANCEL_PERIOD = 7171
+ORDER_DETAIL_DATATYPE = [10, 12, 13]
+CANCEL_DETAIL_DATATYPE = [13, 20, 37, 82]
+ORDER_DETAIL_FLAG = 0x003A
+ORDER_DETAIL_RECORD_SIZE = 20
+ORDER_DETAIL_FIELD_COUNT = 5
+CANCEL_DETAIL_FLAG = 0x0042
+CANCEL_DETAIL_RECORD_SIZE = 31
+CANCEL_DETAIL_FIELD_COUNT = 7
+
+_ORDER_DETAIL_FIELDS = (
+    (1, 0x30, 4),
+    (56, 0x30, 4),
+    (10, 0x70, 4),
+    (13, 0x70, 4),
+    (12, 0x30, 4),
+)
+_CANCEL_DETAIL_FIELDS = (
+    (1, 0x30, 4),
+    (5, 0x10, 7),
+    (56, 0x30, 4),
+    (82, 0x30, 4),
+    (20, 0x70, 4),
+    (13, 0x70, 4),
+    (37, 0x30, 4),
+)
+
 # 外层请求路由标记（2026-08-05 抓包确认，0x02FC = 小端 fc 02；区别于 auction 的 0x01FC）
 _SUPERORDER_ROUTE = b"\xfc\x02"
 
@@ -303,6 +335,276 @@ def parse_order_queue_response(
             "visible_major_hands": major_shares / 100.0,
             "record_count": record_count,
         }
+
+
+def build_order_detail_query(
+    code: str,
+    market: int = 33,
+    start_ts: int = -29,
+    end_ts: int = 0,
+    *,
+    period: int = ORDER_DETAIL_PERIOD,
+    pageid: int = ORDER_QUEUE_PAGEID,
+    seq: int | None = None,
+) -> bytes:
+    """Build a full order/cancel detail query from the PC 4214 panel.
+
+    ``period=7175`` returns all submitted orders. ``7170`` and ``7171``
+    return buy-side and sell-side cancellations. Negative ranges request the
+    newest rows (for example ``-29-0``); absolute Unix ranges retrieve a
+    complete interval.
+    """
+    if period not in (
+        ORDER_DETAIL_PERIOD,
+        BUY_CANCEL_PERIOD,
+        SELL_CANCEL_PERIOD,
+    ):
+        raise ValueError(f"unsupported order detail period: {period}")
+    if not code or not code.isascii() or not code.isalnum():
+        raise ValueError(f"非法证券代码: {code!r}")
+    if pageid != ORDER_QUEUE_PAGEID:
+        raise ValueError("挂单/撤单全量明细目前仅确认 pageid=4214")
+
+    target = f"{market}({code},);"
+    datatype = (
+        ORDER_DETAIL_DATATYPE
+        if period == ORDER_DETAIL_PERIOD
+        else CANCEL_DETAIL_DATATYPE
+    )
+    datatype_text = ",".join(str(value) for value in datatype) + ","
+    detail_text = (
+        f"CodeList={target}\r\n"
+        f"DataType={datatype_text}\r\n"
+        f"DateTime={period}({start_ts}-{end_ts})\r\n"
+        "LackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={pageid}\r\n"
+    ).encode("gbk")
+
+    if period in (BUY_CANCEL_PERIOD, SELL_CANCEL_PERIOD):
+        # 7170/7171 are direct 0x01fc query frames. Byte 16 selects the
+        # cancel side: 0x02=buy cancel, 0x03=sell cancel.
+        if seq is None:
+            seq = 0x00B5 if period == BUY_CANCEL_PERIOD else 0x00B7
+        header = bytearray(23)
+        header[0] = 0x09
+        header[1:5] = b"\x00\x16\x00\x00"
+        struct.pack_into("<H", header, 5, seq & 0xFFFF)
+        header[7:11] = b"\x12\x00\x09\x00"
+        header[11:13] = b"\xfc\x01"
+        header[13:16] = b"\x00\x00\x40"
+        header[16:19] = (
+            b"\x00\x02\x1c"
+            if period == BUY_CANCEL_PERIOD
+            else b"\x00\x03\x1c"
+        )
+        struct.pack_into("<I", header, 19, len(detail_text))
+        return encode_frame(bytes(header) + detail_text)
+
+    # 7175 uses the captured three-level 0x02fc -> 0x02e1 -> 0x01fc form.
+    outer_text = f"CodeList={target}\r\npageid={pageid}\r\n".encode("gbk")
+    middle_text = outer_text
+
+    inner_header = bytearray(22)
+    inner_header[0:4] = b"\x00\x16\x00\x00"
+    inner_seq = 0x00B3 if seq is None else seq
+    struct.pack_into("<H", inner_header, 4, inner_seq & 0xFFFF)
+    inner_header[6:10] = b"\x12\x00\x09\x00"
+    inner_header[10:12] = b"\xfc\x01"
+    inner_header[12:16] = b"\x00\x00\x40\x00"
+    inner_header[16:18] = b"\x07\x1c"
+    struct.pack_into("<I", inner_header, 18, len(detail_text))
+
+    middle_header = bytearray(22)
+    middle_header[0:4] = b"\x00\x16\x00\x00"
+    middle_header[6:10] = b"\x12\x00\x02\x00"
+    middle_header[10:12] = b"\xe1\x02"
+    struct.pack_into("<I", middle_header, 18, len(middle_text))
+
+    outer_header = bytearray(23)
+    outer_header[0] = 0x09
+    outer_header[1:5] = b"\x00\x16\x00\x00"
+    outer_header[7:11] = b"\x12\x00\x02\x00"
+    outer_header[11:13] = b"\xfc\x02"
+    struct.pack_into("<I", outer_header, 19, len(outer_text))
+    return encode_frame(
+        bytes(outer_header)
+        + outer_text
+        + bytes(middle_header)
+        + middle_text
+        + bytes(inner_header)
+        + detail_text
+    )
+
+
+def _order_detail_table(
+    body: bytes,
+    *,
+    period: int,
+) -> tuple[bytes, int, int, str] | None:
+    """Return ``(body, data_offset, row_count, shell_code)`` for one table."""
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError as exc:
+            logger.debug("order detail normalization failed: %s", exc)
+            return None
+
+    expected = (
+        (
+            ORDER_DETAIL_FLAG,
+            ORDER_DETAIL_RECORD_SIZE,
+            ORDER_DETAIL_FIELD_COUNT,
+            _ORDER_DETAIL_FIELDS,
+        )
+        if period == ORDER_DETAIL_PERIOD
+        else (
+            CANCEL_DETAIL_FLAG,
+            CANCEL_DETAIL_RECORD_SIZE,
+            CANCEL_DETAIL_FIELD_COUNT,
+            _CANCEL_DETAIL_FIELDS,
+        )
+    )
+    flag_expected, size_expected, count_expected, fields_expected = expected
+    position = 0
+    while True:
+        marker = body.find(b"hd1.0\x00", position)
+        if marker < 0:
+            return None
+        position = marker + 6
+        base = marker + 6
+        if base + 10 > len(body):
+            continue
+        row_count, flag, row_size, field_count = struct.unpack_from(
+            "<IHHH", body, base
+        )
+        if (
+            flag != flag_expected
+            or row_size != size_expected
+            or field_count != count_expected
+            or row_count > 2_000_000
+        ):
+            continue
+        fields = tuple(_parse_hd_field_table(body, base + 10, field_count))
+        if fields != fields_expected:
+            continue
+        shell_start = base + 10 + field_count * 4
+        shell_end = min(shell_start + 120, len(body) - 22)
+        for code_pos in range(shell_start, shell_end + 1):
+            if body[code_pos] not in (0x11, 0x21):
+                continue
+            raw_code = body[code_pos + 1 : code_pos + 7]
+            if len(raw_code) != 6 or not raw_code.isalnum():
+                continue
+            # These three tables use a 22-byte shell whose market marker is
+            # four bytes into the shell, so records start marker+18.
+            data_offset = code_pos + 18
+            available_bytes = len(body) - data_offset
+            expected_bytes = row_count * row_size
+            if available_bytes < expected_bytes:
+                # 8901 明文表的 declared body length 偶尔少 1 字节。服务层会
+                # 从 socket 补读真实尾字节；纯解析调用无法补读时，至少保留
+                # 前面的完整行，避免整张表被误判为空。
+                if available_bytes != expected_bytes - 1:
+                    return None
+                row_count -= 1
+            return body, data_offset, row_count, raw_code.decode("ascii")
+
+
+def parse_order_detail_response(
+    body: bytes,
+    *,
+    period: int,
+) -> list[dict]:
+    """Parse 7175 orders or 7170/7171 cancellation detail rows."""
+    if period not in (
+        ORDER_DETAIL_PERIOD,
+        BUY_CANCEL_PERIOD,
+        SELL_CANCEL_PERIOD,
+    ):
+        raise ValueError(f"unsupported order detail period: {period}")
+    located = _order_detail_table(body, period=period)
+    if located is None:
+        return []
+    normalized, data_offset, row_count, shell_code = located
+    row_size = (
+        ORDER_DETAIL_RECORD_SIZE
+        if period == ORDER_DETAIL_PERIOD
+        else CANCEL_DETAIL_RECORD_SIZE
+    )
+    records: list[dict] = []
+    for index in range(row_count):
+        row = normalized[
+            data_offset + index * row_size : data_offset + (index + 1) * row_size
+        ]
+        if period == ORDER_DETAIL_PERIOD:
+            order_id, placed_ts, price_raw, volume, kind_raw = struct.unpack(
+                "<IIIII", row
+            )
+            side_code = kind_raw & 0xFF
+            side = "buy" if side_code == 1 else "sell" if side_code == 2 else None
+            try:
+                placed_time = datetime.fromtimestamp(placed_ts)
+            except (OSError, ValueError, OverflowError):
+                placed_time = None
+            records.append({
+                "event": "order",
+                "code": shell_code,
+                "side": side,
+                "time": placed_time,
+                "ts": placed_ts,
+                "placed_time": placed_time,
+                "placed_ts": placed_ts,
+                "price": decode_ths_float(price_raw),
+                "price_raw": price_raw,
+                "volume": volume,
+                "hands": volume / 100.0,
+                "order_id": order_id,
+                "kind_raw": kind_raw,
+                "kind_flags": kind_raw & ~0xFF,
+                "dt1": order_id,
+                "dt56": placed_ts,
+                "dt10": price_raw,
+                "dt13": volume,
+                "dt12": kind_raw,
+            })
+            continue
+
+        cancel_id = struct.unpack_from("<I", row, 0)[0]
+        row_code = row[5:11].decode("ascii", errors="replace")
+        placed_ts, cancelled_ts, price_raw, volume, order_id = struct.unpack_from(
+            "<IIIII", row, 11
+        )
+        try:
+            placed_time = datetime.fromtimestamp(placed_ts)
+            cancelled_time = datetime.fromtimestamp(cancelled_ts)
+        except (OSError, ValueError, OverflowError):
+            placed_time = cancelled_time = None
+        side = "buy" if period == BUY_CANCEL_PERIOD else "sell"
+        records.append({
+            "event": "cancel",
+            "code": row_code or shell_code,
+            "side": side,
+            "time": cancelled_time,
+            "ts": cancelled_ts,
+            "placed_time": placed_time,
+            "placed_ts": placed_ts,
+            "cancelled_time": cancelled_time,
+            "cancelled_ts": cancelled_ts,
+            "elapsed_seconds": cancelled_ts - placed_ts,
+            "price": decode_ths_float(price_raw),
+            "price_raw": price_raw,
+            "volume": volume,
+            "hands": volume / 100.0,
+            "cancel_id": cancel_id,
+            "order_id": order_id,
+            "dt1": cancel_id,
+            "dt56": placed_ts,
+            "dt82": cancelled_ts,
+            "dt20": price_raw,
+            "dt13": volume,
+            "dt37": order_id,
+        })
+    return records
 
 
 def build_superorder_query(
@@ -896,10 +1198,23 @@ __all__ = [
     "ORDER_QUEUE_FLAG",
     "ORDER_QUEUE_RECORD_SIZE",
     "ORDER_QUEUE_FIELD_COUNT",
+    "ORDER_DETAIL_PERIOD",
+    "BUY_CANCEL_PERIOD",
+    "SELL_CANCEL_PERIOD",
+    "ORDER_DETAIL_DATATYPE",
+    "CANCEL_DETAIL_DATATYPE",
+    "ORDER_DETAIL_FLAG",
+    "ORDER_DETAIL_RECORD_SIZE",
+    "ORDER_DETAIL_FIELD_COUNT",
+    "CANCEL_DETAIL_FLAG",
+    "CANCEL_DETAIL_RECORD_SIZE",
+    "CANCEL_DETAIL_FIELD_COUNT",
     "build_superorder_query",
     "parse_superorder_response",
     "build_snapshot_replay_query",
     "parse_snapshot_replay_response",
     "build_order_queue_query",
     "parse_order_queue_response",
+    "build_order_detail_query",
+    "parse_order_detail_response",
 ]

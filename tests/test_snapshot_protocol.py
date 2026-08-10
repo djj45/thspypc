@@ -2,6 +2,7 @@
 
 import hashlib
 import struct
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,69 @@ def test_snapshot_push_parser_rejects_other_shapes(body):
     assert snapshot_protocol.parse_snapshot_push(body) is None
 
 
+@pytest.mark.parametrize(
+    ("fixture", "side", "placed", "cancelled", "price", "aux_id"),
+    [
+        (
+            "auction_cancel_buy_002428.hex",
+            "buy",
+            datetime(2026, 8, 10, 9, 15, 2),
+            datetime(2026, 8, 10, 9, 18, 57),
+            110.09,
+            216_579,
+        ),
+        (
+            "auction_cancel_sell_002428.hex",
+            "sell",
+            datetime(2026, 8, 10, 9, 18, 0),
+            datetime(2026, 8, 10, 9, 19, 3),
+            90.07,
+            291_607,
+        ),
+    ],
+)
+def test_captured_auction_cancel_push_contract(
+    fixture,
+    side,
+    placed,
+    cancelled,
+    price,
+    aux_id,
+):
+    body = _captured_depth_push(fixture)
+
+    assert snapshot_protocol.is_auction_cancel_push(body)
+    assert not snapshot_protocol.is_snapshot_push(body)
+    result = snapshot_protocol.parse_auction_cancel_push(body)
+
+    assert result is not None
+    assert result["code"] == "002428"
+    assert result["market"] == "SZ"
+    assert result["event"] == "auction_cancel"
+    assert result["side"] == side
+    assert result["side_raw"] == (0x08 if side == "buy" else 0x0C)
+    assert result["placed_at"] == placed
+    assert result["cancelled_at"] == cancelled
+    assert result["lifetime_seconds"] == int(
+        (cancelled - placed).total_seconds()
+    )
+    assert result["price"] == price
+    assert result["volume"] == 100
+    assert result["lots"] == 1
+    assert result["aux_id"] == aux_id
+    assert result["raw_len"] == 71
+
+
+def test_auction_cancel_push_rejects_mismatched_context_code():
+    body = bytearray(
+        _captured_depth_push("auction_cancel_buy_002428.hex")
+    )
+    body[29:35] = b"002429"
+
+    assert not snapshot_protocol.is_auction_cancel_push(bytes(body))
+    assert snapshot_protocol.parse_auction_cancel_push(bytes(body)) is None
+
+
 def test_protocol_reexports_snapshot_builder_and_constants():
     assert (
         protocol.build_snapshot_subscribe
@@ -177,6 +241,14 @@ def test_protocol_reexports_snapshot_builder_and_constants():
     )
     assert protocol.parse_snapshot_push is snapshot_protocol.parse_snapshot_push
     assert protocol.is_snapshot_push is snapshot_protocol.is_snapshot_push
+    assert (
+        protocol.parse_auction_cancel_push
+        is snapshot_protocol.parse_auction_cancel_push
+    )
+    assert (
+        protocol.is_auction_cancel_push
+        is snapshot_protocol.is_auction_cancel_push
+    )
     assert (
         protocol.parse_auction_depth_push
         is snapshot_protocol.parse_auction_depth_push

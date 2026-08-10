@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import struct
+from datetime import datetime
 
 from ..codecs.framing import encode_frame
 from ..codecs.numeric import decode_ths_float
@@ -152,6 +153,69 @@ def is_snapshot_push(body: bytes) -> bool:
         and body[1:5] == b"\x7b\xd0\x01\x7f"
         and all(0x30 <= value <= 0x39 for value in body[29:35])
     )
+
+
+_AUCTION_CANCEL_SIDES = {0x08: "buy", 0x0C: "sell"}
+
+
+def is_auction_cancel_push(body: bytes) -> bool:
+    """Return whether ``body`` is a 71-byte opening-auction cancel push.
+
+    The ``0x60`` subtype is distinct from the ``0x7f`` trade-tick subtype.
+    Its two embedded code markers must agree; this prevents an adjacent or
+    truncated 71-byte payload from being accepted accidentally.
+    """
+    return (
+        len(body) == 71
+        and body[0:5] == b"\x09\x7b\xd0\x01\x60"
+        and body[5] in _AUCTION_CANCEL_SIDES
+        and body[28] in (0x11, 0x21)
+        and body[43] == body[28]
+        and body[29:35] == body[44:50]
+        and body[29:35].isdigit()
+        and body[-1] == 0x7D
+    )
+
+
+def parse_auction_cancel_push(body: bytes) -> dict | None:
+    """Parse one 71-byte opening-auction order-cancellation event.
+
+    Verified against the PC client's order/cancel view for ``002428`` on
+    2026-08-10.  The UI's ``买撤``/``卖撤`` rows map to marker ``0x08``/
+    ``0x0c`` respectively.  The UI suffix beside the cancel side is exactly
+    ``cancelled_at - placed_at`` (for example ``30s`` or ``4m``).
+
+    ``volume`` is expressed in shares, matching the rest of the public quote
+    parsers; ``lots`` exposes the PC view's 100-share 手 unit.
+    """
+    if not is_auction_cancel_push(body):
+        return None
+
+    market_flag = body[43]
+    placed_timestamp = struct.unpack_from("<I", body, 50)[0]
+    cancelled_timestamp = struct.unpack_from("<I", body, 54)[0]
+    volume = struct.unpack_from("<I", body, 62)[0]
+    side_raw = body[5]
+    return {
+        "code": body[44:50].decode("ascii"),
+        "market": "SH" if market_flag == 0x11 else "SZ",
+        "event": "auction_cancel",
+        "side": _AUCTION_CANCEL_SIDES[side_raw],
+        "side_raw": side_raw,
+        "placed_at": datetime.fromtimestamp(placed_timestamp),
+        "cancelled_at": datetime.fromtimestamp(cancelled_timestamp),
+        "placed_timestamp": placed_timestamp,
+        "cancelled_timestamp": cancelled_timestamp,
+        "lifetime_seconds": cancelled_timestamp - placed_timestamp,
+        "price": decode_ths_float(struct.unpack_from("<I", body, 58)[0]),
+        "volume": volume,
+        "lots": volume / 100,
+        # The PC view used for side/price/volume truth does not display this
+        # value.  Preserve it without over-claiming its exact order-ID role.
+        "aux_id": struct.unpack_from("<I", body, 66)[0],
+        "seq": struct.unpack_from("<I", body, 39)[0],
+        "raw_len": len(body),
+    }
 
 
 # ── 550B 十档盘口推送（2026-08-07 盘中破译）──
@@ -637,7 +701,9 @@ __all__ = [
     "SNAPSHOT_SUBTYPE",
     "build_market_snapshot_query",
     "build_snapshot_subscribe",
+    "is_auction_cancel_push",
     "is_snapshot_push",
+    "parse_auction_cancel_push",
     "parse_snapshot_push",
     "is_stock_depth_envelope",
     "is_auction_depth_push",

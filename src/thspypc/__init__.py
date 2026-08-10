@@ -80,6 +80,7 @@ from .protocol import (
     INDEX_AUCTION_PAGEID, INDEX_CLOSING_AUCTION_CODES,
     # 实时分时推送（pageid=4214 逐 tick 快照，现价随成交跳动）
     build_snapshot_subscribe, parse_snapshot_push, is_snapshot_push,
+    parse_auction_cancel_push, is_auction_cancel_push,
     is_stock_depth_envelope,
     parse_auction_depth_push, is_auction_depth_push,
     QuoteStreamNormalizer, normalize_stock_depth_push,
@@ -139,6 +140,7 @@ __all__ = [
     "parse_index_timeline_response", "enrich_index_lead_line",
     "INDEX_TIMELINE_FLAGS", "INDEX_TIMELINE_MARKETS",
     "build_snapshot_subscribe", "parse_snapshot_push", "is_snapshot_push",
+    "parse_auction_cancel_push", "is_auction_cancel_push",
     "is_stock_depth_envelope",
     "parse_auction_depth_push", "is_auction_depth_push",
     "QuoteStreamNormalizer", "normalize_stock_depth_push",

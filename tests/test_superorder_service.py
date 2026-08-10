@@ -1,12 +1,21 @@
 """Offline routing and entitlement contracts for Level2 order queues."""
 
+import struct
+
 import pytest
 
 from thspypc._transport import ConnectionManager, ConnectionRole
 from thspypc.errors import CapabilityUnavailableError
 from thspypc.features.superorder_protocol import build_order_queue_query
+from thspypc.features.superorder_protocol import (
+    BUY_CANCEL_PERIOD,
+    ORDER_DETAIL_PERIOD,
+    SELL_CANCEL_PERIOD,
+    parse_order_detail_response,
+)
 from thspypc.models import AccountKind, AccountProfile, Capability, Support
 from thspypc.services import SuperorderService
+from thspypc.services.superorder import _repair_order_detail_tail
 
 
 class FakeSocket:
@@ -25,6 +34,16 @@ class FakeSocket:
 
     def close(self):
         pass
+
+
+class TailSocket(FakeSocket):
+    def __init__(self, tail):
+        super().__init__()
+        self.tail = tail
+
+    def recv(self, _size):
+        tail, self.tail = self.tail, b""
+        return tail
 
 
 def _profile(kind):
@@ -120,3 +139,103 @@ def test_historical_pair_builds_4096_context_once(monkeypatch):
     assert result["buy"]["total_shares"] == 1_069_767
     assert result["buy"]["total_hands"] == 10_698
     assert result["buy"]["average_hands"] == pytest.approx(15.2824, rel=1e-3)
+
+
+def test_order_details_queries_three_feeds_and_links_cancels(monkeypatch):
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: FakeSocket(),
+    )
+    service = SuperorderService(manager)
+    calls = []
+    order = {
+        "event": "order",
+        "side": "buy",
+        "ts": 100,
+        "placed_ts": 100,
+        "price_raw": 123,
+        "volume": 500,
+        "order_id": 42,
+        "kind_raw": 0x0201,
+    }
+    cancel = {
+        "event": "cancel",
+        "side": "buy",
+        "ts": 104,
+        "placed_ts": 100,
+        "price_raw": 123,
+        "volume": 500,
+        "order_id": 42,
+    }
+
+    def fake_one(code, **kwargs):
+        calls.append((code, kwargs))
+        if kwargs["period"] == ORDER_DETAIL_PERIOD:
+            return [order]
+        if kwargs["period"] == BUY_CANCEL_PERIOD:
+            return [cancel]
+        return []
+
+    monkeypatch.setattr(service, "_order_detail_one", fake_one)
+    result = service.order_details(
+        "002428",
+        market=33,
+        start_ts=1786345007,
+        end_ts=1786345199,
+    )
+    assert [call[1]["period"] for call in calls] == [
+        ORDER_DETAIL_PERIOD,
+        BUY_CANCEL_PERIOD,
+        SELL_CANCEL_PERIOD,
+    ]
+    assert result["buy_cancels"][0]["linked_order"] is True
+    assert result["buy_cancels"][0]["link_exact"] is True
+    assert [event["event"] for event in result["events"]] == [
+        "order",
+        "cancel",
+    ]
+
+
+def test_standard_account_order_details_rejected_before_socket():
+    opened = []
+    manager = ConnectionManager(
+        _profile(AccountKind.STANDARD),
+        lambda spec: opened.append(spec.role) or FakeSocket(),
+    )
+    with pytest.raises(CapabilityUnavailableError):
+        SuperorderService(manager).order_details(
+            "002428",
+            market=33,
+        )
+    assert opened == []
+
+
+def test_order_detail_live_short_tail_is_consumed_and_restored():
+    fields = bytes.fromhex(
+        "01300004383000040a7000040d7000040c300004"
+    )
+    shell = bytearray(22)
+    shell[0:4] = b"\x16\x00\x01\x00"
+    shell[4:11] = b"\x21" + b"002428"
+    rows = b"".join((
+        struct.pack("<IIIII", 1, 1786345013, 0xC00FA3E8, 100, 0x0201),
+        struct.pack("<IIIII", 2, 1786345014, 0xC00FA7D0, 1000, 0x08000202),
+    ))
+    complete = (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", 2, 0x003A, 20, 5)
+        + fields
+        + bytes(shell)
+        + rows
+    )
+    truncated = complete[:-1]
+    # 纯解析调用至少保留第一条完整记录。
+    assert len(parse_order_detail_response(truncated, period=7175)) == 1
+    repaired = _repair_order_detail_tail(
+        TailSocket(complete[-1:]),
+        truncated,
+        period=7175,
+    )
+    parsed = parse_order_detail_response(repaired, period=7175)
+    assert len(parsed) == 2
+    assert parsed[-1]["kind_raw"] == 0x08000202

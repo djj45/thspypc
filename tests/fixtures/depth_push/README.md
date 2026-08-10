@@ -11,5 +11,7 @@
 | `continuous_000657.hex` | 898.762650s | 550B 标准十档，现价 69.05 |
 | `variable_c51_two_records.hex` | 10.215964s | 770B 变长帧，native 还原为 600000/600012 两条 707B 记录 |
 | `variable_c57_three_records.hex` | 23.756018s | 855B 变长帧，native 还原为 300308/300322/300394 三条 707B 记录 |
+| `auction_cancel_buy_002428.hex` | 233.452787s | 09:15:02 挂单、09:18:57 买撤，110.09、1 手，辅助 ID 216579 |
+| `auction_cancel_sell_002428.hex` | 239.507957s | 09:18:00 挂单、09:19:03 卖撤，90.07、1 手，辅助 ID 291607 |
 
 文本十六进制格式便于代码审查；测试用 `bytes.fromhex()` 恢复原始 body。

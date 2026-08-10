@@ -416,6 +416,125 @@ def test_protocol_reexports_order_queue():
     assert protocol.ORDER_QUEUE_SELL_PERIOD == 7174
 
 
+# ─────────────────────────── 7175/7170/7171 挂撤全量明细 ───────────────────────────
+
+def _build_order_detail_frame(period: int) -> bytes:
+    shell = bytearray(22)
+    shell[0:4] = b"\x16\x00\x01\x00"
+    shell[4] = 0x21
+    shell[5:11] = b"002428"
+    if period == 7175:
+        fields = bytes.fromhex(
+            "01300004383000040a7000040d7000040c300004"
+        )
+        rows = b"".join((
+            struct.pack("<IIIII", 1001, 1786345013, 0xC00FA3E8, 100, 0x0201),
+            struct.pack("<IIIII", 1002, 1786345014, 0xC00FA7D0, 1000, 0x0202),
+        ))
+        return (
+            b"hd1.0\x00"
+            + struct.pack("<IHHH", 2, 0x003A, 20, 5)
+            + fields
+            + bytes(shell)
+            + rows
+        )
+
+    fields = bytes.fromhex(
+        "01300004051000073830000452300004147000040d70000425300004"
+    )
+    side_order = 1001 if period == 7170 else 1002
+    placed = 1786345013 if period == 7170 else 1786345014
+    cancelled = placed + (4 if period == 7170 else 57)
+    price_raw = 0xC00FA3E8 if period == 7170 else 0xC00FA7D0
+    volume = 100 if period == 7170 else 1000
+    row = (
+        struct.pack("<I", 2000 + period)
+        + b"\x21" + b"002428"
+        + struct.pack(
+            "<IIIII",
+            placed,
+            cancelled,
+            price_raw,
+            volume,
+            side_order,
+        )
+    )
+    return (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", 1, 0x0042, 31, 7)
+        + fields
+        + bytes(shell)
+        + row
+    )
+
+
+def test_build_order_detail_queries_match_captured_shapes():
+    order = superorder_protocol.build_order_detail_query(
+        "002428", market=33, period=7175, start_ts=-29, end_ts=0,
+        seq=0x00B3,
+    )
+    body = order[12:]
+    assert body[11:13] == b"\xfc\x02"
+    middle = 23 + len(b"CodeList=33(002428,);\r\npageid=4214\r\n")
+    assert body[middle + 10 : middle + 12] == b"\xe1\x02"
+    inner = middle + 22 + len(b"CodeList=33(002428,);\r\npageid=4214\r\n")
+    assert body[inner + 10 : inner + 12] == b"\xfc\x01"
+    assert body[inner + 16 : inner + 18] == b"\x07\x1c"
+    assert b"DataType=10,12,13," in body
+    assert b"DateTime=7175(-29-0)" in body
+
+    buy_cancel = superorder_protocol.build_order_detail_query(
+        "002428", market=33, period=7170, start_ts=-29, end_ts=0,
+    )[12:]
+    sell_cancel = superorder_protocol.build_order_detail_query(
+        "002428", market=33, period=7171, start_ts=-29, end_ts=0,
+    )[12:]
+    assert buy_cancel[11:13] == sell_cancel[11:13] == b"\xfc\x01"
+    assert buy_cancel[16:19] == b"\x00\x02\x1c"
+    assert sell_cancel[16:19] == b"\x00\x03\x1c"
+    assert b"DataType=13,20,37,82," in buy_cancel
+
+
+def test_parse_order_detail_buy_and_sell_rows():
+    rows = superorder_protocol.parse_order_detail_response(
+        _build_order_detail_frame(7175),
+        period=7175,
+    )
+    assert [row["side"] for row in rows] == ["buy", "sell"]
+    assert [row["order_id"] for row in rows] == [1001, 1002]
+    assert [row["hands"] for row in rows] == [1.0, 10.0]
+    assert rows[0]["price"] == pytest.approx(102.5)
+    assert rows[1]["price"] == pytest.approx(102.6)
+    assert rows[0]["dt12"] == 0x0201
+
+
+@pytest.mark.parametrize(
+    ("period", "side", "elapsed", "order_id"),
+    [(7170, "buy", 4, 1001), (7171, "sell", 57, 1002)],
+)
+def test_parse_cancel_detail_links_original_order(period, side, elapsed, order_id):
+    rows = superorder_protocol.parse_order_detail_response(
+        _build_order_detail_frame(period),
+        period=period,
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event"] == "cancel"
+    assert row["side"] == side
+    assert row["elapsed_seconds"] == elapsed
+    assert row["order_id"] == order_id
+    assert row["dt37"] == order_id
+    assert row["cancelled_ts"] - row["placed_ts"] == elapsed
+
+
+def test_protocol_reexports_order_detail():
+    assert protocol.build_order_detail_query is superorder_protocol.build_order_detail_query
+    assert protocol.parse_order_detail_response is superorder_protocol.parse_order_detail_response
+    assert protocol.ORDER_DETAIL_PERIOD == 7175
+    assert protocol.BUY_CANCEL_PERIOD == 7170
+    assert protocol.SELL_CANCEL_PERIOD == 7171
+
+
 # ────────────────── 4096 盘口快照回放（超级盘口分时曲线）──────────────────
 
 def test_build_snapshot_replay_query_4417_matches_capture_fixture():

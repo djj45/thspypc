@@ -878,6 +878,53 @@ class ServiceFacade:
             ),
         )
 
+    def order_details(
+        self,
+        code: str,
+        start=-29,
+        end=0,
+        *,
+        market: int = 0,
+        timeout: float = 30.0,
+    ) -> dict:
+        """查 4214 看盘页的全量挂单、买撤和卖撤明细。
+
+        ``start/end`` 接受 ``datetime``、``time`` 或 Unix 秒；默认 ``-29-0``
+        返回各路最新一页。传绝对时间区间可一次取回该区间的全部记录。撤单行
+        同时返回挂单/撤单时间及 ``elapsed_seconds``，并尽可能通过委托号回连
+        ``orders`` 中的原挂单。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        start_ts = self._superorder_ts(start)
+        end_ts = self._superorder_ts(end)
+        if self._auth is None and self._service_connections is None:
+            self.authenticate()
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and self._snapshot_thread is not None
+            and self._snapshot_thread.is_alive()
+        ):
+            raise ChannelUnavailableError(
+                "l2_snapshot",
+                "后台快照线程正在读取 4214 连接",
+            )
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            lambda: self._superorder_service.order_details(
+                code,
+                market=market,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                timeout=timeout,
+            ),
+        )
+
     @staticmethod
     def _order_queue_context(trade_date) -> tuple[int, int]:
         """把历史交易日转换成 4417@4096 的全天上下文区间。"""
