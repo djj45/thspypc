@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """全服务器登录冒烟验证（单 client、逐角色、不依赖交易时段）。
 
-验证 6 类连接角色在协议修复（account_type 0xC8 + check +13 + L2 身份）后
+验证 6 类连接角色在协议修复（account_type 0xC8 / K=13 配对 + L2 身份）后
 都能 VerifyCode=0：
   MAIN         connect()          — main.123ths.com:8901
   SH_L2/SZ_L2  order_details      — shlv2/szlv2:8901（LoginIdentity.L2）

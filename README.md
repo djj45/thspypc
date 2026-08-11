@@ -280,6 +280,26 @@ with THSClient("账号", "密码") as client:
 `seal_amount` 单位为元；正常交易状态为 `0.0`，涨停或跌停时分别按买一或卖一
 的价格与挂单量计算。
 
+### Level2 十档实时事件（`depth_subscribe`）
+
+Level2 账号可在沪深 L2 通道上订阅多只股票。深度事件与旧式现价回调分开，既可
+按代码回调，也可从事件队列顺序读取；合并推送帧中的每只股票都会独立分发：
+
+```python
+client.depth_subscribe("600519", callback=lambda depth: print(depth["code"], depth["bids"]))
+client.depth_subscribe("000001")
+
+event = client.receive_depth(timeout=2.0)  # 超时返回 None
+latest = client.latest_depth("000001")
+
+client.depth_unsubscribe("600519")
+client.depth_unsubscribe("000001")
+```
+
+现有抓包没有确认 4214 单码退订帧，因此存在其他订阅时，`depth_unsubscribe()`
+只停止该代码的本地回调、队列交付和缓存；最后一个快照/深度订阅退出时关闭后台
+读取线程及沪深 L2 通道。普通账号会在建连前按 capability 明确拒绝。
+
 ## 全市场股票列表（`stock_list`）
 
 获取沪深+北交所+新三板+基金全市场代码表（约 7400 条），用于批量行情查询。
@@ -523,6 +543,23 @@ records = client.auction("603118", trade_date=date(2026, 7, 27))
 # records[0] = {"time": datetime(2026,7,27,9,15,1), "dt10": 14.19, "dt49": 600.0,
 #               "dt27": None, "dt33": 11500.0}
 ```
+
+沪深指数仍使用同一个入口，但底层改走 `pageid=6240` 的 `T_URL` JSON 接口，
+并且只提供当前交易日：
+
+```python
+index_records = client.auction("1A0001")  # 399001/399006 同形，市场码自动推断
+# index_records[-1] = {
+#     "time": datetime(...), "dt10": 3962.208523,
+#     "newprice": 3962.208523, "lead_price": 3965.410889,
+#     "leadprice": 3965.410889, "volume": 107894820,
+#     "auction_type": "opening",
+# }
+```
+
+同花顺 PC 客户端在竞价时段约每 10 秒重新请求一次 `T_URL` 后重绘曲线；这不是
+主动推送。`client.auction()` 只执行一次查询并返回当前已有的全部点，需要实时追踪
+时可由调用方按约 10 秒周期重复调用，并按 `markettime` 去重。
 
 ### 五字段语义（全部已确定，六股 × thsdk oracle 全量验证）
 

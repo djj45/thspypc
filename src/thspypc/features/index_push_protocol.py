@@ -17,7 +17,7 @@
   填充到 off=48，价格区从 off=48 起，321B 定长。服务器 121.37.31.87 / 8.134.86.216。
 - **沪市指数**（1A0001/1B0680）：代码@33（ASCII 6 位，大写字母开头）+ 无名称区，
   价格区从 off=39 起，298-302B。服务器 8.134.115.123 / 122.9.202.190。
-- **北证50**（899050）：代码@29，97-98B 紧凑帧，字段用**相对代码偏移**（与分时响应
+- **北证50**（899050）：盘中代码@29、97-98B 紧凑帧，字段用**相对代码偏移**（与分时响应
   交叉验证逐字节确认）：``code+6`` dt10 最新点位、``code+10`` dt13 累计量、
   ``code+14`` dt19 累计额、``code+30`` dt22、``code+34`` dt23。无 dt6/dt7/高/低
   （需从分时响应取）。存在 93B 子类型（字段掩码不同），按非稳态帧处理不解价格。
@@ -95,44 +95,72 @@ def _parse_price_block(body: bytes, base: int) -> dict:
 def parse_index_push(body: bytes) -> dict | None:
     """解析一个指数实时推送帧。
 
-    支持**深市指数**（399001/399006 等 3xxxxx）和**沪市指数**（1A0001/1B0680
-    等大写字母开头）。北证50（899050）字段布局不同，当前返回基础信息（代码/名称）
-    不解价格字段，待后续扩展。
+    支持沪深北指数的盘中稳态帧和 2026-08-11 实测集合竞价阶段帧。竞价阶段
+    ``097bd00f`` 只含近静态参考价，不含 ``pageid=6240 Auction.newprice``；因此
+    竞价结果明确返回 ``phase="auction"`` 和 ``reference_price``，不把参考价误报
+    成实时撮合价 ``price``。
 
     Returns:
-        ``{code, name, prevclose, open, price, high, low, change_pct,
-        amount, volume}``；格式不符返回 ``None``。北证50 返回不含价格的 dict。
+        盘中返回 ``{code, name, phase, prevclose, open, price, high, low,
+        change_pct, amount, volume}``；竞价返回 ``{code, name, phase,
+        reference_price, ...}``；格式不符返回 ``None``。
     """
     if not is_index_push(body):
         return None
     if len(body) < 60:
         return None
 
-    # ── 深市指数：body[14:22] 完整匹配 SZ_INDEX_FLAG，代码@22 ──
+    # ── 深市盘中指数：代码@22 ──
     if body[14:22] == SZ_INDEX_FLAG:
         code = body[22:28].decode("ascii", errors="replace")
         if not code.isdigit():
             return None
         name_end = body.find(b"\x00", 28)
         name = body[28:name_end].decode("gbk", errors="replace") if name_end > 28 else ""
-        result = {"code": code, "name": name}
+        result = {"code": code, "name": name, "phase": "continuous"}
         result.update(_parse_price_block(body, 48))
         result["amount"] = round(_read_ths(body, 76), 0)  # dt19 成交额
         result["volume"] = round(_read_ths(body, 80), 0)
         return result
 
-    # ── 沪市指数：body[14:21] 匹配前缀，代码@33（形如 1A0001 / 1B0680）──
+    # ── 竞价阶段：沪深代码都右移到 off33 ──
+    # 沪市没有名称区，参考价@39；深市有 GBK 名称区，参考价@59。
+    # 市场标志末字节会随阶段变化，故以代码本身判市场，不依赖 body[14:22]
+    # 完整相等。Auction.newprice/leadprice/volume 来自 pageid=6240 JSON 轮询，
+    # 不能用这里的近静态值替代。
     if body[14:21] == SH_INDEX_FLAG_PREFIX:
         code = body[33:39].decode("ascii", errors="replace")
-        # 沪市指数代码：数字开头 + 大写字母 + 数字（1A0001 / 1B0680）
-        if not (len(code) == 6 and code[0].isdigit()
-                and code[1].isalpha() and code[2:].isdigit()):
-            return None
-        result = {"code": code, "name": _sh_index_name(code)}
-        result.update(_parse_price_block(body, 39))
-        result["amount"] = round(_read_ths(body, 63), 0)  # dt19 成交额
-        result["volume"] = round(_read_ths(body, 67), 0)
-        return result
+        if _is_sh_index_code(code):
+            prices = _parse_price_block(body, 39)
+            # 盘中五个 OHLC 字段均为有效正数；竞价期中间字段为 0/哨兵，
+            # off39/off55 是两项近静态快照值。
+            if all(prices[field] > 0 for field in ("prevclose", "open", "high", "low", "price")):
+                result = {
+                    "code": code,
+                    "name": _sh_index_name(code),
+                    "phase": "continuous",
+                }
+                result.update(prices)
+                result["amount"] = round(_read_ths(body, 63), 0)
+                result["volume"] = round(_read_ths(body, 67), 0)
+                return result
+            return {
+                "code": code,
+                "name": _sh_index_name(code),
+                "phase": "auction",
+                "reference_price": round(_read_ths(body, 39), 3),
+                "secondary_reference_price": round(_read_ths(body, 55), 3),
+            }
+
+        if _is_sz_index_code(code):
+            name_end = body.find(b"\x00", 39, 59)
+            name = body[39:name_end].decode("gbk", errors="replace") if name_end > 39 else ""
+            return {
+                "code": code,
+                "name": name,
+                "phase": "auction",
+                "reference_price": round(_read_ths(body, 59), 3),
+            }
 
     # ── 北证50（899050）：代码@29，97-98B 紧凑帧，字段相对代码偏移 ──
     # 布局（2026-08-05 逆向 + 分时响应交叉验证逐字节确认）：
@@ -148,17 +176,45 @@ def parse_index_push(body: bytes) -> dict | None:
         return {
             "code": "899050",
             "name": "北证50",
+            "phase": "continuous",
             "price": round(_read_ths(body, code_idx + 6), 3),
             "volume": round(_read_ths(body, code_idx + 10), 0),   # dt13 累计量
             "amount": round(_read_ths(body, code_idx + 14), 0),   # dt19 累计额
             # 北证50 紧凑帧无 dt6/dt7/高/低（需从分时响应取，见 timeline 协议）
             "change_pct": 0.0,
         }
+    if b"899050" in body[20:40] and 117 <= len(body) <= 121:
+        code_idx = body.find(b"899050", 20, 40)
+        name_end = body.find(b"\x00", code_idx + 6, code_idx + 26)
+        name = (
+            body[code_idx + 6:name_end].decode("gbk", errors="replace")
+            if name_end > code_idx + 6
+            else "北证50"
+        )
+        return {
+            "code": "899050",
+            "name": name,
+            "phase": "auction",
+            "reference_price": round(_read_ths(body, code_idx + 26), 3),
+        }
     if b"899050" in body[20:40]:
         # 93B 等非稳态子类型：字段掩码不同，不解价格
         return {"code": "899050", "name": "北证50", "note": "non-steady subtype, price TBD"}
 
     return None
+
+
+def _is_sh_index_code(code: str) -> bool:
+    return (
+        len(code) == 6
+        and code[0].isdigit()
+        and code[1].isalpha()
+        and code[2:].isdigit()
+    )
+
+
+def _is_sz_index_code(code: str) -> bool:
+    return len(code) == 6 and code.startswith("399") and code.isdigit()
 
 
 def _sh_index_name(code: str) -> str:

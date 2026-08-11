@@ -213,6 +213,24 @@ compileall / git diff --check：通过
 - 要验收生产订阅 API 时，沪深各一只股票，验证换股、退订、断线和 socket 生命周期；
 - 发现某个具体证券类型的十档仍异常时，做带超级盘口截图锚点的定向抓包。
 
+## 2026-08-11 盘后：生产消费 API 已收口
+
+- 新增 `THSClient.depth_subscribe(code, market=None, callback=None)`：复用 4214
+  注册，但使用独立的 `callback(record)` 深度事件，不再占用旧式现价回调签名；
+- 新增 `receive_depth(timeout)` 队列消费和 `latest_depth(code)` 最新缓存；队列有界，
+  满时丢弃最旧事件，避免无人消费时无限增长；
+- 后台循环改用 `parse_depth_push_records()`，C51/C57 等合并帧中的所有股票都会
+  分发，不再只消费第一条；
+- 新增 `depth_unsubscribe(code)`：停止该代码的本地回调、队列交付和缓存。因现有
+  抓包没有确认 4214 单码退订帧，仍有其他代码时不会伪造 wire unsubscribe；最后
+  一个快照/深度消费者退出时关闭读取线程及沪深 L2 通道；
+- 沪深多代码、重复订阅只发一次注册、最后订阅退出、普通账号建连前拒绝、批量帧
+  完整分发均已有离线测试。定向测试 `107 passed`；排除已知 HFD1 旧契约后的全量
+  回归为 `527 passed, 17 skipped, 1 deselected`。生产代码只剩下个交易日的沪深
+  盘中端到端验收。
+- 明日直接运行 `uv run python tests/verify_depth_push_live.py`；脚本只调用一次
+  `get_client()`，同一客户端订阅沪深各一只并同时校验回调、队列和十档数量。
+
 ## 明日指数 Auction 抓包计划
 
 ### 时间与操作

@@ -42,7 +42,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from thspypc.protocol import decode_ths_float  # noqa: E402
+from thspypc.protocol import (  # noqa: E402
+    decode_ths_float,
+    is_index_push,
+    parse_index_auction_response,
+    parse_index_push,
+)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -57,6 +62,7 @@ DEFAULT_CODES = ("1A0001", "399001")
 MAX_FRAME_SIZE = 32 * 1024 * 1024
 
 WIRESHARK_DIRS = (
+    Path(r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark"),
     Path(r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"),
     Path(r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark"),
     Path(r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark"),
@@ -71,6 +77,10 @@ INDEX_CODE_TEXT_RE = re.compile(
 )
 INDEX_CODE_BYTES_RE = re.compile(
     rb"(?:1[AB][0-9A-Z]{4}|399\d{3}|899\d{3}|88[15]\d{3})",
+    re.IGNORECASE,
+)
+INDEX_AUCTION_URL_RE = re.compile(
+    r"/quote/auction/(USH|USZ)/(USHI|USZI)_(CLOSE_)?([0-9A-Z]{6})\.dat",
     re.IGNORECASE,
 )
 
@@ -293,6 +303,10 @@ def _codes_in_body(body: bytes) -> list[str]:
 
 def _request_info(event: FrameEvent) -> dict[str, object] | None:
     text = event.body.decode("gbk", "replace")
+
+    def values(pattern: str) -> list[str]:
+        return list(dict.fromkeys(re.findall(pattern, text, re.IGNORECASE)))
+
     code_groups = re.findall(r"CodeList=(\d+)\(([^)]*)\)", text, re.IGNORECASE)
     codes: list[str] = []
     markets: list[int] = []
@@ -302,11 +316,17 @@ def _request_info(event: FrameEvent) -> dict[str, object] | None:
         if index_codes:
             markets.append(int(market))
             codes.extend(index_codes)
+
+    auction_urls = values(r"T_URL=([^\r\n]+)")
+    auction_urls = [url for url in auction_urls if INDEX_AUCTION_URL_RE.fullmatch(url)]
+    for url in auction_urls:
+        match = INDEX_AUCTION_URL_RE.fullmatch(url)
+        if match is None:
+            continue
+        markets.append(16 if match.group(1).upper() == "USH" else 32)
+        codes.append(match.group(4).upper())
     if not codes:
         return None
-
-    def values(pattern: str) -> list[str]:
-        return list(dict.fromkeys(re.findall(pattern, text, re.IGNORECASE)))
 
     datatypes = values(r"DataType=([^\r\n]+)")
     datetime_values = values(r"DateTime=([^\r\n]+)")
@@ -314,7 +334,13 @@ def _request_info(event: FrameEvent) -> dict[str, object] | None:
     methods = values(r"method=([\w-]+)")
     actions = values(r"action=([\w-]+)")
     pageids = [int(value) for value in values(r"pageid=(\d+)")]
-    if push_fields and 5716 in pageids:
+    if auction_urls:
+        kind = (
+            "6240 指数尾盘竞价轮询"
+            if any("_CLOSE_" in url.upper() for url in auction_urls)
+            else "6240 指数竞价轮询"
+        )
+    elif push_fields and 5716 in pageids:
         kind = "5716 指数推送订阅"
     elif 4214 in pageids:
         kind = "4214 快照订阅"
@@ -336,44 +362,81 @@ def _request_info(event: FrameEvent) -> dict[str, object] | None:
         "push_fields": push_fields,
         "methods": methods,
         "actions": actions,
+        "auction_urls": auction_urls,
         "body_size": len(event.body),
     }
 
 
-def _decode_ohlc(body: bytes, code: str) -> dict[str, float] | None:
+def _auction_response_info(event: FrameEvent) -> dict[str, object] | None:
+    """Summarize a pageid=6240 Auction JSON response."""
+    if event.direction != "S2C":
+        return None
+    records = parse_index_auction_response(event.body)
+    if not records:
+        return None
+    first = records[0]
+    last = records[-1]
+    return {
+        "time": event.time,
+        "stream": event.stream,
+        "auction_type": first["auction_type"],
+        "record_count": len(records),
+        "first_markettime": first.get("markettime"),
+        "last_markettime": last.get("markettime"),
+        "first_newprice": first["newprice"],
+        "last_newprice": last["newprice"],
+        "first_leadprice": first["leadprice"],
+        "last_leadprice": last["leadprice"],
+        "last_volume": last.get("volume"),
+        "body_size": len(event.body),
+    }
+
+
+def _decode_ohlc(body: bytes, code: str) -> dict[str, float | str] | None:
     """解出标准指数快照中的昨收、开、高、低、最新。
 
     沪指五字段紧跟代码 6B；深指代码之后还有 26B 壳。这里使用相对代码
     位置，而不是固定帧偏移，从而兼容 ``状态文本 + 399006 快照`` 这类 487B
     复合帧。
     """
-    code_position = body.find(code.encode("ascii"))
-    if code_position < 0:
+    parsed = parse_index_push(body)
+    if parsed is None or parsed.get("code") != code:
         return None
-    offset = (
-        code_position + 6
-        if code.startswith(("1A", "1B"))
-        else code_position + 26
-        if code.startswith("399")
-        else None
-    )
-    if offset is None or len(body) < offset + 20:
-        return None
-    values = [decode_ths_float(struct.unpack_from("<I", body, offset + i * 4)[0]) for i in range(5)]
-    if not all(0 < value < 10_000_000 for value in values):
-        return None
-    return dict(zip(("prev_close", "open", "high", "low", "latest"), values))
+    if parsed.get("phase") == "auction":
+        return {
+            "phase": "auction",
+            "reference_price": parsed["reference_price"],
+            **(
+                {"secondary_reference_price": parsed["secondary_reference_price"]}
+                if "secondary_reference_price" in parsed
+                else {}
+            ),
+        }
+    return {
+        "phase": "continuous",
+        "prev_close": parsed["prevclose"],
+        "open": parsed["open"],
+        "high": parsed["high"],
+        "low": parsed["low"],
+        "latest": parsed["price"],
+    }
 
 
-def _decode_bj50_compact(body: bytes, code: str) -> dict[str, float] | None:
-    """解出 899050 的 97/98B 稳态紧凑帧已确认字段。
+def _decode_bj50_compact(body: bytes, code: str) -> dict[str, float | str] | None:
+    """解出 899050 的盘中稳态帧或 117-121B 竞价参考价。
 
     字段由同机 ``pageid=9354`` 分时响应逐字节标定。93B 省略型帧的字段
     掩码不同，不在这里用固定偏移强解。
     """
-    code_position = body.find(code.encode("ascii"))
-    if code_position < 0 or len(body) not in (97, 98):
+    parsed = parse_index_push(body)
+    if parsed is None or parsed.get("code") != code:
         return None
+    if parsed.get("phase") == "auction":
+        return {
+            "phase": "auction",
+            "reference_price": parsed["reference_price"],
+        }
+    code_position = body.find(code.encode("ascii"))
     offsets = {
         "latest": code_position + 6,
         "volume": code_position + 10,
@@ -393,7 +456,11 @@ def _decode_bj50_compact(body: bytes, code: str) -> dict[str, float] | None:
 
 
 def _push_info(event: FrameEvent) -> dict[str, object] | None:
-    if event.direction != "S2C" or not 80 <= len(event.body) <= 900:
+    if (
+        event.direction != "S2C"
+        or not 80 <= len(event.body) <= 900
+        or not is_index_push(event.body)
+    ):
         return None
     codes = _codes_in_body(event.body)
     if not codes:
@@ -414,6 +481,13 @@ def _push_info(event: FrameEvent) -> dict[str, object] | None:
         "body_size": len(event.body),
         "ohlc": ohlc,
         "compact_fields": compact_fields,
+        "phase": (
+            compact_fields.get("phase")
+            if compact_fields is not None
+            else ohlc.get("phase")
+            if ohlc is not None
+            else None
+        ),
         "layout": "compact" if compact else "standard",
         "sha256": hashlib.sha256(event.body).hexdigest(),
         "head_hex": event.body[:48].hex(),
@@ -426,8 +500,10 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
     rows = _packet_rows(tshark, pcap)
     events = reconstruct_frames(rows)
     requests = [info for event in events if event.direction == "C2S" if (info := _request_info(event))]
+    auction_requests = [request for request in requests if request["auction_urls"]]
     replies = []
     pushes = []
+    auction_responses = []
     push_bodies: list[tuple[dict[str, object], bytes]] = []
     for event in events:
         if event.direction != "S2C":
@@ -444,6 +520,28 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
                     "body_size": len(event.body),
                 }
             )
+        auction_info = _auction_response_info(event)
+        if auction_info:
+            preceding = [
+                request
+                for request in auction_requests
+                if request["stream"] == event.stream
+                and request["time"] <= event.time
+                and (
+                    request["kind"] == "6240 指数竞价轮询"
+                    if auction_info["auction_type"] == "opening"
+                    else request["kind"] == "6240 指数尾盘竞价轮询"
+                )
+            ]
+            if preceding:
+                request = preceding[-1]
+                auction_info["request_time"] = request["time"]
+                auction_info["latency_ms"] = round(
+                    (event.time - float(request["time"])) * 1000,
+                    3,
+                )
+                auction_info["codes"] = request["codes"]
+            auction_responses.append(auction_info)
         info = _push_info(event)
         if info:
             pushes.append(info)
@@ -468,6 +566,7 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
             tuple(item["datatypes"]),
             tuple(item["datetimes"]),
             tuple(item["push_fields"]),
+            tuple(item["auction_urls"]),
         )
         request_groups[key].append(item)
     # 优先显示明确的 4214 订阅和 8192 分时请求，再显示首次出现的启动请求。
@@ -492,6 +591,8 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
         print(f"             DataType={dtype} DateTime={item['datetimes'] or '-'}")
         if item["push_fields"]:
             print(f"             PushField={item['push_fields']}")
+        if item["auction_urls"]:
+            print(f"             T_URL={item['auction_urls']}")
     if len(ordered_request_groups) > 30:
         print(f"  ... 另有 {len(ordered_request_groups) - 30} 种启动/辅助请求，完整内容见 JSON 报告。")
 
@@ -523,7 +624,47 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
             f"CodeListSize={reply['code_list_sizes']} ({reply['body_size']}B)"
         )
 
-    print("\n[3] 服务端指数快照候选")
+    print("\n[3] pageid=6240 指数竞价轮询响应")
+    if not auction_requests:
+        print("  未发现 /quote/auction T_URL 请求。")
+    elif not auction_responses:
+        print("  已发现 T_URL 请求，但没有解析出 Auction/CloseAuction JSON 响应。")
+    auction_request_groups: dict[tuple[int, str, str], list[dict[str, object]]] = defaultdict(list)
+    for request in auction_requests:
+        for code in request["codes"]:
+            auction_request_groups[(int(request["stream"]), str(request["kind"]), str(code))].append(request)
+    for (stream, kind, code), items in sorted(
+        auction_request_groups.items(),
+        key=lambda pair: pair[1][0]["time"],
+    ):
+        times = [float(item["time"]) for item in items]
+        intervals = [right - left for left, right in zip(times, times[1:])]
+        interval_text = (
+            f"，请求间隔中位数={sorted(intervals)[len(intervals) // 2]:.3f}s"
+            if intervals
+            else ""
+        )
+        print(
+            f"  stream={stream:<3} code={code} {kind} × {len(items)}，"
+            f"{times[0]:.3f}s → {times[-1]:.3f}s{interval_text}"
+        )
+    for item in auction_responses[:30]:
+        codes = ",".join(item.get("codes", [])) or "?"
+        latency = (
+            f" latency={item['latency_ms']:.3f}ms"
+            if "latency_ms" in item
+            else ""
+        )
+        print(
+            f"    {item['time']:8.3f}s stream={item['stream']:<3} code={codes} "
+            f"{item['auction_type']} rows={item['record_count']} "
+            f"newprice={item['first_newprice']:.6g}→{item['last_newprice']:.6g}"
+            f"{latency}"
+        )
+    if len(auction_responses) > 30:
+        print(f"  ... 另有 {len(auction_responses) - 30} 个竞价 JSON 响应，完整内容见 JSON 报告。")
+
+    print("\n[4] 服务端指数快照候选")
     # 抓包常从已登录、已订阅的长连接中途开始；此时没有 C2S CodeList，不能
     # 因此丢弃随后真实到达的 S2C 指数帧。
     relevant_pushes = (
@@ -545,6 +686,7 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
             for request in requests
             if request["stream"] == stream
             and code in request["codes"]
+            and not request["auction_urls"]
             and times[0] <= request["time"] <= times[-1]
         ]
         request_text = f"，期间同码请求={len(same_code_requests)}"
@@ -554,7 +696,17 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
         )
         for item in items[:5]:
             ohlc = item["ohlc"]
-            if ohlc:
+            if ohlc and ohlc.get("phase") == "auction":
+                secondary = (
+                    f" 第二参考价={ohlc['secondary_reference_price']:.6g}"
+                    if "secondary_reference_price" in ohlc
+                    else ""
+                )
+                print(
+                    f"    {item['time']:8.3f}s 竞价参考价="
+                    f"{ohlc['reference_price']:.6g}{secondary}"
+                )
+            elif ohlc:
                 print(
                     f"    {item['time']:8.3f}s 昨={ohlc['prev_close']:.6g} "
                     f"开={ohlc['open']:.6g} 高={ohlc['high']:.6g} "
@@ -562,15 +714,26 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
                 )
             elif item["compact_fields"]:
                 fields = item["compact_fields"]
-                print(
-                    f"    {item['time']:8.3f}s 最新={fields['latest']:.6g} "
-                    f"量={fields['volume']:.6g} 额={fields['amount']:.6g} "
-                    f"dt22={fields['dt22']:.6g} dt23={fields['dt23']:.6g}"
-                )
+                if fields.get("phase") == "auction":
+                    print(
+                        f"    {item['time']:8.3f}s 竞价参考价="
+                        f"{fields['reference_price']:.6g}"
+                    )
+                else:
+                    print(
+                        f"    {item['time']:8.3f}s 最新={fields['latest']:.6g} "
+                        f"量={fields['volume']:.6g} 额={fields['amount']:.6g} "
+                        f"dt22={fields['dt22']:.6g} dt23={fields['dt23']:.6g}"
+                    )
             else:
                 print(f"    {item['time']:8.3f}s head={item['head_hex'][:64]}")
 
-    print("\n[4] 结论")
+    print("\n[5] 结论")
+    if auction_requests and auction_responses:
+        print(
+            "  指数竞价分时由 pageid=6240 T_URL 请求-响应更新；"
+            "Auction JSON 携带 newprice/leadprice/volume，不是主动推送。"
+        )
     repeated = []
     for (stream, code, _), items in grouped.items():
         same_code_request_count = sum(
@@ -578,6 +741,7 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
             for request in requests
             if request["stream"] == stream
             and code in request["codes"]
+            and not request["auction_urls"]
             and items[0]["time"] <= request["time"] <= items[-1]["time"]
         )
         if (
@@ -610,6 +774,8 @@ def analyze(tshark: Path, pcap: Path, report_path: Path | None = None) -> dict[s
         "frame_count": len(events),
         "stream_count": len({event.stream for event in events}),
         "requests": requests,
+        "auction_requests": auction_requests,
+        "auction_responses": auction_responses,
         "registration_replies": relevant_replies,
         "pushes": relevant_pushes,
         "push_groups": [

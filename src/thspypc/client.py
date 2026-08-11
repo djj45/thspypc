@@ -696,14 +696,15 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
         返回 LoginResult，含成功/失败诊断。失败时 error 字段区分：
           - "http_auth_failed"   HTTP 三步鉴权失败（账号/密码/网络问题）
-          - "all_hosts_failed"   所有 8901 IP 都连不上（网络/防火墙）
+          - "all_hosts_failed"   所有 8901 IP 都连不上，且刷新 passport 后仍失败
           - "login_rejected"     连上了但 VerifyCode != 0（passport 被拒）
           - "init_failed"        VerifyCode=0，但 MAIN 行情通道初始化失败
 
         VerifyCode=-1 有两种：A. login 帧内容错误（check 字节/sk/sv，已修复）；
-        B. 同 IP 短时间重复 login 的会话冲突（level2 单点登录；**非账号封禁**——
-        IP 充分分散时不触发，同花顺客户端始终能登）。本方法用 IP 轮换规避，
-        连续 5 个 -1 判定会话冲突提前放弃（error="session_conflict"）。
+        B. passport 过期或同 IP 短时间重复 login 的会话冲突。MAIN 服务器对过期
+        passport 静默返回 -1（无 PromptText）。本方法检测到连续 -1 或全 IP 失败时，
+        **自动重新 HTTP 鉴权拿新鲜 Passport64 重试一轮**（和 L2/BOARD 通道一致），
+        刷新后通常即恢复。仅当刷新后仍全失败才返回 all_hosts_failed。
 
         **连接治理（防 -1）**：若距上次成功 connect < 20s 且当前连接仍活着，本方法
         **直接复用现有连接**返回成功，不重新 login——这是 hexin 客户端的策略
@@ -997,7 +998,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
     @staticmethod
     def _market_for_code(code: str) -> int:
-        """股票代码 → 市场码（6xx=沪17，其余=深33；指数 1A0/399 需调用方手动传 16/32）。"""
+        """股票代码 → 市场码（含 1A/1B 沪指、399 深指和 899 北证指数）。"""
         if code.startswith("6"):
             return 17
         if code.startswith(("1A", "1B")):   # 沪市指数

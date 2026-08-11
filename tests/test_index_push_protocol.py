@@ -63,6 +63,23 @@ REAL_899050_HEX = (
     "a6d910f10000b855207d"
 )
 
+# 2026-08-11 09:15 集合竞价真实帧。竞价帧中的参考价近乎静态，不能当成
+# pageid=6240 Auction.newprice；完整字段结论见 HANDOFF_INDEX_AUCTION_PUSH_20260811。
+REAL_AUCTION_1A0001_HEX = (
+    "097bd00f7f7c00900653696f97b48083818080808101fc7df717fee7ffffff3f10314130303031730d06a0000000000000000000000000510d06a00000000000000000000000000000000000000000310900008e0000008f000000f0b7c6131dfaed1200000000d00c00a069c02464a6f8b0636b4040036b404003000000000000000000000000f7b67e22b13526216b4040036b404003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000090000b8ab6a"
+)
+
+REAL_AUCTION_399001_HEX = (
+    "097bd00f7f7c00a00653696fc1b480838180808081028007f717fee7ffffff3f20333939303031c9eed6a4b3c9d6b8000000000000000000000000a175dab00000000000000000000000000000000000000000760b00003804000008040000ca7a2113764b1a1100000000830900a0a4b7b56234294e62bdf70321bdf703210000000000000000000000000000000000000000bdf70321bdf70321000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e7c"
+)
+
+REAL_AUCTION_899050_HEX = (
+    "097bd00f7f7c01900653696f99b48183818080808100e047c30f3d0890383939"
+    "303530b1b1d6a4353000ffffffffffffffffffffffffff3b2211b03b2211b000"
+    "000000000000004e010000390000003a00000046021f00bc341c00edffffffcb"
+    "a27a226d020d34333ece429867bc0161289d0100000000f384"
+)
+
 
 def test_parse_sz_index_399001():
     """深市 399001 深证成指：代码/名称/dt6/dt7/dt10/高/低/成交额。
@@ -141,6 +158,51 @@ def test_parse_bj_index_899050():
     assert result["amount"] == 16740986000.0
     # dt13 累计量（code+10 = body 39）
     assert result["volume"] == 746674780.0
+
+
+def test_parse_sh_index_auction_does_not_mislabel_reference_as_price():
+    body = bytes.fromhex(REAL_AUCTION_1A0001_HEX)
+    assert len(body) == 277
+
+    result = index_push_protocol.parse_index_push(body)
+
+    assert result == {
+        "code": "1A0001",
+        "name": "上证指数",
+        "phase": "auction",
+        "reference_price": 3966.59,
+        "secondary_reference_price": 3966.25,
+    }
+    assert "price" not in result
+
+
+def test_parse_sz_index_auction_uses_code_at_33_not_continuous_market_flag():
+    body = bytes.fromhex(REAL_AUCTION_399001_HEX)
+    assert len(body) == 281
+
+    result = index_push_protocol.parse_index_push(body)
+
+    assert result == {
+        "code": "399001",
+        "name": "深证成指",
+        "phase": "auction",
+        "reference_price": 14316.961,
+    }
+    assert "price" not in result
+
+
+def test_parse_bj_index_auction_121b_uses_shifted_reference_price():
+    body = bytes.fromhex(REAL_AUCTION_899050_HEX)
+    assert len(body) == 121
+
+    result = index_push_protocol.parse_index_push(body)
+
+    assert result == {
+        "code": "899050",
+        "name": "北证50",
+        "phase": "auction",
+        "reference_price": 1122.875,
+    }
 
 
 def test_is_index_push_and_reject():

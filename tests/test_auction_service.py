@@ -79,6 +79,35 @@ def test_standard_account_uses_main_protocol(monkeypatch):
     ).socket.sent[0]
 
 
+def test_index_auction_uses_t_url_and_parses_live_json():
+    opened = []
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        LEVEL2_PROFILE,
+        lambda spec: opened.append(spec.role) or sock,
+    )
+    response = (
+        b'{"Auction":[{"markettime":"1786410922",'
+        b'"newprice":"3962.208523","leadprice":"3965.410889",'
+        b'"volume":"107894820.000000"}]}'
+    )
+    service = AuctionService(
+        manager,
+        frame_reader=lambda _sock: response,
+        max_frames=1,
+    )
+
+    result = service.auction("1A0001", market=16)
+
+    assert opened == [ConnectionRole.SH_L2]
+    assert result[0]["dt10"] == 3962.208523
+    assert result[0]["lead_price"] == 3965.410889
+    assert result[0]["volume"] == 107894820
+    assert b"CodeList=16(1A0001,)" in sock.sent[0]
+    assert b"T_URL=/quote/auction/USH/USHI_1A0001.dat" in sock.sent[0]
+    assert b"pageid=6240" in sock.sent[0]
+
+
 def test_unknown_account_stops_before_opening():
     opened = []
     manager = ConnectionManager(

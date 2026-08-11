@@ -6,6 +6,7 @@ import logging
 import struct
 from datetime import date as date_type
 from datetime import datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 
 from ..codecs.compression import normalize_8901_response
 from ..codecs.compression import (
@@ -136,7 +137,14 @@ def build_index_auction_query(
 
 
 def parse_index_auction_response(body: bytes) -> list[dict]:
-    """Parse index auction JSON and expose white/lead line aliases."""
+    """Parse an index-auction ``Auction``/``CloseAuction`` JSON response.
+
+    The PC client polls the pageid=6240 ``T_URL`` about every ten seconds.
+    Live responses encode prices, volume and often ``markettime`` as JSON
+    strings; the root object's final brace may also be omitted before NUL.
+    Normalize those wire variants and expose the same aliases used by the
+    other timeline/auction parsers.
+    """
     if body.startswith(b"\x0a"):
         try:
             body = normalize_8901_response(body)
@@ -206,8 +214,8 @@ def parse_index_auction_response(body: bytes) -> list[dict]:
         volume = row.get("volume")
         if volume is not None:
             try:
-                record["volume"] = int(volume)
-            except (TypeError, ValueError):
+                record["volume"] = int(Decimal(str(volume)))
+            except (InvalidOperation, OverflowError, TypeError, ValueError):
                 pass
         records.append(record)
     return records

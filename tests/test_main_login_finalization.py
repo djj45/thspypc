@@ -259,3 +259,121 @@ def test_winner_init_failure_does_not_fallback_to_more_logins(monkeypatch):
     assert not result.success
     assert result.error == "init_failed"
     assert serial_attempts == []
+
+
+def test_all_fail_triggers_passport_refresh_and_retry(monkeypatch):
+    """全部 IP -1 时自动刷新 passport 重试一轮（和 L2/BOARD 通道一致）。
+
+    MAIN 服务器对过期 passport 静默返回 -1（无 PromptText）。旧逻辑直接判
+    session_conflict 放弃；新逻辑刷新 passport 后重试，通常即恢复。
+    """
+    import socket
+
+    import thspypc.client as client_module
+
+    client = _client()
+    hosts = [f"192.0.2.{index}" for index in range(1, 9)]
+    refresh_calls = []
+
+    monkeypatch.setattr(client_module, "MARKET_HOSTS", hosts)
+    monkeypatch.setattr(client_module, "save_ip_state", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        client,
+        "_probe_fastest_hosts",
+        lambda candidates, timeout=1.0, **_kw: list(candidates),
+    )
+
+    # 第一轮 _concurrent_login 返回 None（全失败），第二轮返回 winner
+    call_count = [0]
+
+    def mock_concurrent_login(batch, login_body):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return None  # 第一轮全失败
+        return (batch[0], FakeSocket(), {"VerifyCode": "0"})  # 第二轮成功
+
+    monkeypatch.setattr(client, "_concurrent_login", mock_concurrent_login)
+    monkeypatch.setattr(
+        client,
+        "_finalize_main_login",
+        lambda host, sock, reply_fields, passport_fields: LoginResult(
+            success=True,
+            verify_code="0",
+            server=f"{host}:8901",
+        ),
+    )
+
+    # 模拟 _refresh_auth_material 返回新 material
+    from unittest.mock import MagicMock
+
+    fresh_material = MagicMock()
+    fresh_material.passport64 = "fresh_passport"
+
+    def mock_refresh():
+        refresh_calls.append(True)
+        return fresh_material
+
+    monkeypatch.setattr(client, "_refresh_auth_material", mock_refresh)
+    monkeypatch.setattr(
+        client._auth_service,
+        "login_body_for_passport",
+        lambda passport64, identity=None: b"fresh_login_body",
+    )
+    # 阻止串行 fallback 误创真实连接
+    monkeypatch.setattr(
+        client_module.socket,
+        "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionRefusedError()),
+    )
+
+    result = client._do_tcp_login_raw(b"login", {})
+
+    assert result.success
+    assert result.error == ""
+    assert len(refresh_calls) == 1  # 刷新了一次 passport
+    assert call_count[0] == 2  # _concurrent_login 被调了两次（第一轮失败 + 第二轮成功）
+
+
+def test_refresh_failure_returns_all_hosts_failed(monkeypatch):
+    """刷新 passport 后仍全失败 → 返回 all_hosts_failed（不无限重试）。"""
+    import socket
+
+    import thspypc.client as client_module
+
+    client = _client()
+    hosts = [f"192.0.2.{index}" for index in range(1, 9)]
+
+    monkeypatch.setattr(client_module, "MARKET_HOSTS", hosts)
+    monkeypatch.setattr(client_module, "save_ip_state", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        client,
+        "_probe_fastest_hosts",
+        lambda candidates, timeout=1.0, **_kw: list(candidates),
+    )
+    # 所有轮次都返回 None（全失败）
+    monkeypatch.setattr(
+        client, "_concurrent_login", lambda batch, login_body: None
+    )
+    monkeypatch.setattr(
+        client_module.socket,
+        "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionRefusedError()),
+    )
+
+    from unittest.mock import MagicMock
+
+    fresh_material = MagicMock()
+    fresh_material.passport64 = "fresh_passport"
+    monkeypatch.setattr(
+        client, "_refresh_auth_material", lambda: fresh_material
+    )
+    monkeypatch.setattr(
+        client._auth_service,
+        "login_body_for_passport",
+        lambda passport64, identity=None: b"fresh_login_body",
+    )
+
+    result = client._do_tcp_login_raw(b"login", {})
+
+    assert not result.success
+    assert result.error == "all_hosts_failed"

@@ -142,6 +142,18 @@ def test_index_auction_builder_and_json_parser():
     )
     assert numeric_time[0]["time"].year == 2026
 
+    # 2026-08-11 09:15 抓包真值：实时响应把所有数值都编码成字符串，
+    # volume 还带六位小数，必须归一化为整数而不是保留原始字符串。
+    live = auction_protocol.parse_index_auction_response(
+        b'{"Auction":[{"markettime":"1786410922",'
+        b'"newprice":"3962.208523","leadprice":"3965.410889",'
+        b'"volume":"107894820.000000"}]}'
+    )
+    assert live[0]["dt10"] == 3962.208523
+    assert live[0]["lead_price"] == 3965.410889
+    assert live[0]["volume"] == 107894820
+    assert int(live[0]["time"].timestamp()) == 1786410922
+
     closing = auction_protocol.build_index_auction_query(
         "399001",
         market=32,

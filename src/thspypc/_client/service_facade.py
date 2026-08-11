@@ -649,17 +649,21 @@ class ServiceFacade:
         trade_date=None,
         timeout: float = 12.0,
     ) -> list[dict]:
-        """查集合竞价（9:15-9:25 每 9 秒一次虚拟撮合：撮合价/累计量/未匹配量）。
+        """查集合竞价（9:15-9:25 的撮合价、领先价、累计量及未匹配量）。
 
         普通账号走 MAIN：当天请求用 ``pageid=9354/period=7176``，历史交易日
         用 ``pageid=9355/period=6144``。Level2 账号保留 4214 通道路径。
+        沪深指数改走 ``pageid=6240`` 的 ``T_URL`` 请求-响应；同花顺 PC 界面
+        在竞价时段约每 10 秒轮询一次，本方法执行其中一次查询并返回当时已生成的
+        全部 ``Auction`` 记录，不启动后台轮询。
 
         Args:
             code: 股票或指数代码（如 ``"000938"``、``"1A0001"``）。
-            market: 市场码（0=按代码前缀自动推断：6xx=沪17，其余=深33）。
+            market: 市场码（0=按代码前缀自动推断，含 1A/1B=沪指16、399=深指32）。
             trade_date: 交易日。``None``（默认）= 最近交易日；传 ``date``/``datetime``
                 = 指定交易日（算该日 9:15/9:25 unix 时间戳）。沪深竞价时段相同。
                 ★ 历史日期的 DateTime 格式基于当日抓包推断，若实测不符需调整。
+                指数 T_URL 只提供当前交易日，因此指数只能传 ``None`` 或今天。
             timeout: 单次 read_frame 超时（秒）。
 
         Returns:
@@ -1519,22 +1523,34 @@ class ServiceFacade:
         Returns:
             True=订阅请求已发送（CodeListSize≥1）；False=注册失败或未登录。
         """
+        try:
+            market = self._register_l2_snapshot_code(code, market=market)
+        except ProtocolError as exc:
+            logger.warning(
+                "snapshot_subscribe: %s 注册失败: %s",
+                code,
+                exc,
+            )
+            return False
+        else:
+            self._activate_snapshot_subscription(code, market, callback)
+            return True
+
+    def _register_l2_snapshot_code(
+        self,
+        code: str,
+        *,
+        market: int | None,
+    ) -> int:
+        """Register one code on its market L2 channel and return market code."""
         if market is None:
             market = 17 if code.startswith("6") else 33
-
-        from ..errors import ProtocolError
-        from ..protocol import pick_l2_market
-
         key = pick_l2_market(market)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
 
         def register() -> bool:
-            role = (
-                ConnectionRole.SH_L2
-                if key == "sh"
-                else ConnectionRole.SZ_L2
-            )
+            role = ConnectionRole.SH_L2 if key == "sh" else ConnectionRole.SZ_L2
             connection = self._service_connections.acquire(
                 role,
                 capability=Capability.L2_SNAPSHOT_PUSH,
@@ -1547,21 +1563,50 @@ class ServiceFacade:
             )
             return True
 
+        self._run_default_service(
+            (Capability.L2_SNAPSHOT_PUSH,),
+            register,
+        )
+        return market
+
+    def depth_subscribe(
+        self,
+        code: str,
+        market: int | None = None,
+        callback=None,
+    ) -> bool:
+        """订阅一只股票的 Level2 十档盘口事件。
+
+        复用 :meth:`snapshot_subscribe` 的 4214 L2 注册和同一后台读取线程，但
+        深度事件使用独立消费接口：``callback(record)``、:meth:`receive_depth`
+        或 :meth:`latest_depth`。一帧携带多只股票时会逐条完整分发，不再只取首条。
+
+        同一客户端可重复调用本方法订阅沪深多只股票；相同代码只发送一次注册帧。
+        普通账号和能力未知账号沿用 ``L2_SNAPSHOT_PUSH`` 的显式拒绝语义。
+        """
         try:
-            self._run_default_service(
-                (Capability.L2_SNAPSHOT_PUSH,),
-                register,
-            )
+            market = self._register_l2_snapshot_code(code, market=market)
         except ProtocolError as exc:
-            logger.warning(
-                "snapshot_subscribe: %s 注册失败: %s",
-                code,
-                exc,
-            )
+            logger.warning("depth_subscribe: %s 注册失败: %s", code, exc)
             return False
-        else:
-            self._activate_snapshot_subscription(code, market, callback)
-            return True
+        self._connection_runtime.activate_depth(code, market, callback)
+        return True
+
+    def depth_unsubscribe(self, code: str, *, clear_latest: bool = True) -> bool:
+        """停止一只股票的本地十档事件交付。
+
+        现有抓包尚未确认 4214 的单码退订帧，因此还有其他订阅时仅移除本地回调、
+        队列交付和缓存；最后一个快照/深度消费者退出时关闭后台线程及 L2 通道。
+        返回该代码在调用前是否处于深度订阅状态。
+        """
+        return self._connection_runtime.deactivate_depth(
+            code,
+            clear_latest=clear_latest,
+        )
+
+    def receive_depth(self, timeout: float | None = None) -> dict | None:
+        """读取下一条已订阅十档事件；超时返回 ``None``。"""
+        return self._connection_runtime.receive_depth(timeout)
 
     def latest_price(self, code: str) -> float | None:
         """取某代码的最新现价（snapshot_subscribe 后由推送线程更新）。"""
@@ -1571,8 +1616,8 @@ class ServiceFacade:
         """取某代码的最新十档盘口（549B 推送解析结果）。
 
         返回 ``parse_depth_push`` 的 dict（含 price/prev_close/open/high/low/
-        bids[10]/asks[10]），或 None。需先 ``snapshot_subscribe`` 且盘中
-        服务器推送了 549B 十档帧。
+        bids[10]/asks[10]），或 None。需先 ``depth_subscribe`` 且盘中服务器
+        推送了十档帧。
         """
         return self._latest_depth.get(code)
 

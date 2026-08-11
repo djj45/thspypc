@@ -706,6 +706,39 @@ def test_auction_opt_in_delegates_with_inferred_market(monkeypatch):
     ]
 
 
+def test_index_auction_delegates_with_inferred_market(monkeypatch):
+    client = _client()
+    calls = []
+
+    class FakeAuctionService:
+        def __init__(self, connections, *, subscriptions, evidence=None):
+            self.connections = connections
+
+        def auction(self, code, **kwargs):
+            calls.append((code, kwargs))
+            return [{"dt10": 14289.804919}]
+
+    monkeypatch.setattr(
+        "thspypc.services.AuctionService",
+        FakeAuctionService,
+    )
+    client.configure_service_context(LEVEL2_PROFILE)
+
+    result = client.auction("399001", timeout=7.0)
+
+    assert result == [{"dt10": 14289.804919}]
+    assert calls == [
+        (
+            "399001",
+            {
+                "market": 32,
+                "trade_date": None,
+                "timeout": 7.0,
+            },
+        )
+    ]
+
+
 def test_closing_auction_level2_delegates_with_l2_profile(monkeypatch):
     client = _client()
     client._push_socks["sh"] = FakeSocket()
@@ -1324,6 +1357,126 @@ def test_snapshot_loop_reads_under_market_request_lock(monkeypatch):
     assert not lock_state["held"]
     assert client.latest_price("000938") == 12.34
     assert callbacks == [("000938", "sz", 12.34, 100)]
+
+
+def test_depth_subscribe_multi_market_and_local_unsubscribe_lifecycle(monkeypatch):
+    client = _client()
+    sh = FakeSocket()
+    sz = FakeSocket()
+    client._push_socks.update({"sh": sh, "sz": sz})
+    client._push_initialized.update({"sh", "sz"})
+    client.configure_service_context(LEVEL2_PROFILE)
+    client._service_subscriptions._read_frame = lambda _sock: b"CodeListSize=1"
+    threads = []
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+            self.joined = False
+            threads.append(self)
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started and not self.joined
+
+        def join(self, timeout=None):
+            self.joined = True
+
+    monkeypatch.setattr("thspypc.client.threading.Thread", FakeThread)
+    callback = lambda _record: None
+
+    assert client.depth_subscribe("603118", callback=callback)
+    assert client.depth_subscribe("000938")
+    assert client.depth_subscribe("603118", callback=callback)
+
+    assert len(sh.sent) == 1
+    assert len(sz.sent) == 1
+    assert client._connection_runtime.depth_codes == {"603118", "000938"}
+    assert client._connection_runtime.depth_callbacks == {"603118": callback}
+    assert len(threads) == 1
+
+    client._connection_runtime.latest_depth["603118"] = {"code": "603118"}
+    assert client.depth_unsubscribe("603118")
+    assert not sh.closed and not sz.closed
+    assert "603118" not in client._connection_runtime.latest_depth
+    assert not client.depth_unsubscribe("603118")
+
+    assert client.depth_unsubscribe("000938")
+    assert sh.closed and sz.closed
+    assert client._connection_runtime.depth_codes == set()
+    assert client._snapshot_thread is None
+
+
+def test_depth_subscribe_standard_account_is_rejected_before_opening():
+    client = _client()
+    profile = AccountProfile(
+        kind=AccountKind.STANDARD,
+        capabilities={
+            Capability.L2_MARKET_ACCESS: Support.NO,
+            Capability.L2_SNAPSHOT_PUSH: Support.NO,
+        },
+    )
+    client.configure_service_context(profile, allow_open=True)
+
+    with pytest.raises(CapabilityUnavailableError):
+        client.depth_subscribe("000938")
+
+    assert client._push_socks == {}
+
+
+def test_snapshot_loop_dispatches_every_record_in_batched_depth_frame(monkeypatch):
+    client = _client()
+    sock = FakeSocket()
+    client._push_socks["sh"] = sock
+    runtime = client._connection_runtime
+    runtime.depth_codes.update({"600000", "600012"})
+    callbacks = []
+    runtime.depth_callbacks["600012"] = callbacks.append
+    records = [
+        {
+            "code": "600000",
+            "market": "SH",
+            "phase": "continuous",
+            "price": 10.01,
+            "bids": [(10.0, 100)],
+            "asks": [(10.02, 200)],
+        },
+        {
+            "code": "600012",
+            "market": "SH",
+            "phase": "continuous",
+            "price": 7.89,
+            "bids": [(7.88, 300)],
+            "asks": [(7.9, 400)],
+        },
+    ]
+    monkeypatch.setattr(
+        "select.select",
+        lambda read, _write, _error, _timeout: (read, [], []),
+    )
+
+    def frame_reader(_sock):
+        runtime.snapshot_stop.set()
+        return b"batched-depth"
+
+    runtime.snapshot_loop(
+        read_frame=frame_reader,
+        is_snapshot_push=lambda _body: False,
+        parse_snapshot_push=lambda _body: None,
+        is_depth_push=lambda _body: True,
+        parse_depth_push_records=lambda _body: records,
+    )
+
+    assert set(runtime.latest_depth) == {"600000", "600012"}
+    assert callbacks == [records[1]]
+    assert client.receive_depth(timeout=0) == records[0]
+    assert client.receive_depth(timeout=0) == records[1]
+    assert client.receive_depth(timeout=0) is None
 
 
 def test_context_borrows_realorder_socket():

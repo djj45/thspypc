@@ -62,6 +62,16 @@ PC_STANDARD_LOGIN_PROFILE = LoginProtocolProfile(
 
 DEFAULT_LOGIN_PROTOCOL_PROFILE = PC_LEVEL2_LOGIN_PROFILE
 
+# check 字节公式里的 K 值：check = (len(fixed) + K) & 0xFF。
+# K 和 account_type[0] 配对——它们共同标识客户端版本（2026-08-11 调查确认）：
+#   0xBE / K=1   → 旧版 hexin 客户端
+#   0xC8 / K=13  → 新版 hexin 客户端 / thspypc（PC_LEVEL2_LOGIN_PROFILE）
+# 服务器两组配对都接受，但混搭（如 C8/K=1）会被拒。
+# thspypc 固定用 C8/K=13（= 新版客户端），任何电脑上都可用——account_type 和 K
+# 不是电脑指纹（imei/Mac64），而是客户端版本标识。
+# 详见 HANDOFF_LOGIN_PROTOCOL_20260810.md "K 值根因调查"章节。
+CHECK_K = 13
+
 
 PASSPORT_DROP_FIELDS = frozenset({
     "M_hq",
@@ -181,7 +191,7 @@ def build_login_body(
     elif identity is LoginIdentity.L2:
         # L2 push 通道（shlv2/szlv2）的 login 壳：2026-08-10 hexin 抓包字节级确认。
         # 无 UserName/Password，7 字段 + Passport64，与 BOARD+supports_manual_identity
-        # 结构相同但走 L2 行情服务器（非 fu4）。check 走通用 fallback（+13）。
+        # 结构相同但走 L2 行情服务器（非 fu4）。check 走通用 fallback（CHECK_K）。
         fields = [
             ("Ask", "login"),
             ("C-Version", profile.tcp_version),
@@ -217,7 +227,7 @@ def build_login_body(
                 "\n".join(f"{key}={value}" for key, value in fields)
                 + "\nPassport64="
             ).encode("gbk")
-            suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])  # K=13, 同上
+            suffix = bytes([(len(fixed) + CHECK_K) & 0xFF, 0x09])
         else:
             fixed = (
                 "Ask=login\n"
@@ -256,10 +266,9 @@ def build_login_body(
     if identity is not LoginIdentity.BOARD:
         suffix = profile.login_header_suffix
     if suffix is None:
-        # K=13 随 hexin 版本变化（08-05~08-10 是 K=1，08-11 起 K=13）。
-        # 严格服务器只接受 hexin 当前版本的 K 值；如未来 hexin 更新导致
-        # VerifyCode=-1 回归，需重新抓包确认新 K 值。
-        suffix = bytes([(len(fixed) + 13) & 0xFF, 0x09])
+        # check = (len(fixed) + CHECK_K) & 0xFF，CHECK_K 和 account_type[0] 配对。
+        # 见模块级 CHECK_K 注释和 HANDOFF_LOGIN_PROTOCOL_20260810.md。
+        suffix = bytes([(len(fixed) + CHECK_K) & 0xFF, 0x09])
     prefix = (
         b"\x09\x41\x09\x00"
         + b"zh_CN.GBK"

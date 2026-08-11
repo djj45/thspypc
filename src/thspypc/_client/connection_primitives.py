@@ -55,128 +55,161 @@ class ConnectionPrimitives:
         hexin 抓包确认：每 ~20s 并发连 7 个 IP，全部 VerifyCode=0，从不 -1。
 
         IP 列表优先用 passport M_hqdns 动态域名解析，回退到硬编码 MARKET_HOSTS。
+
+        全部 IP 失败时，重新 HTTP 鉴权拿新鲜 Passport64 重试一轮（和 L2/BOARD
+        通道一致）。MAIN 服务器对过期 passport 静默返回 -1（无 PromptText），
+        旧逻辑判为 session_conflict 直接放弃；实际刷新 passport 后即可恢复。
         """
-        # 动态解析 M_hqdns 域名拿 IP，回退到硬编码 MARKET_HOSTS
-        hosts = []
-        if self._auth:
-            hosts = self._resolve_market_hosts(
-                self._auth.get("passport_bytes", b"")
-            )
-        if not hosts:
-            logger.info("M_hqdns 动态解析无结果，回退到硬编码 MARKET_HOSTS")
-            hosts = list(self._market_host_candidates())
+        def _try_round(body: bytes):
+            """一轮登录尝试（并发 + 串行 fallback）。
 
-        # 测速选最快的 IP（复刻同花顺「测试 IP」功能）。
-        # 并发 TCP 握手测延迟，选最快的 login，避免盲选到慢 IP（曾 46s 超时）。
-        # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
-        sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0, role="main")
-        if sorted_ips:
-            # ★ K线坏 IP 黑名单过滤：部分 IP（如 116.63.x.x）不支持大 K线查询，
-            # 只返回部分数据或 timeout（实测 §14j）。重连时跳过这些 IP，优先选
-            # 未失败过的。若全部在黑名单（罕见），退而用全表（不让黑名单卡死）。
-            good_ips = [ip for ip in sorted_ips if ip not in self._bad_kline_ips]
-            pool = good_ips if good_ips else sorted_ips
-            n_concurrent = min(7, len(pool))
-            offset = self._login_rr_offset.get("main", 0) % max(1, len(pool))
-            # 环形取 n_concurrent 个（offset 起，绕回）
-            batch = (pool[offset:] + pool[:offset])[:n_concurrent]
-            skip_note = f"（跳过 {len(self._bad_kline_ips)} 个坏IP）" if self._bad_kline_ips else ""
-            logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）%s: %s",
-                        len(batch), offset, skip_note, batch[:3])
-        else:
-            # 测速全部超时（网络异常），回退到盲取前 7 个
-            logger.warning("IP 测速全部超时，回退到盲取前 7 个")
-            n_concurrent = min(7, len(hosts))
-            batch = hosts[:n_concurrent]
+            返回 None = 全部 IP 失败（可刷新 passport 再试）；
+            返回 LoginResult = 有明确结论（成功 / login_rejected / init_failed）。
+            """
+            # 动态解析 M_hqdns 域名拿 IP，回退到硬编码 MARKET_HOSTS
+            hosts = []
+            if self._auth:
+                hosts = self._resolve_market_hosts(
+                    self._auth.get("passport_bytes", b"")
+                )
+            if not hosts:
+                logger.info("M_hqdns 动态解析无结果，回退到硬编码 MARKET_HOSTS")
+                hosts = list(self._market_host_candidates())
 
-        winner = self._concurrent_login(batch, login_body)
-        # 推进轮换偏移：下次 connect 用不同的 IP 子集。写盘持久化（跨进程共享）。
-        self._login_rr_offset["main"] = (self._login_rr_offset.get("main", 0) + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
-        if sorted_ips:
-            self._persist_ip_state(sorted_ips, self._login_rr_offset["main"], role="main")
-        if winner:
-            host, sock, result = winner
-            # VerifyCode=0 后若 init 失败，不得在同一次 connect 中继续串行
-            # login 其他服务器。短时间跨节点重复登录会触发会话保护；本次直接
-            # 返回 init_failed，下次独立 connect 再按持久化 offset 换一批节点。
-            return self._finalize_main_login(
-                host,
-                sock,
-                result,
-                passport_fields,
-            )
+            # 测速选最快的 IP（复刻同花顺「测试 IP」功能）。
+            # 并发 TCP 握手测延迟，选最快的 login，避免盲选到慢 IP（曾 46s 超时）。
+            # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
+            sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0, role="main")
+            if sorted_ips:
+                # ★ K线坏 IP 黑名单过滤：部分 IP（如 116.63.x.x）不支持大 K线查询，
+                # 只返回部分数据或 timeout（实测 §14j）。重连时跳过这些 IP，优先选
+                # 未失败过的。若全部在黑名单（罕见），退而用全表（不让黑名单卡死）。
+                good_ips = [ip for ip in sorted_ips if ip not in self._bad_kline_ips]
+                pool = good_ips if good_ips else sorted_ips
+                n_concurrent = min(7, len(pool))
+                offset = self._login_rr_offset.get("main", 0) % max(1, len(pool))
+                # 环形取 n_concurrent 个（offset 起，绕回）
+                batch = (pool[offset:] + pool[:offset])[:n_concurrent]
+                skip_note = f"（跳过 {len(self._bad_kline_ips)} 个坏IP）" if self._bad_kline_ips else ""
+                logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）%s: %s",
+                            len(batch), offset, skip_note, batch[:3])
+            else:
+                # 测速全部超时（网络异常），回退到盲取前 7 个
+                logger.warning("IP 测速全部超时，回退到盲取前 7 个")
+                n_concurrent = min(7, len(hosts))
+                batch = hosts[:n_concurrent]
 
-        # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）。
-        # 加连续 -1 计数：单点登录会话冲突时所有 IP 秒回 -1，试更多 IP 无意义，
-        # 串行 fallback：测速排序后的剩余可达 IP（跳过本次 batch），再补原始列表里
-        # 测速超时但可能可用的 IP。加连续 -1 计数，避免傻试拖到几十秒。
-        fallback_hosts = [ip for ip in (sorted_ips or hosts) if ip not in set(batch)]
-        # 补上测速时剔除的超时 IP（万一它们只是测速瞬间不可达）
-        seen = set(batch) | set(fallback_hosts)
-        for h in hosts:
-            if h not in seen:
-                fallback_hosts.append(h)
+            winner = self._concurrent_login(batch, body)
+            # 推进轮换偏移：下次 connect 用不同的 IP 子集。写盘持久化（跨进程共享）。
+            self._login_rr_offset["main"] = (self._login_rr_offset.get("main", 0) + n_concurrent) % max(1, len(sorted_ips) if sorted_ips else len(hosts))
+            if sorted_ips:
+                self._persist_ip_state(sorted_ips, self._login_rr_offset["main"], role="main")
+            if winner:
+                host, sock, result = winner
+                # VerifyCode=0 后若 init 失败，不得在同一次 connect 中继续串行
+                # login 其他服务器。短时间跨节点重复登录会触发会话保护；本次直接
+                # 返回 init_failed，下次独立 connect 再按持久化 offset 换一批节点。
+                return self._finalize_main_login(
+                    host,
+                    sock,
+                    result,
+                    passport_fields,
+                )
 
-        last_err = ""
-        consecutive_minus1 = 0
-        MAX_CONSECUTIVE_MINUS1 = 5
-        for host in fallback_hosts:
-            try:
-                logger.info("尝试连接 %s:%d ...", host, MARKET_PORT)
-                sock = socket.create_connection((host, MARKET_PORT), timeout=15)
-                sock.sendall(encode_frame(login_body) + b"\n")
-                resp_body = self._connection_read_frame(sock)
-                result = self._parse_connection_login_response(resp_body)
+            # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）。
+            # 加连续 -1 计数：单点登录会话冲突时所有 IP 秒回 -1，试更多 IP 无意义，
+            # 串行 fallback：测速排序后的剩余可达 IP（跳过本次 batch），再补原始列表里
+            # 测速超时但可能可用的 IP。加连续 -1 计数，避免傻试拖到几十秒。
+            fallback_hosts = [ip for ip in (sorted_ips or hosts) if ip not in set(batch)]
+            # 补上测速时剔除的超时 IP（万一它们只是测速瞬间不可达）
+            seen = set(batch) | set(fallback_hosts)
+            for h in hosts:
+                if h not in seen:
+                    fallback_hosts.append(h)
 
-                verify_code = result.get("VerifyCode", "?")
-                logger.info("%s:%d 响应 VerifyCode=%s", host, MARKET_PORT, verify_code)
+            last_err = ""
+            consecutive_minus1 = 0
+            MAX_CONSECUTIVE_MINUS1 = 5
+            for host in fallback_hosts:
+                try:
+                    logger.info("尝试连接 %s:%d ...", host, MARKET_PORT)
+                    sock = socket.create_connection((host, MARKET_PORT), timeout=15)
+                    sock.sendall(encode_frame(body) + b"\n")
+                    resp_body = self._connection_read_frame(sock)
+                    result = self._parse_connection_login_response(resp_body)
 
-                if verify_code == "0":
-                    # 与并发 winner 相同：认证成功后 init 失败即结束本次 connect，
-                    # 不在同一会话窗口继续尝试其他服务器。
-                    return self._finalize_main_login(
-                        host,
-                        sock,
-                        result,
-                        passport_fields,
-                    )
-                else:
-                    sock.close()
-                    if verify_code == "-1":
-                        consecutive_minus1 += 1
-                        logger.warning("%s:%d VerifyCode=-1（连续 %d 次）",
-                                       host, MARKET_PORT, consecutive_minus1)
-                        # 连续多个 -1 = 同 IP 短时间重复 login 的会话冲突（level2 单点
-                        # 登录，对相同 IP 重复 login 触发）。非账号封禁——IP 分散时不触发，
-                        # 同花顺客户端始终能登，改用不同 IP 即恢复。
-                        if consecutive_minus1 >= MAX_CONSECUTIVE_MINUS1:
-                            logger.warning("连续 %d 个 IP 返回 -1，判定为同 IP 重复 login 会话冲突，"
-                                           "停止重试（改用不同 IP 即恢复）",
-                                           consecutive_minus1)
-                            return self._login_result_type(
-                                success=False,
-                                verify_code="-1",
-                                error="session_conflict",
-                                detail=f"连续 {consecutive_minus1} 个 IP VerifyCode=-1，"
-                                       "疑似同 IP 短时间重复 login 的会话冲突（level2 单点登录）。"
-                                       "改用不同 IP 或等片刻即恢复，非账号封禁",
-                            )
-                        continue
-                    logger.warning("%s:%d 登录被拒 (VerifyCode=%s)", host, MARKET_PORT, verify_code)
-                    return self._login_result_type(
-                        success=False,
-                        verify_code=verify_code,
-                        server=f"{host}:{MARKET_PORT}",
-                        reply_fields=result,
-                        passport_fields=passport_fields,
-                        error="login_rejected",
-                    )
-            except (socket.timeout, ConnectionError, OSError) as e:
-                last_err = f"{host}: {e}"
-                logger.warning("连接 %s 失败: %s", host, e)
-                continue
+                    verify_code = result.get("VerifyCode", "?")
+                    logger.info("%s:%d 响应 VerifyCode=%s", host, MARKET_PORT, verify_code)
 
-        return self._login_result_type(success=False, error="all_hosts_failed", detail=last_err)
+                    if verify_code == "0":
+                        # 与并发 winner 相同：认证成功后 init 失败即结束本次 connect，
+                        # 不在同一会话窗口继续尝试其他服务器。
+                        return self._finalize_main_login(
+                            host,
+                            sock,
+                            result,
+                            passport_fields,
+                        )
+                    else:
+                        sock.close()
+                        if verify_code == "-1":
+                            consecutive_minus1 += 1
+                            logger.warning("%s:%d VerifyCode=-1（连续 %d 次）",
+                                           host, MARKET_PORT, consecutive_minus1)
+                            # 连续多个 -1 = passport 过期或同 IP 短时间重复 login
+                            # 会话冲突。返回 None 让外层刷新 passport 再试一轮
+                            # （和 L2/BOARD 通道一致）。旧逻辑直接判 session_conflict
+                            # 返回失败，但实际刷新 passport 后通常即可恢复。
+                            if consecutive_minus1 >= MAX_CONSECUTIVE_MINUS1:
+                                logger.warning("连续 %d 个 IP 返回 -1，停止本轮（可能 passport 过期）",
+                                               consecutive_minus1)
+                                return None
+                            continue
+                        # VerifyCode 非 0 非 -1 = 明确拒绝（账号/权限问题），
+                        # 刷新 passport 无益，直接返回。
+                        logger.warning("%s:%d 登录被拒 (VerifyCode=%s)", host, MARKET_PORT, verify_code)
+                        return self._login_result_type(
+                            success=False,
+                            verify_code=verify_code,
+                            server=f"{host}:{MARKET_PORT}",
+                            reply_fields=result,
+                            passport_fields=passport_fields,
+                            error="login_rejected",
+                        )
+                except (socket.timeout, ConnectionError, OSError) as e:
+                    last_err = f"{host}: {e}"
+                    logger.warning("连接 %s 失败: %s", host, e)
+                    continue
+
+            # 全部 IP 都试完了仍无结论（全 -1 或全超时）→ 返回 None 让外层刷新重试
+            logger.warning("MAIN 本轮全部 %d 个 IP 失败（last_err=%s）",
+                           len(fallback_hosts), last_err or "(无)")
+            return None
+
+        # 第一轮
+        result = _try_round(login_body)
+        if result is not None:
+            return result
+
+        # 全失败：重新 HTTP 鉴权拿新鲜 Passport64 重试一轮（和 L2/BOARD 通道一致）。
+        # MAIN 服务器对过期 passport 静默返回 -1（无 PromptText），刷新后通常即恢复。
+        logger.warning("MAIN 全部 IP 失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...")
+        try:
+            fresh = self._refresh_auth_material()
+            fresh_body = self._auth_service.login_body_for_passport(fresh.passport64)
+            logger.info("MAIN 已拿到新鲜 Passport64，重试一轮")
+            result = _try_round(fresh_body)
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.error("MAIN 重新鉴权失败: %s", e)
+
+        # 刷新后仍全失败
+        return self._login_result_type(
+            success=False,
+            error="all_hosts_failed",
+            detail="passport 刷新后仍全部 IP 失败（账号可能被临时限制，等片刻重试）",
+        )
 
     def _finalize_main_login(
         self,

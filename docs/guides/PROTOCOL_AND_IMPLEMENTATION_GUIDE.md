@@ -527,6 +527,12 @@ PC 客户端先在同一 8901 外层帧中发送 `CodeList + pageid` 子帧和�
 “修正”为普通 `\r\n`。响应 JSON 根为 `Auction`，字段 `markettime/newprice/leadprice/volume`；
 解析后另提供 `time`、`dt10=newprice`、`lead_price=leadprice`、`auction_type="opening"`。
 
+2026-08-11 竞价时段抓包进一步确认：PC 客户端约每 10 秒重发一次纯 `T_URL`，
+服务端通常在数十毫秒内返回当时已有的 `Auction` 点，界面据此重绘，并非主动推送。
+实时 JSON 常把数值写成字符串（例如 `volume="107894820.000000"`）；解析器会把
+价格归一化为 `float`、量归一化为 `int`。`client.auction()` 执行一次查询，不在
+库内启动轮询。
+
 ---
 
 ## 10. 尾盘竞价（`closing_auction`，14:57-15:00）
