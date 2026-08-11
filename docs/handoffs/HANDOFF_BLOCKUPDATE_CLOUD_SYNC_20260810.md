@@ -181,3 +181,223 @@ services/blockupdate_cloud.py      # HTTPS 请求、下载、校验、原子替�
 - 服务端是否允许从任意旧版本跨多个版本合并，还是只支持相邻版本。
 
 这些未决项不会阻塞 `_entries` parser、CRC 校验、缓存模型以及全量兜底的实现。
+
+---
+
+# 2026-08-11 抓包突破：协议已完全还原
+
+## TL;DR
+
+用 Frida hook `wininet.dll` 的 9 个 API + curl 重放，**完整还原了板块云同步的
+HTTP 明文协议**。修正了上文的多处推测，解开了全部 5 个「未决问题」：
+
+- **不是 `.diff` 二进制补丁**，而是 **protobuf 增量**：服务端只返回版本号大于
+  客户端请求版本的那部分文件，每个文件整体下发。
+- **两条并存通道**：旧的 `cloud.10jqka.com.cn` 匿名 GET（交接文档原线索）和新的
+  `cs.10jqka.com.cn/multiStorage`（带鉴权，实际主力）。
+- **纯下载，无上传**：上文看到的「上传失败 XML」是没带鉴权的报错，客户端本身只 GET。
+
+## 抓包工具链（已沉淀为脚本）
+
+| 文件 | 作用 |
+|------|------|
+| `tests/_blockupdate_frida_hook.js` | Frida JS，hook `InternetConnectA` / `HttpOpenRequestA` / `HttpAddRequestHeadersA` / `HttpSendRequest{A,W,ExA}` / `InternetWriteFile` / `InternetReadFile` / `HttpQueryInfoA` |
+| `tests/capture_blockupdate_cloud.py` | 三合一编排：frida + `_entries` 文件监控 + dumpcap |
+| `tests/_blockupdate_lib.py` | `_entries` 解析 / CRC32 / snapshot / diff |
+| `tests/_smoke_frida_wininet.py` | Frida+WinINet 链路冒烟测试 |
+
+环境：venv（Python 3.10.20，`uv` 创建）+ `frida==16.7.19` + `frida-tools==12.5.1`
+（frida 17.x 需要 `typing.NotRequired`，3.10 没有，必须用 16.x）。
+
+**关键坑**：Frida 在 JS 里 `send({b64: base64_string})` 经 JSON 序列化传大 buffer
+会被吞掉（251 条 `resp_body` 的 `b64` 字段全空）。必须用 `send(payload, data)` 的
+第二个参数传 `ArrayBuffer` 附件，Python 侧 `on_message(msg, data)` 的 `data` 才是
+原始字节。
+
+## 实抓结果
+
+### 首次抓包（20:20）：真实增量
+
+`_entries.system.version` 从 `204910 → 205176`，3 次连续变化，38 个 `block_*.ini`
+更新。产物在 `captures_live/blockupdate_20260811_202014/`，含三个
+`entries_change_*` 子目录（每次变化前后的文件快照）。
+
+### 第二次抓包（20:25）：无更新事务
+
+`version=17449` 已是服务端当前版本，返回 7B protobuf。产物在
+`captures_live/blockupdate_20260811_202536/`，含完整响应字节 `bodies/`。
+
+### curl 重放验证（无需 frida）
+
+**`cs.10jqka.com.cn` 的 token 只校验 query string（sessionid/token/expires），
+不校验 User-Agent 或 Cookie，任何 HTTP 客户端均可调用**。已用 curl 完整复现三种
+响应形态，样本存于 `captures_live/blockupdate_replay_20260811/`：
+
+- `blockstock_ver0_full_185480.bin` — 全量（version=0）
+- `blockstock_ver17449_notmodified_7b.bin` — 无更新
+- `header_ver5_notmodified_5b.bin` — 无更新（其它 app）
+
+## 协议规范（已确认）
+
+### 通道 A：`cs.10jqka.com.cn` `/multiStorage`（主力）
+
+```text
+GET /multiStorage?reqtype=download
+                &version={客户端当前版本}
+                &appname={blockstock|header|user_profile|infoCenter|pc_customize|...}
+                &userid=&sessionid=&expires=&token=
+                &storepath=/
+Header: Connection: close
+（无请求体）
+```
+
+`userid/sessionid/token/expires` 来自登录 session（与 8901 鉴权同源，具体由哪个 HTTP
+鉴权接口签发待确认；token 明确有效期 ~24h）。
+
+响应为 **protobuf**：
+
+```protobuf
+message MultiStorageResponse {
+  int32 status_code = 1;       // 200=OK有数据 / 304=Not Modified / 404=NotFound
+  int32 server_version = 2;    // 服务端当前版本号；客户端下次请求要带这个值
+  repeated FileEntry files = 3;// 仅包含 version > {请求version} 的文件（增量）
+}
+message FileEntry {
+  FileId id = 1;               // 嵌套 {int32 numeric_id = 1;}
+  int32 version = 2;           // 该文件版本号
+  FileContent content = 3;     // 嵌套 {bytes data = 1;}
+}
+```
+
+**增量判据**（已用版本扫描验证）：
+
+| 请求 version | 状态码 | field3 条数 | 响应大小 | 含义 |
+|--------------|--------|------------|---------|------|
+| 0            | 200    | 118        | 185480B  | 全量 |
+| 17185        | 200    | 37         | 139244B  | 增量（ver>17185 的 37 个文件）|
+| 17414        | 200    | 11         | 130542B  | 增量（ver>17414 的 11 个文件，与首次抓包字节级吻合）|
+| 17449        | 304    | 0          | 7B       | 无更新（= 服务端当前版本）|
+| 17450        | 200    | 118        | 185480B  | 未知版本 → 退化为全量 |
+| 99999        | 200    | 118        | 185480B  | 同上 |
+
+服务端版本号 = max(所有 entry 的 version)。`blockstock` app 当前是 `17449`。
+**`appname` 各自独立版本号空间**，互不影响。
+
+### 通道 B：`cloud.10jqka.com.cn`（legacy，匿名）
+
+```text
+GET /storage/stockblock_ths/v2_hqtyb_client//
+     &storetype~1&version~{_entries.system.version}&reqtype~d
+```
+
+注意 URL 编码：`%26`=`&`、`%7E`=`~`。`version` 直接用 `_entries.system.version`
+（就是交接文档第 27 行 `BlockUpdateURL` 指的那个入口）。匿名，无鉴权。
+这条通道在首次抓包中也出现了，但 `cs.10jqka.com.cn` 才是触发本地 `_entries` 变化的
+主力（`appname=blockstock`）。
+
+## FileEntry 内容编码
+
+118 个 entry 的内容统计：**110 个 base64，2 个纯文本，7 个空**。
+
+- 短内容（base64 解出 2-8 字节）：板块**名称**（GBK 中文），如
+  `d2bac0e4` → GBK「节目」类词。
+- 长内容（如 entry id=0 的 409B）：逗号分隔的 hex block id 列表，描述板块树父子关系。
+- entry id 范围 `0 ~ 334`（hex `0 ~ 14E`），是 protobuf 包内部的文件标识，
+  **既不等于 `block_*.ini` 文件名的 hex 部分，也不等于 `block_tree.ini` 里的
+  `@numId`** —— 三套独立命名空间，客户端落盘时做映射。ID→文件名的精确映射待后续
+  对照（不阻塞协议实现）。
+
+## 修正交接文档的误判
+
+| 原文 | 实际 |
+|------|------|
+| 第 14 行「系统板块云缓存同步 `cloud.10jqka.com.cn:443`」| 主力是 `cs.10jqka.com.cn/multiStorage`，`cloud` 是 legacy 通道 |
+| 第 36 行「直接 GET 返回上传失败 XML」| 那是没带鉴权的报错；带 token 的 GET 正常返回 protobuf |
+| 第 88 行 DLL 字符串 `.diff` / `merge download file error` | 实际响应是 protobuf 增量，不是二进制 diff 补丁；`.diff` 可能是旧版本残留或另一路径 |
+| 第 177-179 行未决的 verb/path/header/body | 全部确认：GET，两条 path 模板见上，仅 `Connection: close` 头，无请求体 |
+| 第 178 行「无更新/全量/增量三类响应封装」| 同一个 protobuf 封装，用 status_code (200/304/404) 区分 |
+
+## 2026-08-11 二次突破：系统板块的真正通道找到了
+
+上节的 `cs.10jqka.com.cn/multiStorage?appname=blockstock` 解码后发现是**用户自定义
+板块**（118 个 entry 全是个人板块名：液冷、涨停、半导体、260807…），不是交接文档要
+的「系统板块（行业/概念/地域）」。系统板块走的是另一条**匿名通道**，已被完整还原。
+
+### 通道 C：`cloud.10jqka.com.cn` 系统板块 ZIP（无鉴权，跨平台首选）
+
+```text
+GET https://cloud.10jqka.com.cn/storage/stockblock_ths/v2_hqtyb_client/
+     &storetype~0&version~N&reqtype~download
+（无 header、无 cookie、无鉴权，纯匿名 GET）
+```
+
+URL 里参数用 `~` 分隔（整段被 URL-encode 成 `%26storetype%7E0%26...`）。关键发现：
+**客户端真实请求里 `reqtype~d` 是 list/check（返回 storage_upload XML），而
+`reqtype~download`（完整单词）才是下载**。交接文档第 27 行看到的 `reqtype~d` 不是
+下载，所以一直拿到"上传失败" XML。
+
+响应二态：
+
+| 请求 version~N | 响应 | Content-Type |
+|----------------|------|--------------|
+| N < 当前版本 | **ZIP 全量包**（772568B），含 58 个 `block_*.ini` | application/zip |
+| N >= 当前版本 | `<storage_download><ret code="0" msg="当前已是最新的版本"/></storage_download>` | text/xml;charset=GBK |
+
+**只支持"全量或无更新"，没有细粒度增量**（`version~204909` 仍返回完整 ZIP）。但 ZIP
+本身压缩比不错（772568B → 解压 3005081B，约 4:1），全量兜底完全可接受。
+
+### 已字节级验证
+
+下载 `version~0` 的 ZIP 解压后，58 个 `block_*.ini` 与本地
+`C:\同花顺软件\同花顺\BlockUpdate\` 的 58 个文件 **100% 字节一致**。`_entries` 不在
+ZIP 内，由客户端本地生成（记录版本/CRC）。产物存于
+`captures_live/blockupdate_cloud_zip_20260811/`。
+
+### 三条通道最终定位
+
+| 通道 | 主机/路径 | 鉴权 | 数据 | 用途 |
+|------|----------|------|------|------|
+| **C（系统板块）** | `cloud.10jqka.com.cn/storage/stockblock_ths/...` | 匿名 | ZIP（block_*.ini 全量）| **行业/概念/地域板块，跨平台首选** |
+| B（用户配置） | `cs.10jqka.com.cn/multiStorage?appname=X` | userid/sessionid/token | protobuf 增量 | 自定义板块（blockstock）、header/user_profile 等个人配置 |
+| A（板块上传） | `cloud.10jqka.com.cn/...reqtype~u` | - | XML | 客户端上传自定义板块（不在本项目范围） |
+
+交接文档原标题「系统板块云缓存同步」的答案是：**通道 C**。这是匿名 GET + ZIP，跨平台
+实现只需 `urllib + zipfile`，不依赖任何鉴权或 WinINet。
+
+## 下一步（更新优先级）
+
+### P0：实现系统板块同步（通道 C，匿名 ZIP，最简单）
+
+```text
+features/blockupdate_cloud.py    # 通道 C: cloud.10jqka.com.cn ZIP 全量下载
+```
+
+只需 `urllib.request` + `zipfile`，**无鉴权**。流程：
+1. GET `https://cloud.10jqka.com.cn/storage/stockblock_ths/v2_hqtyb_client/&storetype~0&version~{本地version}&reqtype~download`
+2. 若返回 XML「当前已是最新的版本」→ 无更新，结束
+3. 若返回 ZIP → 解压覆盖本地 `block_*.ini`，用 `_blockupdate_lib` 算 CRC32 重建 `_entries`
+4. 本地 version 从 `_entries.system.version` 读，首次填 0 触发全量
+
+这一步**完全解除非 Windows 平台对本机 hexin 文件的依赖**（交接文档的核心目标）。
+已字节级验证：`captures_live/blockupdate_cloud_zip_20260811/` 的 58 个文件与本地一致。
+
+### P1：实现用户自定义板块同步（通道 B，protobuf，需鉴权）
+
+```text
+features/userblocks_cloud.py     # 通道 B: cs.10jqka.com.cn/multiStorage protobuf 增量
+```
+
+需要 `userid/sessionid/token/expires`（来自登录 session）。protobuf schema 已还原，
+增量天然支持（version=0 全量，之后只拿变化文件）。
+
+待解决：token 签发入口（哪个 HTTP 鉴权接口）。两次抓包的 token 有效期至 2026-08-12 20:25。
+
+### P2：FileEntry ID → block_*.ini 文件名映射（仅通道 B 需要）
+
+通道 B 的 118 个 entry 用数字 id（0~334），与本地文件名是三套独立命名空间。
+若要复用通道 B 的数据，需系统对照 还原映射规则。通道 C 不需要此步。
+
+### P3：通道 A 板块上传（不在 MVP 范围）
+
+客户端上传自定义板块到云端。非本项目目标。
+

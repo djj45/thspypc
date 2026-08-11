@@ -1063,3 +1063,168 @@ TCP 截断，不是新的压缩变体。遇到少量未知帧时，先检查 TCP
 
 这次最重要的结论是：**变长推送首先是一个有状态、由 schema 驱动的归一化问题；偏移和可见
 数值只能帮助找样本，不能替代原生调用链与逐字节 oracle。**
+
+## 24. HTTPS 明文逆向：WinINet hook + curl 重放的分级策略
+
+2026-08-11 逆向板块云同步时（见 `docs/handoffs/HANDOFF_BLOCKUPDATE_CLOUD_SYNC_20260810.md`），
+第一次需要看 HTTPS 内部的 HTTP 明文。dumpcap 在传输层只能看到 TLS 连接、时序和流量大小，
+读不到请求行、头和响应体。这一节沉淀可复用的 HTTPS 逆向流程，是 21b（动态附加绕过反调试）
+的姊妹篇——21b 抓 8901 二进制，本节抓 443 HTTPS 明文。
+
+### 24.1 分级策略：能 curl 重放就别用 frida
+
+HTTPS 逆向最大的效率陷阱是"全程 hook 目标进程"。正确做法是分级，让 frida 只承担
+**首次发现**职责，之后用最简单的工具重放：
+
+```text
+第 1 级  dumpcap
+         只够确认"发生了 HTTPS 通信"、主机、端口、流量大小、时序。
+         读不到明文。定位"有没有流量、往哪个主机发"足够。
+
+第 2 级  Frida hook WinINet（仅首次需要）
+         目标只有一个：拿到鉴权信息的位置和形式。
+         典型发现：鉴权 token 在 query string 里（不在加密通道、不在签名体里）。
+
+第 3 级  curl / requests 重放（之后全部）
+         token 一旦确认在 URL/header，就脱离目标进程，
+         任意 HTTP 客户端都能复现请求、扫参数、跑矩阵。
+```
+
+判据很直接：**鉴权信息出现在 URL/header（而非加密通道、签名体、HMAC）时，token 拿到后
+整个协议空间就能脱离目标进程探测**。本次板块同步的 token 在 query string 里
+（`?...&sessionid=...&token=...&expires=...`），frida 只用了一次，之后版本扫描、appname
+扫描全部 curl 完成，9 个 version 参数一把跑完，不用反复启动同花顺。
+
+反例：如果 token 是请求体的 HMAC、依赖请求时序或服务端下发的 nonce，就不能重放，必须全程
+hook。先做一次 hook 确认 token 形式，再决定后续策略。
+
+### 24.2 必 hook 的 WinINet API 及各自拿什么数据
+
+同花顺的 HTTPS（`cloud.10jqka.com.cn`、`cs.10jqka.com.cn`、`upass.10jqka.com.cn` 等）
+都走 `wininet.dll`，函数名固定、签名稳定，不需要 PID 级别适配。最小 hook 集合：
+
+| API | 拿什么 | 备注 |
+|-----|--------|------|
+| `InternetConnectA` | 服务器主机名、端口 | onLeave 的返回值是连接 handle |
+| `HttpOpenRequestA` | HTTP verb、object path | args[1]=verb、args[2]=path，返回请求 handle |
+| `HttpAddRequestHeadersA` | 全部请求头（含自定义） | args[1] 是 `
+` 分隔的多行 |
+| `HttpSendRequestA` / `HttpSendRequestW` / `HttpSendRequestExA` | 标记请求已发出 | 三者都要 hook，客户端可能用任一变体 |
+| `InternetWriteFile` | POST/PUT 请求体 | args[1]=buffer、args[2]=len |
+| `InternetReadFile` | 响应体（可能多次调用） | onLeave 读 args[3] 指向的"已读字节数" |
+| `HttpQueryInfoA` | 响应状态码、Content-Length、ETag、Last-Modified | info level 必须按 `HTTP_QUERY_*` 解（见 24.3）|
+
+handle 关联：`InternetConnectA` 返回连接 handle，`HttpOpenRequestA` 接收连接 handle 并返回
+请求 handle；后续 API 都用请求 handle。Python 侧按 handle 归并事务，把分片的
+`InternetReadFile` 回调拼成完整响应。
+
+Frida 16.x 可用（17.x 需 `typing.NotRequired`，Python 3.10 没有）。冒烟测试不必启目标
+进程，attach 到 explorer 等常驻进程 8 秒，确认 9 个 hook 都 load 即可。
+
+### 24.3 HttpQueryInfoA 的 info level 必须按常量名解
+
+`HttpQueryInfoA` 的 args[1] 是 `dwInfoLevel`，由 `HTTP_QUERY_<字段>` 低位索引和
+`HTTP_QUERY_FLAG_NUMBER (0x20000000)` 等高位 flag 或成。直接按 hex 打印会得到一堆
+`0x20000013: ?`，毫无信息。必须在 JS 里映射成可读名：
+
+```text
+idx = level & 0xffff
+flags = level & 0xffff0000
+name = HTTP_QUERY_NAMES[idx]      // 5=CONTENT_LENGTH, 12=STATUS_CODE, 29=ETAG ...
+flags 里 0x20000000 = NUMBER, 0x80000000 = REQUEST_HEADERS
+```
+
+关键坑：**当 `level` 带 `FLAG_NUMBER` 时，返回值是 DWORD 而不是字符串**。本次就是因为先
+按字符串读、再按 DWORD 读，才确认 `field1=200/304/404` 是 HTTP 风格状态码而不是版本号。
+这条不分流，状态码语义就解错。
+
+### 24.4 Frida 大 buffer 的附件通道坑（最重要）
+
+Frida 的 `send(payload)` 把数据序列化成 JSON 发回 Python。直觉写法是
+`send({t:'resp_body', b64: base64_of_bytes})`，但**大 base64 字符串经 JSON 会被吞**——
+本次实测 251 条 `resp_body` 事件的 `b64` 字段全空，但 `len` 字段正确（sum ≈ 986KB）。
+表现是：元信息都在，字节全丢。
+
+正确做法是用 `send` 的第二个参数传 `ArrayBuffer` 附件，不走 JSON：
+
+```javascript
+// ❌ 大 buffer 经 JSON 会被吞
+var b64 = btoa(String.fromCharCode.apply(null, new Uint8Array(bytes)));
+send({t:'resp_body', handle: h, len: n, b64: b64});
+
+// ✅ data 附件通道，原始字节不经序列化
+var arr = this.buf.readByteArray(n);
+send({t:'resp_body', handle: h, len: n}, arr);
+```
+
+Python 侧 `on_message(message, data)` 的 `data` 就是原始字节，只有 `message["type"]=='send'`
+且 JS 侧传了第二参数时才非空。落盘时把每个分片写成 `*.bin`，按 offset 拼回完整响应。
+
+判据：**任何超过几百字节的二进制数据，都必须用 `send(payload, data)` 附件通道**。小数据
+（状态码、路径、header）塞 JSON 没问题。这个坑和 TLS 自己加密无关，是 frida 的 message
+传输限制，而且失败是静默的（不报错，字段就是空），极易漏判。
+
+### 24.5 先看响应大小分布，再解字节
+
+拿到一批响应后，先按 `(请求参数, 响应大小)` 列表，**不要直接解第一帧**。本次的响应大小
+分布一上来就指向了协议族：
+
+```text
+blockstock ver=17449  →    772575B  （有数据）
+blockstock ver=17414  →    130542B  （增量）
+header      ver=5     →         5B  （占位？）
+infoCenter  ver=1     →         5B
+```
+
+5B/7B 这种"小到装不下任何结构"的响应立刻指向"状态码占位"假说；772575 vs 130542 的差异
+立刻指向"全量 vs 增量"。解出 7B 是 protobuf `08 b0 02 10 a9 88 01`（field1=304, field2=17449）
+后，再回看大小分布，才确认 field1 是状态码（304=Not Modified）而不是版本号——单解一帧会
+把 304 误读成版本号。
+
+通用规律：**响应大小是免费的先验信息，先把分布画出来，再决定解哪一帧**。
+
+### 24.6 协议字段名只是入口，数据语义必须看内容
+
+`appname=blockstock` 字面像"板块库存"=系统板块。本次差点把它对接到 `system_blocks`
+服务。但解码 118 个 entry 后发现内容全是"液冷、涨停、半导体、260807"这类**用户自定义板块
+名称**（base64+GBK），根本不是系统板块（行业/概念/地域）。
+
+教训（对齐第 22 章 name_16_16 的复盘风格）：**协议字段名只是入口线索，不是语义证明**。
+确认数据归属时要看内容特征：
+
+- 系统板块：固定的板块树结构、`block_*.ini` 命名、行业代码 881xxx
+- 用户数据：中文短名称、日期命名的临时板块、个人自选
+
+如果不先验证内容，就会把用户数据当系统数据去落地，实现出来的"系统板块同步"其实同步的是
+当前账号的个人板块。本次真正的系统板块走的是另一条**匿名**通道（`cloud.10jqka.com.cn`
+的 ZIP），与带鉴权的用户数据通道完全分开。
+
+### 24.7 参数语义不能靠字面猜（`reqtype~d` vs `reqtype~download`）
+
+交接文档里看到的 URL 参数是 `reqtype~d`，直接 GET 返回 `<storage_upload><ret code="-1"
+msg="上传失败">`。一度结论是"这是上传接口，不是下载"。实际 `reqtype~d` 是 list/check
+缩写，**真正的下载是完整单词 `reqtype~download`**，返回正常 ZIP。
+
+通用规律：**当一个参数值返回"失败"响应时，先扫一遍它的可能取值再下结论**。本次扫了
+`d/u/r/w/q/download/upload/list/get` 共 9 个值，立刻看到 `download` 返回
+`<storage_download><ret code="0">`，两分钟解开了一个困扰交接文档的误判。
+
+把参数扫描当成和版本扫描一样的标准动作：拿到一个未知参数，先 enumerate 它的取值空间，
+看响应类型/大小分布，再解释。
+
+### 24.8 本案例的最短工作流
+
+```text
+dumpcap 确认 HTTPS 流量往哪个主机发（拿不到明文也没关系）
+  -> Frida hook WinINet 9 个 API（send(payload, data) 附件通道）
+  -> 首次抓包定位 token 位置（URL? header? 加密体?）
+  -> 若 token 在 URL/header：切换到 curl/requests 重放
+  -> 版本扫描 + 参数扫描，看响应大小分布和状态码
+  -> 解最小响应（占位帧）定 schema，再用大响应验证
+  -> 确认数据语义（看内容，别信字段名）
+  -> 字节级 oracle（本地真值文件）逐项校验
+```
+
+这次最重要的结论是：**HTTPS 逆向的瓶颈不在 TLS（WinINet hook 在加密前后都能拿到明文），
+而在拿到明文后如何高效探测协议空间。frida 是发现工具不是探测工具；token 可重放后，
+整个探测应该用 curl/requests 在协议层完成。**
