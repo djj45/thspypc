@@ -33,13 +33,19 @@ FULL_STOCK_LIST_MARKETS = (
 )
 
 SORT_BY_VALUES = {
-    "涨幅": {"sort_by": 199112, "verified": True},
+    "涨幅": {"sort_by": 199112, "verified": True, "response_dt": 200},
     "涨速": {"sort_by": 48, "verified": True},
     "换手率": {"sort_by": 1968584, "verified": True},
     "量比": {"sort_by": 1771976, "verified": True},
     "主力净流入": {"sort_by": 592890, "verified": True},
-    "竞价金额": {"sort_by": 68758, "verified": True},
+    "竞价金额": {"sort_by": 68758, "verified": True, "response_dt": 150},
     "竞价涨幅": {"sort_by": 68762, "verified": True},
+    # 2026-08-11 抓包+活网确认(pageid=1334,与涨幅榜同通道):
+    # 全市场 2899 只股票按封单额降序,SortTotal=2899/2655(沪深/含北交所)。
+    # 不是客户端查所有盘口本地排,而是服务端排序后返回代码列表。
+    # response_dt=44 经 verify_sort_values_online.py 活网验证(首条 3.43 亿,
+    # 量级符合涨停封单)。
+    "封单额": {"sort_by": 265260, "verified": True, "response_dt": 44},
 }
 
 DDE_PAGEID = 10723
@@ -489,14 +495,32 @@ def _parse_stock_list_hd31_records(body: bytes) -> list[dict]:
 
 
 def _parse_stock_list_hd31_variant(body: bytes) -> list[dict]:
-    """Parse stock identities from the 16-bit-count hd3.1 variant."""
-    return [
-        {
+    """Parse stock identities from the 16-bit-count hd3.1 variant.
+
+    保留底层 record 的全部 ``dt<N>`` 字段值(排序值、行情字段等),不只 code/name。
+    调用方只取 ``code`` 时不受影响(多余字段被忽略)。想丢弃数值字段只留身份,
+    用 :func:`strip_to_identity`。
+    """
+    out = []
+    for record in _parse_stock_list_hd31_records(body):
+        item = {
             "code": record["code"],
             "name": "",
             "market": record.get("market", 0),
         }
-        for record in _parse_stock_list_hd31_records(body)
+        # 保留 dt<N>(数值)和 dt<N>_format(字段格式),丢弃 _raw(中间态)。
+        for key, value in record.items():
+            if key.startswith("dt") and not key.endswith("_raw"):
+                item[key] = value
+        out.append(item)
+    return out
+
+
+def strip_to_identity(stocks: list[dict]) -> list[dict]:
+    """把带 dt 字段的 ranked 结果裁成只剩 code/name/market。"""
+    return [
+        {"code": s.get("code", ""), "name": s.get("name", ""), "market": s.get("market", 0)}
+        for s in stocks
     ]
 
 

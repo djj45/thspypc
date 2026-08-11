@@ -1356,6 +1356,7 @@ class ServiceFacade:
         sort_by: int = 199112,
         sort_dir: str = "D",
         max_pages: int = 120,
+        with_values: bool = False,
     ) -> list[dict]:
         """获取排序榜单（自动翻页，可拿完整榜单）。
 
@@ -1364,9 +1365,13 @@ class ServiceFacade:
         翻页，直到拿满 ``count`` 条或取完整个榜单。
 
         ``sort_by`` 是排序键编号（见 :data:`protocol.SORT_BY_VALUES`，均为活网验证）：
-        涨幅=199112、涨速=48、换手率=1968584、量比=1771976、主力净流入=592890、
-        竞价金额=68758、竞价涨幅=68762。默认按涨幅降序（涨幅榜）。
+        涨幅=199112(响应 dt200)、涨速=48、换手率=1968584、量比=1771976、
+        主力净流入=592890、竞价金额=68758(响应 dt150)、竞价涨幅=68762、
+        封单额=265260(响应 dt44)。默认按涨幅降序（涨幅榜）。
         换成跌幅榜传 ``sort_by=199112, sort_dir="A"``（升序值 A 为推测，未实测）。
+        封单额榜 ``sort_by=265260`` 是服务端排序（不是查所有盘口本地排），
+        全市场约 2899 只参与，非涨停股封单额为 0 排在末尾。
+        dt200/dt150/dt44 经 ``tests/verify_sort_values_online.py`` 活网验证。
 
         ⚠ 成交量/成交额**不能**通过本方法拿——它们不走 SortBy 路径，而是客户端
         订阅行情推送（dt13/dt19）后本地排序。详见
@@ -1385,10 +1390,15 @@ class ServiceFacade:
                 :data:`protocol.SORT_BY_VALUES`。
             sort_dir: 排序方向，``"D"``=降序（默认）、``"A"``=升序（推测，未实测）。
             max_pages: 翻页安全阀（默认 120，≈5300/59），防止死循环。
+            with_values: 是否保留响应里的 ``dt<N>`` 数值字段（默认 False，只返回
+                code/name/market）。传 True 时每项额外含排序值等 dt 字段，免去
+                之后走 :meth:`list_quotes` 回填。已活网验证的响应字段：涨幅 dt200、
+                竞价金额 dt150、封单额 dt44（见 ``tests/verify_sort_values_online.py``）。
 
         Returns:
-            list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``。
-            按 code 去重（页边界可能重叠）。
+            list[dict]，每项 ``{"code": "600519", "name": "贵州茅台"}``；
+            ``with_values=True`` 时额外含 ``dt<N>`` 字段。按 code 去重（页边界
+            可能重叠）。
 
         Raises:
             RuntimeError: 未登录。
@@ -1402,6 +1412,7 @@ class ServiceFacade:
                 sort_by=sort_by,
                 sort_dir=sort_dir,
                 max_pages=max_pages,
+                with_values=with_values,
             ),
         )
         if with_names and stocks:

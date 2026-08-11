@@ -20,6 +20,7 @@ from ..features.stock_list_protocol import (
     parse_dde_response,
     parse_init_response,
     parse_stock_list_response,
+    strip_to_identity,
 )
 from ..models import AccountKind, Capability, Support
 
@@ -75,8 +76,14 @@ class StockListService:
         sort_by: int = 199112,
         sort_dir: str = "D",
         max_pages: int = 120,
+        with_values: bool = False,
     ) -> list[dict]:
-        """Fetch and de-duplicate ranked pages up to ``count`` records."""
+        """Fetch and de-duplicate ranked pages up to ``count`` records.
+
+        ``with_values=False``(默认)只返回 ``code/name/market``,与历史行为一致。
+        ``with_values=True`` 保留响应里的全部 ``dt<N>`` 字段(排序值、行情字段),
+        供调用方拿到封单额(dt<响应字段>)、涨幅等数值,不必再走 list_quotes 回填。
+        """
         if count <= 0 or max_pages <= 0:
             return []
 
@@ -140,7 +147,7 @@ class StockListService:
                 break
             sort_begin = len(stocks)
 
-        return stocks
+        return stocks if with_values else strip_to_identity(stocks)
 
     def dde_ranked(
         self,
