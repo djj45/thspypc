@@ -11,6 +11,7 @@ import os
 import socket
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 from .models import AccountKind, AccountProfile, Capability, Support
@@ -175,6 +176,12 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._push_initialized: set[str] = set()
         self._preheat_threads: dict[str, threading.Thread] = {}  # 预热线程（主流程可 join 等待）
         self._service_connections: ConnectionManager | None = None
+        # 只保护 service registry 的懒创建/连接收编；网络请求仍由每条
+        # ManagedConnection 自己的 single-flight 锁保护并可跨角色并行。
+        self._service_context_lock = threading.RLock()
+        # 显式请求允许对尚无证据的 capability 做一次乐观探测。并发调用时必须
+        # 保留所有在途请求的授权并集，不能让先结束的调用撤销另一调用的授权。
+        self._service_capability_leases: Counter[Capability] = Counter()
         self._service_allow_open = False
         self._service_auto_profile = False
         self._account_evidence = AccountEvidenceRecorder()
@@ -198,7 +205,12 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         # 的服务器，测速结果和轮换偏移不能混用。
         self._probe_cache: dict[str, tuple[float, list[str]]] = {}
         self._PROBE_CACHE_TTL = 300.0        # 测速缓存有效期（秒），5 分钟
-        self._login_rr_offset: dict[str, int] = {"main": 0, "sh": 0, "sz": 0}
+        self._login_rr_offset: dict[str, int] = {
+            "main": 0,
+            "kline": 0,
+            "sh": 0,
+            "sz": 0,
+        }
         # 从磁盘加载跨进程共享的测速状态 + 轮换偏移（避免每个进程都 offset=0）
         _disk = load_ip_state()
         if _disk is not None:
@@ -437,6 +449,74 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         manager.update_profile(profile)
         return profile
 
+    def preheat_l2_connections(self) -> dict[str, dict[str, object]]:
+        """建立并保留沪、深两条 Level2 行情连接，不发送股票业务请求。
+
+        MAIN 登录后的账号证据必须明确为 Level2；普通或未知账号不会进行权限
+        探测。两条 L2 socket 顺序建立，每条都由 ConnectionFactory 刷新独立的
+        Passport64，并完成对应市场 init。失败按市场记录，不影响另一市场。
+        """
+        profile = self.observed_account_profile
+        if profile.kind is not AccountKind.LEVEL2:
+            return {
+                "sh": {"ready": False, "skipped": True},
+                "sz": {"ready": False, "skipped": True},
+            }
+
+        roles = (
+            ("sh", ConnectionRole.SH_L2),
+            ("sz", ConnectionRole.SZ_L2),
+        )
+
+        def operation():
+            results: dict[str, dict[str, object]] = {}
+            manager = self._service_connections
+            if manager is None:
+                raise RuntimeError("service context 尚未初始化")
+            for key, role in roles:
+                try:
+                    connection = manager.acquire(
+                        role,
+                        capability=Capability.L2_TIMELINE,
+                    )
+                    results[key] = {
+                        "ready": bool(connection.active),
+                        "initialized": bool(connection.init_complete),
+                    }
+                except Exception as exc:
+                    results[key] = {
+                        "ready": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            return results
+
+        return self._run_default_service(
+            (Capability.L2_TIMELINE,),
+            operation,
+        )
+
+    def preheat_service_connections(self) -> dict[str, dict[str, object]]:
+        """Pre-open the L2 lanes and the optional fast K-line lane."""
+        results = self.preheat_l2_connections()
+        try:
+            connection = self._run_default_service(
+                (Capability.BASIC_QUOTE,),
+                lambda: self._service_connections.acquire(
+                    ConnectionRole.KLINE_FAST,
+                    capability=Capability.BASIC_QUOTE,
+                ),
+            )
+            results["kline"] = {
+                "ready": bool(connection.active),
+                "initialized": bool(connection.init_complete),
+            }
+        except Exception as exc:
+            results["kline"] = {
+                "ready": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return results
+
     def _ensure_default_service_context(
         self,
         *capabilities: Capability,
@@ -449,39 +529,8 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         Explicit contexts created through :meth:`configure_service_context`
         retain their caller-supplied conservative profile.
         """
+        profile = self._default_service_profile(capabilities)
         if self._service_connections is None:
-            observed = self.observed_account_profile
-            support = dict(observed.capabilities)
-            l2_capabilities = {
-                Capability.L2_TIMELINE,
-                Capability.L2_AUCTION,
-                Capability.L2_SNAPSHOT_PUSH,
-                Capability.L2_HISTORY_TIMELINE,
-            }
-            requested_l2 = any(
-                capability in l2_capabilities
-                for capability in capabilities
-            )
-            for capability in capabilities:
-                if support.get(capability, Support.UNKNOWN) is Support.UNKNOWN:
-                    support[capability] = Support.YES
-            if (
-                requested_l2
-                and support.get(
-                    Capability.L2_MARKET_ACCESS,
-                    Support.UNKNOWN,
-                )
-                is Support.UNKNOWN
-            ):
-                support[Capability.L2_MARKET_ACCESS] = Support.YES
-            kind = observed.kind
-            if requested_l2 and kind is AccountKind.UNKNOWN:
-                kind = AccountKind.LEVEL2
-            profile = AccountProfile(
-                kind=kind,
-                capabilities=support,
-                passport_fields=observed.passport_fields,
-            )
             manager = self.configure_service_context(
                 profile,
                 allow_open=True,
@@ -490,41 +539,47 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             return manager
 
         if self._service_auto_profile:
-            observed = self.observed_account_profile
-            support = dict(observed.capabilities)
-            l2_capabilities = {
-                Capability.L2_TIMELINE,
-                Capability.L2_AUCTION,
-                Capability.L2_SNAPSHOT_PUSH,
-                Capability.L2_HISTORY_TIMELINE,
-            }
-            requested_l2 = any(
-                capability in l2_capabilities
-                for capability in capabilities
-            )
-            for capability in capabilities:
-                if support.get(capability, Support.UNKNOWN) is Support.UNKNOWN:
-                    support[capability] = Support.YES
-            if (
-                requested_l2
-                and support.get(
-                    Capability.L2_MARKET_ACCESS,
-                    Support.UNKNOWN,
-                )
-                is Support.UNKNOWN
-            ):
-                support[Capability.L2_MARKET_ACCESS] = Support.YES
-            kind = observed.kind
-            if requested_l2 and kind is AccountKind.UNKNOWN:
-                kind = AccountKind.LEVEL2
-            self._service_connections.update_profile(
-                AccountProfile(
-                    kind=kind,
-                    capabilities=support,
-                    passport_fields=observed.passport_fields,
-                )
-            )
+            self._service_connections.update_profile(profile)
         return self._service_connections
+
+    def _default_service_profile(
+        self,
+        capabilities,
+    ) -> AccountProfile:
+        """Combine observed evidence with capabilities leased by active calls."""
+        observed = self.observed_account_profile
+        support = dict(observed.capabilities)
+        l2_capabilities = {
+            Capability.L2_TIMELINE,
+            Capability.L2_AUCTION,
+            Capability.L2_SNAPSHOT_PUSH,
+            Capability.L2_HISTORY_TIMELINE,
+        }
+        requested = tuple(capabilities)
+        requested_l2 = any(
+            capability in l2_capabilities
+            for capability in requested
+        )
+        for capability in requested:
+            if support.get(capability, Support.UNKNOWN) is Support.UNKNOWN:
+                support[capability] = Support.YES
+        if (
+            requested_l2
+            and support.get(
+                Capability.L2_MARKET_ACCESS,
+                Support.UNKNOWN,
+            )
+            is Support.UNKNOWN
+        ):
+            support[Capability.L2_MARKET_ACCESS] = Support.YES
+        kind = observed.kind
+        if requested_l2 and kind is AccountKind.UNKNOWN:
+            kind = AccountKind.LEVEL2
+        return AccountProfile(
+            kind=kind,
+            capabilities=support,
+            passport_fields=observed.passport_fields,
+        )
 
     def _run_default_service(
         self,
@@ -532,16 +587,33 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         operation,
     ):
         """Execute one explicit business call and commit observed evidence."""
-        manager = self._ensure_default_service_context(*capabilities)
-        self.sync_service_connections()
+        manager = None
+        with self._service_context_lock:
+            self._service_capability_leases.update(capabilities)
         try:
+            with self._service_context_lock:
+                active = tuple(self._service_capability_leases)
+                manager = self._ensure_default_service_context(*active)
             return operation()
         finally:
-            if self._service_auto_profile:
-                manager.update_profile(self.observed_account_profile)
+            with self._service_context_lock:
+                self._service_capability_leases.subtract(capabilities)
+                self._service_capability_leases += Counter()
+                if self._service_auto_profile and manager is not None:
+                    manager.update_profile(
+                        self._default_service_profile(
+                            tuple(self._service_capability_leases)
+                        )
+                    )
 
     def _open_service_connection(self, spec) -> OpenedConnection:
         """Compatibility delegate to the role-aware connection factory."""
+        if spec.role is ConnectionRole.KLINE_FAST:
+            return OpenedConnection(
+                socket=self._open_independent_main_connection(),
+                owns_socket=True,
+                initialized=True,
+            )
         return self._connection_factory.open(spec)
 
     def _assign_board_socket(self, sock) -> None:

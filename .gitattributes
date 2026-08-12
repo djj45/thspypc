@@ -2,3 +2,5 @@
 # changes the CRC32 recorded in each version manifest.
 tests/fixtures/blockupdate/**/_entries binary
 tests/fixtures/blockupdate/**/*.ini binary
+*.bat text eol=crlf
+*.sh text eol=lf

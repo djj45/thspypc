@@ -1,7 +1,4 @@
-import { api } from '../../api/endpoints'
-import { useData } from '../../data/useData'
 import { useStock } from '../../state/StockContext'
-import type { Depth } from '../../types'
 
 function fmtPrice(n: number) {
   return n.toFixed(2)
@@ -16,11 +13,9 @@ function fmtAmt(n: number) {
 }
 
 export function DepthPanel() {
-  const { code } = useStock()
-  const { data, loading, error } = useData<Depth>(
-    () => api.depth(code, 5),
-    [code],
-  )
+  const { marketView } = useStock()
+  const { loading, error } = marketView
+  const data = marketView.data?.depth ?? null
 
   if (loading) return <div className="dim" style={{ padding: 8 }}>加载盘口…</div>
   if (error) return <div className="down" style={{ padding: 8 }}>{error}</div>

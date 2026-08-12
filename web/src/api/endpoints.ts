@@ -12,7 +12,45 @@ import type {
   RankItem,
   Dxjl,
   StockGroup,
+  MarketView,
+  MarketViewFast,
 } from '../types'
+
+const marketViewInFlight = new Map<string, Promise<MarketView>>()
+const fastViewInFlight = new Map<string, Promise<MarketViewFast>>()
+const intradayInFlight = new Map<
+  string,
+  Promise<(AuctionPoint & TimelinePoint)[]>
+>()
+const klineInFlight = new Map<string, Promise<Kline[]>>()
+
+function dedupe<T>(
+  requests: Map<string, Promise<T>>,
+  key: string,
+  fetcher: () => Promise<T>,
+): Promise<T> {
+  const current = requests.get(key)
+  if (current) return current
+  const request = fetcher().finally(() => requests.delete(key))
+  requests.set(key, request)
+  return request
+}
+
+function getMarketView(
+  code: string,
+  period: string,
+  count: number,
+  fuquan: string,
+): Promise<MarketView> {
+  const key = `${code}|${period}|${count}|${fuquan}`
+  const current = marketViewInFlight.get(key)
+  if (current) return current
+  const request = getJson<MarketView>(
+    `/api/market_view/${code}?period=${period}&count=${count}&fuquan=${encodeURIComponent(fuquan)}`,
+  ).finally(() => marketViewInFlight.delete(key))
+  marketViewInFlight.set(key, request)
+  return request
+}
 
 // 市场码：0 让后端按代码前缀自推断（支持 沪/深/指数/北交所）
 export const api = {
@@ -31,17 +69,37 @@ export const api = {
     period = 'day',
     count = 2146,
     fuquan = 'Q',
-  ) =>
-    getJson<Kline[]>(
-      `/api/kline/${code}?period=${period}&count=${count}&fuquan=${fuquan}`,
-    ),
+    channel: 'auto' | 'level2' | 'ifindhq_fast' = 'auto',
+  ) => {
+    const key = `${code}|${period}|${count}|${fuquan}|${channel}`
+    return dedupe(klineInFlight, key, () =>
+      getJson<Kline[]>(
+        `/api/kline/${code}?period=${period}&count=${count}&fuquan=${encodeURIComponent(fuquan)}&channel=${channel}`,
+      ),
+    )
+  },
   timeline: (code: string) => getJson<TimelinePoint[]>(`/api/timeline/${code}`),
   historyTimeline: (code: string, date: string) =>
     getJson<TimelinePoint[]>(`/api/history_timeline/${code}?date=${date}`),
   auction: (code: string) => getJson<AuctionPoint[]>(`/api/auction/${code}`),
   closingAuction: (code: string) =>
     getJson<AuctionPoint[]>(`/api/closing_auction/${code}`),
-  intraday: (code: string) => getJson<AuctionPoint[]>(`/api/intraday/${code}`),
+  intraday: (code: string) =>
+    dedupe(intradayInFlight, code, () =>
+      getJson<(AuctionPoint & TimelinePoint)[]>(`/api/intraday/${code}`),
+    ),
+  marketView: (code: string, period = 'day', count = 320, fuquan = 'Q') =>
+    getMarketView(code, period, count, fuquan),
+  marketViewFast: (code: string) =>
+    dedupe(fastViewInFlight, code, () =>
+      getJson<MarketViewFast>(`/api/market_view_fast/${code}`),
+    ),
+  intradayAuctions: (code: string) =>
+    dedupe(intradayInFlight, `auctions|${code}`, () =>
+      getJson<(AuctionPoint & TimelinePoint)[]>(
+        `/api/intraday_auctions/${code}`,
+      ),
+    ),
 
   // 板块
   boardCategories: () => getJson<BoardCategory[]>('/api/board_categories'),

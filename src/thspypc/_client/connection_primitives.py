@@ -330,6 +330,80 @@ class ConnectionPrimitives:
                 len(frames),
             )
 
+    def _initialize_independent_main_socket(
+        self,
+        sock: socket.socket,
+        *,
+        timeout: float = 2.0,
+    ) -> None:
+        """Activate an ordinary 8901 socket without touching ``self._sock``."""
+        sock.sendall(build_init_query() + b"\n")
+        sock.settimeout(timeout)
+        try:
+            first_frame = self._connection_read_frame(sock)
+        except socket.timeout as exc:
+            raise TimeoutError("waiting for KLINE_FAST init timed out") from exc
+
+        frames = [first_frame]
+        sock.settimeout(0.3)
+        for _ in range(8):
+            try:
+                frames.append(self._connection_read_frame(sock))
+            except socket.timeout:
+                break
+        if not any(
+            parse_init_response(frame).get("server_info")
+            for frame in frames
+        ):
+            raise ValueError(
+                "KLINE_FAST init response did not contain server config"
+            )
+
+    def _open_independent_main_connection(self) -> socket.socket:
+        """Open a role-owned iFinD socket with a fresh one-use Passport.
+
+        Candidate hosts race concurrently.  Once a host returns
+        ``VerifyCode=0`` the Passport is consumed, so this method never tries
+        serial logins with the same credential.
+        """
+        material = self.authenticate(force=True)
+        hosts = self._resolve_market_hosts(material.passport_bytes)
+        if not hosts:
+            hosts = list(self._market_host_candidates())
+        sorted_ips = self._probe_fastest_hosts(
+            hosts,
+            timeout=1.0,
+            role="kline",
+        )
+        pool = [ip for ip in sorted_ips if ip not in self._bad_kline_ips]
+        if not pool:
+            pool = sorted_ips or hosts
+        count = min(7, len(pool))
+        offset = self._login_rr_offset.get("kline", 0) % max(1, len(pool))
+        batch = (pool[offset:] + pool[:offset])[:count]
+        self._login_rr_offset["kline"] = (
+            offset + count
+        ) % max(1, len(pool))
+        login_body = self._auth_service.login_body_for_passport(
+            material.passport64
+        )
+        winner = self._concurrent_login(batch, login_body)
+        if winner is None:
+            raise ConnectionError(
+                "KLINE_FAST concurrent login failed; fresh auth required"
+            )
+        host, sock, _reply = winner
+        try:
+            self._initialize_independent_main_socket(sock)
+        except Exception:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+        logger.info("KLINE_FAST connected (%s:%d)", host, MARKET_PORT)
+        return sock
+
     def _probe_fastest_hosts(self, hosts: list[str], timeout: float = 1.0,
                              use_cache: bool = True,
                              role: str = "main") -> list[str]:

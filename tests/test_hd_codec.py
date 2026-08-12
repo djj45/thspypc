@@ -4,6 +4,7 @@ import struct
 
 import thspypc.protocol as protocol
 from thspypc.codecs import hd
+from thspypc.codecs.compression import _transpose_bitplane_0x1763410
 
 
 def _field(dt: int, fmt: int, width: int) -> bytes:
@@ -41,3 +42,40 @@ def test_protocol_reexports_hd_codec_implementations():
     assert protocol._parse_hd_records is hd._parse_hd_records
     assert protocol.parse_hd1_response is hd.parse_hd1_response
     assert protocol.parse_hd3_response is hd.parse_hd3_response
+
+
+def _reference_transpose(src: bytes, record_size: int, record_count: int) -> bytes:
+    rows = bytearray(record_size * record_count)
+    for column in range(record_size):
+        for plane in range(8):
+            for row in range(record_count):
+                bit_offset = (column * 8 + plane) * record_count + row
+                if (src[bit_offset >> 3] >> (bit_offset & 7)) & 1:
+                    rows[row * record_size + column] |= 1 << plane
+    return bytes(rows)
+
+
+def test_bitplane_transpose_matches_unaligned_reference_and_row_slice():
+    record_size = 7
+    record_count = 17
+    bitplane = bytes((index * 73 + 19) & 0xFF for index in range(119))
+    expected = _reference_transpose(bitplane, record_size, record_count)
+
+    assert (
+        _transpose_bitplane_0x1763410(
+            bitplane,
+            record_size,
+            record_count,
+        )
+        == expected
+    )
+    assert (
+        _transpose_bitplane_0x1763410(
+            bitplane,
+            record_size,
+            record_count,
+            row_start=9,
+            row_count=7,
+        )
+        == expected[9 * record_size : 16 * record_size]
+    )

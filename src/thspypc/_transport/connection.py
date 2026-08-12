@@ -1,6 +1,7 @@
 """Role-aware managed connection."""
 from __future__ import annotations
 
+import socket
 import threading
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ class CloseableSocket(SocketLike, Protocol):
 
 class ConnectionRole(str, Enum):
     MAIN = "main"
+    KLINE_FAST = "kline_fast"
     SH_L2 = "sh_l2"
     SZ_L2 = "sz_l2"
     REALORDER = "realorder"
@@ -48,6 +50,12 @@ CONNECTION_SPECS = {
         role=ConnectionRole.MAIN,
         identity=LoginIdentity.STANDARD,
         port=8901,
+    ),
+    ConnectionRole.KLINE_FAST: ConnectionSpec(
+        role=ConnectionRole.KLINE_FAST,
+        identity=LoginIdentity.STANDARD,
+        port=8901,
+        required_capability=Capability.BASIC_QUOTE,
     ),
     ConnectionRole.SH_L2: ConnectionSpec(
         role=ConnectionRole.SH_L2,
@@ -110,10 +118,35 @@ class ManagedConnection:
     ) -> None:
         self.spec = spec
         self._socket: CloseableSocket | None = sock
+        self._enable_low_latency(sock)
         self._lock = request_lock or threading.RLock()
-        self._session = MarketSession(lambda: self._socket, self._lock)
+        self._session = MarketSession(
+            lambda: self._socket,
+            self._lock,
+            timing_name=spec.role.value,
+        )
         self._owns_socket = owns_socket
         self.init_complete = initialized
+
+    @staticmethod
+    def _enable_low_latency(sock: CloseableSocket) -> None:
+        """Disable Nagle on market-data streams when the socket supports it.
+
+        Quote pipelines intentionally write several small protocol frames in
+        quick succession.  With Nagle enabled, the second write can wait for
+        the peer's delayed ACK, producing an otherwise unexplained 40 ms tail.
+        Socket-like test doubles and wrappers may not expose ``setsockopt``;
+        those are left unchanged.
+        """
+        setsockopt = getattr(sock, "setsockopt", None)
+        if setsockopt is None:
+            return
+        try:
+            setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, TypeError, ValueError):
+            # A connected stream remains usable even when the platform or a
+            # socket wrapper does not support this optional latency hint.
+            pass
 
     @property
     def role(self) -> ConnectionRole:
@@ -162,11 +195,27 @@ class ManagedConnection:
     ) -> AbstractContextManager[SocketLike]:
         return self._session.receive(timeout=timeout)
 
+    def dispatch(
+        self,
+        requests,
+        *,
+        frame_reader,
+        timeout: float,
+        max_frames: int = 32,
+    ):
+        return self._session.dispatch(
+            requests,
+            frame_reader=frame_reader,
+            timeout=timeout,
+            max_frames=max_frames,
+        )
+
     def mark_initialized(self) -> None:
         self.init_complete = True
 
     def close(self) -> None:
         with self._lock:
+            self._session.close()
             sock, self._socket = self._socket, None
             self.init_complete = False
             if sock is not None and self._owns_socket:

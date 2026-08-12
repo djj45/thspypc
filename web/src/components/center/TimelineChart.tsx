@@ -1,21 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import * as echarts from 'echarts'
 import type { ECharts } from 'echarts'
-import { api } from '../../api/endpoints'
-import { useData } from '../../data/useData'
 import { useStock } from '../../state/StockContext'
-import type { AuctionPoint, TimelinePoint } from '../../types'
+import type { TimelinePoint } from '../../types'
 
-// auction（早盘竞价）盘后要 ~12s（client 等实时竞价超时），当日数据固定，
-// 用「代码+日期」缓存避免切回重复等待。
-const auctionCache = new Map<string, AuctionPoint[]>()
-function todayStr() {
-  return new Date().toISOString().slice(0, 10)
-}
+type IntradayPoint = TimelinePoint & { phase?: string; time?: string }
 
-// 真实时刻 → 交易分钟 x（午休压缩）：
-//   早盘竞价 9:15-9:25 → -15..-5；上午 9:30-11:29 → 0..119；
-//   午休压缩；下午 13:00-14:56 → 120..236；尾盘竞价 14:57-15:00 → 237..240
+// 真实时刻 -> 交易分钟 x（午休压缩）。
+// 早盘竞价 9:15-9:25 -> -15..-5；盘中 9:30-11:29 -> 0..119；
+// 下午 13:00-14:56 -> 120..236；尾盘竞价 14:57-15:00 -> 237..240。
 function timeToX(iso?: string): number | null {
   if (!iso) return null
   const d = new Date(iso)
@@ -26,6 +19,7 @@ function timeToX(iso?: string): number | null {
   if (mins < 780) return 120
   return mins - 660
 }
+
 function xToLabel(v: number): string {
   const mins = v < 120 ? 570 + v : 660 + v
   return `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(
@@ -36,40 +30,11 @@ function xToLabel(v: number): string {
 export function TimelineChart() {
   const hostRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<ECharts | null>(null)
-  const { code } = useStock()
-
-  // 盘中 + 尾盘竞价：都快（<0.13s），立即拉
-  const continuous = useData<TimelinePoint[]>(() => api.timeline(code), [code])
-  const closing = useData<AuctionPoint[]>(
-    () => api.closingAuction(code),
-    [code],
-  )
-
-  // 早盘竞价：慢（~12s），延后到盘中就绪后再后台拉，且当日缓存。
-  // 这样切换股票时盘中分时立即显示，竞价段异步补，不阻塞。
-  const [opening, setOpening] = useState<AuctionPoint[]>([])
-  useEffect(() => {
-    if (!continuous.data) return // 等盘中先就绪
-    let alive = true
-    const key = `${code}@${todayStr()}`
-    const cached = auctionCache.get(key)
-    if (cached) {
-      setOpening(cached)
-      return
-    }
-    setOpening([])
-    api
-      .auction(code)
-      .then((d) => {
-        if (!alive) return
-        auctionCache.set(key, d)
-        setOpening(d)
-      })
-      .catch(() => {})
-    return () => {
-      alive = false
-    }
-  }, [continuous.data, code])
+  const { marketView } = useStock()
+  const intraday = {
+    ...marketView,
+    data: (marketView.data?.intraday ?? null) as IntradayPoint[] | null,
+  }
 
   useEffect(() => {
     const el = hostRef.current
@@ -88,10 +53,15 @@ export function TimelineChart() {
   useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
-    const cont = continuous.data ?? []
+
+    const points = intraday.data ?? []
+    const continuous = points.filter((p) => p.phase === 'continuous')
+    const opening = points.filter((p) => p.phase === 'opening_auction')
+    const closing = points.filter((p) => p.phase === 'closing_auction')
+
     const contData: [number, number][] = []
     const avgData: [number, number][] = []
-    cont.forEach((p, i) => {
+    continuous.forEach((p, i) => {
       if (p.dt10 != null) contData.push([i, p.dt10])
       if (p.lead_price != null) avgData.push([i, p.lead_price])
     })
@@ -101,7 +71,7 @@ export function TimelineChart() {
       if (x != null && p.dt10 != null) openData.push([x, p.dt10])
     })
     const closeData: [number, number][] = []
-    ;(closing.data ?? []).forEach((p) => {
+    closing.forEach((p) => {
       const x = timeToX(p.time)
       if (x != null && p.dt10 != null) closeData.push([x, p.dt10])
     })
@@ -161,19 +131,19 @@ export function TimelineChart() {
         },
       ],
     })
-  }, [continuous.data, closing.data, opening])
+  }, [intraday.data])
 
   return (
     <>
       <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
-      {continuous.loading && (
+      {intraday.loading && (
         <div className="dim" style={{ position: 'absolute', padding: 8 }}>
-          加载盘中…
+          加载分时…
         </div>
       )}
-      {continuous.error && (
+      {intraday.error && (
         <div className="down" style={{ position: 'absolute', padding: 8 }}>
-          {continuous.error}
+          {intraday.error}
         </div>
       )}
     </>

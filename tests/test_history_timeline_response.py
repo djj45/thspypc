@@ -35,6 +35,105 @@ BAR_OFFSETS = (
     + list(range(290, 350))
     + [354]
 )
+
+
+def test_parse_bundled_l2_bitrle_timeline_selects_target_code(monkeypatch):
+    fields = [(1, 0x30, 0, 4), (10, 0x70, 0, 4)] + [
+        (datatype, 0x70, 0, 4) for datatype in range(11, 32)
+    ]
+    field_table = b"".join(bytes(field) for field in fields)
+    bars = list(range(132670046, 132670287))
+    benchmark_rows = b"".join(
+        struct.pack("<23I", bar, 1, *([0] * 21)) for bar in bars
+    )
+    target_rows = b"".join(
+        struct.pack("<23I", bar, 2, *([0] * 21)) for bar in bars
+    )
+    rows = benchmark_rows + target_rows
+    count = len(bars) * 2
+    shell = b"\x28\x00\x02\x00 399002" + b"\0" * 10 + b"!000001"
+    body = (
+        b"hd3.1\0"
+        + struct.pack("<IHHH", count, 0x0094, 92, len(fields))
+        + field_table
+        + shell
+        + struct.pack(">I", len(rows))
+        + b"encoded"
+    )
+    monkeypatch.setattr(
+        history_timeline_protocol,
+        "_decode_bitrle_0x13746d0",
+        lambda _body, _expected: rows,
+    )
+    monkeypatch.setattr(
+        history_timeline_protocol,
+        "_transpose_bitplane_0x1763410",
+        lambda _plane, size, _count, *, row_start=0, row_count=None: rows[
+            row_start * size : (row_start + row_count) * size
+        ],
+    )
+
+    result = parse_history_timeline_response(
+        body,
+        code="000001",
+        requested_codes=("399002", "000001"),
+    )
+
+    assert len(result) == 241
+    assert result[0]["bar_index"] == bars[0]
+    assert result[0]["dt10"] == 2.0
+
+
+def test_parse_bundled_l2_partial_timeline_only_when_explicitly_allowed(
+    monkeypatch,
+):
+    fields = [(1, 0x30, 0, 4), (10, 0x70, 0, 4)] + [
+        (datatype, 0x70, 0, 4) for datatype in range(11, 32)
+    ]
+    bars = list(range(132670046, 132670076))
+    benchmark = b"".join(
+        struct.pack("<23I", bar, 1, *([0] * 21)) for bar in bars
+    )
+    target = b"".join(
+        struct.pack("<23I", bar, 2, *([0] * 21)) for bar in bars
+    )
+    rows = benchmark + target
+    count = len(bars) * 2
+    body = (
+        b"hd3.1\0"
+        + struct.pack("<IHHH", count, 0x0094, 92, len(fields))
+        + b"".join(bytes(field) for field in fields)
+        + b"\x28\x00\x02\x00 399002"
+        + b"\0" * 10
+        + b"!000001"
+        + struct.pack(">I", len(rows))
+        + b"encoded"
+    )
+    monkeypatch.setattr(
+        history_timeline_protocol,
+        "_decode_bitrle_0x13746d0",
+        lambda _body, _expected: rows,
+    )
+    monkeypatch.setattr(
+        history_timeline_protocol,
+        "_transpose_bitplane_0x1763410",
+        lambda _plane, size, _count, *, row_start=0, row_count=None: rows[
+            row_start * size : (row_start + row_count) * size
+        ],
+    )
+    kwargs = {
+        "code": "000001",
+        "requested_codes": ("399002", "000001"),
+    }
+
+    assert parse_history_timeline_response(body, **kwargs) == []
+    result = parse_history_timeline_response(
+        body,
+        **kwargs,
+        allow_partial=True,
+    )
+    assert len(result) == 30
+    assert result[0]["dt10"] == 2.0
 STOCK_FIELDS = [
     1, 10, 13, 19, 22, 23, 54,
     201, 202, 203, 204, 207, 208, 209, 210,

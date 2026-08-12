@@ -1,6 +1,6 @@
 """Offline account, role, and response contracts for call auctions."""
 
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -22,6 +22,7 @@ def _profile(kind, auction, market_access):
             Capability.BASIC_AUCTION: basic,
             Capability.L2_AUCTION: auction,
             Capability.L2_MARKET_ACCESS: market_access,
+            Capability.L2_HISTORY_TIMELINE: market_access,
         },
     )
 
@@ -226,6 +227,365 @@ def test_level2_historical_opening_sends_4417_context_bundle(
     assert b"pageid=9355" not in bundle
 
 
+def test_level2_intraday_consumes_all_three_bundle_responses(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([
+        b"CodeListSize=1",
+        b"hd1.0\x00continuous",
+        b"hd1.0\x00closing",
+        b"hd1.0\x00opening",
+    ])
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_history_timeline_response",
+        lambda body, **_kwargs: (
+            [{"bar_index": 0, "dt10": 12.3}]
+            if body.endswith(b"continuous")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_closing_auction_response",
+        lambda body: (
+            [{"time": "14:57", "dt10": 12.4}]
+            if body.endswith(b"closing")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda body: (
+            [{"time": "09:15", "dt10": 12.2}]
+            if body.endswith(b"opening")
+            else []
+        ),
+    )
+    service = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    )
+
+    result = service.intraday(
+        "603118",
+        market=17,
+        trade_date=date(2026, 7, 24),
+    )
+
+    assert [row["phase"] for row in result] == [
+        "opening_auction",
+        "continuous",
+        "closing_auction",
+    ]
+    assert len(sock.sent) == 2  # subscription + exactly one three-frame bundle
+    assert sock.sent[1].count(b"\xfd\xfd\xfd\xfd") == 3
+
+
+def test_level2_intraday_auctions_returns_only_opening_and_closing(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([
+        b"CodeListSize=1",
+        b"hd1.0\x00continuous-context",
+        b"hd1.0\x00closing",
+        b"hd1.0\x00opening",
+    ])
+    continuous_calls = []
+    monkeypatch.setattr(
+        "thspypc.services.auction._now",
+        lambda: datetime(2026, 8, 12, 15, 1),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_history_timeline_response",
+        lambda *_args, **_kwargs: continuous_calls.append(True) or [],
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_closing_auction_response",
+        lambda body: (
+            [{"time": "14:57", "dt10": 12.4}]
+            if body.endswith(b"closing")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda body: (
+            [{"time": "09:15", "dt10": 12.2}]
+            if body.endswith(b"opening")
+            else []
+        ),
+    )
+
+    result = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    ).intraday_auctions("603118", market=17)
+
+    assert [row["phase"] for row in result] == [
+        "opening_auction",
+        "closing_auction",
+    ]
+    assert continuous_calls == []
+    assert sock.sent[1].count(b"\xfd\xfd\xfd\xfd") == 3
+
+
+def test_level2_intraday_returns_partial_phases_after_short_tail(monkeypatch):
+    class TimeoutReader:
+        def __init__(self):
+            self.responses = iter([
+                b"CodeListSize=1",
+                b"hd1.0\x00continuous",
+            ])
+
+        def __call__(self, _sock):
+            try:
+                return next(self.responses)
+            except StopIteration:
+                import socket
+
+                raise socket.timeout
+
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_history_timeline_response",
+        lambda body, **_kwargs: (
+            [{"bar_index": 0, "dt10": 12.3}]
+            if body.endswith(b"continuous")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_closing_auction_response",
+        lambda _body: [],
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda _body: [],
+    )
+    service = AuctionService(manager, frame_reader=TimeoutReader())
+
+    result = service.intraday(
+        "603118",
+        market=17,
+        trade_date=date(2026, 7, 24),
+        timeout=12.0,
+    )
+
+    assert result == [
+        {"phase": "continuous", "bar_index": 0, "dt10": 12.3}
+    ]
+    assert sock.timeout == 0.25
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (datetime(2026, 8, 12, 9, 14, 59), ()),
+        (datetime(2026, 8, 12, 9, 15), ("opening_auction",)),
+        (datetime(2026, 8, 12, 9, 25), ("opening_auction",)),
+        (
+            datetime(2026, 8, 12, 9, 30),
+            ("opening_auction", "continuous"),
+        ),
+        (
+            datetime(2026, 8, 12, 14, 56, 59),
+            ("opening_auction", "continuous"),
+        ),
+        (
+            datetime(2026, 8, 12, 14, 57),
+            ("opening_auction", "continuous", "closing_auction"),
+        ),
+        (
+            datetime(2026, 8, 12, 15, 0),
+            ("opening_auction", "continuous", "closing_auction"),
+        ),
+    ],
+)
+def test_current_intraday_phase_boundaries(current, expected):
+    from thspypc.services.auction import _current_intraday_phases
+
+    assert _current_intraday_phases(current) == expected
+
+
+def test_default_intraday_before_0915_returns_previous_trade_day(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([
+        b"CodeListSize=1",
+        b"hd1.0\x00continuous",
+        b"hd1.0\x00closing",
+        b"hd1.0\x00opening",
+    ])
+    monkeypatch.setattr(
+        "thspypc.services.auction._now",
+        lambda: datetime(2026, 8, 12, 9, 14, 59),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.latest_trade_date",
+        lambda _now=None: date(2026, 8, 11),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_history_timeline_response",
+        lambda body, **_kwargs: (
+            [{"bar_index": 0, "dt10": 12.3}]
+            if body.endswith(b"continuous")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_closing_auction_response",
+        lambda body: (
+            [{"time": "14:57", "dt10": 12.4}]
+            if body.endswith(b"closing")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda body: (
+            [{"time": "09:15", "dt10": 12.2}]
+            if body.endswith(b"opening")
+            else []
+        ),
+    )
+
+    result = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    ).intraday("000938", market=33)
+
+    assert [row["phase"] for row in result] == [
+        "opening_auction",
+        "continuous",
+        "closing_auction",
+    ]
+    assert b"20260811" not in sock.sent[1]  # protocol carries timestamp/bar cursor
+    assert sock.sent[1].count(b"\xfd\xfd\xfd\xfd") == 3
+
+
+def test_explicit_today_before_0915_remains_empty(monkeypatch):
+    opened = []
+    manager = ConnectionManager(
+        LEVEL2_PROFILE,
+        lambda spec: opened.append(spec.role) or FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction._now",
+        lambda: datetime(2026, 8, 12, 9, 14, 59),
+    )
+
+    result = AuctionService(manager).intraday(
+        "000938",
+        market=33,
+        trade_date=date(2026, 8, 12),
+    )
+
+    assert result == []
+    assert opened == []
+
+
+def test_current_0925_to_0930_returns_opening_only(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([
+        b"CodeListSize=1",
+        b"hd3.1\x00continuous-context",
+        b"hd1.0\x00opening",
+    ])
+    continuous_calls = []
+    monkeypatch.setattr(
+        "thspypc.services.auction._now",
+        lambda: datetime(2026, 8, 12, 9, 25),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_history_timeline_response",
+        lambda *_args, **_kwargs: continuous_calls.append(True) or [
+            {"bar_index": 0}
+        ],
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda body: (
+            [{"time": "09:15", "dt10": 12.2}]
+            if body.endswith(b"opening")
+            else []
+        ),
+    )
+
+    result = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    ).intraday("000938", market=33)
+
+    assert result == [
+        {"phase": "opening_auction", "time": "09:15", "dt10": 12.2}
+    ]
+    assert continuous_calls == []
+    bundle = sock.sent[1]
+    assert bundle.count(b"\xfd\xfd\xfd\xfd") == 2
+    assert b"DateTime=8192(" in bundle  # required page-4417 context
+    assert b"DateTime=6144(" in bundle
+    assert b"DateTime=7424(" not in bundle
+
+
+def test_current_midday_intraday_accepts_partial_timeline_and_skips_close(
+    monkeypatch,
+):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([
+        b"CodeListSize=1",
+        b"hd3.1\x00partial-continuous",
+        b"hd1.0\x00opening",
+    ])
+    calls = []
+
+    def parse_continuous(body, **kwargs):
+        calls.append((body, kwargs))
+        return (
+            [{"bar_index": 0, "dt10": 12.3}]
+            if body.endswith(b"partial-continuous")
+            else []
+        )
+
+    monkeypatch.setattr(
+        "thspypc.services.auction._now",
+        lambda: datetime(2026, 8, 12, 10, 0),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_history_timeline_response",
+        parse_continuous,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda body: (
+            [{"time": "09:15", "dt10": 12.2}]
+            if body.endswith(b"opening")
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_closing_auction_response",
+        lambda _body: [],
+    )
+
+    result = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    ).intraday("000938", market=33)
+
+    assert [row["phase"] for row in result] == [
+        "opening_auction",
+        "continuous",
+    ]
+    assert calls[0][1]["allow_partial"] is True
+    bundle = sock.sent[1]
+    assert bundle.count(b"\xfd\xfd\xfd\xfd") == 2
+    assert b"DateTime=8192(" in bundle
+    assert b"DateTime=6144(" in bundle
+    assert b"DateTime=7424(" not in bundle
+
+
 def test_level2_distinguishes_parser_failure(monkeypatch):
     manager = ConnectionManager(
         LEVEL2_PROFILE,
@@ -409,11 +769,11 @@ def test_in_auction_session_boundary():
     from thspypc.services.auction import _in_auction_session
 
     assert _in_auction_session(datetime(2026, 8, 12, 9, 15, 0)) is True
-    assert _in_auction_session(datetime(2026, 8, 12, 9, 25, 0)) is True
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 24, 59)) is True
     assert _in_auction_session(datetime(2026, 8, 12, 9, 20, 0)) is True
     # 边界外
     assert _in_auction_session(datetime(2026, 8, 12, 9, 14, 59)) is False
-    assert _in_auction_session(datetime(2026, 8, 12, 9, 25, 1)) is False
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 25, 0)) is False
     assert _in_auction_session(datetime(2026, 8, 12, 12, 0, 0)) is False  # 午间休市
     assert _in_auction_session(datetime(2026, 8, 12, 22, 0, 0)) is False  # 盘后
     # 周末即使在 9:15-9:25 也 False

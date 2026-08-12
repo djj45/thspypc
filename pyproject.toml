@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "a-trade-calendar>=1.0",
     "pycryptodome>=3.20.0",
     "qrcode>=8.2",
     "requests>=2.28",
@@ -27,8 +28,8 @@ server = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.11.23,<0.12.0"]
-build-backend = "uv_build"
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.uv]
 # package = false：不把 thspypc 当包构建安装（避免 uv_build 子进程被

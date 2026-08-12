@@ -1,5 +1,8 @@
 """Contracts for borrowing legacy THSClient sockets into services."""
 
+import concurrent.futures
+import threading
+
 import pytest
 
 from thspypc._transport import ConnectionRole
@@ -206,6 +209,84 @@ def test_refresh_from_evidence_requires_service_context():
 
     with pytest.raises(RuntimeError, match="configure_service_context"):
         client.refresh_service_profile_from_evidence()
+
+
+def test_preheat_l2_connections_reuses_ready_market_roles():
+    client = _client()
+    sh = FakeSocket()
+    sz = FakeSocket()
+    client._push_socks.update({"sh": sh, "sz": sz})
+    client._push_initialized.update({"sh", "sz"})
+    client._account_evidence.record_l2_entitlement(Support.YES)
+    client._account_evidence.record_manual_login(Support.YES)
+    client._account_evidence.record_l2_init(Support.YES)
+    client.configure_service_context(LEVEL2_PROFILE, allow_open=True)
+
+    result = client.preheat_l2_connections()
+
+    assert result == {
+        "sh": {"ready": True, "initialized": True},
+        "sz": {"ready": True, "initialized": True},
+    }
+    assert client._push_socks == {"sh": sh, "sz": sz}
+
+
+def test_preheat_l2_connections_skips_non_level2_profile():
+    client = _client()
+    client._account_evidence.record_main_ready()
+    client._account_evidence.record_l2_entitlement(Support.NO)
+
+    assert client.preheat_l2_connections() == {
+        "sh": {"ready": False, "skipped": True},
+        "sz": {"ready": False, "skipped": True},
+    }
+    assert client._push_socks == {}
+
+
+def test_concurrent_default_calls_keep_each_others_capability_lease():
+    client = _client()
+    client._account_evidence.record_l2_entitlement(Support.YES)
+    client._account_evidence.record_manual_login(Support.YES)
+    client._account_evidence.record_l2_init(Support.YES)
+    both_entered = threading.Event()
+    release_second = threading.Event()
+    entered = 0
+    entered_lock = threading.Lock()
+
+    def enter():
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+        assert both_entered.wait(timeout=1.0)
+
+    def first_operation():
+        enter()
+        return "first"
+
+    def second_operation():
+        enter()
+        assert release_second.wait(timeout=2.0)
+        assert client._service_connections.profile.supports(
+            Capability.L2_AUCTION
+        )
+        return "second"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client._run_default_service,
+            (Capability.L2_TIMELINE,),
+            first_operation,
+        )
+        second = executor.submit(
+            client._run_default_service,
+            (Capability.L2_AUCTION,),
+            second_operation,
+        )
+        assert first.result(timeout=2.0) == "first"
+        release_second.set()
+        assert second.result(timeout=2.0) == "second"
 
 
 def test_standard_profile_cannot_adopt_accidental_l2_socket():
@@ -444,6 +525,30 @@ def test_depth_quote_opt_in_preserves_transport_retry(monkeypatch):
     assert client._sock is replacement
 
 
+def test_market_view_pipeline_delegates_to_quote_service(monkeypatch):
+    client = _client()
+    client._sock = FakeSocket()
+    calls = []
+    expected = (
+        {"code": "000001", "dt10": 12.34},
+        {"code": "000001", "buy": [], "sell": []},
+    )
+
+    class FakeQuoteService:
+        def __init__(self, connections, *, evidence=None, subscriptions=None):
+            self.connections = connections
+
+        def market_view_pipeline(self, code, **kwargs):
+            calls.append((code, kwargs))
+            return expected
+
+    monkeypatch.setattr("thspypc.services.QuoteService", FakeQuoteService)
+    client.configure_service_context(LEVEL2_PROFILE)
+
+    assert client.market_view_pipeline("000001", timeout=3.0) is expected
+    assert calls == [("000001", {"market": 33, "timeout": 3.0})]
+
+
 def test_kline_opt_in_delegates_without_l2(monkeypatch):
     client = _client()
     client._sock = FakeSocket()
@@ -484,6 +589,7 @@ def test_kline_opt_in_delegates_without_l2(monkeypatch):
                 "anchor": 0,
                 "fuquan": "H",
                 "timeout": 5.0,
+                "channel": "auto",
             },
         )
     ]
@@ -984,6 +1090,54 @@ def test_intraday_combines_historical_phases_in_display_order(
     assert calls[2][0] == "closing"
 
 
+def test_level2_historical_intraday_uses_one_service_workflow(monkeypatch):
+    client = _client()
+    client.configure_service_context(LEVEL2_PROFILE)
+    expected = [
+        {"phase": "opening_auction", "time": "09:15"},
+        {"phase": "continuous", "bar_index": 0},
+        {"phase": "closing_auction", "time": "14:57"},
+    ]
+    calls = []
+    monkeypatch.setattr(
+        client._auction_service,
+        "intraday",
+        lambda code, **kwargs: (
+            calls.append((code, kwargs)) or expected
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "auction",
+        lambda *_args, **_kwargs: pytest.fail("must not make a second request"),
+    )
+    monkeypatch.setattr(
+        client,
+        "history_timeline",
+        lambda *_args, **_kwargs: pytest.fail("must not make a second request"),
+    )
+    monkeypatch.setattr(
+        client,
+        "closing_auction",
+        lambda *_args, **_kwargs: pytest.fail("must not make a second request"),
+    )
+
+    result = client.intraday(
+        "603118",
+        market=17,
+        trade_date="2026-07-24",
+        timeout=6.0,
+    )
+
+    assert result == expected
+    assert calls == [
+        (
+            "603118",
+            {"market": 17, "trade_date": "2026-07-24", "timeout": 6.0},
+        )
+    ]
+
+
 def test_historical_index_intraday_has_no_auction_phases(monkeypatch):
     client = _client()
     monkeypatch.setattr(
@@ -1024,7 +1178,7 @@ def test_controlled_opener_builds_and_caches_borrowed_l2_socket(
     monkeypatch,
 ):
     client = _client()
-    client._auth = {}
+    client.authenticate = lambda **_kwargs: object()
     sock = FakeSocket()
     opened_markets = []
 
@@ -1096,7 +1250,7 @@ def test_controlled_opener_can_bridge_main_login(monkeypatch):
 
 def test_controlled_opener_reports_l2_open_failure(monkeypatch):
     client = _client()
-    client._auth = {}
+    client.authenticate = lambda **_kwargs: object()
     monkeypatch.setattr(
         client,
         "_open_manual_push_connection",

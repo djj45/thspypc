@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import struct
 
+try:
+    from . import _compression_native
+except ImportError:  # Optional accelerator; source checkouts use Python fallback.
+    _compression_native = None
+
 
 _MAX_NORMALIZED_8901_SIZE = 16 * 1024 * 1024
 
@@ -175,6 +180,8 @@ def _decode_bitrle_0x13746d0(src: bytes, expect: int) -> bytes:
     与 Unicorn 模拟真实机器码逐字节对照验证（6 帧 × 1363 字节 + 7526 条全量表
     534346 字节，全部一致）。无 unicorn 依赖。
     """
+    if _compression_native is not None:
+        return _compression_native.decode_bitrle(src, expect)
     if len(src) < 4:
         return b""
     out_len = struct.unpack(">I", src[:4])[0]
@@ -302,7 +309,32 @@ def _decode_bitrle_0x13746d0(src: bytes, expect: int) -> bytes:
     return bytes(out[:out_len])
 
 
-def _transpose_bitplane_0x1763410(src: bytes, hs: int, dc: int) -> bytes:
+def _build_bitplane_byte_to_rows() -> tuple[tuple[int, ...], ...]:
+    """Build lookup masks for transposing one 8-record bit-plane block."""
+    tables: list[tuple[int, ...]] = []
+    for plane in range(8):
+        values = []
+        for value in range(256):
+            packed = 0
+            for row in range(8):
+                if value & (1 << row):
+                    packed |= 1 << (row * 8 + plane)
+            values.append(packed)
+        tables.append(tuple(values))
+    return tuple(tables)
+
+
+_BITPLANE_BYTE_TO_ROWS = _build_bitplane_byte_to_rows()
+
+
+def _transpose_bitplane_0x1763410(
+    src: bytes,
+    hs: int,
+    dc: int,
+    *,
+    row_start: int = 0,
+    row_count: int | None = None,
+) -> bytes:
     """纯 Python 移植 hexin.exe 0x1763410（位平面转置）。
 
     把 _decode_bitrle_0x13746d0 输出的 dc*hs 字节位平面转成 dc 条行主序记录
@@ -313,17 +345,49 @@ def _transpose_bitplane_0x1763410(src: bytes, hs: int, dc: int) -> bytes:
       输出字节 (r,c) 的第 p 位（LSB）置为该源位。
     与 Unicorn 对照 6 帧 1363 字节 + 7526 条 534346 字节全部一致。
     """
-    out = bytearray(dc * hs)
-    if dc == 0 or hs == 0:
+    if _compression_native is not None:
+        return _compression_native.transpose(
+            src,
+            hs,
+            dc,
+            row_start=row_start,
+            row_count=row_count,
+        )
+    row_start = max(0, min(row_start, dc))
+    if row_count is None:
+        row_count = dc - row_start
+    row_count = max(0, min(row_count, dc - row_start))
+    out = bytearray(row_count * hs)
+    if row_count == 0 or hs == 0:
         return bytes(out)
-    outlen = len(out)
-    srclen = len(src)
+
+    # A plane contains one bit per record.  The original implementation read
+    # one bit at a time (hs * 8 * dc Python loop iterations).  Read eight
+    # records from every plane at once, then combine them through lookup masks
+    # into eight row bytes.  Plane starts need not be byte-aligned when dc is
+    # not divisible by eight, hence the two-byte sliding window below.
+    expected = dc * hs
+    data = src[:expected]
+    if len(data) < expected:
+        data += bytes(expected - len(data))
+    data += b"\x00"
+    tables = _BITPLANE_BYTE_TO_ROWS
+
     for c in range(hs):
-        for p in range(8):
-            for r in range(dc):
-                m = (c * 8 + p) * dc + r
-                byte = m >> 3
-                if byte < srclen and (src[byte] >> (m & 7)) & 1:
-                    if r * hs + c < outlen:
-                        out[r * hs + c] |= 1 << p
+        column_start = c * 8 * dc
+        for source_row in range(row_start, row_start + row_count, 8):
+            packed = 0
+            for plane in range(8):
+                bit_offset = column_start + plane * dc + source_row
+                byte_offset = bit_offset >> 3
+                shift = bit_offset & 7
+                value = data[byte_offset] >> shift
+                if shift:
+                    value |= data[byte_offset + 1] << (8 - shift)
+                packed |= tables[plane][value & 0xFF]
+
+            rows_in_block = min(8, row_start + row_count - source_row)
+            out_offset = (source_row - row_start) * hs + c
+            for row in range(rows_in_block):
+                out[out_offset + row * hs] = (packed >> (row * 8)) & 0xFF
     return bytes(out)

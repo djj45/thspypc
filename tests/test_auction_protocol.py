@@ -9,6 +9,46 @@ import thspypc.protocol as protocol
 from thspypc.features import auction_protocol
 
 
+def test_parse_level2_bitrle_opening_auction(monkeypatch):
+    fields = [(1, 0x30, 0, 4), (10, 0x70, 0, 4)]
+    field_table = b"".join(bytes(field) for field in fields)
+    timestamps = [
+        1_786_412_100,
+        1_786_412_103,
+        1_786_412_106,
+    ]
+    rows = b"".join(struct.pack("<II", ts, 2) for ts in timestamps)
+    shell = b"\x16\x00\x01\x00!000001" + b"\0" * 15
+    body = (
+        b"hd3.1\0"
+        + struct.pack("<IHHH", len(timestamps), 0x003A, 8, len(fields))
+        + field_table
+        + shell
+        + struct.pack(">I", len(rows))
+        + b"encoded"
+    )
+    monkeypatch.setattr(
+        auction_protocol,
+        "_decode_bitrle_0x13746d0",
+        lambda _body, _expected: rows,
+    )
+    monkeypatch.setattr(
+        auction_protocol,
+        "_transpose_bitplane_0x1763410",
+        lambda _plane, _size, _count: rows,
+    )
+    monkeypatch.setattr(
+        auction_protocol,
+        "_auction_ts_in_range",
+        lambda _ts: True,
+    )
+
+    result = auction_protocol.parse_auction_response(body)
+
+    assert len(result) == 3
+    assert result[0]["dt10"] == 2.0
+
+
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 

@@ -1,8 +1,8 @@
 # Web API 服务（单用户 REST，FastAPI）
 
 > 前端（JS 架构）消费的后端接口层。单用户：进程内持有一个
-> `THSClient`，所有请求经 `ThsRuntime` 全局锁串行化（复用库内
-> single-flight，避免并发抢一条 8901 socket）。
+> `THSClient`。`ThsRuntime` 只串行化首次登录；业务请求由库内
+> MAIN/SH_L2/SZ_L2 等连接各自的 single-flight 锁保护，不同连接可并行。
 >
 > 实时推送（短线精灵 / 快照订阅）暂未接入——待盘中抓包核对后再加
 > WebSocket 通道。
@@ -32,6 +32,10 @@ OpenAPI 文档。
 | GET | `/api/auction/{code}?trade_date=` | 早盘集合竞价 |
 | GET | `/api/closing_auction/{code}?trade_date=` | 尾盘集合竞价 |
 | GET | `/api/intraday/{code}?trade_date=` | 完整日内序列 |
+| GET | `/api/market_view/{code}?period=day&count=320&fuquan=Q&levels=5` | 单股页面聚合数据（行情 + 完整日内 + K 线 + 盘口） |
+| GET | `/api/market_view_fast/{code}?levels=5` | 首屏行情与盘口（不包含分时） |
+| GET | `/api/intraday/{code}` | 统一返回早盘竞价、盘中分时、尾盘竞价 |
+| GET | `/api/intraday_auctions/{code}` | 兼容接口；新前端不再使用 |
 | GET | `/api/stocks` | 全市场代码表（~7400 条，首次较慢） |
 | GET | `/api/hot?count=29&sort_by=199112&sort_dir=D` | 排序榜单 |
 | GET | `/api/market_snapshot` | 全市场快照 |
@@ -52,10 +56,25 @@ OpenAPI 文档。
 数据以 JSON 返回；`datetime` 字段自动序列化为 ISO 字符串。板块/分组等
 dataclass 实体自动转成字典。
 
+所有 HTTP 响应包含 `Server-Timing`，用于区分后端总耗时和连接排队，例如：
+
+```text
+total;dur=48.2, sh_l2_wait;dur=11.1, sh_l2_io;dur=31.9, app;dur=43.4
+```
+
+- `main_wait` / `sh_l2_wait` / `sz_l2_wait`：等待对应连接 single-flight 锁。
+- `main_io` / `sh_l2_io` / `sz_l2_io`：持有连接、发送并读取协议响应的时间。
+- `lifecycle_wait`：仅冷启动登录时可能出现的生命周期锁等待。
+- `app`：业务方法总时间；`total` 还包含 FastAPI 序列化等 HTTP 层时间。
+
 ## 设计说明
 
 - 单用户：`ThsRuntime` 懒创建唯一 `THSClient`，首次业务调用自动登录；
-  所有调用持同一把 RLock（`runtime.call`）。
+  首次登录持生命周期锁，业务调用不持跨连接全局锁。
+- 服务启动后后台预热 MAIN、SH_L2、SZ_L2；Uvicorn 不等待预热完成即可监听，
+  `/api/status` 的 `preheat.state` 和 `preheat.markets` 可查看进度与结果。
+  每条新 L2 socket 在登录前独立刷新 Passport64，已建立的 MAIN 不会被关闭；
+  普通或账号类型仍未知时跳过 L2 预热。
 - 若以后要多人/多账号，把 `ThsRuntime` 改成"每账号一个实例"的池即可，
   REST 契约不变。
 - 实时推送接口（`subscribe_realtime` / `snapshot_subscribe`）等盘中抓包
@@ -63,7 +82,7 @@ dataclass 实体自动转成字典。
 
 ## 相关文件
 
-- `src/thspypc/server/runtime.py`：`ThsRuntime`（唯一 client + 全局锁）
+- `src/thspypc/server/runtime.py`：`ThsRuntime`（唯一 client + 登录生命周期锁）
 - `src/thspypc/server/app.py`：`create_app()`（FastAPI 路由 + 错误映射）
 - `src/thspypc/server/__main__.py`：`python -m thspypc.server`
 - `tests/test_server_api.py`：路由/错误映射离线契约（`uv run --extra server pytest`）

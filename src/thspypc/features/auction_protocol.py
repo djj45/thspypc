@@ -5,7 +5,7 @@ import json
 import logging
 import struct
 from datetime import date as date_type
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 
 from ..codecs.compression import normalize_8901_response
@@ -17,6 +17,7 @@ from ..codecs.framing import encode_frame
 from ..codecs.hd import _parse_hd_field_table
 from ..codecs.numeric import decode_ths_float
 from .timeline_protocol import TIMELINE_L2_PAGEID
+from .trade_calendar import latest_trade_date
 
 
 logger = logging.getLogger(__name__)
@@ -285,35 +286,15 @@ def _coerce_trade_date(value) -> date_type:
 def resolve_trade_date(value=None) -> date_type:
     """Resolve a trade-date argument to a concrete date.
 
-    ``None`` / 未传 → 最近已收盘的交易日（周末回退；收盘前 15:00 回退到前一交易日）。
+    ``None`` / 未传 → 当前页面默认交易日（交易日 9:15 起为当天；9:15 前、
+    周末和节假日为最近一个交易日）。
     传 ``date``/``datetime``/ISO 字符串 → 原样返回（不强加交易日校验）。
 
-    2026-08-05 抓包确认：同花顺客户端盘后查竞价/尾盘时，默认查的是**最近交易日**
-    （8/4 周一）的时间戳，而非"今天"（8/5）。此前代码用 ``datetime.now().date()``
-    导致盘后/周末请求当日竞价超时（当日无数据）。
+    该选择使用 A 股交易日历，避免把节假日当成交易日；显式日期不做改写。
     """
     if value is not None:
         return _coerce_trade_date(value)
-    now = datetime.now()
-    d = now.date()
-    # 收盘前（15:00 前）且是工作日 → 当日竞价/尾盘可能尚未产生，回退到前一交易日
-    if d.weekday() < 5 and now.time() < time(15, 0):
-        return _trading_days_back(d, 1)
-    # 周末或收盘后 → 回退到最近的工作日（不处理节假日，需调用方传显式日期）
-    while d.weekday() >= 5:
-        d = d - timedelta(days=1)
-    return d
-
-
-def _trading_days_back(from_date: date_type, n: int) -> date_type:
-    """Go back n trading days (skipping weekends; holidays not handled)."""
-    d = from_date
-    count = 0
-    while count < n:
-        d = d - timedelta(days=1)
-        if d.weekday() < 5:
-            count += 1
-    return d
+    return latest_trade_date()
 
 
 def build_basic_auction_query(
@@ -690,6 +671,64 @@ def _split_auction_history_segment(
     return records
 
 
+def _decode_bitrle_auction_table(
+    body: bytes,
+    base: int,
+    record_count: int,
+    record_size: int,
+    field_count: int,
+) -> list[dict]:
+    """Decode a Level2 page-4417 hd3.1 opening-auction table."""
+    fields = _parse_hd_field_table(body, base + 10, field_count)
+    if (
+        len(fields) != field_count
+        or sum(width for _, _, width in fields) != record_size
+    ):
+        return []
+    shell_offset = base + 10 + field_count * 4
+    expected = record_count * record_size
+    bitrle_offset = -1
+    scan_end = min(len(body) - 3, shell_offset + 128)
+    for candidate in range(shell_offset, scan_end):
+        if struct.unpack_from(">I", body, candidate)[0] == expected:
+            bitrle_offset = candidate
+            break
+    if bitrle_offset < 0:
+        return []
+    bitplane = _decode_bitrle_0x13746d0(body[bitrle_offset:], expected)
+    if len(bitplane) < expected:
+        return []
+    rows = _transpose_bitplane_0x1763410(
+        bitplane,
+        record_size,
+        record_count,
+    )
+    records: list[dict] = []
+    for index in range(record_count):
+        row = rows[index * record_size : (index + 1) * record_size]
+        raw_timestamp = struct.unpack_from("<I", row)[0]
+        if not _auction_ts_in_range(raw_timestamp):
+            continue
+        record: dict = {}
+        field_offset = 0
+        for datatype, _fmt, width in fields:
+            chunk = row[field_offset : field_offset + width]
+            field_offset += width
+            if width != 4:
+                record[f"dt{datatype}_raw"] = chunk
+                continue
+            raw_value = struct.unpack("<I", chunk)[0]
+            if datatype == 1:
+                record["time"] = datetime.fromtimestamp(raw_value)
+            else:
+                record[f"dt{datatype}"] = _auction_value(
+                    raw_value,
+                    datatype,
+                )
+        records.append(record)
+    return records
+
+
 def parse_auction_response(body: bytes) -> list[dict]:
     """Parse fixed and historical auction frames."""
     if body.startswith(b"\x0a"):
@@ -704,9 +743,17 @@ def parse_auction_response(body: bytes) -> list[dict]:
     position = 0
     records: list[dict] = []
     while True:
-        marker = body.find(b"hd1.0", position)
+        p1 = body.find(b"hd1.0", position)
+        p3 = body.find(b"hd3.1", position)
+        if p1 < 0:
+            marker = p3
+        elif p3 < 0:
+            marker = p1
+        else:
+            marker = min(p1, p3)
         if marker < 0:
             break
+        marker_name = body[marker : marker + 5]
         position = marker + 6
         base = marker + 6
         if len(body) < base + 10:
@@ -717,6 +764,18 @@ def parse_auction_response(body: bytes) -> list[dict]:
         record_size = struct.unpack("<H", body[base + 6:base + 8])[0]
         field_count = struct.unpack("<H", body[base + 8:base + 10])[0]
         if flag != 0x003A or record_size == 0 or field_count == 0:
+            continue
+
+        if marker_name == b"hd3.1":
+            bitrle_records = _decode_bitrle_auction_table(
+                body,
+                base,
+                record_count & 0xFFFF,
+                record_size,
+                field_count,
+            )
+            if bitrle_records:
+                return bitrle_records
             continue
 
         if record_count > 1000:

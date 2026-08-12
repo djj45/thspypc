@@ -9,6 +9,7 @@ from .connection import (
 )
 from .connection_manager import ConnectionManager, OpenedConnection
 from .session import MarketSession, SocketLike
+from .dispatcher import DispatchDecision, DispatchRequest, ResponseDispatcher
 
 __all__ = [
     "CONNECTION_SPECS",
@@ -20,4 +21,7 @@ __all__ = [
     "MarketSession",
     "OpenedConnection",
     "SocketLike",
+    "DispatchDecision",
+    "DispatchRequest",
+    "ResponseDispatcher",
 ]

@@ -64,6 +64,7 @@ class ConnectionFactory:
         self._connect_main = connect_main
         self._main_lock = main_lock
         self._current_auth = current_auth
+        # 保留注入参数兼容现有组合根；L2 建连已不再需要拆掉健康 MAIN。
         self._drop_main = drop_main
         self._open_manual = open_manual
         self._push_sockets = push_sockets
@@ -149,12 +150,13 @@ class ConnectionFactory:
                 current = self._push_sockets.get(key)
                 initialized = key in self._push_initialized
             if current is None:
-                if self._current_auth() is None:
-                    try:
-                        self._authenticate()
-                    except Exception as exc:
-                        raise OSError(f"L2 HTTP 鉴权失败: {exc}") from exc
-                self._drop_main()
+                # 一个 Passport64 在首次成功登录后即视为已消费。MAIN、SH_L2、
+                # SZ_L2 每条新 socket 都使用独立的新一代通行证；刷新 HTTP 鉴权
+                # 不影响已经登录并保持心跳的 MAIN socket。
+                try:
+                    self._authenticate(force=True)
+                except Exception as exc:
+                    raise OSError(f"L2 HTTP 鉴权失败: {exc}") from exc
                 opened = self._open_manual(market)
                 if opened is None:
                     raise OSError(f"L2[{key}] 建连或 init 失败")
@@ -555,6 +557,18 @@ class ConnectionRuntime:
                         logger.debug("8901 连接正在处理业务请求，跳过本轮心跳")
                 except OSError as exc:
                     logger.debug("8901 心跳发送失败（不影响查询）: %s", exc)
+            manager = self._service_connections()
+            if manager is not None:
+                kline = manager.peek(ConnectionRole.KLINE_FAST)
+                if kline is not None:
+                    try:
+                        self.heartbeat_seq_main += 1
+                        kline.try_send(build_main(self.heartbeat_seq_main))
+                    except OSError as exc:
+                        logger.debug(
+                            "KLINE_FAST heartbeat failed: %s",
+                            exc,
+                        )
             if tick % 10 == 0 and self._realorder_socket():
                 try:
                     self.heartbeat_seq_realorder += 1

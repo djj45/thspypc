@@ -3,6 +3,14 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
+name = "a-trade-calendar"
+version = "2028.4.14"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/c4/c416426969d6feef7f3a0456cfe61b22d4dcb7f167465c14433230d55b12/a_trade_calendar-2028.4.14-py2.py3-none-any.whl", hash = "sha256:ae792a5a175c31e9323e0c5c8cd0b3f28083bc4d2ed9711c3ef4585e8f7b5205", size = 21074, upload-time = "2026-08-04T15:01:46.194Z" },
+]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.5"
 source = { registry = "https://pypi.org/simple" }
@@ -490,6 +498,7 @@ name = "thspypc"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "a-trade-calendar" },
     { name = "pycryptodome" },
     { name = "qrcode" },
     { name = "requests" },
@@ -510,6 +519,7 @@ server = [
 
 [package.metadata]
 requires-dist = [
+    { name = "a-trade-calendar", specifier = ">=1.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "pycryptodome", specifier = ">=3.20.0" },

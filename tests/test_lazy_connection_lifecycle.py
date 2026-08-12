@@ -162,6 +162,42 @@ def test_l2_service_opener_authenticates_without_main_login(monkeypatch):
     assert client._sock is None
 
 
+def test_l2_service_opener_refreshes_passport_without_dropping_main(monkeypatch):
+    client = _client()
+    calls = []
+    _install_http_auth(client, calls)
+    client.authenticate()
+    main_sock = FakeSocket()
+    l2_sock = FakeSocket()
+    client._sock = main_sock
+    dropped = []
+    monkeypatch.setattr(
+        client,
+        "_drop_connection",
+        lambda: dropped.append(True),
+    )
+    monkeypatch.setattr(
+        client,
+        "_open_manual_push_connection",
+        lambda market: l2_sock,
+    )
+    manager = client.configure_service_context(
+        _level2_profile(),
+        allow_open=True,
+    )
+
+    connection = manager.acquire(
+        ConnectionRole.SH_L2,
+        capability=Capability.L2_TIMELINE,
+    )
+
+    assert connection.socket is l2_sock
+    assert len(calls) == 2
+    assert client._sock is main_sock
+    assert not main_sock.closed
+    assert dropped == []
+
+
 def test_realorder_authenticates_without_main_login(monkeypatch):
     import thspypc.client as client_module
 

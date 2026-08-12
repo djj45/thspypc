@@ -5,7 +5,13 @@ import logging
 import struct
 from collections.abc import Callable
 
-from .._transport import ConnectionManager, ConnectionRole, SocketLike
+from .._transport import (
+    ConnectionManager,
+    ConnectionRole,
+    DispatchDecision,
+    DispatchRequest,
+    SocketLike,
+)
 from ..codecs.framing import read_frame
 from ..codecs.hd import parse_hd1_response, parse_hd3_response
 from ..errors import (
@@ -27,6 +33,27 @@ from .subscription import L2SubscriptionCoordinator
 
 logger = logging.getLogger(__name__)
 FrameReader = Callable[[SocketLike], bytes]
+
+
+def _hd_field_ids(body: bytes) -> set[int]:
+    """Return the hd field ids without touching the socket or record bytes."""
+    marker = body.find(b"hd1.0")
+    if marker < 0:
+        marker = body.find(b"hd3.1")
+    if marker < 0:
+        return set()
+    base = marker + 6
+    if base + 10 > len(body):
+        return set()
+    field_count = struct.unpack("<H", body[base + 8 : base + 10])[0]
+    table_start = base + 10
+    table_end = table_start + field_count * 4
+    if not 0 < field_count < 256 or table_end > len(body):
+        return set()
+    return {
+        body[table_start + index * 4]
+        for index in range(field_count)
+    }
 
 
 def _repair_short_record(sock, body: bytes) -> bytes:
@@ -100,6 +127,59 @@ class QuoteService:
             capability=Capability.BASIC_QUOTE,
         )
 
+        # The default one-stock quote shape has fields which cannot be
+        # confused with the depth table.  Route this hot path through the
+        # connection dispatcher so an independently issued depth request may
+        # be in flight at the same time.  Custom field sets retain the legacy
+        # synchronous reader until their response signatures are proven.
+        if len(codes) == 1 and datatype == LIST_QUOTE_DATATYPE_DEFAULT:
+            code = codes[0]
+            quote_only_fields = {
+                "dt6", "dt7", "dt17", "dt48", "dt49", "dt66", "dt1111"
+            }
+            quote_only_field_ids = {6, 7, 17, 48, 49, 66, 1111 & 0xFF}
+
+            def consume(response: bytes, sock) -> DispatchDecision:
+                if b"hd1.0" not in response and b"hd3.1\x00" not in response:
+                    return DispatchDecision(False)
+                field_ids = _hd_field_ids(response)
+                if field_ids:
+                    if not quote_only_field_ids.intersection(field_ids):
+                        return DispatchDecision(False)
+                    response = _repair_short_record(sock, response)
+                records = (
+                    parse_hd3_response(response)
+                    if b"hd3.1\x00" in response
+                    else parse_hd1_response(response)
+                )
+                if not records:
+                    raise ProtocolError("收到行情数据帧但无法解析")
+                if records and not any(
+                    row.get("code") == code
+                    and quote_only_fields.intersection(row)
+                    for row in records
+                ):
+                    if field_ids:
+                        return DispatchDecision(False)
+                return DispatchDecision(True, True, records)
+
+            records = connection.dispatch(
+                [
+                    DispatchRequest(
+                        frame,
+                        consume,
+                        name=f"quote:{code}",
+                        fallback=[],
+                    )
+                ],
+                frame_reader=self._read_frame,
+                timeout=timeout,
+                max_frames=self._max_frames,
+            )[0]
+            if self._evidence is not None:
+                self._evidence.record_main_ready()
+            return records
+
         saw_data_frame = False
         with connection.request(frame, timeout=timeout) as sock:
             for _ in range(self._max_frames):
@@ -127,6 +207,92 @@ class QuoteService:
             raise ProtocolError("收到行情数据帧但无法解析")
         return []
 
+    def market_view_pipeline(
+        self,
+        code: str,
+        *,
+        market: int,
+        timeout: float = 12.0,
+    ) -> tuple[dict | None, DepthQuote]:
+        """Fetch one-stock quote and five-level depth in one MAIN flight.
+
+        Both requests are written before the first response is read.  This is
+        the bounded first-paint pipeline used by the web UI: one caller owns
+        the socket for the whole bundle, so unrelated responses cannot be
+        consumed by competing service methods.
+        """
+        quote_frame = build_list_quote_query(
+            [code],
+            market=market,
+            datatype=LIST_QUOTE_DATATYPE_DEFAULT,
+            pageid=1335,
+        )
+        depth_frame = build_depth_quote_query(code, market=market)
+        connection = self._connections.acquire(
+            ConnectionRole.MAIN,
+            capability=Capability.BASIC_QUOTE,
+        )
+
+        quote: dict | None = None
+        depth: DepthQuote = {}
+        # Fields which distinguish the compact quote table from the depth
+        # table.  Both tables contain dt10, so price alone is not sufficient.
+        quote_only_fields = {
+            "dt6", "dt7", "dt17", "dt48", "dt49", "dt66", "dt1111"
+        }
+        quote_only_field_ids = {6, 7, 17, 48, 49, 66, 1111 & 0xFF}
+
+        def consume_quote(response: bytes, sock) -> DispatchDecision:
+            if b"hd1.0" not in response and b"hd3.1\x00" not in response:
+                return DispatchDecision(False)
+            if not quote_only_field_ids.intersection(_hd_field_ids(response)):
+                return DispatchDecision(False)
+            response = _repair_short_record(sock, response)
+            records = (
+                parse_hd3_response(response)
+                if b"hd3.1\x00" in response
+                else parse_hd1_response(response)
+            )
+            candidate = next(
+                (
+                    row
+                    for row in records
+                    if row.get("code") == code
+                    and quote_only_fields.intersection(row)
+                ),
+                None,
+            )
+            return (
+                DispatchDecision(True, True, candidate)
+                if candidate is not None
+                else DispatchDecision(False)
+            )
+
+        def consume_depth(response: bytes, sock) -> DispatchDecision:
+            if 24 not in _hd_field_ids(response):
+                return DispatchDecision(False)
+            response = _repair_short_record(sock, response)
+            candidate = parse_depth_quote_response(response)
+            return (
+                DispatchDecision(True, True, candidate)
+                if candidate and candidate.get("code") == code
+                else DispatchDecision(False)
+            )
+
+        quote, depth = connection.dispatch(
+            [
+                DispatchRequest(quote_frame, consume_quote, name="quote"),
+                DispatchRequest(depth_frame, consume_depth, name="depth"),
+            ],
+            frame_reader=self._read_frame,
+            timeout=timeout,
+            max_frames=self._max_frames * 2,
+        )
+
+        if self._evidence is not None and (quote is not None or depth):
+            self._evidence.record_main_ready()
+        return quote, depth
+
     def depth_quote(
         self,
         code: str,
@@ -146,32 +312,37 @@ class QuoteService:
             capability=Capability.BASIC_QUOTE,
         )
 
-        saw_depth_frame = False
-        with connection.request(frame, timeout=timeout) as sock:
-            for _ in range(self._max_frames):
-                try:
-                    response = self._read_frame(sock)
-                except ValueError:
-                    recv = getattr(sock, "recv", None)
-                    if recv is None:
-                        continue
-                    try:
-                        recv(8192)
-                    except OSError as exc:
-                        raise ConnectionError("连接已关闭") from exc
-                    continue
+        def consume(response: bytes, sock) -> DispatchDecision:
+            field_ids = _hd_field_ids(response)
+            if field_ids:
+                if 24 not in field_ids:
+                    return DispatchDecision(False)
                 response = _repair_short_record(sock, response)
-                result = parse_depth_quote_response(response)
-                if result:
-                    if self._evidence is not None:
-                        self._evidence.record_main_ready()
-                    return result
-                if b"hd1.0" in response:
-                    saw_depth_frame = True
+            elif b"hd1.0" not in response:
+                return DispatchDecision(False)
+            result = parse_depth_quote_response(response)
+            if not result:
+                raise ProtocolError("收到五档盘口帧但无法解析")
+            if result and result.get("code") not in (None, "", code):
+                return DispatchDecision(False)
+            return DispatchDecision(True, True, result)
 
-        if saw_depth_frame:
-            raise ProtocolError("收到五档盘口帧但无法解析")
-        return {}
+        result = connection.dispatch(
+            [
+                DispatchRequest(
+                    frame,
+                    consume,
+                    name=f"depth:{code}",
+                    fallback={},
+                )
+            ],
+            frame_reader=self._read_frame,
+            timeout=timeout,
+            max_frames=self._max_frames,
+        )[0]
+        if self._evidence is not None:
+            self._evidence.record_main_ready()
+        return result
 
     def _depth_ten(
         self,

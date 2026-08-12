@@ -10,6 +10,9 @@ from ._transport import (
     MarketSession,
     OpenedConnection,
     SocketLike,
+    DispatchDecision,
+    DispatchRequest,
+    ResponseDispatcher,
 )
 
 __all__ = [
@@ -22,4 +25,7 @@ __all__ = [
     "MarketSession",
     "OpenedConnection",
     "SocketLike",
+    "DispatchDecision",
+    "DispatchRequest",
+    "ResponseDispatcher",
 ]

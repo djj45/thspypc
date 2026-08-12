@@ -73,6 +73,22 @@ export interface AuctionPoint {
   [k: string]: number | string | null | undefined
 }
 
+export interface MarketView {
+  code: string
+  period: string
+  fuquan: string
+  quote: Quote | null
+  intraday: (AuctionPoint & TimelinePoint)[]
+  kline: Kline[]
+  depth: Depth
+}
+
+export interface MarketViewFast {
+  code: string
+  quote: Quote | null
+  depth: Depth
+}
+
 // ── 板块（hot_boards）──
 export interface Board {
   code: string

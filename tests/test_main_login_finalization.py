@@ -7,6 +7,8 @@ LOGIN→INIT→行情查询）。list_quotes 走 hd1.0/hd3.1 不强依赖 init�
 MAIN 登录收尾必须触发 init，并正确替换旧 socket。
 """
 
+from types import SimpleNamespace
+
 from thspypc.client import LoginResult, THSClient
 from thspypc.models import Capability, Support
 
@@ -33,6 +35,60 @@ def _client():
         "offline-password",
         enable_heartbeat=False,
     )
+
+
+def test_independent_main_uses_fresh_passport_and_concurrent_race(monkeypatch):
+    client = _client()
+    sock = FakeSocket()
+    material = SimpleNamespace(
+        passport64="fresh-passport",
+        passport_bytes=b"passport-dns",
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        client,
+        "authenticate",
+        lambda *, force=False: calls.append(("auth", force)) or material,
+    )
+    monkeypatch.setattr(
+        client,
+        "_resolve_market_hosts",
+        lambda passport: calls.append(("resolve", passport))
+        or ["192.0.2.1", "192.0.2.2"],
+    )
+    monkeypatch.setattr(
+        client,
+        "_probe_fastest_hosts",
+        lambda hosts, timeout, role: calls.append(
+            ("probe", tuple(hosts), role)
+        )
+        or list(hosts),
+    )
+    monkeypatch.setattr(
+        client._auth_service,
+        "login_body_for_passport",
+        lambda passport: calls.append(("body", passport)) or b"login",
+    )
+    monkeypatch.setattr(
+        client,
+        "_concurrent_login",
+        lambda hosts, body: calls.append(("race", tuple(hosts), body))
+        or (hosts[0], sock, {"VerifyCode": "0"}),
+    )
+    monkeypatch.setattr(
+        client,
+        "_initialize_independent_main_socket",
+        lambda current: calls.append(("init", current)),
+    )
+
+    assert client._open_independent_main_connection() is sock
+    assert ("auth", True) in calls
+    assert ("resolve", b"passport-dns") in calls
+    assert ("body", "fresh-passport") in calls
+    assert ("race", ("192.0.2.1", "192.0.2.2"), b"login") in calls
+    assert ("init", sock) in calls
+    assert client._sock is None
 
 
 def test_main_login_sends_init_to_activate_channel(monkeypatch):

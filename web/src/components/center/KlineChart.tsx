@@ -1,16 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import {
   createChart,
   ColorType,
   type IChartApi,
   type ISeriesApi,
 } from 'lightweight-charts'
-import { api } from '../../api/endpoints'
-import { useData } from '../../data/useData'
-import { useStock } from '../../state/StockContext'
+import { KLINE_PERIODS, useStock } from '../../state/StockContext'
 
-const PERIODS = ['day', 'week', 'month', '60', '30', '15', '5', '1'] as const
-type Period = (typeof PERIODS)[number]
 const FUQUAN = [
   { v: 'Q', label: '前复权' },
   { v: 'H', label: '后复权' },
@@ -22,14 +18,9 @@ export function KlineChart() {
   const chartRef = useRef<IChartApi | null>(null)
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null)
-  const { code } = useStock()
-  const [period, setPeriod] = useState<Period>('day')
-  const [fuquan, setFuquan] = useState('Q')
-
-  const { data, error } = useData(
-    () => api.kline(code, period, 320, fuquan),
-    [code, period, fuquan],
-  )
+  const { code, period, setPeriod, fuquan, setFuquan, klineState } = useStock()
+  const data = klineState.data
+  const error = klineState.error
 
   useEffect(() => {
     const el = hostRef.current
@@ -84,7 +75,12 @@ export function KlineChart() {
     const candle = candleRef.current
     const vol = volRef.current
     const chart = chartRef.current
-    if (!candle || !vol || !chart || !data) return
+    if (!candle || !vol || !chart) return
+    if (!data) {
+      candle.setData([])
+      vol.setData([])
+      return
+    }
     const rows = data.map((k) => ({ ...k, day: (k.time || '').slice(0, 10) }))
     candle.setData(
       rows.map((r) => ({
@@ -111,7 +107,7 @@ export function KlineChart() {
       <div className="panel-title">
         日K · {code}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-          {PERIODS.map((p) => (
+          {KLINE_PERIODS.map((p) => (
             <span
               key={p}
               className={`chip ${period === p ? 'active' : ''}`}
@@ -142,6 +138,11 @@ export function KlineChart() {
         {error && (
           <div className="down" style={{ position: 'absolute', padding: 8 }}>
             {error}
+          </div>
+        )}
+        {klineState.loading && !data && (
+          <div className="dim" style={{ position: 'absolute', padding: 8 }}>
+            加载K线…
           </div>
         )}
       </div>

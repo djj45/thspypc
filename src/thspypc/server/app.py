@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import concurrent.futures
+from contextlib import asynccontextmanager
+import contextvars
 from dataclasses import asdict, is_dataclass
+import time
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..errors import (
@@ -14,6 +18,11 @@ from ..errors import (
     UnsupportedAccountFeatureError,
 )
 from .runtime import ThsRuntime
+from .._transport.timing import (
+    RequestTiming,
+    reset_request_timing,
+    set_request_timing,
+)
 
 
 def _market_for_code(code: str) -> int:
@@ -69,10 +78,17 @@ def _jsonable(value):
 
 def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     runtime = runtime or ThsRuntime()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        runtime.start_preheat()
+        yield
+
     app = FastAPI(
         title="thspypc Web API",
         version="0.1.0",
         description="同花顺 PC 协议的单用户 REST 接口（前端 JS 消费）。",
+        lifespan=lifespan,
     )
     # 开发期放开跨域，方便本地前端（React/Vue dev server）调试
     app.add_middleware(
@@ -82,6 +98,20 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         allow_headers=["*"],
     )
     app.state.runtime = runtime
+
+    @app.middleware("http")
+    async def server_timing(request: Request, call_next):
+        timing = RequestTiming()
+        token = set_request_timing(timing)
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+            response.headers["Server-Timing"] = timing.header(
+                (time.perf_counter() - started) * 1000
+            )
+            return response
+        finally:
+            reset_request_timing(token)
 
     def _call(operation: Callable[[object], object]) -> object:
         try:
@@ -138,6 +168,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         anchor: int = 0,
         fuquan: str = "Q",
         market: int = 0,
+        channel: str = "auto",
     ) -> list[dict]:
         return _call(
             lambda client: client.kline(
@@ -147,6 +178,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 anchor=anchor,
                 fuquan=fuquan,
                 market=market,
+                channel=channel,
             )
         )
 
@@ -203,6 +235,136 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 )
             )
         )
+
+    @app.get("/api/intraday_auctions/{code}")
+    def intraday_auctions(
+        code: str,
+        trade_date: str | None = None,
+        market: int = 0,
+    ) -> list[dict]:
+        """Return opening/closing auctions that supplement the fast timeline."""
+        return _jsonable(
+            _call(
+                lambda client: client.intraday_auctions(
+                    code,
+                    market=market,
+                    trade_date=trade_date,
+                )
+            )
+        )
+
+    @app.get("/api/market_view_fast/{code}")
+    def market_view_fast(
+        code: str,
+        levels: int = 5,
+        market: int = 0,
+    ) -> dict:
+        """Return first-paint quote and depth without querying intraday data."""
+        if levels not in (5, 10):
+            raise HTTPException(400, "levels 只能是 5 或 10")
+
+        def operation(client) -> dict:
+            resolved_market = market or _market_for_code(code)
+            if levels == 5 and hasattr(client, "market_view_pipeline"):
+                quote_row, depth_row = client.market_view_pipeline(
+                    code,
+                    market=resolved_market,
+                )
+            else:
+                rows = client.list_quotes([code], market=resolved_market)
+                quote_row = next(
+                    (row for row in rows if str(row.get("code", "")) == code),
+                    rows[0] if rows else None,
+                )
+                depth_row = client.depth_quote(
+                    code,
+                    market=market,
+                    ten_levels=levels == 10,
+                )
+
+            return {
+                "code": code,
+                "quote": quote_row,
+                "depth": depth_row,
+            }
+
+        return _jsonable(_call(operation))
+
+    @app.get("/api/market_view/{code}")
+    def market_view(
+        code: str,
+        period: str = "day",
+        count: int = 320,
+        anchor: int = 0,
+        fuquan: str = "Q",
+        levels: int = 5,
+        market: int = 0,
+        trade_date: str | None = None,
+    ) -> dict:
+        """Return all data needed by the single-stock screen in one HTTP response.
+
+        MAIN owns quote/depth while the selected market L2 connection owns
+        intraday/kline.  Each lane remains sequential (one socket, one reader),
+        but the two independent sockets run concurrently.
+        """
+        if levels not in (5, 10):
+            raise HTTPException(400, "levels 只能是 5 或 10")
+
+        def operation(client) -> dict:
+            resolved_market = market or _market_for_code(code)
+
+            def main_lane() -> tuple[dict | None, dict]:
+                rows = client.list_quotes([code], market=resolved_market)
+                quote_row = next(
+                    (row for row in rows if str(row.get("code", "")) == code),
+                    rows[0] if rows else None,
+                )
+                depth_row = client.depth_quote(
+                    code,
+                    market=market,
+                    ten_levels=levels == 10,
+                )
+                return quote_row, depth_row
+
+            def market_lane() -> tuple[list[dict], list[dict]]:
+                intraday_rows = client.intraday(
+                    code,
+                    market=market,
+                    trade_date=trade_date,
+                )
+                kline_rows = client.kline(
+                    code,
+                    period=period,
+                    count=count,
+                    anchor=anchor,
+                    fuquan=fuquan,
+                    market=market,
+                )
+                return intraday_rows, kline_rows
+
+            # ContextVars are not automatically copied into ThreadPoolExecutor
+            # workers.  Separate copies preserve request-local Server-Timing for
+            # both lanes without attempting to enter one Context concurrently.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                main_future = executor.submit(contextvars.copy_context().run, main_lane)
+                market_future = executor.submit(
+                    contextvars.copy_context().run,
+                    market_lane,
+                )
+                quote_row, depth_row = main_future.result()
+                intraday_rows, kline_rows = market_future.result()
+
+            return {
+                "code": code,
+                "period": period,
+                "fuquan": fuquan,
+                "quote": quote_row,
+                "intraday": intraday_rows,
+                "kline": kline_rows,
+                "depth": depth_row,
+            }
+
+        return _jsonable(_call(operation))
 
     # ── 全市场 ──
     @app.get("/api/stocks")

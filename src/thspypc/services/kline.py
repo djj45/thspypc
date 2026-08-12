@@ -6,21 +6,21 @@ from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
-from ..errors import ProtocolError
+from ..errors import CapabilityUnavailableError, ProtocolError
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.kline_protocol import (
     build_kline_l2_query,
     build_kline_query,
     parse_kline_hd3_response,
 )
-from ..models import AccountKind, Capability
+from ..models import AccountKind, Capability, Support
 
 
 FrameReader = Callable[[SocketLike], bytes]
 
 # 大 K 线响应在少数服务器上可能拆成多个独立 hd3.1 业务帧。只有首帧未达到
 # 请求窗口大小时才需要短暂尾读；正常完整响应不应为兼容分片固定等待数秒。
-KLINE_FRAGMENT_TAIL_TIMEOUT = 0.25
+KLINE_FRAGMENT_TAIL_TIMEOUT = 0.02
 
 
 def _kline_l2_role(market: int) -> ConnectionRole:
@@ -62,10 +62,24 @@ class KlineService:
         anchor: int = 0,
         fuquan: str = "Q",
         timeout: float = 12.0,
+        channel: str = "auto",
     ) -> list[dict]:
         """Return all K-line data frames belonging to one request."""
+        if channel not in ("auto", "level2", "ifindhq_fast"):
+            raise ValueError(
+                "K-line channel must be auto, level2, or ifindhq_fast"
+            )
         profile = self._connections.profile
-        use_l2 = profile.kind is AccountKind.LEVEL2
+        use_l2 = (
+            profile.kind is AccountKind.LEVEL2
+            if channel == "auto"
+            else channel == "level2"
+        )
+        if use_l2 and profile.kind is not AccountKind.LEVEL2:
+            raise CapabilityUnavailableError(
+                Capability.L2_TIMELINE,
+                "kline:level2",
+            )
         if use_l2:
             request = build_kline_l2_query(
                 code,
@@ -88,8 +102,13 @@ class KlineService:
                 count=count,
                 anchor=anchor,
             )
+            role = (
+                ConnectionRole.KLINE_FAST
+                if channel == "ifindhq_fast"
+                else ConnectionRole.MAIN
+            )
             connection = self._connections.acquire(
-                ConnectionRole.MAIN,
+                role,
                 capability=Capability.BASIC_QUOTE,
             )
         records: list[dict] = []
@@ -132,7 +151,13 @@ class KlineService:
 
         if records:
             if self._evidence is not None:
-                self._evidence.record_main_ready()
+                if use_l2:
+                    self._evidence.record_feature(
+                        Capability.L2_TIMELINE,
+                        Support.YES,
+                    )
+                else:
+                    self._evidence.record_main_ready()
             return records
         if saw_kline_frame:
             raise ProtocolError("received K-line frame but parsing failed")

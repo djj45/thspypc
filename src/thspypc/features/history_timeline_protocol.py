@@ -566,6 +566,8 @@ def parse_history_timeline_response(
     body: bytes,
     code: str | None = None,
     requested_codes: Sequence[str] | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> list[dict]:
     """Parse safely anchored records from a historical timeline response.
 
@@ -625,6 +627,7 @@ def parse_history_timeline_response(
         flag = struct.unpack("<H", body[base + 4 : base + 6])[0]
         record_size = struct.unpack("<H", body[base + 6 : base + 8])[0]
         field_count = struct.unpack("<H", body[base + 8 : base + 10])[0]
+        marker_kind = body[marker : marker + 5]
         normal_table = (
             flag == 0x0042
             and record_size == 28
@@ -635,10 +638,19 @@ def parse_history_timeline_response(
             and record_size in (88, 92)
             and field_count in (22, 23)
         )
+        bundled_l2_table = (
+            marker_kind == b"hd3.1"
+            and flag == 0x0094
+            and record_size == 92
+            and field_count == 23
+        )
         if (
-            (record_count >> 16) != 0x0400
+            (
+                not bundled_l2_table
+                and (record_count >> 16) != 0x0400
+            )
             or (record_count & 0xFFFF) == 0
-            or not (normal_table or level2_table)
+            or not (normal_table or level2_table or bundled_l2_table)
         ):
             continue
 
@@ -651,7 +663,7 @@ def parse_history_timeline_response(
         else:
             next_marker = min(next_p1, next_p3)
         block_end = next_marker if next_marker >= 0 else len(body)
-        if flag in (0x0042, 0x007E, 0x0082):
+        if flag in (0x0042, 0x007E, 0x0082, 0x0094):
             # 0x0082 与 0x007E/0x0042 一样有内联字段表（fc×4B，紧跟 header），
             # 之后是壳段（含 ASCII 代码标签）和记录数据。早期代码误以为 0x0082
             # 没有内联字段表面硬编码 6 字段，实测字段表就在 base+10。
@@ -681,6 +693,70 @@ def parse_history_timeline_response(
             # not a historical timeline stock/index table.
             continue
 
+        if bundled_l2_table:
+            count = record_count & 0xFFFF
+            expected = count * record_size
+            bitrle_offset = -1
+            scan_end = min(block_end - 3, search_start + 128)
+            for candidate in range(search_start, scan_end):
+                if struct.unpack_from(">I", body, candidate)[0] == expected:
+                    bitrle_offset = candidate
+                    break
+            shell = body[search_start:bitrle_offset]
+            present_codes = [
+                (shell.find(value.encode("ascii")), value)
+                for value in requested
+                if shell.find(value.encode("ascii")) >= 0
+            ]
+            ordered_codes = tuple(
+                value for _, value in sorted(present_codes)
+            ) or requested
+            if (
+                bitrle_offset < 0
+                or not ordered_codes
+                or code not in ordered_codes
+                or count % len(ordered_codes) != 0
+            ):
+                continue
+            bitplane = _decode_bitrle_0x13746d0(
+                body[bitrle_offset:],
+                expected,
+            )
+            if len(bitplane) < expected:
+                continue
+            rows_per_code = count // len(ordered_codes)
+            code_index = ordered_codes.index(code)
+            first = code_index * rows_per_code
+            decoded = _transpose_bitplane_0x1763410(
+                bitplane,
+                record_size,
+                count,
+                row_start=first,
+                row_count=rows_per_code,
+            )
+            target_expected = rows_per_code * record_size
+            if len(decoded) < target_expected:
+                continue
+            rows = []
+            for index in range(rows_per_code):
+                row_offset = index * record_size
+                bar = struct.unpack_from("<I", decoded, row_offset)[0]
+                if 100_000_000 <= bar <= 200_000_000:
+                    rows.append((row_offset, bar))
+            minimum_rows = (
+                1
+                if allow_partial
+                else _HISTORY_TIMELINE_MIN_ANCHORED_ROWS
+            )
+            if len(rows) < minimum_rows:
+                continue
+            return _decode_history_timeline_rows(
+                decoded,
+                rows,
+                fields,
+                record_size,
+            )
+
         explicit_code = _history_timeline_table_code(
             body,
             search_start,
@@ -698,7 +774,6 @@ def parse_history_timeline_response(
         if code is not None and code != label:
             continue
 
-        marker_kind = body[marker : marker + 5]
         if (
             marker_kind == b"hd3.1"
             and flag == 0x0042

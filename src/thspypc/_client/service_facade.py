@@ -15,6 +15,7 @@ from ..features.superorder_protocol import (
 from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
 from ..features.stock_name_bootstrap import STOCK_NAME_GROUPS
 from ..features.stock_name_cache import default_cache_path, group_cache_path
+from ..features.trade_calendar import latest_trade_date
 from ..services.stock_name import (
     download_all_stock_names,
     download_full_stock_names,
@@ -404,6 +405,29 @@ class ServiceFacade:
                 self._drop_connection()
         raise RuntimeError(f"depth_quote {code} 重试 {retries} 次仍失败: {last_err}")
 
+    def market_view_pipeline(
+        self,
+        code: str,
+        market: int = 0,
+        timeout: float = 12.0,
+    ) -> tuple[dict | None, DepthQuote]:
+        """Return quote and five-level depth using one bounded MAIN pipeline."""
+        if market == 0:
+            market = self._market_for_code(code)
+        self._ensure_main_connection()
+        try:
+            return self._run_default_service(
+                (Capability.BASIC_QUOTE,),
+                lambda: self._quote_service.market_view_pipeline(
+                    code,
+                    market=market,
+                    timeout=timeout,
+                ),
+            )
+        except ProtocolError as exc:
+            logger.warning("market_view_pipeline: %s", exc)
+            return None, {}
+
     def kline(
         self,
         code: str,
@@ -414,6 +438,7 @@ class ServiceFacade:
         market: int = 0,
         timeout: float = 12.0,
         retries: int = 3,
+        channel: str = "auto",
     ) -> list[dict]:
         """查 K线（复用登录后的 8901 长连接，复刻 hexin 单连接连发模式）。
 
@@ -462,10 +487,17 @@ class ServiceFacade:
             if self._service_connections is not None
             else self.observed_account_profile
         )
+        if channel not in ("auto", "level2", "ifindhq_fast"):
+            raise ValueError(
+                "channel must be auto, level2, or ifindhq_fast"
+            )
+        use_l2 = (
+            profile.kind is AccountKind.LEVEL2
+            if channel == "auto"
+            else channel == "level2"
+        )
         kline_capability = (
-            Capability.BASIC_QUOTE
-            if profile.kind is AccountKind.STANDARD
-            else Capability.L2_TIMELINE
+            Capability.L2_TIMELINE if use_l2 else Capability.BASIC_QUOTE
         )
 
         last_err = ""
@@ -493,6 +525,7 @@ class ServiceFacade:
                             anchor=anchor,
                             fuquan=fuquan,
                             timeout=timeout,
+                            channel=channel,
                         ),
                     )
                 except ProtocolError as exc:
@@ -506,7 +539,13 @@ class ServiceFacade:
                 logger.warning("kline %s %s 失败（attempt %d, IP=%s）: %s",
                                code, period, attempt + 1, self._connected_ip or "?", last_err)
                 # 传输失败仅断连重试，不拉黑 IP（登录成功即好 IP）
-                self._drop_connection()
+                if channel == "ifindhq_fast":
+                    if self._service_connections is not None:
+                        self._service_connections.close(
+                            ConnectionRole.KLINE_FAST
+                        )
+                else:
+                    self._drop_connection()
         raise RuntimeError(f"kline {code} {period} 重试 {retries} 次仍失败: {last_err}")
 
     def _index_previous_close(
@@ -1106,16 +1145,49 @@ class ServiceFacade:
             value = date_type.fromisoformat(value)
         elif isinstance(value, datetime):
             value = value.date()
+        elif value is None:
+            value = latest_trade_date()
+        service_trade_date = value if trade_date is None else trade_date
         historical = value is not None and value != date_type.today()
 
         historical_index = historical and market in (16, 32, 144)
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and market not in (16, 32, 144, 151)
+        ):
+            if (
+                self._snapshot_thread is not None
+                and self._snapshot_thread.is_alive()
+            ):
+                raise ChannelUnavailableError(
+                    "l2_snapshot",
+                    "后台快照线程正在读取 Level2 连接",
+                )
+            return self._run_default_service(
+                (
+                    Capability.L2_AUCTION,
+                    Capability.L2_HISTORY_TIMELINE,
+                ),
+                lambda: self._auction_service.intraday(
+                    code,
+                    market=market,
+                    trade_date=service_trade_date,
+                    timeout=timeout,
+                ),
+            )
+
         opening = (
             []
             if historical_index
             else self.auction(
                 code,
                 market=market,
-                trade_date=trade_date,
+                trade_date=value,
                 timeout=timeout,
             )
         )
@@ -1139,7 +1211,7 @@ class ServiceFacade:
             else self.closing_auction(
                 code,
                 market=market,
-                trade_date=trade_date,
+                trade_date=value,
                 timeout=timeout,
             )
         )
@@ -1155,6 +1227,75 @@ class ServiceFacade:
                 for record in records
             )
         return result
+
+    def intraday_auctions(
+        self,
+        code: str,
+        market: int = 0,
+        trade_date=None,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """Return auction phases used to supplement the fast live timeline."""
+        if market == 0:
+            market = self._market_for_code(code)
+        value = trade_date
+        if isinstance(value, str):
+            value = date_type.fromisoformat(value)
+        elif isinstance(value, datetime):
+            value = value.date()
+        elif value is None:
+            value = latest_trade_date()
+        service_trade_date = value if trade_date is None else trade_date
+
+        # The staged web endpoint must provide the whole previous session
+        # before today's 09:15 boundary and on non-trading days.  Otherwise
+        # the fast live-timeline endpoint is intentionally empty and the
+        # chart would contain only opening/closing auctions.
+        if value != date_type.today():
+            return self.intraday(
+                code,
+                market=market,
+                trade_date=value,
+                timeout=timeout,
+            )
+        profile = (
+            self._service_connections.profile
+            if self._service_connections is not None
+            else self.observed_account_profile
+        )
+        if (
+            profile.kind is AccountKind.LEVEL2
+            and market not in (16, 32, 144, 151)
+        ):
+            return self._run_default_service(
+                (
+                    Capability.L2_AUCTION,
+                    Capability.L2_HISTORY_TIMELINE,
+                ),
+                lambda: self._auction_service.intraday_auctions(
+                    code,
+                    market=market,
+                    trade_date=service_trade_date,
+                    timeout=timeout,
+                ),
+            )
+
+        opening = self.auction(
+            code,
+            market=market,
+            trade_date=service_trade_date,
+            timeout=timeout,
+        )
+        closing = self.closing_auction(
+            code,
+            market=market,
+            trade_date=service_trade_date,
+            timeout=timeout,
+        )
+        return [
+            *({"phase": "opening_auction", **row} for row in opening),
+            *({"phase": "closing_auction", **row} for row in closing),
+        ]
 
     def history_timeline(
         self,

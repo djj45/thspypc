@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/endpoints'
-import { useData } from '../data/useData'
 import { useStock } from '../state/StockContext'
 
 function color(n: number | undefined): string {
@@ -11,39 +10,13 @@ function color(n: number | undefined): string {
 }
 
 export function Header() {
-  const { code, setCode, setQuote } = useStock()
+  const { code, setCode, marketView } = useStock()
   const [input, setInput] = useState(code)
   const [status, setStatus] = useState<{
     connected: boolean
     server: string
     account_kind: string
   } | null>(null)
-
-  // 拉选中股票的行情
-  const { data, error } = useData(() => api.quote([code]), [code])
-
-  useEffect(() => {
-      if (data && data[0]) {
-        const q = data[0]
-        const price = q.dt10
-        const prevClose = q.dt6
-        const chg =
-          price != null && prevClose != null ? price - prevClose : undefined
-        const chgPct =
-          chg != null && prevClose ? (chg / prevClose) * 100 : undefined
-        setQuote({
-          price,
-          prevClose,
-          open: q.dt7,
-          high: q.dt8,
-          low: q.dt9,
-          vol: q.dt13,
-          amount: q.dt19,
-          chg,
-          chgPct,
-        })
-      }
-  }, [data, setQuote])
 
   useEffect(() => {
     api.status().then(setStatus).catch(() => {})
@@ -64,7 +37,7 @@ export function Header() {
     if (c && c !== code) setCode(c)
   }
 
-  const q = data?.[0]
+  const q = marketView.data?.quote
   const price = q?.dt10
   const prevClose = q?.dt6
   // 涨跌额 = 现价 - 昨收（dt66 盘后可能不准，前端按昨收自算涨跌幅更可靠）
@@ -104,7 +77,9 @@ export function Header() {
           )}
         </>
       )}
-      {error && <span className="dim">行情错误：{error.slice(0, 40)}</span>}
+      {marketView.error && (
+        <span className="dim">行情错误：{marketView.error.slice(0, 40)}</span>
+      )}
       <span className="status-dot">
         <span className={`dot ${status?.connected ? 'on' : ''}`} />
         {status

@@ -76,7 +76,7 @@ DNS 抓包方法论:`tshark -f "tcp port 80 or udp port 53" -Y "http or dns"` �
 **修复**(`kline.py`):
 
 ```python
-KLINE_FRAGMENT_TAIL_TIMEOUT = 0.25  # 尾读窗口从 2.0s 降到 0.25s
+KLINE_FRAGMENT_TAIL_TIMEOUT = 0.02  # 短历史尾读仅保留 20ms 分片兼容窗口
 
 if len(records) >= count + 1:
     break  # ★ 收满 count+1 根立即返回,不再等待
@@ -113,3 +113,118 @@ sock.settimeout(KLINE_FRAGMENT_TAIL_TIMEOUT)  # 不足才短暂尾读(兼容分�
 - `test_market_host_resolution.py`:重写反映 ifindhq 优先(4 测试)
 - `test_kline_service.py`:新增完整窗口只读一帧的测试
 - 全量 538 passed + 19 skipped( auction 29 + host_resolution 4 + kline 14 + 其它)
+
+## 2026-08-12 第四阶段：页面聚合请求
+
+新增 `/api/market_view/{code}`。浏览器切换股票时不再并发发送
+`quote + intraday + kline + depth` 四个 HTTP 请求，而是发送一个聚合请求。
+后端内部按物理连接拆成两条并行 lane：
+
+- MAIN lane：`quote → depth`
+- 对应市场 L2 lane：`intraday → kline`
+
+每条 socket 内保持单读者串行，两条独立 socket 并行。前端把 K 线周期和复权状态提升到
+`StockProvider`，四个面板共享同一份 `market_view`；同时合并相同参数的在途 Promise，
+避免 React StrictMode 开发模式重复挂载造成重复请求。
+
+真实热态连续切换各 50 只（单 HTTP、每次四类数据均完整）：
+
+```
+SH: avg=58.3ms median=57.7ms p95=62.1ms max=88.2ms >100ms=0
+SZ: avg=49.3ms median=49.3ms p95=51.1ms max=60.5ms >100ms=0
+```
+
+`Server-Timing` 会同时记录 `main_*` 与 `sh_l2_*` / `sz_l2_*`，可直接确认两条
+lane 没有互相排队。全量测试：572 passed + 19 skipped；前端生产构建通过。
+
+## 2026-08-13 第五阶段：复刻 PC 客户端分阶段首屏
+
+保留 `/api/market_view` 兼容接口，页面改用三阶段调度：
+
+1. `/api/market_view_fast/{code}`：MAIN 上 `quote → depth`，与市场 L2 上实时
+   `1334/8192 timeline` 并行；返回后立即显示首屏。
+2. `/api/intraday_auctions/{code}`：补充早盘、尾盘竞价并合并到同一张分时图。
+3. `/api/kline/{code}`：竞价请求结束后才进入相同市场 L2 lane；切周期只重拉 K 线。
+
+前端用请求代次阻止旧股票结果回写，并合并 StrictMode 下的相同在途请求。若切股发生
+在 fast 尚未完成时，旧股票的竞价和 K 线不会发送。已发送的 socket 请求不可中途取消，
+但其结果也不会覆盖新股票。
+
+时段边界：9:15前 fast 不请求实时 `timeline`，避免服务器保留的上一交易日241点被
+误当作当天数据；随后 `intraday_auctions` 按默认日期语义回退最近交易日，并一次返回
+该日早盘竞价、241点盘中分时和尾盘竞价。周末/节假日同样显示最近交易日全量数据。
+9:15–9:30 只补当天已产生的早盘竞价；9:30后 fast 才请求当天盘中分时；
+14:57后竞价补全包含尾盘阶段。
+
+2026-08-13 预盘热态实测：fast 后端约 19ms（行情+盘口，分时为空），日 K 后端
+约 13–15ms。盘中 fast 目标由抓包和单接口实测约束为 20–30ms。全量测试：
+576 passed + 19 skipped；前端生产构建通过。
+
+## 2026-08-13 第六阶段：消除 MAIN 约 70ms 的偶发长尾
+
+### 现象
+
+`market_view_pipeline()` 已经把行情与五档盘口请求先后写入 MAIN socket，再由一个
+dispatcher 统一读帧。正常热请求约 18ms，但无间隔连续切股时偶尔出现 56–70ms：
+
+```text
+median ≈ 17.7ms，max ≈ 57ms
+```
+
+这不是解码长尾。逐帧打点显示，慢请求的 CPU 时间接近 0，短记录补读
+`_repair_short_record()` 约 0.01ms；真正的等待集中在第一个行情响应：
+
+```text
+quote frame: 约 55.8–56.5ms
+depth frame: 约 0.02–0.09ms
+```
+
+两个响应几乎同时到达，符合 Nagle 与对端 delayed ACK 组合产生的约 40ms 等待。
+Python 创建的 TCP socket 默认 `TCP_NODELAY=0`，而 pipeline 原先连续执行两次
+`sendall()` 发送两个小请求；第二次写入有机会被内核暂存到首个小包获得 ACK 后。
+
+### 可逆 A/B 证据
+
+在同一 MAIN 长连接、同一进程中，用 `600519` / `000001` 交替 500 次，仅切换
+`TCP_NODELAY`：
+
+| 配置 | 中位数 | p95 | 最大值 | >50ms |
+|---|---:|---:|---:|---:|
+| 默认 `TCP_NODELAY=0` | 17.70ms | 19.09ms | 57.34ms | 2/500 |
+| 临时设置 `TCP_NODELAY=1` | 9.10ms | 10.71ms | 13.97ms | 0/500 |
+| 恢复 `TCP_NODELAY=0` | 17.77ms | 20.81ms | 57.04ms | 3/500 |
+
+恢复默认后长尾重新出现，排除了股票、解析器和服务器节点偶发变化等解释。
+
+### 修复
+
+1. `ManagedConnection` 收编任何真实行情 socket 时设置
+   `TCP_NODELAY=1`。这个入口覆盖 MAIN、KLINE_FAST、SH_L2、SZ_L2，以及断线后
+   重新建立并被连接管理器收编的新 socket；不需要在各登录分支重复设置。
+2. `ResponseDispatcher.submit()` 将同一批 pipeline 请求拼接后执行一次
+   `sendall()`，保留每个请求自己的换行策略。这样减少系统调用，也避免同一批次的
+   第二个小请求独立进入 Nagle 状态。
+3. 不支持 `setsockopt()` 的测试替身或包装 socket 保持兼容；系统不支持低延迟选项时
+   仅放弃该提示，不影响已经成功建立的行情连接。
+
+### 修复后活网验证
+
+2026-08-13，MAIN 节点 `139.159.135.214:8901`，沪深两只股票交替 500 次：
+
+```text
+TCP_NODELAY=1
+n=500 avg=11.71ms median=11.38ms p95=14.45ms p99=16.20ms
+max=17.52ms >30ms=0 >50ms=0
+```
+
+结果说明本地可控的 70ms 长尾已消除。以后若再次看到高延迟，应先根据逐连接
+`Server-Timing` 区分 MAIN、KLINE_FAST、SH_L2/SZ_L2；单只股票或特定服务器完全
+不响应导致的秒级超时属于另一类问题，不能与本次 TCP 小包长尾混为一谈。
+
+新增/更新的回归覆盖：
+
+- `test_managed_connection_disables_nagle`：连接收编时开启 `TCP_NODELAY`；
+- dispatcher pipeline 单次写入及逐请求换行策略；
+- quote/depth 响应乱序时仍能正确分派。
+
+全量测试：590 passed + 19 skipped。

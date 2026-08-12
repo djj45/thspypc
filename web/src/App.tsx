@@ -18,8 +18,8 @@ function LeftPlaceholders() {
   ]
   return (
     <div className="left-grid">
-      {titles.map((t) => (
-        <div className="cell" key={t}>
+      {titles.map((t, index) => (
+        <div className="cell" key={`${t}-${index}`}>
           <div className="cell-title">{t}</div>
           <div className="dim" style={{ padding: 8, fontSize: 11 }}>
             待接入

@@ -165,7 +165,8 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 - MAIN/REALORDER 启动心跳线程（`build_heartbeat_8901`）。
 - 能力证据写入 `AccountEvidenceRecorder`，路由 profile 随证据升级。
 - 连接治理：`connect_main` 距上次成功 <20s 且连接存活时直接复用；K线失败 IP 进黑名单；
-  L2 连接建立时会短暂占用主连接（`_drop_main`），故竞价/分时脚本期间不同时跑其他查询。
+  L2 每条新连接使用独立刷新的一代 Passport64；已登录的 MAIN 保持长连接，
+  不再通过 `_drop_main` 为 L2 建连让路。竞价/分时仍由各自市场连接锁保护。
 
 ### 4.5 多会话并发登录与长连接（名称同步，2026-08-08）
 

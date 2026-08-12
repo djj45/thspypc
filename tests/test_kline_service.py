@@ -125,10 +125,12 @@ def test_kline_level2_uses_l2_role_and_pageid_1334(monkeypatch):
         "thspypc.services.kline.parse_kline_hd3_response",
         parsed.__getitem__,
     )
+    evidence = AccountEvidenceRecorder()
     service = KlineService(
         manager,
         frame_reader=lambda _sock: next(responses),
         max_frames=4,
+        evidence=evidence,
     )
 
     result = service.kline(
@@ -153,6 +155,37 @@ def test_kline_level2_uses_l2_role_and_pageid_1334(monkeypatch):
         + b"\n"
     ]
     assert b"pageid=1334" in sock.sent[0]
+    assert evidence.profile().supports(Capability.L2_TIMELINE)
+
+
+def test_kline_ifindhq_fast_uses_dedicated_role(monkeypatch):
+    sock = FakeSocket()
+    opened = []
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda spec: opened.append(spec.role) or sock,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd3_response",
+        lambda _body: [{"code": "600519"}],
+    )
+    service = KlineService(
+        manager,
+        frame_reader=lambda _sock: b"hd3.1\x00data",
+        max_frames=1,
+    )
+
+    result = service.kline(
+        "600519",
+        market=17,
+        period=KLINE_PERIOD_DAY,
+        channel="ifindhq_fast",
+    )
+
+    assert result == [{"code": "600519"}]
+    assert opened == [ConnectionRole.KLINE_FAST]
+    assert manager.peek(ConnectionRole.MAIN) is None
+    assert manager.peek(ConnectionRole.SH_L2) is None
 
 
 def test_kline_timeout_after_data_finishes_successfully(monkeypatch):

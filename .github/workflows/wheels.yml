@@ -1,0 +1,31 @@
+name: Build native wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  wheels:
+    name: ${{ matrix.os }} wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pypa/cibuildwheel@v3.2
+        env:
+          CIBW_BUILD: "cp310-*"
+          CIBW_ARCHS_WINDOWS: "AMD64"
+          CIBW_ARCHS_LINUX: "x86_64 aarch64"
+          CIBW_ARCHS_MACOS: "universal2"
+          CIBW_TEST_COMMAND: >-
+            python -c "from thspypc.codecs import compression;
+            assert compression._compression_native is not None"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
