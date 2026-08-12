@@ -17,7 +17,8 @@ wheels/
 !.env.example
 
 # 抓包数据 / 逆向样本（含实时行情，可能敏感）
-data/
+# 锚定根目录，避免误伤 web/src/data/ 等子目录
+/data/
 captures_live/
 *.pcap
 *.pcapng
