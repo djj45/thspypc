@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
@@ -19,6 +19,7 @@ from ..features.auction_protocol import (
     build_l2_closing_auction_query,
     build_l2_history_auction_query,
     parse_auction_response,
+    resolve_trade_date,
     parse_closing_auction_response,
     parse_index_auction_response,
 )
@@ -48,6 +49,8 @@ def _build_l2_history_auction_bundle(
     trade_date,
 ) -> bytes:
     """Prime page 4417 exactly as the PC client before auction companions."""
+    if trade_date is None:
+        trade_date = resolve_trade_date(None)
     benchmark = {
         17: (16, "1A0002"),
         33: (32, "399002"),
@@ -156,13 +159,17 @@ class AuctionService:
                     code,
                     market=market,
                 )
-            elif _is_historical_date(trade_date):
+            elif _is_historical_date(trade_date) or not _in_auction_session():
+                # 非竞价时段(9:25 之后当日竞价已完整生成)或显式历史日期:
+                # 走 L2 历史路径 pageid=4417,拿当日完整竞价序列(实测 ~39ms)。
+                # 实时路径 pageid=1334 在非竞价时段会死等 timeout(盘后偶发 12s+)。
                 frame = _build_l2_history_auction_bundle(
                     code,
                     market=market,
                     trade_date=trade_date,
                 )
             else:
+                # 9:15-9:25 实时竞价时段:走 L2 实时路径,拿实时撮合
                 frame = build_auction_query(
                     code,
                     market=market,
@@ -360,3 +367,17 @@ def _is_historical_date(value) -> bool:
     elif isinstance(value, datetime):
         value = value.date()
     return value != date.today()
+
+
+# 沪深 A 股集合竞价时段(9:15-9:25)。此时段内服务端推送实时撮合,应走实时路径;
+# 时段外发实时请求会死等 timeout(盘后偶发 12s+),应改走历史路径(11ms,完整序列)。
+AUCTION_SESSION_START = time(9, 15)
+AUCTION_SESSION_END = time(9, 25)
+
+
+def _in_auction_session(now: datetime | None = None) -> bool:
+    """当前是否在 9:15-9:25 集合竞价时段(周一到周五)。"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    return AUCTION_SESSION_START <= now.time() <= AUCTION_SESSION_END

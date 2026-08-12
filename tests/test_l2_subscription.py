@@ -170,6 +170,10 @@ def test_timeline_and_auction_share_registration(monkeypatch):
         "thspypc.services.auction.parse_auction_response",
         lambda _body: [{"dt10": 12.4}],
     )
+    # 本测试验证实时竞价路径(DateTime=7176),强制"在竞价时段内"
+    monkeypatch.setattr(
+        "thspypc.services.auction._in_auction_session", lambda now=None: True
+    )
 
     assert timeline.timeline("000938", market=33)
     assert auction.auction("000938", market=33)

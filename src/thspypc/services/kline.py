@@ -18,6 +18,10 @@ from ..models import AccountKind, Capability
 
 FrameReader = Callable[[SocketLike], bytes]
 
+# 大 K 线响应在少数服务器上可能拆成多个独立 hd3.1 业务帧。只有首帧未达到
+# 请求窗口大小时才需要短暂尾读；正常完整响应不应为兼容分片固定等待数秒。
+KLINE_FRAGMENT_TAIL_TIMEOUT = 0.25
+
 
 def _kline_l2_role(market: int) -> ConnectionRole:
     """Level2 K线连接角色（与 timeline/depth 的 L2 角色一致）。"""
@@ -115,7 +119,13 @@ class KlineService:
                     parsed = parse_kline_hd3_response(response)
                     if parsed:
                         records.extend(parsed)
-                        sock.settimeout(2.0)
+                        # DateTime={period}(-count-anchor) 返回窗口包含终点，正常
+                        # 是 count+1 根。达到完整窗口即可立即返回；新股等历史不足
+                        # 的合法短响应则保留一个很短的尾读窗口，以兼容服务器把
+                        # 大响应拆成多个 hd3.1 业务帧的旧行为。
+                        if len(records) >= count + 1:
+                            break
+                        sock.settimeout(KLINE_FRAGMENT_TAIL_TIMEOUT)
                     continue
                 if records:
                     break
@@ -129,4 +139,4 @@ class KlineService:
         return []
 
 
-__all__ = ["KlineService"]
+__all__ = ["KLINE_FRAGMENT_TAIL_TIMEOUT", "KlineService"]

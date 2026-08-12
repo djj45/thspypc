@@ -14,6 +14,7 @@ from thspypc.features.kline_protocol import (
 )
 from thspypc.models import AccountKind, AccountProfile, Capability, Support
 from thspypc.services import KlineService
+from thspypc.services.kline import KLINE_FRAGMENT_TAIL_TIMEOUT
 
 
 class FakeSocket:
@@ -88,7 +89,7 @@ def test_kline_standard_uses_main_and_merges_data_frames(monkeypatch):
     assert opened == [ConnectionRole.MAIN]
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert manager.peek(ConnectionRole.SZ_L2) is None
-    assert sock.timeout == 2.0
+    assert sock.timeout == KLINE_FRAGMENT_TAIL_TIMEOUT
     assert sock.sent == [
         build_kline_query(
             "600519",
@@ -141,7 +142,7 @@ def test_kline_level2_uses_l2_role_and_pageid_1334(monkeypatch):
     assert [record["bar"] for record in result] == [1, 2]
     assert opened == [ConnectionRole.SH_L2]
     assert manager.peek(ConnectionRole.MAIN) is None
-    assert sock.timeout == 2.0
+    assert sock.timeout == KLINE_FRAGMENT_TAIL_TIMEOUT
     assert sock.sent == [
         build_kline_l2_query(
             "600519",
@@ -179,6 +180,45 @@ def test_kline_timeout_after_data_finishes_successfully(monkeypatch):
         market=33,
         period=KLINE_PERIOD_DAY,
     ) == [{"code": "000001"}]
+
+
+def test_kline_complete_window_returns_without_tail_read(monkeypatch):
+    """完整的 count+1 根响应应立即返回，不再固定等待尾读超时。"""
+    sock = FakeSocket()
+    read_count = 0
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: sock,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd3_response",
+        lambda _body: [
+            {"code": "000001", "bar": 1},
+            {"code": "000001", "bar": 2},
+            {"code": "000001", "bar": 3},
+        ],
+    )
+
+    def read_response(_sock):
+        nonlocal read_count
+        read_count += 1
+        if read_count > 1:
+            raise AssertionError("完整 K 线响应后不应继续读取")
+        return b"hd3.1\x00complete"
+
+    service = KlineService(manager, frame_reader=read_response)
+
+    result = service.kline(
+        "000001",
+        market=33,
+        period=KLINE_PERIOD_DAY,
+        count=2,
+        timeout=4.0,
+    )
+
+    assert len(result) == 3
+    assert read_count == 1
+    assert sock.timeout == 4.0
 
 
 def test_kline_timeout_before_data_remains_transport_failure():

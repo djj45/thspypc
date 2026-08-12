@@ -169,6 +169,10 @@ def test_level2_uses_market_role_and_matches_response(
         "thspypc.services.auction.parse_auction_response",
         lambda _body: expected,
     )
+    # 本测试验证实时路径(pageid=1334),强制"在竞价时段内"
+    monkeypatch.setattr(
+        "thspypc.services.auction._in_auction_session", lambda now=None: True
+    )
 
     result = service.auction(
         "603118" if market == 17 else "000938",
@@ -394,3 +398,80 @@ def test_index_closing_primes_opening_and_waits_for_close_root(monkeypatch):
     assert bundle.count(b"\xfd\xfd\xfd\xfd") == 2
     assert b"/quote/auction/USH/USHI_1A0001.dat" in bundle
     assert b"/quote/auction/USH/USHI_CLOSE_1A0001.dat" in bundle
+
+
+# ── 非竞价时段走 L2 历史路径(避免盘后死等)──
+
+
+def test_in_auction_session_boundary():
+    """_in_auction_session 在 9:15-9:25 内为 True,其它时段 False。"""
+    from datetime import datetime
+    from thspypc.services.auction import _in_auction_session
+
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 15, 0)) is True
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 25, 0)) is True
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 20, 0)) is True
+    # 边界外
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 14, 59)) is False
+    assert _in_auction_session(datetime(2026, 8, 12, 9, 25, 1)) is False
+    assert _in_auction_session(datetime(2026, 8, 12, 12, 0, 0)) is False  # 午间休市
+    assert _in_auction_session(datetime(2026, 8, 12, 22, 0, 0)) is False  # 盘后
+    # 周末即使在 9:15-9:25 也 False
+    assert _in_auction_session(datetime(2026, 8, 16, 9, 20, 0)) is False  # 周日
+
+
+def test_level2_offsession_uses_historical_4417(monkeypatch):
+    """非竞价时段(如盘后),L2 账号走历史路径 pageid=4417,而非实时 1334。
+
+    修复背景:此前 trade_date=None 盘后走实时 1334,服务端不响应死等 timeout(12s+)。
+    现在 9:25 之后(当日竞价已完整生成)改走 L2 历史路径,~39ms 拿完整序列。
+    """
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda _b: [{"dt10": 12.34}],
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction._in_auction_session", lambda now=None: False
+    )
+    # 历史路径会读多帧(订阅+bundle),超出后返回空让循环退出
+    responses = iter([b"CodeListSize=1", b"hd1.0\x00auction", b"", b""])
+
+    def _reader(_sock, _it=iter(responses)):
+        try:
+            return next(_it)
+        except StopIteration:
+            return b""
+
+    service = AuctionService(manager, frame_reader=_reader)
+
+    service.auction("603118", market=17, trade_date=None, timeout=6.0)
+
+    sent = b"".join(sock.sent)
+    assert b"pageid=4417" in sent
+    assert b"pageid=1334" not in sent
+
+
+def test_level2_in_session_uses_realtime_1334(monkeypatch):
+    """竞价时段(9:15-9:25),L2 账号仍走实时路径 pageid=1334 拿实时撮合。"""
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    responses = iter([b"CodeListSize=1", b"hd1.0\x00auction"])
+    service = AuctionService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction.parse_auction_response",
+        lambda _b: [{"dt10": 12.34}],
+    )
+    monkeypatch.setattr(
+        "thspypc.services.auction._in_auction_session", lambda now=None: True
+    )
+
+    service.auction("603118", market=17, trade_date=None, timeout=6.0)
+
+    sent = b"".join(sock.sent)
+    assert b"pageid=1334" in sent
+    assert b"pageid=4417" not in sent

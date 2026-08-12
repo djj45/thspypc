@@ -562,6 +562,7 @@ def test_stock_list_hot_opt_in_delegates_without_l2(monkeypatch):
             "sort_by": 48,
             "sort_dir": "D",
             "max_pages": 2,
+            "with_values": False,
         }
     ]
     assert manager.peek(ConnectionRole.SH_L2) is None
