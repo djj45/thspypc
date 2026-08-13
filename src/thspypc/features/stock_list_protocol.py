@@ -31,6 +31,13 @@ FULL_STOCK_LIST_MARKETS = (
     150,
     151,
 )
+# Level2 账号的深市代码表不在 MAIN：同一 DataType=[5],[55] 查询必须发到
+# szlv2（SZ_L2），市场码用 32（名称同步同源，段 [name_32_*]）/33（行情市场码）。
+# 2026-08-14 活网验证：szlv2 对该查询回单帧 3274 行，覆盖全部深市 A 股。
+FULL_STOCK_LIST_SZ_MARKETS = (32, 33)
+# 沪市风险警示板（ST）不在 16/17 等常规市场表里：MAIN 上单独查 22 号市场。
+# 2026-08-14 活网验证：MAIN 回 84 只沪市 ST 代码（600525/600745 等）。
+FULL_STOCK_LIST_ST_MARKETS = (22,)
 
 SORT_BY_VALUES = {
     "涨幅": {"sort_by": 199112, "verified": True, "response_dt": 200},
@@ -46,6 +53,19 @@ SORT_BY_VALUES = {
     # response_dt=44 经 verify_sort_values_online.py 活网验证(首条 3.43 亿,
     # 量级符合涨停封单)。
     "封单额": {"sort_by": 265260, "verified": True, "response_dt": 44},
+}
+
+# sort_by → 响应里承载排序值的 dt 字段名（合并沪深两个榜单时按它全局排序）。
+# 与 web/src/types.ts 的 SORT_BY_DT 对齐；1968584/1771976 无独立字段，沿用 dt200。
+RANKED_VALUE_FIELDS = {
+    199112: "dt200",
+    48: "dt48",
+    1968584: "dt200",
+    1771976: "dt200",
+    592890: "dt250",
+    68758: "dt150",
+    68762: "dt154",
+    265260: "dt44",
 }
 
 DDE_PAGEID = 10723

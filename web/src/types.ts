@@ -142,6 +142,13 @@ export interface RankItem {
   [k: string]: number | string | undefined
 }
 
+// ── 全市场代码表（/api/stocks2）──
+export interface StockListItem {
+  code: string
+  name: string
+  market: number | null
+}
+
 // ── 短线精灵 ──
 export interface Dxjl {
   时间: number

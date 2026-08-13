@@ -5,30 +5,7 @@ import { KlineChart } from './components/center/KlineChart'
 import { StockInfo } from './components/right/StockInfo'
 import { DepthPanel } from './components/right/DepthPanel'
 import { DxjlPanel } from './components/right/DxjlPanel'
-
-// 左栏 6 格占位（阶段 B 后续填板块表/全市场表/自选/动态）。
-function LeftPlaceholders() {
-  const titles = [
-    '同花顺板块',
-    '全市场',
-    '自定义板块',
-    '自选',
-    '动态板块',
-    '动态板块',
-  ]
-  return (
-    <div className="left-grid">
-      {titles.map((t, index) => (
-        <div className="cell" key={`${t}-${index}`}>
-          <div className="cell-title">{t}</div>
-          <div className="dim" style={{ padding: 8, fontSize: 11 }}>
-            待接入
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
+import { LeftGrid } from './components/left/LeftGrid'
 
 export default function App() {
   return (
@@ -37,7 +14,7 @@ export default function App() {
         <Header />
         <div className="body">
           <div className="col">
-            <LeftPlaceholders />
+            <LeftGrid />
           </div>
           <div className="col center">
             <div className="panel" style={{ flex: 1, minHeight: 0 }}>

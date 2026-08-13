@@ -13,13 +13,10 @@ from ..features.superorder_protocol import (
     SNAPSHOT_REPLAY_PAGEID,
 )
 from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
-from ..features.stock_name_bootstrap import STOCK_NAME_GROUPS
-from ..features.stock_name_cache import default_cache_path, group_cache_path
+from ..features.auth_protocol import LoginIdentity
+from ..features.stock_name_bootstrap import STOCK_NAME_GROUPS, name_group_login_identity
 from ..features.trade_calendar import latest_trade_date
-from ..services.stock_name import (
-    download_all_stock_names,
-    download_full_stock_names,
-)
+from ..services.stock_name import download_all_stock_names
 from ..transport import ConnectionRole
 from .stock_cache import (
     default_stock_cache_path,
@@ -239,10 +236,17 @@ class ServiceFacade:
         Call after login to refresh the full stock-name list.
         """
         material = self._auth_service.require_current()
-        login_body = self._auth_service.login_body_for_passport(material.passport64)
         account_kind = self.observed_account_profile.kind
+
+        def login_body_factory(group_key: str) -> bytes:
+            identity = name_group_login_identity(group_key)
+            return self._auth_service.login_body_for_passport(
+                material.passport64,
+                identity=LoginIdentity(identity),
+            )
+
         result = download_all_stock_names(
-            login_body,
+            login_body_factory,
             account_kind,
             timeout=timeout,
             settle_timeout=settle_timeout,
@@ -256,31 +260,38 @@ class ServiceFacade:
         return result
 
     def fetch_stock_names_full(self, timeout: float = 45.0) -> dict:
-        """Download the full stock-name list over a fresh 123ths.com session.
+        """Download the full stock-name list (all market groups), daily-cached.
 
-        Cross-platform, pure TCP: logs in to the account-specific domain
-        (``shlv2.123ths.com`` for level2, ``main.123ths.com`` for standard),
-        replays the captured cold-start bootstrap, sends the ``0x001c
-        StockNameVer=;;`` trigger, and decodes the full ``name_16_16``
-        response. No Windows hexin stockname files are read.
+        Cross-platform, pure TCP: logs into every account-specific 123ths
+        market group (shlv2/szlv2 for level2, main for standard), replays each
+        group's bootstrap and merges every ``[name_*]`` segment into one map.
+        Results are cached per group under ``~/.thspypc/stockname/``; once all
+        groups are fresh for the current day, subsequent calls return the
+        cached names without any network round-trip.
 
         Returns:
-            :func:`decode_name_frame` result dict; empty names on failure.
+            ``{"names": {code: name}, "by_segment": {}, "skipped": [], "segments": []}``.
         """
         material = self._auth_service.require_current()
-        login_body = self._auth_service.login_body_for_passport(material.passport64)
         account_kind = self.observed_account_profile.kind
-        result = download_full_stock_names(
-            login_body,
-            account_kind=account_kind,
+
+        def login_body_factory(group_key: str) -> bytes:
+            identity = name_group_login_identity(group_key)
+            return self._auth_service.login_body_for_passport(
+                material.passport64,
+                identity=LoginIdentity(identity),
+            )
+
+        result = download_all_stock_names(
+            login_body_factory,
+            account_kind,
             timeout=timeout,
-            cache_path=str(default_cache_path(account_kind)),
         )
         logger.info(
-            "fetch_stock_names_full(account=%s): %d names, %d skipped",
+            "fetch_stock_names_full(account=%s): %d names, %d segments",
             account_kind.value,
             len(result["names"]),
-            len(result["skipped"]),
+            len(result["segments"]),
         )
         return result
 
@@ -1593,8 +1604,13 @@ class ServiceFacade:
             RuntimeError: 未登录。
         """
         self._ensure_main_connection()
+        capabilities: tuple[Capability, ...] = (Capability.BASIC_QUOTE,)
+        if self.observed_account_profile.kind is AccountKind.LEVEL2:
+            # Level2 的深市代码表在 SZ_L2（szlv2）：乐观租借
+            # L2_MARKET_ACCESS 让 full_list 能开 SZ 通道合并深市表。
+            capabilities = (Capability.BASIC_QUOTE, Capability.L2_MARKET_ACCESS)
         stocks = self._run_default_service(
-            (Capability.BASIC_QUOTE,),
+            capabilities,
             lambda: self._stock_list_service.full_list(timeout=timeout),
         )
         if with_names and stocks:

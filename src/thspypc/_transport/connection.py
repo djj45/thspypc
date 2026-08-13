@@ -177,6 +177,22 @@ class ManagedConnection:
             trailing_newline=trailing_newline,
         )
 
+    def request_latest(
+        self,
+        frame: bytes,
+        *,
+        gate: int,
+        timeout: float,
+        trailing_newline: bool = True,
+    ) -> AbstractContextManager[SocketLike]:
+        """Latest-wins request (see ``MarketSession.request_latest``)."""
+        return self._session.request_latest(
+            frame,
+            gate=gate,
+            timeout=timeout,
+            trailing_newline=trailing_newline,
+        )
+
     def try_send(
         self,
         frame: bytes,

@@ -36,6 +36,18 @@ class FakeClient:
         self.is_connected = True
         return _Result()
 
+    def _market_for_code(self, code):
+        # 与 THSClient._market_for_code 的基础映射一致（测试桩无名称缓存，不做 ST 覆盖）
+        if code.startswith(("1A", "1B")):
+            return 16
+        if code.startswith("39"):
+            return 32
+        if code.startswith("899"):
+            return 144
+        if code.startswith(("43", "83", "87", "920")):
+            return 151
+        return 17 if code.startswith("6") else 33
+
     def list_quotes(self, codes, market=17):
         self.calls.append(("list_quotes", codes, market))
         return [{"code": code, "market": market} for code in codes]

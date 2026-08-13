@@ -10,6 +10,7 @@ import type {
   BoardCategory,
   SystemBlock,
   RankItem,
+  StockListItem,
   Dxjl,
   StockGroup,
   MarketView,
@@ -100,6 +101,9 @@ export const api = {
         `/api/intraday_auctions/${code}`,
       ),
     ),
+
+  // 全市场代码表（磁盘缓存，自然日有效；供左栏名称回填）
+  stocks2: () => getJson<StockListItem[]>('/api/stocks2'),
 
   // 板块
   boardCategories: () => getJson<BoardCategory[]>('/api/board_categories'),

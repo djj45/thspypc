@@ -27,6 +27,11 @@ import sys
 import time
 from collections import defaultdict
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Wireshark portable path (override with THS_WIRESHARK_DIR)
@@ -71,6 +76,7 @@ def capture(iface_idx: int, duration: int, pcap_path: str):
     """用 dumpcap 抓包。iface_idx 是 dumpcap -D 列出的编号（从 1 开始）。"""
     cmd = [
         DUMPCAP, "-i", str(iface_idx),
+        "-f", "tcp port 8901",
         "-a", f"duration:{duration}",
         "-w", pcap_path,
         "-q",
@@ -83,9 +89,16 @@ def capture(iface_idx: int, duration: int, pcap_path: str):
 
 
 def analyze_pcap(pcap_path: str):
-    """分析 pcap，提取 upstockname 帧。"""
+    """分析 pcap，重组每条 TCP 流、解码 0x0a 名称帧，报告名称数量与服务器 IP。
+
+    输出两类信息：
+      · 请求(→)：StockNameVer / upstockname 名称触发帧的 MarketCode + pageid
+      · 响应(←)：0x0a LZ 压缩名称帧解码后的名称总数（沪 6x / 深 0/3x 各多少）
+    并保存重组后的完整 0x0a 帧体到 captures_live/upstockname_full_*.bin。
+    """
     import subprocess
-    # 用 tshark 过滤 8901 端口包含 upstockname 的 TCP 流
+    from thspypc.features.stock_name_protocol import decode_name_frame
+
     tshark = os.path.join(WS, "tshark.exe")
     if not os.path.exists(tshark):
         print("⚠ tshark 不可用，跳过分析")
@@ -93,74 +106,108 @@ def analyze_pcap(pcap_path: str):
 
     print("\n分析 pcap...")
 
-    # Step 1: 找包含 "upstockname" 的 TCP 流
-    cmd = [
-        tshark, "-r", pcap_path,
-        "-Y", 'tcp.payload and frame contains "upstockname"',
-        "-T", "fields", "-e", "tcp.stream",
-    ]
+    # Step 1: 找名称同步相关 TCP 流
+    filter_expr = (
+        'tcp.payload and '
+        '(frame contains "upstockname" or '
+        'frame contains "StockNameVer" or '
+        'frame contains "[name_")'
+    )
+    cmd = [tshark, "-r", pcap_path, "-Y", filter_expr,
+           "-T", "fields", "-e", "tcp.stream"]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         out_text = out.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError:
-        print("未找到 upstockname 请求")
+        print("未找到名称同步请求/响应")
         return
+    streams = sorted({s for s in out_text.strip().splitlines() if s})
+    print(f"找到 {len(streams)} 个名称同步 TCP 流: {streams}")
 
-    streams = set(out_text.strip().splitlines())
-    print(f"找到 {len(streams)} 个 upstockname TCP 流: {streams}")
+    MAGIC = b"\xfd\xfd\xfd\xfd"
 
-    # Step 2: 导出每个流的全部 payload
-    for stream_id in sorted(streams):
-        if not stream_id:
-            continue
-        # 导出该 TCP 流的服务端→客户端方向数据
-        cmd_export = [
-            tshark, "-r", pcap_path,
-            "-Y", f"tcp.stream eq {stream_id}",
-            "-T", "fields", "-e", "tcp.payload",
-        ]
+    def reassemble(stream, srcport):
+        y = f"tcp.stream eq {stream} and tcp.payload"
+        if srcport is not None:
+            y += f" and tcp.srcport=={srcport}"
+        cmd = [tshark, "-r", pcap_path, "-Y", y,
+               "-T", "fields", "-e", "tcp.payload"]
         try:
-            out = subprocess.check_output(cmd_export, stderr=subprocess.DEVNULL)
-            out_text = out.decode("utf-8", errors="replace")
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError:
-            continue
+            return b""
+        return b"".join(
+            bytes.fromhex(h.replace(":", ""))
+            for h in out.decode("utf-8", "replace").splitlines() if h.strip()
+        )
 
-        payloads_hex = [line.strip() for line in out_text.splitlines() if line.strip()]
-        print(f"  流 {stream_id}: {len(payloads_hex)} 个 TCP segment")
-
-        # 解码 hex payload，找名称帧
-        name_frames = []
-        for ph in payloads_hex:
-            try:
-                data = bytes.fromhex(ph)
-            except ValueError:
+    def frames_in(seg):
+        frames = []
+        i = 0
+        while True:
+            j = seg.find(MAGIC, i)
+            if j < 0:
+                break
+            ln = seg[j + 4:j + 12]
+            if not re.fullmatch(rb"[0-9A-Fa-f]{8}", ln):
+                i = j + 4
                 continue
-            if len(data) < 100:
+            blen = int(ln, 16)
+            frames.append((j, blen, seg[j + 12:j + 12 + blen]))
+            i = j + 12 + blen
+        return frames
+
+    for stream_id in streams:
+        # 服务器 IP：取该流 srcport==8901 的第一条 ip.src
+        cmd = [tshark, "-r", pcap_path, "-Y",
+               f"tcp.stream eq {stream_id} and tcp.srcport==8901",
+               "-T", "fields", "-e", "ip.src"]
+        try:
+            peer = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            peer_lines = peer.decode("utf-8", "replace").strip().splitlines()
+            server_ip = peer_lines[0].strip() if peer_lines and peer_lines[0].strip() else "?"
+        except (subprocess.CalledProcessError, IndexError):
+            server_ip = "?"
+
+        c2s = reassemble(stream_id, None)
+        s2c = reassemble(stream_id, 8901)
+
+        print(f"\n  流 {stream_id}  服务器 IP={server_ip}")
+
+        # 请求：client→server 帧里找 StockNameVer / upstockname
+        for _j, _blen, body in frames_in(c2s):
+            text = body.decode("gbk", errors="replace")
+            if "StockNameVer" not in text and "upstockname" not in text:
                 continue
-            # 名称帧特征：含 MarketCode= 或 [name_ 或 ConfigVer=
-            if b"MarketCode" in data or b"[name_" in data or b"StockNameVer" in data:
-                name_frames.append(data)
-                print(f"    名称帧 {len(data)}B")
+            m_mc = re.search(r"MarketCode=([^\r\n\0]+)", text)
+            m_mk = re.search(r"(?m)^market=(\S+)", text)
+            m_pid = re.search(r"pageid=(\d+)", text)
+            market = m_mc.group(1) if m_mc else (m_mk.group(1) if m_mk else "-")
+            pageid = m_pid.group(1) if m_pid else "-"
+            print(f"    请求(→) MarketCode={market} pageid={pageid}")
+            break
 
-        # 保存
-        for i, nf in enumerate(name_frames):
-            fname = f"upstockname_full_stream{stream_id}_{i}.bin"
-            fpath = os.path.join(CAPTURE_DIR, fname)
-            with open(fpath, "wb") as f:
-                f.write(nf)
-            print(f"    保存: {fpath} ({len(nf)}B)")
-
-            # 预览
-            print(f"    预览: ", end="")
-            for b in nf[:160]:
-                if 32 <= b < 127:
-                    print(chr(b), end="")
-                elif b == 0x0a:
-                    print("\\n", end="")
-                else:
-                    print(".", end="")
-            print()
-
+        # 响应：server→client 里解码 0x0a 名称帧
+        saved = False
+        for j, blen, body in frames_in(s2c):
+            result = decode_name_frame(body)
+            if not result["names"]:
+                continue
+            saved = True
+            sh = sum(1 for k in result["names"] if k.startswith("6"))
+            sz = sum(1 for k in result["names"]
+                     if k.startswith(("0", "3")))
+            print(f"    响应(←) 名称帧 {blen}B → {len(result['names'])} 名称"
+                  f"（沪6x={sh} 深0/3x={sz}）")
+            segs = sorted({s[0] for s in result["segments"]})
+            print(f"        段: {segs}")
+            if result["skipped"]:
+                print(f"        跳过(块编码历史段): {result['skipped']}")
+            fname = f"upstockname_full_stream{stream_id}_{j}.bin"
+            with open(os.path.join(CAPTURE_DIR, fname), "wb") as f:
+                f.write(body)
+        if not saved:
+            print("    未找到 0x0a 名称响应帧")
 
 def main():
     parser = argparse.ArgumentParser(description="抓 hexin 启动时 upstockname 全量名称")

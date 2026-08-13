@@ -185,9 +185,16 @@ export function StockProvider({ children }: { children: ReactNode }) {
         }
       }
     }
-    void load()
+    // K 线延迟约 40ms 发出：合并连续切股。快速连续 setCode 时只保留最后一次
+    // 的 K 线请求，避免旧请求在唯一 KLINE_FAST socket 上排队（后端另有
+    // latest-wins 兜底，淘汰已排队但尚未发送的旧请求）。
+    const KLINE_DEBOUNCE_MS = 40
+    const timer = setTimeout(() => {
+      void load()
+    }, KLINE_DEBOUNCE_MS)
     return () => {
       alive = false
+      clearTimeout(timer)
     }
   }, [code, period, fuquan, refreshTick])
 

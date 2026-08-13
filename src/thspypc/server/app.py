@@ -140,7 +140,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         def operation(client) -> list[dict]:
             groups: dict[int, list[str]] = {}
             for code in code_list:
-                groups.setdefault(_market_for_code(code), []).append(code)
+                groups.setdefault(client._market_for_code(code), []).append(code)
             merged: list[dict] = []
             for market, batch in groups.items():
                 merged.extend(client.list_quotes(batch, market=market))
@@ -264,7 +264,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             raise HTTPException(400, "levels 只能是 5 或 10")
 
         def operation(client) -> dict:
-            resolved_market = market or _market_for_code(code)
+            resolved_market = market or client._market_for_code(code)
             if levels == 5 and hasattr(client, "market_view_pipeline"):
                 quote_row, depth_row = client.market_view_pipeline(
                     code,
@@ -311,7 +311,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             raise HTTPException(400, "levels 只能是 5 或 10")
 
         def operation(client) -> dict:
-            resolved_market = market or _market_for_code(code)
+            resolved_market = market or client._market_for_code(code)
 
             def main_lane() -> tuple[dict | None, dict]:
                 rows = client.list_quotes([code], market=resolved_market)

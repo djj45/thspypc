@@ -7,6 +7,7 @@ the server can skip the full download when the local version is current.
 """
 from __future__ import annotations
 
+import datetime
 import os
 import re
 from pathlib import Path
@@ -108,6 +109,18 @@ def load_name_cache(
     return config_vers, names
 
 
+def name_cache_is_fresh(path: str | Path) -> bool:
+    """名称缓存是否为今天写入（自然日）。用于「每天拉取一次」策略。"""
+    path = Path(path)
+    if not path.exists():
+        return False
+    try:
+        written = datetime.date.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return False
+    return written == datetime.date.today()
+
+
 def build_version_value(
     config_vers: dict[str, str],
     markets: str,
@@ -146,5 +159,6 @@ __all__ = [
     "extract_config_vers",
     "group_cache_path",
     "load_name_cache",
+    "name_cache_is_fresh",
     "save_name_cache",
 ]

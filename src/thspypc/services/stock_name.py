@@ -1,6 +1,7 @@
 """Incremental stock-name synchronization over MAIN."""
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
@@ -24,6 +25,7 @@ from ..features.stock_name_cache import (
     extract_config_vers,
     group_cache_path,
     load_name_cache,
+    name_cache_is_fresh,
     save_name_cache,
 )
 from ..features.stock_name_protocol import (
@@ -34,6 +36,8 @@ from ..features.stock_name_protocol import (
 from ..models import AccountKind, Capability
 from ..protocol import build_heartbeat_8901
 from ..testing import LoginFailed, login_socket
+
+logger = logging.getLogger(__name__)
 
 FrameReader = Callable[[SocketLike], bytes]
 Clock = Callable[[], float]
@@ -107,22 +111,26 @@ def _send_frame(
     else:
         sock.sendall(payload)
 
-def _login_one(login_body: bytes, group_key: str) -> socket.socket | None:
+def _login_one(login_body_factory: Callable[[str], bytes], group_key: str) -> socket.socket | None:
     domain = stock_name_group(group_key)["domain"]
     ips = _resolve_ips(domain)
     if not ips:
         return None
-    return _connect_and_login(login_body, ips)
+    return _connect_and_login(login_body_factory(group_key), ips)
 
 def _login_sessions(
-    login_body: bytes,
+    login_body_factory: Callable[[str], bytes],
     groups: list[str],
 ) -> dict[str, tuple[socket.socket, threading.Lock]]:
-    """Log in to every market group concurrently (hexin cold-start style)."""
+    """Log in to every market group concurrently (hexin cold-start style).
+
+    每组用 login_body_factory(group_key) 生成各自的 login body——不同域名
+    需要不同 LoginIdentity（standard/manual/l2），共用一份会登录失败。
+    """
     sessions: dict[str, tuple[socket.socket, threading.Lock]] = {}
     with ThreadPoolExecutor(max_workers=max(1, len(groups))) as pool:
         futures = {
-            pool.submit(_login_one, login_body, group_key): group_key
+            pool.submit(_login_one, login_body_factory, group_key): group_key
             for group_key in groups
         }
         for future in as_completed(futures):
@@ -236,7 +244,7 @@ def _collect_group(
     return result
 
 def download_stock_name_group(
-    login_body: bytes,
+    login_body_factory: Callable[[str], bytes],
     group_key: str,
     *,
     timeout: float = 45.0,
@@ -248,7 +256,7 @@ def download_stock_name_group(
     meta = stock_name_group(group_key)
     domain = meta["domain"]
     ips = _resolve_ips(domain)
-    sock = _connect_and_login(login_body, ips) if ips else None
+    sock = _connect_and_login(login_body_factory(group_key), ips) if ips else None
     if sock is None:
         return empty_name_result()
     try:
@@ -304,6 +312,18 @@ def download_full_stock_names(
     cached = load_name_cache(cache_path) if cache_path else None
     cached_config_vers = cached[0] if cached else {}
     cached_names = cached[1] if cached else {}
+    # 当日已拉取过名称，直接复用缓存，不再走 8901 登录 + 引导 + 全量下载。
+    if cached_names and name_cache_is_fresh(cache_path):
+        logger.info(
+            "download_full_stock_names: 命中当日名称缓存 (%d 条)",
+            len(cached_names),
+        )
+        return {
+            "names": dict(cached_names),
+            "by_segment": {},
+            "skipped": [],
+            "segments": [],
+        }
     markets, pageid = _NAME_GROUPS.get(key, ("16;144;208;", 5716))
     if cached_config_vers:
         trigger = build_stock_name_ver_frame(
@@ -374,8 +394,20 @@ def download_full_stock_names(
             except OSError:
                 pass
 
+def _merge_cached_group_names(groups: list[str]) -> dict[str, str] | None:
+    """所有组的当日缓存都存在且新鲜时合并返回；否则返回 None。"""
+    merged: dict[str, str] = {}
+    for group_key in groups:
+        path = group_cache_path(group_key)
+        cached = load_name_cache(path)
+        if cached is None or not name_cache_is_fresh(path):
+            return None
+        merged.update(cached[1])
+    return merged
+
+
 def download_all_stock_names(
-    login_body: bytes,
+    login_body_factory: Callable[[str], bytes],
     account_kind: AccountKind = AccountKind.LEVEL2,
     *,
     timeout: float = 45.0,
@@ -395,13 +427,25 @@ def download_all_stock_names(
         else "standard"
     )
     groups = STOCK_NAME_GROUPS.get(key, STOCK_NAME_GROUPS["standard"])
+    cached = _merge_cached_group_names(groups)
+    if cached:
+        logger.info(
+            "download_all_stock_names: 命中当日组缓存 (%d 条)",
+            len(cached),
+        )
+        return {
+            "names": cached,
+            "by_segment": {},
+            "skipped": [],
+            "segments": [],
+        }
     result = {
         "names": {},
         "by_segment": {},
         "skipped": [],
         "segments": [],
     }
-    sessions = _login_sessions(login_body, groups)
+    sessions = _login_sessions(login_body_factory, groups)
     heartbeats: list[tuple[threading.Event, socket.socket]] = []
     try:
         for group_key, (sock, lock) in sessions.items():

@@ -59,6 +59,47 @@ def test_text_and_nul_terminated_segment_names_are_decoded():
     ]
 
 
+def test_history_lines_are_skipped_and_current_name_wins():
+    # 同一代码在响应里同时有 ``code=现名|别名@f`` 与历史行
+    # ``code=旧名@h1|旧名2@h2|...``；历史行必须跳过，否则历史名会覆盖现名
+    # （600664 被 "S哈药" 覆盖、000001 被 "深发展A" 覆盖）。
+    body = (
+        b"[name_16_16]\r\n"
+        + b"ConfigVer=20260807_1\r\n"
+        + "600664=哈药股份|哈药股份@f\r\n".encode("gbk")
+        + "600664=S哈药@h1|哈药集团@h2|哈医药@h3\r\n".encode("gbk")
+        + "000001=平安银行|平安银行@f\r\n".encode("gbk")
+        + "000001=深发展A@h1|S深发展A@h2\r\n".encode("gbk")
+        + "600519=贵州茅台|贵州茅台@f\r\n".encode("gbk")
+    )
+
+    result = decode_name_frame(body)
+
+    assert result["names"] == {
+        "600664": "哈药股份",
+        "000001": "平安银行",
+        "600519": "贵州茅台",
+    }
+    assert result["skipped"] == []
+
+
+def test_captured_normal_name_response_prefers_current_over_history():
+    path = (
+        Path(__file__).parents[1]
+        / "captures_live"
+        / "upstockname_full_normal_215908.bin"
+    )
+    if not path.exists():
+        pytest.skip("optional captured normal name response is unavailable")
+
+    # fd fd fd fd + 8 位 ASCII hex 长度 + body（body 以 0x0a 开头）
+    result = decode_name_frame(path.read_bytes()[12:])
+
+    assert result["names"]["600664"] == "哈药股份"
+    assert result["names"]["600403"] == "大有能源"
+    assert result["names"]["000001"] == "平安银行"
+
+
 def test_block_encoded_segment_is_reported_not_guessed():
     body = b"[name_16_16]\x00\xffbroken\x00payload"
 
@@ -68,6 +109,26 @@ def test_block_encoded_segment_is_reported_not_guessed():
     assert result["by_segment"] == {}
     assert result["skipped"] == ["16_16"]
     assert result["segments"] == [("16_16", 15, "block")]
+
+
+def test_st_name_detection_and_market_mapping():
+    from thspypc.features.stock_name_protocol import is_st_name, st_market
+
+    # ST/*ST/SST/S*ST 前缀识别
+    assert is_st_name("ST长园") is True
+    assert is_st_name("*ST闻泰") is True
+    assert is_st_name("S*ST生化") is True
+    assert is_st_name("SST中华") is True
+    assert is_st_name("贵州茅台") is False
+    assert is_st_name("平安银行") is False
+    assert is_st_name("") is False
+    assert is_st_name(None) is False
+
+    # 风险警示股市场码映射：仅沪 17→22，深市无独立市场码（33 不变）
+    assert st_market(17) == 22
+    assert st_market(33) == 33
+    assert st_market(16) == 16
+    assert st_market(151) == 151
 
 
 def test_captured_text_stream_preserves_known_result():
@@ -115,7 +176,8 @@ def test_captured_a_share_compressed_stream_decodes_names():
 
     assert result["names"]["600000"].encode("gbk") == bytes.fromhex("c6d6b7a2d2f8d0d0")
     assert result["names"]["1A0001"].encode("gbk") == bytes.fromhex("c9cfd6a4d6b8cafd")
-    assert result["skipped"] == []
+    # 历史段（第三个 [name_16_16]，块状）现在被显式跳过，不再把历史名当当前名解析。
+    assert result["skipped"] == ["16_16"]
     assert len(result["names"]) > 20000
 
 
@@ -164,6 +226,19 @@ def test_stock_name_cache_roundtrip_and_version_value(tmp_path):
 
     frame = b"[name_16_16]\r\nConfigVer=20260807_1\r\n600000=test\r\n"
     assert extract_config_vers(frame) == {"16_16": "20260807_1"}
+
+
+def test_name_cache_is_fresh(tmp_path):
+    from thspypc.features.stock_name_cache import (
+        name_cache_is_fresh,
+        save_name_cache,
+    )
+
+    path = tmp_path / "stockname_test_0.txt"
+    save_name_cache({"600000": "浦发银行"}, {"16_16": "20260807_1"}, path)
+
+    assert name_cache_is_fresh(path) is True
+    assert name_cache_is_fresh(tmp_path / "missing.txt") is False
 
 
 def test_stock_name_bootstrap_templates_match_captures(tmp_path):

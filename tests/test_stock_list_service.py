@@ -337,9 +337,11 @@ def test_full_list_builds_one_minimum_query(monkeypatch):
     )
 
     assert service.full_list(settle_timeout=0) == expected
-    assert len(sock.sent) == 1
+    # 常规市场表 + 沪市风险警示板(22) 两次查询，都在 MAIN 上。
+    assert len(sock.sent) == 2
     assert len(sock.sent[0]) == 147
     assert b"DataType=[5],[55]" in sock.sent[0]
+    assert b"CodeList=22();" in sock.sent[1]
     assert manager.peek(ConnectionRole.MAIN) is not None
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert manager.peek(ConnectionRole.SZ_L2) is None
@@ -372,6 +374,200 @@ def test_full_list_rebuilds_minimum_query_with_newline_on_every_call(
 
     assert service.full_list(settle_timeout=0) == expected
     assert service.full_list(settle_timeout=0) == expected
-    assert len(sock.sent) == 2
-    assert all(len(request) == 147 for request in sock.sent)
+    assert len(sock.sent) == 4
+    assert len(sock.sent[0]) == 147 and len(sock.sent[2]) == 147
+    assert b"CodeList=22();" in sock.sent[1]
+    assert b"CodeList=22();" in sock.sent[3]
     assert all(request.endswith(b"\n") for request in sock.sent)
+
+
+def _profile_level2():
+    return AccountProfile(
+        kind=AccountKind.LEVEL2,
+        capabilities={
+            Capability.BASIC_QUOTE: Support.YES,
+            Capability.L2_MARKET_ACCESS: Support.YES,
+        },
+    )
+
+
+def test_full_list_level2_merges_sz_table(monkeypatch):
+    main_sock = FakeSocket()
+    sz_sock = FakeSocket()
+    opened = []
+
+    def opener(spec):
+        opened.append(spec.role)
+        return sz_sock if spec.role is ConnectionRole.SZ_L2 else main_sock
+
+    manager = ConnectionManager(_profile_level2(), opener)
+    recorder = AccountEvidenceRecorder()
+
+    def parse_response(body):
+        if body == b"sz-full-table":
+            return {
+                "stocks": [
+                    {"code": "000001", "name": "", "market": 0},
+                    {"code": "300846", "name": "", "market": 0},
+                ],
+                "server_info": {},
+                "hd31_frames": [
+                    {"pos": 0, "dc": 3274, "unk": 0x18, "hs": 71, "fc": 2}
+                ],
+            }
+        return {
+            "stocks": [
+                {"code": "600000", "name": "", "market": 0},
+                {"code": "000001", "name": "", "market": 0},
+            ],
+            "server_info": {},
+            "hd31_frames": [
+                {"pos": 0, "dc": 7479, "unk": 0x18, "hs": 71, "fc": 2}
+            ],
+        }
+
+    monkeypatch.setattr(
+        "thspypc.services.stock_list.parse_init_response",
+        parse_response,
+    )
+    service = StockListService(
+        manager,
+        frame_reader=lambda sock: (
+            b"sz-full-table" if sock is sz_sock else b"main-full-table"
+        ),
+        sleep=lambda _delay: None,
+        evidence=recorder,
+    )
+
+    result = service.full_list(settle_timeout=0)
+
+    assert [item["code"] for item in result] == ["600000", "000001", "300846"]
+    assert opened == [ConnectionRole.MAIN, ConnectionRole.SZ_L2]
+    assert b"CodeList=32();33();" in sz_sock.sent[0]
+    assert recorder.profile().supports(Capability.L2_MARKET_ACCESS)
+
+
+def test_full_list_merges_st_board_table(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        _profile(AccountKind.STANDARD),
+        lambda _spec: sock,
+    )
+    responses = iter([b"main-full-table", b"st-full-table"])
+
+    def parse_response(body):
+        if body == b"st-full-table":
+            return {
+                "stocks": [
+                    {"code": "600525", "name": "", "market": 0},
+                    {"code": "600745", "name": "", "market": 0},
+                ],
+                "server_info": {},
+                "hd31_frames": [
+                    {"pos": 0, "dc": 84, "unk": 0x18, "hs": 71, "fc": 2}
+                ],
+            }
+        return {
+            "stocks": [{"code": "600000", "name": "", "market": 0}],
+            "server_info": {},
+            "hd31_frames": [
+                {"pos": 0, "dc": 7479, "unk": 0x18, "hs": 71, "fc": 2}
+            ],
+        }
+
+    monkeypatch.setattr(
+        "thspypc.services.stock_list.parse_init_response",
+        parse_response,
+    )
+    service = StockListService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        sleep=lambda _delay: None,
+    )
+
+    result = service.full_list(settle_timeout=0)
+
+    assert [item["code"] for item in result] == [
+        "600000",
+        "600525",
+        "600745",
+    ]
+
+
+def test_ranked_queries_all_markets_on_main(monkeypatch):
+    # 2026-08-14 活网验证：MAIN 单请求 CodeList=17();22();33();151(); 即返回
+    # 沪深京全市场排序（SortTotal=5217），无需拆沪深再本地合并。
+    sock = FakeSocket()
+    opened = []
+    manager = ConnectionManager(
+        _profile_level2(),
+        lambda spec: opened.append(spec.role) or sock,
+    )
+
+    monkeypatch.setattr(
+        "thspypc.services.stock_list.parse_stock_list_response",
+        lambda _body: {
+            "sort_total": 2,
+            "sort_begin": 0,
+            "sort_count": 59,
+            "sort_data_count": 2,
+            "stocks": [
+                {"code": "300862", "name": "", "market": 0, "dt44": 1038104520.0},
+                {"code": "601991", "name": "", "market": 0, "dt44": 377052580.0},
+            ],
+        },
+    )
+    service = StockListService(
+        manager,
+        frame_reader=lambda _sock: b"SortTotal=2",
+        sleep=lambda _delay: None,
+    )
+
+    result = service.ranked(count=10, sort_by=265260, with_values=True)
+
+    assert [r["code"] for r in result] == ["300862", "601991"]
+    assert opened == [ConnectionRole.MAIN]
+    assert b"CodeList=17();22();33();151();" in sock.sent[0]
+    assert manager.peek(ConnectionRole.SZ_L2) is None
+
+
+def test_full_list_level2_sz_gate_failure_falls_back_to_main():
+    main_sock = FakeSocket()
+    opened = []
+
+    def opener(spec):
+        opened.append(spec.role)
+        return main_sock
+
+    manager = ConnectionManager(
+        AccountProfile(
+            kind=AccountKind.LEVEL2,
+            capabilities={
+                Capability.BASIC_QUOTE: Support.YES,
+                Capability.L2_MARKET_ACCESS: Support.NO,
+            },
+        ),
+        opener,
+    )
+    service = StockListService(
+        manager,
+        frame_reader=lambda _sock: b"main-full-table",
+        sleep=lambda _delay: None,
+    )
+    import thspypc.services.stock_list as module
+
+    original = module.parse_init_response
+    module.parse_init_response = lambda _body: {
+        "stocks": [{"code": "600000", "name": "", "market": 0}],
+        "server_info": {},
+        "hd31_frames": [
+            {"pos": 0, "dc": 7479, "unk": 0x18, "hs": 71, "fc": 2}
+        ],
+    }
+    try:
+        result = service.full_list(settle_timeout=0)
+    finally:
+        module.parse_init_response = original
+
+    assert [item["code"] for item in result] == ["600000"]
+    assert opened == [ConnectionRole.MAIN]

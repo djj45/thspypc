@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import socket
+import threading
 from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
-from ..errors import CapabilityUnavailableError, ProtocolError
+from ..errors import CapabilityUnavailableError, ProtocolError, SupersededError
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.kline_protocol import (
     build_kline_l2_query,
@@ -51,6 +52,8 @@ class KlineService:
         self._read_frame = frame_reader
         self._max_frames = max_frames
         self._evidence = evidence
+        self._kline_gate = 0
+        self._kline_gate_lock = threading.Lock()
 
     def kline(
         self,
@@ -114,7 +117,8 @@ class KlineService:
         records: list[dict] = []
         saw_kline_frame = False
 
-        with connection.request(request, timeout=timeout) as sock:
+        def drain(sock) -> None:
+            nonlocal records, saw_kline_frame
             for _ in range(self._max_frames):
                 try:
                     response = self._read_frame(sock)
@@ -148,6 +152,25 @@ class KlineService:
                     continue
                 if records:
                     break
+
+        if channel == "ifindhq_fast":
+            # KLINE_FAST 是唯一 socket：快速切股会让旧请求串行排队。领递增 gate，
+            # 用 latest-wins——排到 socket 时若已被更新的请求取代则直接淘汰。
+            with self._kline_gate_lock:
+                self._kline_gate += 1
+                gate = self._kline_gate
+            try:
+                with connection.request_latest(
+                    request,
+                    gate=gate,
+                    timeout=timeout,
+                ) as sock:
+                    drain(sock)
+            except SupersededError:
+                return []
+        else:
+            with connection.request(request, timeout=timeout) as sock:
+                drain(sock)
 
         if records:
             if self._evidence is not None:

@@ -53,3 +53,12 @@ class ChannelUnavailableError(THSPyPCError):
 class ProtocolError(THSPyPCError):
     """A response was received but could not be recognized or decoded."""
 
+
+class SupersededError(THSPyPCError):
+    """A newer request superseded this one before it reached the socket.
+
+    Raised by latest-wins connection requests: the request was queued behind the
+    connection lock and a more recent request arrived first, so this one was
+    dropped without being sent.
+    """
+

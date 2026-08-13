@@ -257,3 +257,79 @@ tr.selected {
   border-color: #6a5a2a;
   background: #2a2510;
 }
+
+/* 左栏 2×3 格内嵌列表与分页 */
+.cell-body {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+}
+.cell-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.cell-toolbar select {
+  width: 100%;
+  background: #0a0a0a;
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  padding: 1px 2px;
+  border-radius: 2px;
+}
+.stock-list {
+  min-height: 0;
+}
+.stock-row {
+  display: grid;
+  grid-template-columns: 54px 1fr 1fr;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  border-bottom: 1px solid #1f1f1f;
+}
+.stock-row:hover {
+  background: #1f2530;
+}
+.stock-row.selected {
+  background: #2a3a5a;
+}
+.stock-row .sc {
+  text-align: left;
+  white-space: nowrap;
+}
+.stock-row .sn {
+  text-align: left;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stock-row > span:last-child {
+  text-align: right;
+  white-space: nowrap;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 3px;
+  border-top: 1px solid var(--border);
+  position: sticky;
+  bottom: 0;
+  background: var(--panel);
+}
+.pager button {
+  padding: 0 7px;
+  line-height: 16px;
+  font-size: 11px;
+}
+.pager button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}

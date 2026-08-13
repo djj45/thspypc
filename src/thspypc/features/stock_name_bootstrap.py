@@ -120,12 +120,43 @@ STOCK_NAME_GROUPS = {
     ],
 }
 
+# 每个名称组在 8901 登录时的 LoginIdentity（2026-08-13 双账号抓包字节级确认）：
+#   main/shlv2 → standard（thsuser/thsuser）
+#   szlv2      → manual（__manual/__manual）
+#   fu4/hkus/ifindhq/fu2/usotc → l2（7 字段壳，无 UserName/Password）
+# 之前下载全量名称时 8 组全用 standard 身份，导致 shlv2/szlv2/fu4/fu2/usotc
+# 登录失败、沪深名称缺失。
+NAME_GROUP_LOGIN_IDENTITY = {
+    "level2_16": "standard",
+    "level2_32": "manual",
+    "fu4_96": "l2",
+    "hkus_176": "l2",
+    "hkus_168": "l2",
+    "ifindhq_120": "l2",
+    "fu2_64": "l2",
+    "usotc_UNS": "l2",
+    "standard_32": "standard",
+    "standard_hkus_176": "l2",
+    "standard_fu4_96": "l2",
+    "standard_ifindhq_120": "l2",
+    "standard_fu2_64": "l2",
+    "standard_usotc_UNS": "l2",
+}
+
+
+def name_group_login_identity(group_key: str) -> str:
+    """返回名称组在 8901 登录时应使用的 LoginIdentity 名（字符串）。"""
+    return NAME_GROUP_LOGIN_IDENTITY.get(group_key, "standard")
+
+
 __all__ = [
     "LEVEL2_BOOTSTRAP_FRAMES",
     "LEVEL2_VERSIONED_BOOTSTRAP_FRAMES",
     "STANDARD_BOOTSTRAP_FRAMES",
     "STOCK_NAME_DOMAINS",
     "STOCK_NAME_GROUPS",
+    "NAME_GROUP_LOGIN_IDENTITY",
     "build_group_frames",
+    "name_group_login_identity",
     "stock_name_group",
 ]

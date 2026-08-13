@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from .models import AccountKind, AccountProfile, Capability, Support
 from .features.account_profile import AccountEvidenceRecorder
+from .features.stock_name_protocol import is_st_name, st_market
 from .services.auth import AuthMaterial, AuthService
 from ._client.connection_runtime import ConnectionFactory, ConnectionRuntime
 from ._client.connection_primitives import ConnectionPrimitives
@@ -1068,11 +1069,14 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
 
 
-    @staticmethod
-    def _market_for_code(code: str) -> int:
-        """股票代码 → 市场码（含 1A/1B 沪指、399 深指和 899 北证指数）。"""
-        if code.startswith("6"):
-            return 17
+    def _market_for_code(self, code: str) -> int:
+        """股票代码 → 市场码（含指数、北交所，以及 ST/风险警示板 22/34）。
+
+        ST/*ST 股票在 8901 里：沪市走独立风险警示板 17→22（2026-08-13 抓包
+        确认 600525/600745 走 CodeList=22(...)）；深市无独立市场码，仍用 33。
+        是否 ST 只能靠名称前缀识别，名称来自 fetch_stock_names_full 的当日
+        缓存，取不到时退回普通市场码。
+        """
         if code.startswith(("1A", "1B")):   # 沪市指数
             return 16
         if code.startswith("39"):            # 深市指数
@@ -1081,7 +1085,21 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             return 144
         if code.startswith(("43", "83", "87", "920")):  # 北交所个股
             return 151
-        return 33
+        base = 17 if code.startswith("6") else 33
+        if is_st_name(self._stock_name(code)):
+            return st_market(base)
+        return base
+
+    def _stock_name(self, code: str) -> str:
+        """股票名称（当日缓存，取不到返回空串）。"""
+        cache = getattr(self, "_name_map_cache", None)
+        if cache is None:
+            try:
+                cache = self.fetch_stock_names_full()["names"]
+            except Exception:
+                cache = {}
+            self._name_map_cache = cache
+        return cache.get(code, "")
 
 
 

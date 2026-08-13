@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
+from ..errors import SupersededError
 from .timing import add_request_timing
 from .session_types import SocketLike
 from .dispatcher import ResponseDispatcher
@@ -24,6 +25,8 @@ class MarketSession:
         self._request_lock = request_lock
         self._timing_name = timing_name
         self._dispatcher = ResponseDispatcher(socket_getter)
+        self._gate_lock = threading.Lock()
+        self._latest_gate = 0
 
     @contextmanager
     def request(
@@ -42,6 +45,53 @@ class MarketSession:
         )
         try:
             self._dispatcher.wait_idle()
+            sock = self._socket_getter()
+            if sock is None:
+                raise ConnectionError("连接已关闭")
+            sock.settimeout(timeout)
+            sock.sendall(frame + (b"\n" if trailing_newline else b""))
+            yield sock
+        finally:
+            add_request_timing(
+                f"{self._timing_name}_io",
+                (time.perf_counter() - acquired) * 1000,
+            )
+            self._request_lock.release()
+
+    @contextmanager
+    def request_latest(
+        self,
+        frame: bytes,
+        *,
+        gate: int,
+        timeout: float,
+        trailing_newline: bool = True,
+    ) -> Iterator[SocketLike]:
+        """Latest-wins request: only the highest ``gate`` issued so far is sent.
+
+        Callers issue monotonically increasing ``gate`` values.  When several
+        such requests queue behind the connection lock, any request whose gate
+        is lower than the most recently issued one is skipped with
+        :class:`~thspypc.errors.SupersededError` before touching the socket; the
+        newest request is the one actually sent.  This prevents a busy
+        single-socket connection from serially replaying stale requests (e.g.
+        rapid stock switching on the shared KLINE_FAST socket).
+        """
+        with self._gate_lock:
+            self._latest_gate = max(self._latest_gate, gate)
+        waiting_started = time.perf_counter()
+        self._request_lock.acquire()
+        acquired = time.perf_counter()
+        add_request_timing(
+            f"{self._timing_name}_wait",
+            (acquired - waiting_started) * 1000,
+        )
+        try:
+            self._dispatcher.wait_idle()
+            with self._gate_lock:
+                superseded = gate != self._latest_gate
+            if superseded:
+                raise SupersededError("request superseded by a newer one")
             sock = self._socket_getter()
             if sock is None:
                 raise ConnectionError("连接已关闭")

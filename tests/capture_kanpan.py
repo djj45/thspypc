@@ -217,8 +217,8 @@ def pick_interface():
             return choice, ifaces[choice][1]
 
 
-def capture(iface, duration, pcap_path, stop_file=None):
-    """抓 8901+9601 全流量 duration 秒。"""
+def capture(iface, duration, pcap_path, stop_file=None, all_ports=False):
+    """抓 8901+9601 全流量 duration 秒（all_ports=True 时抓全端口）。"""
     os.makedirs(PCAP_DIR, exist_ok=True)
     if stop_file and os.path.exists(stop_file):
         try:
@@ -226,7 +226,8 @@ def capture(iface, duration, pcap_path, stop_file=None):
         except OSError:
             pass
     print(f"\n{'='*70}")
-    print(f"开始抓包 {duration}s（8901 + 9601，网卡 {iface}）")
+    port_label = "全端口 tcp or udp" if all_ports else "8901 + 9601"
+    print(f"开始抓包 {duration}s（{port_label}，网卡 {iface}）")
     print(f"{'='*70}")
     print(">>> 抓包期间按【看盘界面 7 区域】逐个操作（阶段间停 2-3 秒）：")
     print("  A【左·板块列表】  导航切【板块】→ 行业/概念列表上下滚动各一次")
@@ -242,7 +243,7 @@ def capture(iface, duration, pcap_path, stop_file=None):
         print(f"  中途叫停：创建 {stop_file} 即可提前结束（脚本每 1 秒检查一次）")
     print("-" * 70)
     proc = subprocess.Popen(
-        [DUMPCAP, "-i", iface, "-f", "tcp port 8901 or tcp port 9601",
+        [DUMPCAP, "-i", iface, "-f", ("tcp or udp" if all_ports else "tcp port 8901 or tcp port 9601"),
          "-w", pcap_path, "-a", f"duration:{duration}"],
     )
     stopped = False
@@ -1044,6 +1045,8 @@ def main():
                     help="只分析现有 pcap 不抓包")
     ap.add_argument("--account", choices=["level2", "normal"], default="level2",
                     help="账号类型（仅影响报告提示，不改抓包），默认 level2")
+    ap.add_argument("--all-ports", action="store_true",
+                    help="抓全端口（tcp or udp），排查非 8901/9601 的行情通道")
     args = ap.parse_args()
 
     print("=" * 70)
@@ -1059,7 +1062,8 @@ def main():
         print(f"\n选用网卡 {iface}: {desc}")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     pcap_path = os.path.join(PCAP_DIR, f"kanpan_{ts}.pcap")
-    capture(iface, args.duration, pcap_path, stop_file=args.stop_file)
+    capture(iface, args.duration, pcap_path, stop_file=args.stop_file,
+            all_ports=args.all_ports)
     analyze(pcap_path, args.account)
 
 

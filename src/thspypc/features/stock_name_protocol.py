@@ -108,6 +108,11 @@ def _parse_name_text(segment_data: bytes) -> dict[str, str]:
             or "=" not in line
         ):
             continue
+        # 历史名行形如 ``code=旧名@h1|旧名2@h2|...``（@hN 标志）。同一代码在
+        # 响应里同时有 ``code=现名|别名@f`` 与历史行；若都解析会互相覆盖
+        # （600664 被 "S哈药" 覆盖、000001 被 "深发展A" 覆盖），故跳过历史行。
+        if "@h" in line:
+            continue
         code, _, rest = line.partition("=")
         code = code.strip().lstrip("@")
         if not _name_code_is_valid(code):
@@ -120,6 +125,27 @@ def _parse_name_text(segment_data: bytes) -> dict[str, str]:
         ):
             names[code] = name
     return names
+
+
+_ST_PREFIX_RE = re.compile(r"^[S*]*ST")
+
+
+def is_st_name(name: str) -> bool:
+    """名称是否为风险警示股（ST/*ST/SST/S*ST 前缀）。
+
+    风险警示股在 8901 里：沪市走独立风险警示板 17→22（2026-08-13 抓包确认
+    600525/600745 请求走 CodeList=22(...)）；深市无独立市场码，仍用 33。
+    """
+    return bool(name) and _ST_PREFIX_RE.match(name.strip()) is not None
+
+
+def st_market(base_market: int) -> int:
+    """风险警示股市场码映射：仅沪市 17→22（风险警示板），其余原样。
+
+    深市无独立的风险警示板市场码——002759 (ST天际) 实测仍用 market 33 返回
+    行情，market 34 超时。
+    """
+    return 22 if base_market == 17 else base_market
 
 
 def _is_block_encoded(segment_data: bytes) -> bool:
@@ -204,4 +230,6 @@ __all__ = [
     "build_stock_name_ver_frame",
     "build_upstockname_request",
     "decode_name_frame",
+    "is_st_name",
+    "st_market",
 ]

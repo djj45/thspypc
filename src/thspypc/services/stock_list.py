@@ -1,6 +1,7 @@
 """Stock-list workflows over the MAIN market connection."""
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 import threading
@@ -9,11 +10,19 @@ from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
-from ..errors import ProtocolError
+from ..errors import (
+    CapabilityUnavailableError,
+    ChannelUnavailableError,
+    ProtocolError,
+    UnsupportedAccountFeatureError,
+)
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.stock_list_protocol import (
     DDE_LEVEL2_MARKETS,
     DDE_STANDARD_MARKETS,
+    FULL_STOCK_LIST_MARKETS,
+    FULL_STOCK_LIST_ST_MARKETS,
+    FULL_STOCK_LIST_SZ_MARKETS,
     build_dde_query,
     build_full_stock_list_query,
     build_stock_list_query,
@@ -28,6 +37,8 @@ from ..models import AccountKind, Capability, Support
 FrameReader = Callable[[SocketLike], bytes]
 Clock = Callable[[], float]
 Sleep = Callable[[float], None]
+
+logger = logging.getLogger(__name__)
 
 
 class StockListService:
@@ -63,10 +74,13 @@ class StockListService:
                 self._dde_sequence = 1
             return self._dde_sequence
 
-    def _get_request_segments(self) -> tuple[bytes, ...]:
+    def _get_request_segments(
+        self,
+        markets: tuple[int, ...] = FULL_STOCK_LIST_MARKETS,
+    ) -> tuple[bytes, ...]:
         if self._replay_segments is not None:
             return self._replay_segments
-        return (build_full_stock_list_query(),)
+        return (build_full_stock_list_query(markets=markets),)
 
     def ranked(
         self,
@@ -87,6 +101,9 @@ class StockListService:
         if count <= 0 or max_pages <= 0:
             return []
 
+        # 全市场单请求：MAIN 支持 CodeList=17();22();33();151(); 并直接按
+        # 沪深京全市场全局排序（SortTotal=5217，2026-08-14 活网验证含深市 33，
+        # 无需拆沪深再本地合并）。
         connection = self._connections.acquire(
             ConnectionRole.MAIN,
             capability=Capability.BASIC_QUOTE,
@@ -98,7 +115,7 @@ class StockListService:
 
         for _page in range(max_pages):
             request = build_stock_list_query(
-                markets=(17, 22, 151),
+                markets=(17, 22, 33, 151),
                 sort_begin=sort_begin,
                 sort_count=59,
                 datatype=[sort_by],
@@ -290,14 +307,103 @@ class StockListService:
         replay_delay: float = 0.3,
         settle_timeout: float = 3.0,
     ) -> list[dict]:
-        """Request all configured markets and select the largest table."""
-        connection = self._connections.acquire(
+        """Request all configured markets and merge every code table.
+
+        Level2 账号的深市代码表不在 MAIN：MAIN 全量表只覆盖沪系市场
+        （16/17/19/20/144-151；2026-08-14 实测 26356 行、无 00/30x 代码）。
+        深市表需在 SZ_L2（szlv2）上用同一 DataType=[5],[55] 查询再取一次
+        （市场码 32/33；实测单帧 3274 行，覆盖全部深市 A 股），合并返回。
+        重放模式（replay_segments）保持 MAIN 单路，不复用抓包字节打 SZ。
+        """
+        stocks = self._full_list_on(
             ConnectionRole.MAIN,
+            FULL_STOCK_LIST_MARKETS,
             capability=Capability.BASIC_QUOTE,
+            timeout=timeout,
+            replay_delay=replay_delay,
+            settle_timeout=settle_timeout,
+            full_frame_min_dc=5000,
         )
+        if self._replay_segments is None:
+            try:
+                st_stocks = self._full_list_on(
+                    ConnectionRole.MAIN,
+                    FULL_STOCK_LIST_ST_MARKETS,
+                    capability=Capability.BASIC_QUOTE,
+                    timeout=timeout,
+                    replay_delay=replay_delay,
+                    settle_timeout=settle_timeout,
+                    full_frame_min_dc=0,
+                )
+            except (
+                CapabilityUnavailableError,
+                UnsupportedAccountFeatureError,
+                ChannelUnavailableError,
+                ProtocolError,
+            ) as exc:
+                logger.warning(
+                    "full_list: 沪市风险警示板(22)代码表不可用: %s",
+                    exc,
+                )
+            else:
+                if st_stocks:
+                    merged = {stock["code"]: stock for stock in stocks}
+                    for stock in st_stocks:
+                        merged.setdefault(stock["code"], stock)
+                    stocks = list(merged.values())
+        if (
+            self._replay_segments is None
+            and self._connections.profile.kind is AccountKind.LEVEL2
+        ):
+            try:
+                sz_stocks = self._full_list_on(
+                    ConnectionRole.SZ_L2,
+                    FULL_STOCK_LIST_SZ_MARKETS,
+                    capability=Capability.L2_MARKET_ACCESS,
+                    timeout=timeout,
+                    replay_delay=replay_delay,
+                    settle_timeout=settle_timeout,
+                    full_frame_min_dc=0,
+                )
+            except (
+                CapabilityUnavailableError,
+                UnsupportedAccountFeatureError,
+                ChannelUnavailableError,
+                ProtocolError,
+            ) as exc:
+                # 深市表拿不到时退回沪系-only（旧行为），不拖垮整个股票表。
+                logger.warning(
+                    "full_list: SZ_L2 深市代码表不可用，仅返回沪系: %s",
+                    exc,
+                )
+            else:
+                if sz_stocks:
+                    if self._evidence is not None:
+                        self._evidence.record_l2_init(Support.YES)
+                    merged = {stock["code"]: stock for stock in stocks}
+                    for stock in sz_stocks:
+                        merged.setdefault(stock["code"], stock)
+                    stocks = list(merged.values())
+        if self._evidence is not None and stocks:
+            self._evidence.record_main_ready()
+        return stocks
+
+    def _full_list_on(
+        self,
+        role: ConnectionRole,
+        markets: tuple[int, ...],
+        *,
+        capability: Capability,
+        timeout: float,
+        replay_delay: float,
+        settle_timeout: float,
+        full_frame_min_dc: int,
+    ) -> list[dict]:
+        """Collect one market family's full code table on one connection."""
+        connection = self._connections.acquire(role, capability=capability)
         generated_request = self._replay_segments is None
         try:
-            segments = self._get_request_segments()
+            segments = self._get_request_segments(markets)
         except (OSError, ValueError) as exc:
             raise ProtocolError(
                 f"stock-list request sequence is invalid: {exc}"
@@ -305,7 +411,7 @@ class StockListService:
         if not segments:
             raise ProtocolError("stock-list request sequence is empty")
 
-        best_stocks: list[dict] = []
+        by_code: dict[str, dict] = {}
         started_at = self._clock()
         full_table_at: float | None = None
         request_timeout = min(2.0, max(timeout, 0.1))
@@ -348,20 +454,20 @@ class StockListService:
                 full_frames = [
                     frame
                     for frame in metadata["hd31_frames"]
-                    if frame["unk"] == 0x18 and frame["dc"] > 5000
+                    if frame["unk"] == 0x18 and frame["dc"] > full_frame_min_dc
                 ]
                 if full_frames and not stocks:
                     raise ProtocolError(
                         "received full stock table but parsing failed"
                     )
-                if len(stocks) > len(best_stocks):
-                    best_stocks = stocks
+                for stock in stocks:
+                    code = stock.get("code", "")
+                    if code:
+                        by_code.setdefault(code, stock)
                 if full_frames:
                     full_table_at = self._clock()
 
-        if self._evidence is not None and best_stocks:
-            self._evidence.record_main_ready()
-        return best_stocks
+        return list(by_code.values())
 
 
 def _merge_dde_rows(rows: list[dict], *, sort_dir: str) -> list[dict]:

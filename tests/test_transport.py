@@ -18,6 +18,7 @@ from thspypc.transport import (
     MarketSession,
 )
 from thspypc.transport import DispatchDecision, DispatchRequest
+from thspypc.errors import SupersededError
 from thspypc._transport.timing import (
     RequestTiming,
     reset_request_timing,
@@ -75,6 +76,58 @@ class MarketSessionTest(unittest.TestCase):
             self.assertIs(sock, self.sock)
             self.assertEqual(self.sock.timeout, 3.5)
             self.assertEqual(self.sock.sent, [b"query\n"])
+
+    def test_request_latest_sends_newest(self) -> None:
+        with self.session.request_latest(b"query", gate=10, timeout=3.5) as sock:
+            self.assertIs(sock, self.sock)
+            self.assertEqual(self.sock.timeout, 3.5)
+            self.assertEqual(self.sock.sent, [b"query\n"])
+
+    def test_request_latest_skips_superseded_request(self) -> None:
+        with self.session._gate_lock:
+            self.session._latest_gate = 5
+        with self.assertRaises(SupersededError):
+            with self.session.request_latest(b"stale", gate=3, timeout=1.0):
+                self.fail("superseded request must not yield")
+        self.assertEqual(self.sock.sent, [])
+
+    def test_request_latest_drops_stale_queued_requests(self) -> None:
+        # 锁被占用时（模拟在途请求），两个新请求排队；只有最高 gate 真正发出。
+        self.lock.acquire()
+        try:
+            results: dict[int, str] = {}
+
+            def run(gate: int) -> None:
+                try:
+                    with self.session.request_latest(
+                        b"q%d" % gate,
+                        gate=gate,
+                        timeout=1.0,
+                    ):
+                        results[gate] = "sent"
+                except SupersededError:
+                    results[gate] = "superseded"
+
+            first = threading.Thread(target=run, args=(1,))
+            second = threading.Thread(target=run, args=(2,))
+            first.start()
+            second.start()
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                with self.session._gate_lock:
+                    if self.session._latest_gate >= 2:
+                        break
+                time.sleep(0.005)
+        finally:
+            self.lock.release()
+
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(results.get(1), "superseded")
+        self.assertEqual(results.get(2), "sent")
+        self.assertEqual(self.sock.sent, [b"q2\n"])
 
     def test_request_lock_covers_entire_response_lifecycle(self) -> None:
         first_entered = threading.Event()

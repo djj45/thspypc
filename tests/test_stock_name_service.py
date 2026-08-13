@@ -133,3 +133,32 @@ def test_fetch_success_records_main_evidence():
     service.fetch()
 
     assert recorder.profile().supports(Capability.BASIC_QUOTE)
+
+
+def test_merge_cached_group_names(monkeypatch, tmp_path):
+    """当日组缓存合并：全部新鲜时合并返回，缺任一组时返回 None。"""
+    from thspypc.features.stock_name_cache import save_name_cache
+    from thspypc.services import stock_name as sn
+
+    monkeypatch.setattr(
+        sn,
+        "group_cache_path",
+        lambda key: tmp_path / f"stockname_{key}_0.txt",
+    )
+
+    save_name_cache(
+        {"600000": "浦发银行"},
+        {"16_16": "20260807_1"},
+        tmp_path / "stockname_g1_0.txt",
+    )
+    save_name_cache(
+        {"000001": "平安银行"},
+        {"32_32": "20260807_1"},
+        tmp_path / "stockname_g2_0.txt",
+    )
+
+    assert sn._merge_cached_group_names(["g1", "g2"]) == {
+        "600000": "浦发银行",
+        "000001": "平安银行",
+    }
+    assert sn._merge_cached_group_names(["g1", "missing"]) is None
