@@ -79,20 +79,45 @@ class ConnectionPrimitives:
             # 测速选最快的 IP（复刻同花顺「测试 IP」功能）。
             # 并发 TCP 握手测延迟，选最快的 login，避免盲选到慢 IP（曾 46s 超时）。
             # 测速纯 TCP 握手不发 login，不触发 -1。结果缓存 5 分钟复用。
-            sorted_ips = self._probe_fastest_hosts(hosts, timeout=1.0, role="main")
+            # main.123ths.com 优先（支持北交所 151，2026-08-14 抓包确认），
+            # 组内按延迟序；ifindhq 等回退域名的 IP 排后，避免测速快的 ifindhq
+            # 抢走 main 连接（ifindhq 排序榜无北交所）。
+            priority_hosts = set()
+            try:
+                _, _, main_ips = socket.gethostbyname_ex("main.123ths.com")
+                priority_hosts = set(main_ips)
+            except OSError:
+                pass
+            sorted_ips = self._probe_fastest_hosts(
+                hosts, timeout=1.0, role="main",
+                priority_hosts=priority_hosts or None,
+            )
             if sorted_ips:
                 # ★ K线坏 IP 黑名单过滤：部分 IP（如 116.63.x.x）不支持大 K线查询，
                 # 只返回部分数据或 timeout（实测 §14j）。重连时跳过这些 IP，优先选
                 # 未失败过的。若全部在黑名单（罕见），退而用全表（不让黑名单卡死）。
                 good_ips = [ip for ip in sorted_ips if ip not in self._bad_kline_ips]
                 pool = good_ips if good_ips else sorted_ips
+                # 优先组（main.123ths.com，支持北交所）恒优先：组内轮换取
+                # 满 n_concurrent 个；不足时才用回退组（ifindhq）补齐。
+                # 轮换偏移只在组内推进，避免偏移把 main 全部跳过。
+                priority_pool = [
+                    ip for ip in pool if ip in (priority_hosts or set())
+                ]
+                fallback_pool = [ip for ip in pool if ip not in (priority_hosts or set())]
                 n_concurrent = min(7, len(pool))
-                offset = self._login_rr_offset.get("main", 0) % max(1, len(pool))
-                # 环形取 n_concurrent 个（offset 起，绕回）
-                batch = (pool[offset:] + pool[:offset])[:n_concurrent]
+                if priority_pool:
+                    offset = self._login_rr_offset.get("main", 0) % len(priority_pool)
+                    batch = (priority_pool[offset:] + priority_pool[:offset])[:n_concurrent]
+                    if len(batch) < n_concurrent:
+                        batch = batch + fallback_pool[: n_concurrent - len(batch)]
+                else:
+                    offset = self._login_rr_offset.get("main", 0) % max(1, len(pool))
+                    batch = (pool[offset:] + pool[:offset])[:n_concurrent]
                 skip_note = f"（跳过 {len(self._bad_kline_ips)} 个坏IP）" if self._bad_kline_ips else ""
-                logger.info("并发连接 %d 个 IP（测速排序+轮换 offset=%d）%s: %s",
-                            len(batch), offset, skip_note, batch[:3])
+                logger.info("并发连接 %d 个 IP（优先组%d+回退%d, 轮换 offset=%d）%s: %s",
+                            len(batch), len(priority_pool), len(fallback_pool),
+                            self._login_rr_offset.get("main", 0), skip_note, batch[:3])
             else:
                 # 测速全部超时（网络异常），回退到盲取前 7 个
                 logger.warning("IP 测速全部超时，回退到盲取前 7 个")
@@ -406,7 +431,8 @@ class ConnectionPrimitives:
 
     def _probe_fastest_hosts(self, hosts: list[str], timeout: float = 1.0,
                              use_cache: bool = True,
-                             role: str = "main") -> list[str]:
+                             role: str = "main",
+                             priority_hosts: set[str] | None = None) -> list[str]:
         """并发 TCP 握手测每个 IP 的延迟，返回**按延迟升序排列的全部可达 IP**。
 
         复刻同花顺客户端「测试 IP」功能的机制（2026-07-23 抓包确认）：并发对多个
@@ -443,6 +469,10 @@ class ConnectionPrimitives:
                 and cache_matches_hosts
             ):
                 logger.debug("IP 测速缓存[%s]命中（%d 个可达 IP）", role, len(cached))
+                if priority_hosts:
+                    in_priority = [ip for ip in cached if ip in priority_hosts]
+                    rest = [ip for ip in cached if ip not in priority_hosts]
+                    return in_priority + rest
                 return cached
             if cached and not cache_matches_hosts:
                 logger.debug("IP 测速缓存[%s]与当前 DNS 候选不一致，重新测速", role)
@@ -469,7 +499,15 @@ class ConnectionPrimitives:
             t.join(timeout=timeout + 0.5)  # 整体最多等 timeout+0.5s
 
         results.sort(key=lambda x: x[1])
-        sorted_ips = [ip for ip, _ in results]  # 全部可达 IP，按延迟升序
+        if priority_hosts:
+            # 域名优先级分组：优先组（如 main.123ths.com，支持北交所）的 IP
+            # 恒排前，组内按延迟升序；非优先组（ifindhq 回退）排后，避免
+            # 测速快但无北交所 151 的 ifindhq 抢走 main 连接。
+            in_priority = [ip for ip, _ in results if ip in priority_hosts]
+            rest = [ip for ip, _ in results if ip not in priority_hosts]
+            sorted_ips = in_priority + rest
+        else:
+            sorted_ips = [ip for ip, _ in results]  # 全部可达 IP，按延迟升序
         if sorted_ips:
             # 写内存缓存 + 磁盘持久化（跨进程共享，避免每个进程都 offset=0）
             self._probe_cache[role] = (time.time(), sorted_ips)

@@ -30,6 +30,7 @@ from ..features.stock_list_protocol import (
     parse_init_response,
     parse_stock_list_response,
     strip_to_identity,
+    RANKED_VALUE_FIELDS,
 )
 from ..models import AccountKind, Capability, Support
 
@@ -101,9 +102,143 @@ class StockListService:
         if count <= 0 or max_pages <= 0:
             return []
 
-        # 全市场单请求：MAIN 支持 CodeList=17();22();33();151(); 并直接按
-        # 沪深京全市场全局排序（SortTotal=5217，2026-08-14 活网验证含深市 33，
-        # 无需拆沪深再本地合并）。
+        direction = sort_dir.upper()
+        if direction not in {"A", "D"}:
+            raise ValueError("sort_dir must be 'A' or 'D'")
+
+        # 账号分流（2026-08-14 客户端抓包确认，captures_live/rank_sort_20260814_1545*.pcap）：
+        # - Level2：拆两条 L2 连接（沪 17();22();151(); + 深 33();），pageid=1341，
+        #   SortCount 放大；MAIN 单请求不返回北交所 151 且 10~20% 区间缺条目。
+        # - 普通：MAIN 单请求 17();22();33();151(); pageid=1334，SortBegin 翻页。
+        if self._connections.profile.kind is AccountKind.LEVEL2:
+            stocks = self._ranked_l2(
+                count=count,
+                timeout=timeout,
+                sort_by=sort_by,
+                sort_dir=direction,
+                max_pages=max_pages,
+                with_values=with_values,
+            )
+        else:
+            stocks = self._ranked_main(
+                count=count,
+                timeout=timeout,
+                sort_by=sort_by,
+                sort_dir=direction,
+                max_pages=max_pages,
+                with_values=with_values,
+            )
+        if with_values:
+            self._normalize_ranked_values(stocks, sort_by)
+        return stocks
+
+    def _ranked_l2(
+        self,
+        *,
+        count: int,
+        timeout: float,
+        sort_by: int,
+        sort_dir: str,
+        max_pages: int,
+        with_values: bool,
+    ) -> list[dict]:
+        """Level2 拆沪深两条 L2 连接取排序榜，本地合并后按排序值重排。
+
+        请求参数对齐 2026-08-14 客户端抓包：pageid=1341、SortCount 从 20
+        起逐步放大（20→160→…→全市场总数），沪 CodeList=17();22();151();
+        深 CodeList=33();。SortBegin 恒 0——服务器按 SortCount 一次给满。
+        """
+        response_field = RANKED_VALUE_FIELDS.get(sort_by, f"dt{sort_by & 0xFF}")
+        # 只对百分比类排序键归一化（涨幅/涨速/换手/量比/竞价涨幅）；
+        # 金额类（竞价额 dt150/封单额 dt44/主力 dt250）是原始元不缩放。
+        pct_sort_keys = {199112, 48, 1968584, 1771976, 68762}
+        normalize_value = sort_by in pct_sort_keys
+
+        def fetch_all(role: ConnectionRole, markets: tuple[int, ...]) -> list[dict]:
+            connection = self._connections.acquire(
+                role, capability=Capability.L2_MARKET_ACCESS
+            )
+            all_rows: list[dict] = []
+            seen: set[str] = set()
+            sort_count = min(20, max(count, 20))
+            for _ in range(max_pages):
+                request = build_stock_list_query(
+                    markets=markets,
+                    sort_begin=0,
+                    sort_count=sort_count,
+                    datatype=[sort_by],
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                    pageid=1341,
+                )
+                response = None
+                try:
+                    with connection.request(request, timeout=timeout) as sock:
+                        for _ in range(max(self._max_frames, 32)):
+                            candidate = self._read_frame(sock)
+                            if b"SortTotal" in candidate:
+                                response = candidate
+                                break
+                except (socket.timeout, OSError):
+                    break
+                if response is None:
+                    break
+                metadata = parse_stock_list_response(response)
+                page_stocks = metadata["stocks"]
+                data_count = metadata["sort_data_count"]
+                if data_count > 0 and not page_stocks:
+                    raise ProtocolError(
+                        "received stock-list data metadata but parsing failed"
+                    )
+                for stock in page_stocks:
+                    code = stock.get("code", "")
+                    if code and code not in seen:
+                        seen.add(code)
+                        # 就地归一化排序字段：L2 响应同榜混用除法（直接小数）
+                        # 与乘法（x1e8）两种编码，排序/展示前统一真值。
+                        if normalize_value:
+                            stock[response_field] = _normalize_rank_value(
+                                stock.get(response_field)
+                            )
+                        all_rows.append(stock)
+                sort_total = metadata["sort_total"]
+                if (
+                    len(all_rows) >= count
+                    or data_count == 0
+                    or (sort_total > 0 and len(all_rows) >= sort_total)
+                ):
+                    break
+                sort_count = max(
+                    sort_count * 4,
+                    min(len(all_rows) + 59, sort_total or 6000),
+                )
+            return all_rows
+
+        sh_rows = fetch_all(ConnectionRole.SH_L2, (17, 22, 151))
+        if self._evidence is not None and sh_rows:
+            self._evidence.record_l2_init(Support.YES)
+        sz_rows = fetch_all(ConnectionRole.SZ_L2, (33,))
+
+        rows = _merge_ranked_rows(
+            sh_rows + sz_rows,
+            sort_dir=sort_dir,
+            value_field=response_field,
+        )
+        if with_values:
+            return rows[:count]
+        return strip_to_identity(rows[:count])
+
+    def _ranked_main(
+        self,
+        *,
+        count: int,
+        timeout: float,
+        sort_by: int,
+        sort_dir: str,
+        max_pages: int,
+        with_values: bool,
+    ) -> list[dict]:
+        """普通账号：MAIN 单请求 17/22/33/151 + pageid=1334，SortBegin 翻页。"""
         connection = self._connections.acquire(
             ConnectionRole.MAIN,
             capability=Capability.BASIC_QUOTE,
@@ -121,6 +256,7 @@ class StockListService:
                 datatype=[sort_by],
                 sort_by=sort_by,
                 sort_dir=sort_dir,
+                pageid=1334,
             )
             response = None
             try:
@@ -165,6 +301,33 @@ class StockListService:
             sort_begin = len(stocks)
 
         return stocks if with_values else strip_to_identity(stocks)
+
+    def _normalize_ranked_values(
+        self,
+        stocks: list[dict],
+        sort_by: int,
+    ) -> None:
+        """统一排序值缩放：真值 = mantissa/10000（2026-08-14 抓包确认）。
+
+        排序响应里同一字段混用两种 THS float 编码：
+        - 除法编码（bit31=1，如 0xc000431c → 1.718）：解码后直接是真值；
+        - 乘法编码（bit31=0，如 0x40001536 → 54300000）：解码值 ×1e8，
+          需 ÷1e8 还原（54300000/1e8 = 0.543）。
+        按量级判断：|dec| >= 1e6 视为乘法编码（×1e8），否则直接使用。
+
+        只归一化**百分比类**排序字段（涨幅 dt200/涨速 dt48/换手 dt200/
+        量比 dt200/竞价涨幅 dt154）；金额类（竞价额 dt150/封单额 dt44/
+        主力 dt250）是原始元，不缩放。
+        """
+        # sort_by → 是否百分比类（与 web/src/types.ts SORT_BY 对齐）。
+        pct_sort_keys = {199112, 48, 1968584, 1771976, 68762}
+        if sort_by not in pct_sort_keys:
+            return
+        field = RANKED_VALUE_FIELDS.get(sort_by)
+        if field is None:
+            return
+        for stock in stocks:
+            stock[field] = _normalize_rank_value(stock.get(field))
 
     def dde_ranked(
         self,
@@ -470,6 +633,28 @@ class StockListService:
         return list(by_code.values())
 
 
+def _normalize_rank_value(value) -> float | None:
+    """统一排序值真值 = mantissa/10000（2026-08-14 抓包/活网确认）。
+
+    排序响应同字段混用三种编码，解码值量级可区分：
+    - 除法 THS float（bit31=1，如 0xc000431c → 1.718）：直接是真值；
+    - 乘法 THS float（bit31=0，如 0x40001536 → 54300000）：×1e8，÷1e8；
+    - 裸 mantissa（如 L2 涨速榜 dt48=17180）：×10000，÷10000。
+    阈值：|v| >= 1e7 → ÷1e8；1e3 <= |v| < 1e7 → ÷1e4；否则原样。
+    A 股涨跌幅/涨速均 < 1000%，不会误伤真值本身。
+    """
+    if not isinstance(value, (int, float)):
+        return value
+    if value == 0.0:
+        return value
+    magnitude = abs(value)
+    if magnitude >= 1e7:
+        return value / 1e8
+    if magnitude >= 1e3:
+        return value / 1e4
+    return value
+
+
 def _merge_dde_rows(rows: list[dict], *, sort_dir: str) -> list[dict]:
     """Globally merge the independently sorted SH and SZ Level2 pages."""
     unique: dict[str, dict] = {}
@@ -485,6 +670,39 @@ def _merge_dde_rows(rows: list[dict], *, sort_dir: str) -> list[dict]:
             0,
             -numeric if sort_dir == "D" else numeric,
             row["code"],
+        )
+
+    return sorted(unique.values(), key=key)
+
+
+
+def _merge_ranked_rows(
+    rows: list[dict],
+    *,
+    sort_dir: str,
+    value_field: str,
+) -> list[dict]:
+    """Globally merge the independently sorted SH and SZ ranked pages.
+
+    沪（17/22/151）与深（33）两榜各自按排序值有序；本地按 value_field
+    做全局归并（数值缺失的记录排末尾）。sort_dir D=降序、A=升序。
+    """
+    unique: dict[str, dict] = {}
+    for row in rows:
+        unique.setdefault(row.get("code", ""), row)
+
+    def key(row: dict) -> tuple:
+        value = row.get(value_field)
+        if value is None:
+            return (1, 0.0, row.get("code", ""))
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return (1, 0.0, row.get("code", ""))
+        return (
+            0,
+            -numeric if sort_dir == "D" else numeric,
+            row.get("code", ""),
         )
 
     return sorted(unique.values(), key=key)

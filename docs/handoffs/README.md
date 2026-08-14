@@ -22,6 +22,8 @@
 | [`HANDOFF_71B_TICK_PUSH_20260807.md`](HANDOFF_71B_TICK_PUSH_20260807.md) | 71B 盘中逐笔推送触发条件调查 |
 | [`HANDOFF_HOT_BOARD_12480_20260807.md`](HANDOFF_HOT_BOARD_12480_20260807.md) | 热门板块 12480 排序协议 |
 | [`HANDOFF_WEB_DASHBOARD.md`](HANDOFF_WEB_DASHBOARD.md) | Web 看板与字段逆向 |
+| [`HANDOFF_ST_NAME_RANKED_20260814.md`](HANDOFF_ST_NAME_RANKED_20260814.md) | 股票名称源补全 / ST 市场码 22 / 全市场排序榜（dt200 缩放） |
+| [`HANDOFF_RANKED_ACCOUNT_SPLIT_20260814.md`](HANDOFF_RANKED_ACCOUNT_SPLIT_20260814.md) | 排序榜账号分流（Level2 拆沪深 L2 / 普通走 MAIN）+ 北交所补全 + 排序值三编码归一化 |
 
 这些文件包含历史调查过程；结论发生变化时，以文档顶部的纠正说明、较新章节以及
 生产代码和回归测试为准。

@@ -273,10 +273,11 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
     """从 passport 的 M_hqdns 字段解析域名，DNS 查询得到 8901 服务器 IP 列表。
 
     hexin 客户端不硬编码 IP——HTTP 鉴权返回的 passport 里有 M_hqdns 字段，
-    普通账号冷启动抓包确认 ``main.123ths.com`` 承载沪深基础行情；较早的
-    独立登录验证也确认 ``ifindhq.123ths.com`` 可承载同类请求。因此优先使用
-    passport 明示的 ``main`` 域名，仅在它缺失时回退到 ``ifindhq``，不把
-    fu4/hkus/euhq/lv2 等其他市场组混入 MAIN。
+    普通账号冷启动抓包确认 ``main.123ths.com`` 承载沪深基础行情（含北交所
+    market 151，2026-08-14 抓包：8.134.108.168 返回 920083）；``ifindhq``
+    仅作回退（不支持北交所）。因此优先使用 passport 明示的 ``main`` 域名，
+    仅在它缺失时回退到 ``ifindhq``，不把 fu4/hkus/euhq/lv2 等其他市场组
+    混入 MAIN。
 
     Args:
         passport_bytes: HTTP 鉴权返回的原始 passport_bytes（含 M_hqdns 字段）。
@@ -300,9 +301,11 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
         m_hqdns = m.group(1)
 
     # M_hqdns 格式: domain:port:markets;:,domain:port:markets;:,...
-    # 官方客户端（2026-08-12 DNS 抓包确认）查 ifindhq.123ths.com，不查 main。
-    # 此前代码强制优先 main 导致解析出被拒 IP（VerifyCode=-1），现改为
-    # 跟着 passport 走：优先 ifindhq，main 仅作回退。shlv2/szlv2 由独立解析器处理。
+    # 2026-08-14 抓包修正：普通账号排序榜客户端连 main.123ths.com 的
+    # 8.134.108.168 登录成功（VerifyCode=0）且拿到北交所 151；ifindhq 的 IP
+    # （如 8.134.121.153）不返回 151。2026-08-12 观察到的 main 全 IP
+    # VerifyCode=-1 是服务器实例临时状态（非封禁，见 HANDOFF §6），今天
+    # main 节点可正常登录。恢复 main 优先（支持北交所），ifindhq 仅回退。
     main_domains = []
     fallback_domains = []
     for entry in m_hqdns.split(","):
@@ -317,18 +320,13 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
             ):
                 fallback_domains.append(dm.group(1))
 
-    # 2026-08-12 修正（DNS 抓包确认）：同花顺客户端查询 ifindhq.123ths.com，
-    # 不查 main.123ths.com；当前 passport 也不下发 main 域名。此前代码强制
-    # 优先 main 并在缺失时硬编码补上，导致解析出被服务端拒绝的 IP（VerifyCode=-1）。
-    # 改为：优先 ifindhq（与官方客户端一致），main 仅作为回退补充。
-    # main.123ths.com 保留在回退里以兼容支持北交所 market 151 的场景。
-    domains = fallback_domains if fallback_domains else main_domains
+    # main 优先（支持北交所 market 151，2026-08-14 客户端抓包确认）；
+    # ifindhq 仅在 main 缺失时回退。passport 两者都无时硬编码 main。
+    domains = main_domains if main_domains else fallback_domains
     if not domains:
-        # passport 既无 ifindhq 也无 main：硬编码 ifindhq（与官方客户端一致）
-        domains = ["ifindhq.123ths.com"]
-    # main 作为回退追加（不优先），北交所等场景若 ifindhq 不支持可由 main 兜底
-    if main_domains and main_domains[0] not in domains:
-        domains = domains + main_domains
+        domains = ["main.123ths.com"]
+    if fallback_domains and fallback_domains[0] not in domains:
+        domains = domains + fallback_domains
 
     # DNS 解析每个域名，收集所有 IP（去重，保序）
     ips: list[str] = []

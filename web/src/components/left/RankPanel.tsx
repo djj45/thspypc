@@ -35,15 +35,11 @@ export function RankPanel() {
   const dtField = SORT_BY_DT[opt.sortBy] ?? 'dt200'
   const rows: StockRowData[] = (data ?? []).map((r) => {
     const raw = r[dtField]
-    // 排序响应里百分比类字段（涨幅 dt200 / 涨速 dt48）服务器存 ×1e8
-    // （涨幅已活网验证 = 涨幅% × 1e8，比例恰好 10^8）；金额类（竞价额 dt150 /
-    // 封单额 dt44 / 主力 dt250）为原始元，不缩放。
-    const v =
-      typeof raw === 'number'
-        ? opt.kind === 'pct'
-          ? raw / 1e8
-          : raw
-        : undefined
+    // 后端 /api/stock_list_ranked (with_values=1) 已统一排序值真值
+    // （2026-08-14 抓包确认：真值 = mantissa/10000，除法/乘法/裸 mantissa
+    // 三种编码已在后端归一化）；金额类（竞价额 dt150 / 封单额 dt44 /
+    // 主力 dt250）为原始元，不缩放。
+    const v = typeof raw === 'number' ? raw : undefined
     return {
       code: r.code,
       name: nameMap.get(r.code) ?? r.name ?? '',

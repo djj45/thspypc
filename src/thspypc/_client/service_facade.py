@@ -1558,8 +1558,16 @@ class ServiceFacade:
             RuntimeError: 未登录。
         """
         self._ensure_main_connection()
+        # 2026-08-14 客户端抓包确认：Level2 排序榜拆 SH_L2/SZ_L2 两条连接
+        # （pageid=1341），普通账号走 MAIN 单请求（pageid=1334）。授权
+        # capability 与 dde_rank 同理按账号类型选择。
+        capability = (
+            Capability.L2_MARKET_ACCESS
+            if self.observed_account_profile.kind is AccountKind.LEVEL2
+            else Capability.BASIC_QUOTE
+        )
         stocks = self._run_default_service(
-            (Capability.BASIC_QUOTE,),
+            (capability,),
             lambda: self._stock_list_service.ranked(
                 count=count,
                 timeout=timeout,
