@@ -90,6 +90,31 @@ def test_zero_status_is_not_remembered():
     )
 
 
+def test_registration_retries_when_first_attempt_sees_only_noise(monkeypatch):
+    import socket
+
+    sock = FakeSocket()
+    manager = ConnectionManager(PROFILE, lambda _spec: sock)
+    connection = manager.acquire(ConnectionRole.SH_L2)
+    calls = []
+
+    def reader(_sock):
+        calls.append(True)
+        if len(calls) == 1:
+            raise socket.timeout
+        return b"CodeListSize=1"
+
+    coordinator = L2SubscriptionCoordinator(frame_reader=reader)
+
+    assert coordinator.ensure_registered(
+        connection,
+        "603118",
+        market=17,
+    )
+    assert len(calls) == 2
+    assert len(sock.sent) == 2
+
+
 def test_uninitialized_adopted_connection_is_rejected_before_send():
     sock = FakeSocket()
     manager = ConnectionManager(PROFILE, lambda _spec: FakeSocket())

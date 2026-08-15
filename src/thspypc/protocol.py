@@ -320,13 +320,15 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
             ):
                 fallback_domains.append(dm.group(1))
 
-    # main 优先（支持北交所 market 151，2026-08-14 客户端抓包确认）；
-    # ifindhq 仅在 main 缺失时回退。passport 两者都无时硬编码 main。
-    domains = main_domains if main_domains else fallback_domains
+    # main 恒优先（支持北交所 market 151，2026-08-14 客户端抓包确认）。
+    # 部分 passport 的 M_hqdns 只带 ifindhq 域名；此时也要把硬编码的
+    # main.123ths.com 放最前，ifindhq 仅作回退（不支持北交所）。
+    domains = list(main_domains)
     if not domains:
         domains = ["main.123ths.com"]
-    if fallback_domains and fallback_domains[0] not in domains:
-        domains = domains + fallback_domains
+    for domain in fallback_domains:
+        if domain not in domains:
+            domains.append(domain)
 
     # DNS 解析每个域名，收集所有 IP（去重，保序）
     ips: list[str] = []
@@ -345,7 +347,7 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
         logger.info(
             "M_hqdns 动态解析 %d 个 MAIN A股域名（%s）→ %d 个 IP: %s",
             len(domains),
-            "main" if main_domains else "ifindhq fallback",
+            "main(+ifindhq fallback)" if main_domains else "硬编码 main(+fallback)",
             len(ips),
             ips[:5],
         )

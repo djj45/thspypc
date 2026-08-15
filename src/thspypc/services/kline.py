@@ -25,8 +25,12 @@ KLINE_FRAGMENT_TAIL_TIMEOUT = 0.02
 
 
 def _kline_l2_role(market: int) -> ConnectionRole:
-    """Level2 K线连接角色（与 timeline/depth 的 L2 角色一致）。"""
-    if market in (16, 17, 144):
+    """Level2 K线连接角色（与 timeline/depth 的 L2 角色一致）。
+
+    北交所（151）也走沪 L2（shlv2）：2026-08-15 抓包确认 Level2 客户端在
+    shlv2 上用 pageid=1334 查询 920083 的日K。
+    """
+    if market in (16, 17, 144, 151):
         return ConnectionRole.SH_L2
     if market in (32, 33):
         return ConnectionRole.SZ_L2

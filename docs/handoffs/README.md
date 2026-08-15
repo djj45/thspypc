@@ -24,6 +24,7 @@
 | [`HANDOFF_WEB_DASHBOARD.md`](HANDOFF_WEB_DASHBOARD.md) | Web 看板与字段逆向 |
 | [`HANDOFF_ST_NAME_RANKED_20260814.md`](HANDOFF_ST_NAME_RANKED_20260814.md) | 股票名称源补全 / ST 市场码 22 / 全市场排序榜（dt200 缩放） |
 | [`HANDOFF_RANKED_ACCOUNT_SPLIT_20260814.md`](HANDOFF_RANKED_ACCOUNT_SPLIT_20260814.md) | 排序榜账号分流（Level2 拆沪深 L2 / 普通走 MAIN）+ 北交所补全 + 排序值三编码归一化 |
+| [`HANDOFF_WEB_LATENCY_BSE_20260815.md`](HANDOFF_WEB_LATENCY_BSE_20260815.md) | Web 冷启动提速 / 名称板块回填 / 北交所 shlv2 路由修正 / 4214 注册重试 |
 
 这些文件包含历史调查过程；结论发生变化时，以文档顶部的纠正说明、较新章节以及
 生产代码和回归测试为准。

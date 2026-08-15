@@ -75,6 +75,34 @@ def test_list_quotes_distinguishes_parse_failure(monkeypatch):
         service.list_quotes(["600519"], market=17)
 
 
+def test_beijing_level2_list_quotes_uses_sh_l2(monkeypatch):
+    sock = FakeSocket()
+    profile = AccountProfile(
+        kind=AccountKind.LEVEL2,
+        capabilities={
+            Capability.BASIC_QUOTE: Support.YES,
+            Capability.L2_MARKET_ACCESS: Support.YES,
+        },
+    )
+    manager = ConnectionManager(profile, lambda _spec: sock)
+    service = QuoteService(
+        manager,
+        frame_reader=lambda _sock: b"hd1.0\x00payload",
+        max_frames=1,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.quote.parse_hd1_response",
+        lambda _body: [{"code": "920083", "dt10": 10.5}],
+    )
+
+    result = service.list_quotes(["920083"], market=151)
+
+    assert result == [{"code": "920083", "dt10": 10.5}]
+    assert manager.peek(ConnectionRole.MAIN) is None
+    assert manager.peek(ConnectionRole.SH_L2) is not None
+    assert b"pageid=1334" in sock.sent[0]
+
+
 def test_list_quotes_returns_empty_when_only_notifications_arrive():
     service, _manager, _sock = _service(
         [b"CodeListSize=0", b"MarketTime=closed"]

@@ -105,6 +105,22 @@ class QuoteService:
             or L2SubscriptionCoordinator(frame_reader=frame_reader)
         )
 
+    def _basic_role(
+        self,
+        market: int,
+    ) -> tuple[ConnectionRole, Capability | None]:
+        """MAIN 基础行情通道；北交所（151）Level2 账号改走沪 L2。
+
+        2026-08-15 抓包确认：Level2 客户端在 shlv2 连接上用 pageid=1334
+        查询 920083 的报价/五档，MAIN（尤其 ifindhq 节点）不返回北交所。
+        """
+        if (
+            market == 151
+            and self._connections.profile.kind is AccountKind.LEVEL2
+        ):
+            return ConnectionRole.SH_L2, Capability.L2_MARKET_ACCESS
+        return ConnectionRole.MAIN, Capability.BASIC_QUOTE
+
     def list_quotes(
         self,
         codes: list[str],
@@ -116,6 +132,10 @@ class QuoteService:
     ) -> list[dict]:
         if datatype is None:
             datatype = LIST_QUOTE_DATATYPE_DEFAULT
+        role, capability = self._basic_role(market)
+        if role is ConnectionRole.SH_L2:
+            # Level2 北交所报价走 shlv2 pageid=1334（与真实客户端一致）
+            pageid = 1334
         frame = build_list_quote_query(
             codes,
             market=market,
@@ -123,8 +143,8 @@ class QuoteService:
             pageid=pageid,
         )
         connection = self._connections.acquire(
-            ConnectionRole.MAIN,
-            capability=Capability.BASIC_QUOTE,
+            role,
+            capability=capability,
         )
 
         # The default one-stock quote shape has fields which cannot be
@@ -221,16 +241,23 @@ class QuoteService:
         the socket for the whole bundle, so unrelated responses cannot be
         consumed by competing service methods.
         """
+        role, capability = self._basic_role(market)
+        quote_pageid = 1334 if role is ConnectionRole.SH_L2 else 1335
+        depth_pageid = 1334 if role is ConnectionRole.SH_L2 else 1333
         quote_frame = build_list_quote_query(
             [code],
             market=market,
             datatype=LIST_QUOTE_DATATYPE_DEFAULT,
-            pageid=1335,
+            pageid=quote_pageid,
         )
-        depth_frame = build_depth_quote_query(code, market=market)
+        depth_frame = build_depth_quote_query(
+            code,
+            market=market,
+            pageid=depth_pageid,
+        )
         connection = self._connections.acquire(
-            ConnectionRole.MAIN,
-            capability=Capability.BASIC_QUOTE,
+            role,
+            capability=capability,
         )
 
         quote: dict | None = None
@@ -303,13 +330,16 @@ class QuoteService:
     ) -> DepthQuote:
         if ten_levels:
             return self._depth_ten(code, market=market, timeout=timeout)
+        role, capability = self._basic_role(market)
+        depth_pageid = 1334 if role is ConnectionRole.SH_L2 else 1333
         frame = build_depth_quote_query(
             code,
             market=market,
+            pageid=depth_pageid,
         )
         connection = self._connections.acquire(
-            ConnectionRole.MAIN,
-            capability=Capability.BASIC_QUOTE,
+            role,
+            capability=capability,
         )
 
         def consume(response: bytes, sock) -> DispatchDecision:

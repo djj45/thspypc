@@ -86,13 +86,19 @@ def select_timeline_plan(
 ) -> TimelinePlan:
     """Choose account-specific transport and wire protocol without I/O."""
     mode = TimelineMode(mode)
-    # 北交所（BSE）走专用 pageid + MAIN 连接，不分 BASIC/LEVEL2
-    # （2026-08-06 抓包确认两种账号都在 MAIN 上请求 pageid=10443/11695）
+    # 北交所（BSE）专用 pageid：普通账号走 MAIN，Level2 账号走沪 L2（shlv2）。
+    # 2026-08-15 抓包确认 Level2 客户端把 920083 的 1334/10443 请求全部发在
+    # shlv2 连接上（MAIN/ifindhq 不响应北交所 151）。
     if market == 151 or (market == 144 and code.startswith("899")):
+        role = (
+            ConnectionRole.SH_L2
+            if profile.kind is AccountKind.LEVEL2
+            else ConnectionRole.MAIN
+        )
         return TimelinePlan(
             mode=TimelineMode.BASIC,
-            role=ConnectionRole.MAIN,
-            capability=None,  # MAIN 连接不需要能力校验
+            role=role,
+            capability=None,  # MAIN 不需要能力校验；SH_L2 由 acquire 校验 L2 权限
         )
     if mode is TimelineMode.BASIC:
         _require(

@@ -243,6 +243,73 @@ def test_preheat_l2_connections_skips_non_level2_profile():
     assert client._push_socks == {}
 
 
+def test_preheat_service_connections_opens_three_roles_in_parallel(monkeypatch):
+    client = _client()
+    client._account_evidence.record_l2_entitlement(Support.YES)
+    client._account_evidence.record_manual_login(Support.YES)
+    client._account_evidence.record_l2_init(Support.YES)
+    manager = client.configure_service_context(LEVEL2_PROFILE, allow_open=True)
+
+    sockets = {
+        "sh": FakeSocket(),
+        "sz": FakeSocket(),
+        "kline": FakeSocket(),
+    }
+    auth_calls = []
+    l2_calls = []
+
+    kline_calls = []
+
+    class Material:
+        passport64 = "passport-parallel"
+        passport_bytes = b"passport-bytes"
+
+    def fake_authenticate(*_args, **_kwargs):
+        auth_calls.append(True)
+        return Material()
+
+    def fake_open_manual(market, **kwargs):
+        # 并行预热必须给每条 L2 传独立材料，否则两路会共享全局最新 Passport。
+        assert kwargs["material"].passport64 == "passport-parallel"
+        l2_calls.append(market)
+        return sockets["sh"] if market == 17 else sockets["sz"]
+
+    def fake_open_kline(material=None):
+        assert material is not None
+        assert material.passport64 == "passport-parallel"
+        kline_calls.append(True)
+        return sockets["kline"]
+
+    monkeypatch.setattr(client, "authenticate", fake_authenticate)
+    monkeypatch.setattr(
+        client,
+        "_open_manual_push_connection",
+        fake_open_manual,
+    )
+    monkeypatch.setattr(
+        client,
+        "_open_independent_main_connection",
+        fake_open_kline,
+    )
+
+    result = client.preheat_service_connections()
+
+    assert result["sh"]["ready"] and result["sz"]["ready"]
+    assert result["kline"]["ready"]
+    assert sorted(l2_calls) == [17, 33]
+    assert kline_calls == [True]
+    assert len(auth_calls) == 3  # sh / sz / kline 各自独立一代 Passport
+    assert manager.peek(ConnectionRole.SH_L2).socket is sockets["sh"]
+    assert manager.peek(ConnectionRole.SZ_L2).socket is sockets["sz"]
+    assert manager.peek(ConnectionRole.KLINE_FAST).socket is sockets["kline"]
+    assert client._push_socks == {
+        "sh": sockets["sh"],
+        "sz": sockets["sz"],
+    }
+
+    client.disconnect()
+
+
 def test_concurrent_default_calls_keep_each_others_capability_lease():
     client = _client()
     client._account_evidence.record_l2_entitlement(Support.YES)
@@ -1138,6 +1205,33 @@ def test_level2_historical_intraday_uses_one_service_workflow(monkeypatch):
     ]
 
 
+def test_intraday_level2_retries_bundle_then_falls_back_to_timeline(monkeypatch):
+    client = _client()
+    client.configure_service_context(LEVEL2_PROFILE)
+    attempts = []
+
+    def flaky_bundle(code, **kwargs):
+        attempts.append((code, kwargs))
+        raise ProtocolError("4214 订阅注册被拒绝: CodeListSize=0")
+
+    monkeypatch.setattr(client._auction_service, "intraday", flaky_bundle)
+    monkeypatch.setattr(
+        client,
+        "timeline",
+        lambda code, **kwargs: [{"dt10": 10.5}],
+    )
+
+    result = client.intraday(
+        "603118",
+        market=17,
+        trade_date="2026-07-24",
+        timeout=6.0,
+    )
+
+    assert result == [{"phase": "continuous", "dt10": 10.5}]
+    assert len(attempts) == 2
+
+
 def test_historical_index_intraday_has_no_auction_phases(monkeypatch):
     client = _client()
     monkeypatch.setattr(
@@ -1172,6 +1266,54 @@ def test_historical_index_intraday_has_no_auction_phases(monkeypatch):
             "lead_price": 3919.23,
         }
     ]
+
+
+def test_beijing_stock_intraday_skips_auction_phases(monkeypatch):
+    from datetime import date as date_type
+
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "auction",
+        lambda *_args, **_kwargs: pytest.fail(
+            "BSE intraday must not request opening auction"
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "closing_auction",
+        lambda *_args, **_kwargs: pytest.fail(
+            "BSE intraday must not request closing auction"
+        ),
+    )
+    timeline_calls = []
+    monkeypatch.setattr(
+        client,
+        "timeline",
+        lambda code, **kwargs: (
+            timeline_calls.append((code, kwargs))
+            or [{"dt10": 10.5}]
+        ),
+    )
+
+    result = client.intraday(
+        "920083",
+        market=151,
+        trade_date=date_type.today().isoformat(),
+    )
+
+    assert result == [{"phase": "continuous", "dt10": 10.5}]
+    assert timeline_calls == [
+        ("920083", {"market": 151, "timeout": 12.0})
+    ]
+
+    # 非交易日/盘前同样走 timeline（服务端返回最近交易日序列），不请求竞价。
+    result = client.intraday(
+        "920083",
+        market=151,
+        trade_date="2026-07-23",
+    )
+    assert result == [{"phase": "continuous", "dt10": 10.5}]
 
 
 def test_controlled_opener_builds_and_caches_borrowed_l2_socket(

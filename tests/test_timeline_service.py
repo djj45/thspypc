@@ -103,6 +103,18 @@ def test_level2_index_market_codes_use_their_market_l2_roles():
     ) == build_timeline_l2_query("1A0001", market=16, pageid=1334)
 
 
+def test_beijing_stock_timeline_uses_sh_l2_for_level2_account():
+    # 2026-08-15 抓包确认：Level2 的 920083 分时请求发在 shlv2，不在 MAIN。
+    plan = select_timeline_plan(LEVEL2_PROFILE, 151, code="920083")
+    assert plan.role is ConnectionRole.SH_L2
+    assert not plan.level2
+    frame = build_timeline_request(plan, "920083", market=151)
+    assert b"pageid=10443" in frame
+
+    std_plan = select_timeline_plan(STANDARD_PROFILE, 151, code="920083")
+    assert std_plan.role is ConnectionRole.MAIN
+
+
 def test_level2_account_can_force_basic_for_protocol_comparison():
     plan = select_timeline_plan(LEVEL2_PROFILE, 33, mode="basic")
 

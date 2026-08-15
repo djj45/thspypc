@@ -96,13 +96,17 @@ def test_main_host_resolution_hardcoded_main_when_passport_has_neither(monkeypat
     assert queried == ["main.123ths.com"]
 
 
-def test_main_host_resolution_ifindhq_only_when_main_missing(monkeypatch):
-    """passport 只有 ifindhq 时用 ifindhq（main 缺失）。"""
+def test_main_host_resolution_ifindhq_only_still_prepends_main(monkeypatch):
+    """passport 只有 ifindhq 时，硬编码 main 仍放最前（ifindhq 不支持北交所）。"""
+    resolved = {
+        "main.123ths.com": ["10.0.9.1"],
+        "ifindhq.123ths.com": ["10.0.0.1"],
+    }
     queried = []
 
     def lookup(domain):
         queried.append(domain)
-        return domain, [], ["10.0.0.1"]
+        return domain, [], resolved[domain]
 
     monkeypatch.setattr(socket, "gethostbyname_ex", lookup)
     passport = _passport(
@@ -110,8 +114,8 @@ def test_main_host_resolution_ifindhq_only_when_main_missing(monkeypatch):
         "fu2.123ths.com:8901:64;80;"
     )
 
-    assert resolve_market_hosts(passport) == ["10.0.0.1"]
-    assert queried == ["ifindhq.123ths.com"]
+    assert resolve_market_hosts(passport) == ["10.0.9.1", "10.0.0.1"]
+    assert queried == ["main.123ths.com", "ifindhq.123ths.com"]
 
 
 def test_main_host_resolution_main_plus_ifindhq_fallback(monkeypatch):

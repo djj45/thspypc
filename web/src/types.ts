@@ -1,9 +1,21 @@
 // ── 连接 / 状态 ──
+export interface PreheatMarket {
+  ready?: boolean
+  initialized?: boolean
+  skipped?: boolean
+  error?: string
+}
 export interface Status {
   connected: boolean
   server: string
   account_kind: string
   credentials: boolean
+  preheat?: {
+    state: 'not_started' | 'running' | 'ready' | 'partial' | 'skipped' | 'error'
+    elapsed_ms?: number
+    markets?: Record<string, PreheatMarket>
+    error?: string
+  }
 }
 
 // ── 个股行情（list_quotes 返回，dt 字段语义见 docs）──

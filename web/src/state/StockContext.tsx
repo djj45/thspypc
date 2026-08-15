@@ -141,6 +141,9 @@ export function StockProvider({ children }: { children: ReactNode }) {
 
     const loadIntraday = async () => {
       try {
+        // 等待后端预热就绪再走 L2，避免冷启动时请求排队等锁/超时。
+        await api.preheatReady()
+        if (!alive || marketGeneration.current !== requestGeneration) return
         const rows = await api.intraday(code)
         if (!alive || marketGeneration.current !== requestGeneration) return
         setIntraday({ code, rows })
@@ -167,12 +170,24 @@ export function StockProvider({ children }: { children: ReactNode }) {
     setKlineError('')
     const load = async () => {
       try {
+        // KLINE_FAST 也在预热范围内；等它就绪再发，避免与预热争建连。
+        await api.preheatReady()
+        if (!alive || klineGeneration.current !== requestGeneration) return
+        // 北交所走后端 auto：Level2 账号会在 shlv2 上用 pageid=1334 查 K线
+        // （与 2026-08-15 客户端抓包一致）；沪深继续用独立 ifindhq_fast 通道。
+        const channel =
+          code.startsWith('920') ||
+          code.startsWith('43') ||
+          code.startsWith('83') ||
+          code.startsWith('87')
+            ? 'auto'
+            : 'ifindhq_fast'
         const rows = await api.kline(
           code,
           period,
           320,
           fuquan,
-          'ifindhq_fast',
+          channel,
         )
         if (!alive || klineGeneration.current !== requestGeneration) return
         setKline({ code, period, fuquan, rows })

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import date as date_type, datetime
 
 from ..errors import ChannelUnavailableError, ProtocolError
@@ -64,12 +65,50 @@ class ServiceFacade:
             RuntimeError: 未登录（缓存未命中需走网络时）。
         """
         path = cache_path or default_stock_cache_path()
+
+        def fill_names(stocks: list[dict]) -> int:
+            """用当日名称组缓存/网络补全 name，返回成功补全的条数。"""
+            try:
+                name_map = self.fetch_stock_names_full()["names"]
+            except Exception as exc:
+                logger.warning(
+                    "stock_list_cached: 名称补全失败（不写缓存）: %s", exc
+                )
+                return 0
+            filled = 0
+            for stock in stocks:
+                if not stock.get("name"):
+                    name = name_map.get(stock["code"], "")
+                    if name:
+                        stock["name"] = name
+                        filled += 1
+            return filled
+
+        def names_are_sparse(stocks: list[dict]) -> bool:
+            """名称覆盖率过低说明名称源还没就绪，不能把空名称写盘。"""
+            if not stocks:
+                return True
+            named = sum(1 for stock in stocks if stock.get("name"))
+            return named < len(stocks) * 0.8
+
         if not refresh:
             loaded = load_stock_codes(path)
             if loaded is not None:
                 stocks, saved_date = loaded
-                logger.info("stock_list_cached: 命中缓存 (%s, %d 条)",
-                            saved_date, len(stocks))
+                # 自愈：早期冷启动曾把「代码有、名称为空」的表写进当日缓存。
+                # 名称组缓存现在可能已就绪，补全后立即覆盖写回。
+                if names_are_sparse(stocks):
+                    if fill_names(stocks):
+                        save_stock_codes(stocks, path)
+                    else:
+                        logger.warning(
+                            "stock_list_cached: 命中缓存但名称稀疏（%s, %d 条），"
+                            "名称源仍未就绪",
+                            saved_date, len(stocks),
+                        )
+                else:
+                    logger.info("stock_list_cached: 命中缓存 (%s, %d 条)",
+                                saved_date, len(stocks))
                 return stocks
         # 缓存不存在/过期/强制刷新 → 走网络
         logger.info("stock_list_cached: 缓存未命中，走 stock_list() 拉取...")
@@ -77,11 +116,19 @@ class ServiceFacade:
         # 覆盖 market 字段为派生值（stock_list 返回的 market 恒为 0）
         for s in stocks:
             s["market"] = market_from_code(s["code"])
-        # 仅在拿到有效结果时写盘，避免失败的拉取被缓存一整天
-        if stocks:
-            save_stock_codes(stocks, path)
-        else:
+        # 仅在拿到有效结果时写盘，避免失败的拉取被缓存一整天。
+        # 名称稀疏时也绝不写盘：否则空名称会污染当天的前端名称回填。
+        if not stocks:
             logger.warning("stock_list_cached: 拉取为空，不写缓存（可重试）")
+        elif names_are_sparse(stocks):
+            if fill_names(stocks):
+                save_stock_codes(stocks, path)
+            else:
+                logger.warning(
+                    "stock_list_cached: 名称覆盖率不足，不写缓存（可重试）"
+                )
+        else:
+            save_stock_codes(stocks, path)
         return stocks
 
     def market_snapshot_with_quotes(
@@ -1162,6 +1209,9 @@ class ServiceFacade:
         historical = value is not None and value != date_type.today()
 
         historical_index = historical and market in (16, 32, 144)
+        # 北交所（151）竞价协议尚未逆向；当日分时主体走 BSE 专用 pageid=10443
+        # （MAIN 连接），竞价两段直接留空，不能走沪深 L2 竞价路径（会 400）。
+        bse_stock = market == 151
         profile = (
             self._service_connections.profile
             if self._service_connections is not None
@@ -1179,22 +1229,49 @@ class ServiceFacade:
                     "l2_snapshot",
                     "后台快照线程正在读取 Level2 连接",
                 )
-            return self._run_default_service(
-                (
-                    Capability.L2_AUCTION,
-                    Capability.L2_HISTORY_TIMELINE,
-                ),
-                lambda: self._auction_service.intraday(
+            last_err: Exception | None = None
+            for attempt in range(2):
+                try:
+                    return self._run_default_service(
+                        (
+                            Capability.L2_AUCTION,
+                            Capability.L2_HISTORY_TIMELINE,
+                        ),
+                        lambda: self._auction_service.intraday(
+                            code,
+                            market=market,
+                            trade_date=service_trade_date,
+                            timeout=timeout,
+                        ),
+                    )
+                except (ProtocolError, ChannelUnavailableError) as exc:
+                    # 首次切换股票时 4214 注册/4417 伴随帧偶发 CodeListSize=0
+                    # 或首帧解析失败；同连接重试一次通常即成功。
+                    last_err = exc
+                    logger.warning(
+                        "intraday %s market=%s L2 bundle 失败（attempt %d）: %s",
+                        code, market, attempt + 1, exc,
+                    )
+                    if attempt == 0:
+                        time.sleep(0.15)
+                        continue
+            # 重试仍失败时降级为纯盘中分时，保证图表不空白，而不是直接 502。
+            try:
+                fallback = self.timeline(
                     code,
                     market=market,
-                    trade_date=service_trade_date,
                     timeout=timeout,
-                ),
-            )
+                )
+            except Exception:
+                raise last_err
+            return [
+                {"phase": "continuous", **record}
+                for record in fallback
+            ]
 
         opening = (
             []
-            if historical_index
+            if historical_index or bse_stock
             else self.auction(
                 code,
                 market=market,
@@ -1203,12 +1280,23 @@ class ServiceFacade:
             )
         )
         if historical:
-            continuous = self.history_timeline(
-                code,
-                value,
-                market=market,
-                timeout=timeout,
-                retries=retries,
+            # 北交所历史分时协议尚未单独对齐；BSE 的 timeline(DateTime=0-0)
+            # 在非交易日/盘前也会返回最近一个交易日序列（实测 241 点），
+            # 直接使用它，而不是返回空 continuous。
+            continuous = (
+                self.timeline(
+                    code,
+                    market=market,
+                    timeout=timeout,
+                )
+                if bse_stock
+                else self.history_timeline(
+                    code,
+                    value,
+                    market=market,
+                    timeout=timeout,
+                    retries=retries,
+                )
             )
         else:
             continuous = self.timeline(
@@ -1218,7 +1306,7 @@ class ServiceFacade:
             )
         closing = (
             []
-            if historical_index
+            if historical_index or bse_stock
             else self.closing_auction(
                 code,
                 market=market,
@@ -1249,6 +1337,9 @@ class ServiceFacade:
         """Return auction phases used to supplement the fast live timeline."""
         if market == 0:
             market = self._market_for_code(code)
+        # 北交所竞价协议未实现，不存在可补全的竞价段。
+        if market == 151:
+            return []
         value = trade_date
         if isinstance(value, str):
             value = date_type.fromisoformat(value)
@@ -1962,13 +2053,28 @@ class ServiceFacade:
         Raises:
             RuntimeError: 未登录或板块通道建连失败。
         """
-        return self._run_default_service(
+        records = self._run_default_service(
             (Capability.BASIC_QUOTE,),
             lambda: self._board_service.hot_boards(
                 codes,
                 timeout=timeout,
             ),
         )
+        # 94 页面的板块行情响应只有 code + 数值，不含名称。板块名称在
+        # name_48 组缓存里（882/885/886 等概念指数），从当日名称组补全，
+        # 避免前端只靠本地 industry.ini（只能覆盖 90 个 881 行业板块）。
+        if records:
+            try:
+                name_map = self.fetch_stock_names_full()["names"]
+            except Exception as exc:
+                logger.warning("hot_boards: 板块名称补全失败: %s", exc)
+            else:
+                for record in records:
+                    if not record.get("name"):
+                        name = name_map.get(str(record.get("code", "")), "")
+                        if name:
+                            record["name"] = name
+        return records
 
     def hot_boards_sorted(
         self,

@@ -6,6 +6,7 @@ import concurrent.futures
 from contextlib import asynccontextmanager
 import contextvars
 from dataclasses import asdict, is_dataclass
+import threading
 import time
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -123,6 +124,33 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         except (ChannelUnavailableError, ProtocolError, RuntimeError, OSError) as exc:
             raise HTTPException(502, str(exc))
 
+    # 短 TTL 响应缓存：同一只票快速来回切换/刷新时，不再重复打 8901 socket。
+    # 仅缓存成功结果；失败不缓存。缓存为进程内、单用户（runtime 唯一）。
+    _cache_lock = threading.Lock()
+    _response_cache: dict[tuple, tuple[float, object]] = {}
+    _cache_max_entries = 64
+
+    def _cached(
+        key: tuple,
+        ttl: float,
+        operation: Callable[[object], object],
+    ) -> object:
+        now = time.monotonic()
+        with _cache_lock:
+            entry = _response_cache.get(key)
+            if entry is not None and now - entry[0] < ttl:
+                return entry[1]
+        result = _call(operation)
+        with _cache_lock:
+            if len(_response_cache) >= _cache_max_entries:
+                oldest = min(
+                    _response_cache,
+                    key=lambda item: _response_cache[item][0],
+                )
+                _response_cache.pop(oldest, None)
+            _response_cache[key] = (time.monotonic(), result)
+        return result
+
     # ── 连接 / 状态 ──
     @app.get("/api/status")
     def status() -> dict:
@@ -170,7 +198,14 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         market: int = 0,
         channel: str = "auto",
     ) -> list[dict]:
-        return _call(
+        intraday_period = period in {
+            "1min", "5min", "15min", "30min", "60min",
+            "1", "5", "15", "30", "60",
+        }
+        ttl = 2.0 if intraday_period else 15.0
+        return _cached(
+            ("kline", code, period, count, anchor, fuquan, market, channel),
+            ttl,
             lambda client: client.kline(
                 code,
                 period=period,
@@ -179,7 +214,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 fuquan=fuquan,
                 market=market,
                 channel=channel,
-            )
+            ),
         )
 
     @app.get("/api/timeline/{code}")
@@ -227,12 +262,14 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     @app.get("/api/intraday/{code}")
     def intraday(code: str, trade_date: str | None = None, market: int = 0) -> list[dict]:
         return _jsonable(
-            _call(
+            _cached(
+                ("intraday", code, trade_date, market),
+                2.0,
                 lambda client: client.intraday(
                     code,
                     market=market,
                     trade_date=trade_date,
-                )
+                ),
             )
         )
 
@@ -288,7 +325,13 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 "depth": depth_row,
             }
 
-        return _jsonable(_call(operation))
+        return _jsonable(
+            _cached(
+                ("market_view_fast", code, levels, market),
+                1.0,
+                operation,
+            )
+        )
 
     @app.get("/api/market_view/{code}")
     def market_view(

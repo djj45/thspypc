@@ -384,14 +384,18 @@ class ConnectionPrimitives:
                 "KLINE_FAST init response did not contain server config"
             )
 
-    def _open_independent_main_connection(self) -> socket.socket:
+    def _open_independent_main_connection(self, material=None) -> socket.socket:
         """Open a role-owned iFinD socket with a fresh one-use Passport.
 
         Candidate hosts race concurrently.  Once a host returns
         ``VerifyCode=0`` the Passport is consumed, so this method never tries
         serial logins with the same credential.
+
+        ``material`` 可传调用方已取得的一代 AuthMaterial（并行预热使用）；
+        默认 None 时方法内部重新 HTTP 鉴权。
         """
-        material = self.authenticate(force=True)
+        if material is None:
+            material = self.authenticate(force=True)
         hosts = self._resolve_market_hosts(material.passport_bytes)
         if not hosts:
             hosts = list(self._market_host_candidates())
@@ -748,13 +752,16 @@ class ConnectionPrimitives:
         t.start()
 
     def _open_manual_push_connection(self, market: int, skip_init: bool = False,
-                                      use_main_ip: bool = False):
+                                      use_main_ip: bool = False,
+                                      material=None):
         """打开一条独立的沪市或深市 L2 8901 连接。
 
         复用当前 HTTP AuthMaterial 的 Passport64/Mac64；不要求 MAIN 已连接。
-        兼容方法名沿用 ``manual``。生产 login 帧使用 ``LoginIdentity.L2``
-        （无 UserName/Password 的 7 字段壳，2026-08-10 hexin 抓包字节级确认）；
-        Level2 权限来自 passport 和业务证据。
+        并行预热时调用方传入 ``material``（独立一代 Passport64），保证每条新
+        socket 只使用自己的通行证，不与其它并发建连共享（一个 Passport64 在
+        首次成功登录后即被消费）。兼容方法名沿用 ``manual``。生产 login 帧
+        使用 ``LoginIdentity.L2``（无 UserName/Password 的 7 字段壳，
+        2026-08-10 hexin 抓包字节级确认）；Level2 权限来自 passport 和业务证据。
         登录后默认发 init 激活行情通道（``skip_init=False``）。
 
         ★ **按沪深选 L2 服务器**（2026-07-24 实测突破）：shlv2/szlv2 是两套独立
@@ -781,6 +788,9 @@ class ConnectionPrimitives:
                     而非 szlv2/shlv2 解析的 IP。设 True 复刻该路径，用于隔离
                     "IP 来源"变量——若 True 能成、False 不能成，说明推送注册
                     需要主连接先在该 IP 建立过普通会话（会话预热）。
+            material: 可选 AuthMaterial。并行建连时传各自独立的新一代鉴权材料，
+                    避免并发线程都读到全局最新 Passport64 而共享同一通行证。
+                    默认 None=沿用历史行为（使用当前全局材料）。
 
         Returns:
             成功激活的 socket，或 None（全组 IP 都失败）。
@@ -788,10 +798,19 @@ class ConnectionPrimitives:
         import socket as _socket
         from thspypc.protocol import resolve_l2_hosts_grouped, pick_l2_market
 
-        if self._auth is None:
+        if self._auth is None and material is None:
             self.authenticate()
 
-        def _try_round(passport64, allow_refresh):
+        if material is None:
+            # 历史路径：直接使用当前全局材料（AuthService 优先，兼容旧 _auth 注入）。
+            passport64 = self._current_passport64()
+            auth_bytes = self._auth.get("passport_bytes", b"")
+        else:
+            # 并行路径：调用方持有独立一代 AuthMaterial，全程只看它。
+            passport64 = material.passport64
+            auth_bytes = material.passport_bytes
+
+        def _try_round(passport64, auth_bytes, allow_refresh):
             """用给定 passport64 尝试所有候选 IP；全失败时可选重新鉴权重试一轮。"""
             if use_main_ip:
                 if not self._connected_ip:
@@ -801,7 +820,7 @@ class ConnectionPrimitives:
                 logger.info("L2[%s] use_main_ip=True → 强制连主连接 IP %s",
                             key, self._connected_ip)
             else:
-                grouped = resolve_l2_hosts_grouped(self._auth.get("passport_bytes", b""))
+                grouped = resolve_l2_hosts_grouped(auth_bytes)
                 candidates = list(grouped.get(key, []))
                 if not candidates:
                     logger.error("L2: 无 %s 组 L2 IP（账号可能无 L2 权限）", key)
@@ -855,18 +874,21 @@ class ConnectionPrimitives:
                     logger.warning("L2[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",
                                    key)
                 try:
-                    fresh = self._refresh_auth_material().passport64
+                    fresh = self.authenticate(force=True)
                     logger.info("L2[%s] 已拿到新鲜 Passport64，重试一轮", key)
-                    return _try_round(fresh, allow_refresh=False)
+                    return _try_round(
+                        fresh.passport64,
+                        fresh.passport_bytes,
+                        allow_refresh=False,
+                    )
                 except Exception as e:
                     logger.error("L2[%s] 重新鉴权失败: %s", key, e)
             logger.error("L2[%s] 全部候选 IP 都失败", key)
             return None
 
-        passport64 = self._current_passport64()
         key = pick_l2_market(market)
         init_market_code = "16;144;" if key == "sh" else "32;"
-        return _try_round(passport64, allow_refresh=True)
+        return _try_round(passport64, auth_bytes, allow_refresh=True)
 
     def _try_open_manual_sock(self, host, passport64, key, init_market_code, skip_init=False):
         """对单个 L2 IP 执行连接 → 标准行情登录壳 → init。

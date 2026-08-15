@@ -78,7 +78,7 @@ export function HotBoardsPanel() {
             {slice.map((b) => (
               <tr key={b.code}>
                 <td className="left" title={b.code}>
-                  {nameMap.get(b.code) ?? b.code}
+                  {b.name ?? nameMap.get(b.code) ?? b.code}
                 </td>
                 <td className={clsOf(b.chg_pct)}>{fmtPct(b.chg_pct)}</td>
                 <td className={clsOf(b.main_inflow)}>{fmtAmt(b.main_inflow)}</td>

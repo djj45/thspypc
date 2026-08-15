@@ -158,6 +158,45 @@ def test_kline_level2_uses_l2_role_and_pageid_1334(monkeypatch):
     assert evidence.profile().supports(Capability.L2_TIMELINE)
 
 
+def test_kline_beijing_level2_uses_sh_l2(monkeypatch):
+    """北交所 Level2 K线走 shlv2 pageid=1334（2026-08-15 抓包对齐）。"""
+    sock = FakeSocket()
+    opened = []
+    responses = iter([b"hd3.1\x00data", b"request-boundary"])
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda spec: opened.append(spec.role) or sock,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd3_response",
+        lambda _body: [{"code": "920083"}],
+    )
+    service = KlineService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=3,
+    )
+
+    result = service.kline(
+        "920083",
+        market=151,
+        period=KLINE_PERIOD_DAY,
+        count=2,
+    )
+
+    assert result == [{"code": "920083"}]
+    assert opened == [ConnectionRole.SH_L2]
+    assert sock.sent == [
+        build_kline_l2_query(
+            "920083",
+            market=151,
+            period=KLINE_PERIOD_DAY,
+            count=2,
+        )
+        + b"\n"
+    ]
+
+
 def test_kline_ifindhq_fast_uses_dedicated_role(monkeypatch):
     sock = FakeSocket()
     opened = []

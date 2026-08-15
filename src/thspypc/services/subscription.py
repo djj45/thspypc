@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
+import socket
 import threading
+import time
 import weakref
 from collections.abc import Callable
 
@@ -64,28 +66,49 @@ class L2SubscriptionCoordinator:
                 )
                 if key in registered:
                     return False
+            last_error: ProtocolError | None = None
+            # 新建连接/切换股票时，注册响应前可能还有 init 遗留帧；实测偶尔
+            # 连续 5 帧都不是 CodeListSize。放宽读取上限并重试一次，避免
+            # 首次 intraday/timeline 偶发 502。
             frame = build_snapshot_subscribe(code, market=market, seq=0)
-            saw_status = False
-            with connection.request(frame, timeout=timeout) as sock:
-                for _ in range(self._max_frames):
-                    response = self._read_frame(sock)
-                    match = _CODE_LIST_SIZE.search(response)
-                    if match is None:
-                        continue
-                    saw_status = True
-                    if int(match.group(1)) >= 1:
-                        with self._state_lock:
-                            registered.add(key)
-                        if self._evidence is not None:
-                            self._evidence.record_feature(
-                                Capability.L2_SNAPSHOT_PUSH,
-                                Support.YES,
-                            )
-                        return True
+            for attempt in range(2):
+                saw_status = False
+                try:
+                    with connection.request(frame, timeout=timeout) as sock:
+                        for _ in range(max(self._max_frames, 24)):
+                            try:
+                                response = self._read_frame(sock)
+                            except socket.timeout:
+                                break
+                            match = _CODE_LIST_SIZE.search(response)
+                            if match is None:
+                                continue
+                            saw_status = True
+                            if int(match.group(1)) >= 1:
+                                with self._state_lock:
+                                    registered.add(key)
+                                if self._evidence is not None:
+                                    self._evidence.record_feature(
+                                        Capability.L2_SNAPSHOT_PUSH,
+                                        Support.YES,
+                                    )
+                                return True
+                except (socket.timeout, OSError) as exc:
+                    last_error = ProtocolError(
+                        f"4214 注册请求网络异常: {exc}"
+                    )
+                if saw_status:
+                    last_error = ProtocolError(
+                        "4214 订阅注册被拒绝: CodeListSize=0"
+                    )
+                else:
+                    last_error = ProtocolError(
+                        "4214 订阅未返回 CodeListSize"
+                    )
+                if attempt == 0:
+                    time.sleep(0.05)
 
-        if saw_status:
-            raise ProtocolError("4214 订阅注册被拒绝: CodeListSize=0")
-        raise ProtocolError("4214 订阅未返回 CodeListSize")
+        raise last_error or ProtocolError("4214 订阅未返回 CodeListSize")
 
     def is_registered(
         self,

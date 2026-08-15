@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -497,26 +498,191 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         )
 
     def preheat_service_connections(self) -> dict[str, dict[str, object]]:
-        """Pre-open the L2 lanes and the optional fast K-line lane."""
-        results = self.preheat_l2_connections()
+        """Pre-open the L2 lanes and the optional fast K-line lane.
+
+        三条通道并行建连，把冷启动耗时压到最长单路而非三者之和。每条 L2 与
+        KLINE_FAST 都持有自己独立的一代 Passport64（一票一连接），不会出现
+        并发线程共享全局最新通行证导致 VerifyCode=-1 的问题。
+        """
+        profile = self.observed_account_profile
+        skipped = {"ready": False, "skipped": True}
+        if profile.kind is not AccountKind.LEVEL2:
+            results = {
+                "sh": dict(skipped),
+                "sz": dict(skipped),
+            }
+            try:
+                connection = self._run_default_service(
+                    (Capability.BASIC_QUOTE,),
+                    lambda: self._service_connections.acquire(
+                        ConnectionRole.KLINE_FAST,
+                        capability=Capability.BASIC_QUOTE,
+                    ),
+                )
+                results["kline"] = {
+                    "ready": bool(connection.active),
+                    "initialized": bool(connection.init_complete),
+                }
+            except Exception as exc:
+                results["kline"] = {
+                    "ready": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            return results
+
+        def operation():
+            manager = self._service_connections
+            if manager is None:
+                raise RuntimeError("service context 尚未初始化")
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=3,
+                thread_name_prefix="ths-preheat-role",
+            ) as executor:
+                futures = {
+                    "sh": executor.submit(
+                        self._preheat_l2_role,
+                        manager,
+                        "sh",
+                        ConnectionRole.SH_L2,
+                        17,
+                    ),
+                    "sz": executor.submit(
+                        self._preheat_l2_role,
+                        manager,
+                        "sz",
+                        ConnectionRole.SZ_L2,
+                        33,
+                    ),
+                    "kline": executor.submit(
+                        self._preheat_kline_role,
+                        manager,
+                    ),
+                }
+                return {key: future.result() for key, future in futures.items()}
+
+        return self._run_default_service(
+            (Capability.L2_TIMELINE, Capability.BASIC_QUOTE),
+            operation,
+        )
+
+    def _preheat_l2_role(
+        self,
+        manager: ConnectionManager,
+        key: str,
+        role: ConnectionRole,
+        market: int,
+    ) -> dict[str, object]:
+        """Build one Level2 lane with its own passport generation and adopt it."""
+        existing = manager.peek(role)
+        if existing is not None and existing.active:
+            return {
+                "ready": True,
+                "initialized": bool(existing.init_complete),
+            }
+        created = False
+        sock = None
         try:
-            connection = self._run_default_service(
-                (Capability.BASIC_QUOTE,),
-                lambda: self._service_connections.acquire(
-                    ConnectionRole.KLINE_FAST,
-                    capability=Capability.BASIC_QUOTE,
-                ),
+            material = self.authenticate(force=True)
+            sock = self._open_manual_push_connection(
+                market,
+                material=material,
             )
-            results["kline"] = {
+            if sock is None:
+                return {
+                    "ready": False,
+                    "error": f"L2[{key}] 建连或 init 失败",
+                }
+            with self._push_lock:
+                current = self._push_socks.get(key)
+                if current is None:
+                    self._push_socks[key] = sock
+                    self._push_initialized.add(key)
+                    current = sock
+                    created = True
+                else:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                    current = current
+            connection = manager.adopt(
+                role,
+                current,
+                capability=Capability.L2_TIMELINE,
+                request_lock=self._push_request_locks[key],
+                owns_socket=False,
+                initialized=key in self._push_initialized,
+            )
+            return {
                 "ready": bool(connection.active),
                 "initialized": bool(connection.init_complete),
             }
         except Exception as exc:
-            results["kline"] = {
+            if created and sock is not None:
+                with self._push_lock:
+                    if self._push_socks.get(key) is sock:
+                        self._push_socks.pop(key, None)
+                        self._push_initialized.discard(key)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            # 与并发懒建连竞争失败时，另一条连接已经就绪，直接复用。
+            existing = manager.peek(role)
+            if existing is not None and existing.active:
+                return {
+                    "ready": True,
+                    "initialized": bool(existing.init_complete),
+                }
+            return {
                 "ready": False,
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        return results
+
+    def _preheat_kline_role(
+        self,
+        manager: ConnectionManager,
+    ) -> dict[str, object]:
+        """Build the fast K-line lane and adopt it into the role registry."""
+        existing = manager.peek(ConnectionRole.KLINE_FAST)
+        if existing is not None and existing.active:
+            return {
+                "ready": True,
+                "initialized": bool(existing.init_complete),
+            }
+        sock = None
+        try:
+            material = self.authenticate(force=True)
+            sock = self._open_independent_main_connection(material=material)
+            connection = manager.adopt(
+                ConnectionRole.KLINE_FAST,
+                sock,
+                capability=Capability.BASIC_QUOTE,
+                owns_socket=True,
+                initialized=True,
+            )
+            return {
+                "ready": bool(connection.active),
+                "initialized": bool(connection.init_complete),
+            }
+        except Exception as exc:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            # 与并发懒建连竞争失败时，另一条连接已经就绪，直接复用。
+            existing = manager.peek(ConnectionRole.KLINE_FAST)
+            if existing is not None and existing.active:
+                return {
+                    "ready": True,
+                    "initialized": bool(existing.init_complete),
+                }
+            return {
+                "ready": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     def _ensure_default_service_context(
         self,
