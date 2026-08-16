@@ -11,7 +11,9 @@ import struct
 
 import thspypc
 import thspypc.protocol as protocol
+from thspypc.errors import ChannelUnavailableError
 from thspypc.features import board_stats_protocol
+from thspypc.services.board_stats import BoardStatsService
 
 
 def _sha256(value: bytes) -> str:
@@ -206,3 +208,20 @@ def test_statscalc_host_env_override(monkeypatch):
     monkeypatch.delenv("THSPYPC_STATSCALC_HOST", raising=False)
     importlib.reload(board_stats_protocol)
     assert board_stats_protocol.STATSCALC_HOST == "8.132.233.77"
+
+
+class _UnavailableConnections:
+    def acquire(self, role, *, capability=None):
+        raise ChannelUnavailableError(role.value, "offline")
+
+
+def test_statscalc_channel_unavailable_degrades_to_empty():
+    service = BoardStatsService(_UnavailableConnections(), lambda: 1)
+
+    assert service.statscalc_interval(["881121"]) == []
+
+
+def test_calcext_channel_unavailable_degrades_to_empty():
+    service = BoardStatsService(_UnavailableConnections(), lambda: 1)
+
+    assert service.calcext("600030", 17) == []

@@ -160,10 +160,12 @@ def analyze():
 
 def _verify_signature_algo(hexin_sig, mainverify_body=""):
     """用 thspypc 的 _sig_to_nibbles 转换 hexin signature，验证算法。"""
-    from thspypc.protocol import _sig_to_nibbles, ACCOUNT_TYPE
+    from thspypc.protocol import _sig_to_nibbles
     print(f"\n  --- signature 算法验证 ---")
     nibbles = _sig_to_nibbles(hexin_sig)
-    head128 = ACCOUNT_TYPE + nibbles[:123]
+    # 前五字节中的 raw 长度要等完整 payload 组装后才能回填；这里仅验证
+    # signature 解码区，不再伪造一个静态 ACCOUNT_TYPE。
+    head128 = b"\x00\x00\x06\x80\x00" + nibbles[:123]
     prefix_5b = nibbles[123:128]
     print(f"  thspypc 算法转换的 head128[5:15]: {head128[5:15].hex(' ')}")
     print(f"  thspypc 算法转换的 prefix_5b: {prefix_5b.hex(' ')}")

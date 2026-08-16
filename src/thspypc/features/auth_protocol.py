@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import struct
 from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
@@ -18,7 +19,7 @@ class LoginIdentity(str, Enum):
 
 @dataclass(frozen=True)
 class LoginProtocolProfile:
-    """Byte-affecting parameters for HTTP verification and TCP login."""
+    """Byte-affecting parameters for one HTTP-ticket/TCP-login generation."""
 
     name: str
     product: str
@@ -26,21 +27,23 @@ class LoginProtocolProfile:
     http_version: str
     tcp_version: str
     qsid: str
+    # Historical name retained for compatibility.  Bytes 0..1 are a dynamic
+    # little-endian raw Passport64 length; this field stores a zero-length
+    # template plus the captured kind/head-length bytes at offsets 2..4.
     account_type: bytes
     supports_manual_identity: bool
     standard_username: str | None = None
     standard_password: str | None = None
-    login_header_suffix: bytes | None = None
 
 
 PC_LEVEL2_LOGIN_PROFILE = LoginProtocolProfile(
-    name="pc-level2-verified",
+    name="pc-level2-length-framed-verified",
     product="E02",
     securities="同花顺统一版",
     http_version="9.60.20.0031",
     tcp_version="E029.60.20.0031",
     qsid="6800",
-    account_type=bytes((0xC8, 0x06, 0x06, 0x80, 0x00)),
+    account_type=bytes((0x00, 0x00, 0x06, 0x80, 0x00)),
     supports_manual_identity=True,
     standard_username="thsuser",
     standard_password="thsuser",
@@ -53,24 +56,13 @@ PC_STANDARD_LOGIN_PROFILE = LoginProtocolProfile(
     http_version="9.60.20.0031",
     tcp_version="E029.60.20.0031",
     qsid="6800",
-    account_type=bytes((0xE8, 0x04, 0x06, 0x80, 0x00)),
+    account_type=bytes((0x00, 0x00, 0x06, 0x80, 0x00)),
     supports_manual_identity=False,
     standard_username="thsuser",
     standard_password="thsuser",
-    login_header_suffix=b"\x58\x07",
 )
 
 DEFAULT_LOGIN_PROTOCOL_PROFILE = PC_LEVEL2_LOGIN_PROFILE
-
-# check 字节公式里的 K 值：check = (len(fixed) + K) & 0xFF。
-# K 和 account_type[0] 配对——它们共同标识客户端版本（2026-08-11 调查确认）：
-#   0xBE / K=1   → 旧版 hexin 客户端
-#   0xC8 / K=13  → 新版 hexin 客户端 / thspypc（PC_LEVEL2_LOGIN_PROFILE）
-# 服务器两组配对都接受，但混搭（如 C8/K=1）会被拒。
-# thspypc 固定用 C8/K=13（= 新版客户端），任何电脑上都可用——account_type 和 K
-# 不是电脑指纹（imei/Mac64），而是客户端版本标识。
-# 详见 HANDOFF_LOGIN_PROTOCOL_20260810.md "K 值根因调查"章节。
-CHECK_K = 13
 
 
 PASSPORT_DROP_FIELDS = frozenset({
@@ -102,9 +94,24 @@ def build_head128(
     *,
     profile: LoginProtocolProfile = DEFAULT_LOGIN_PROTOCOL_PROFILE,
 ) -> tuple[bytes, bytes]:
-    """Build the 128-byte account header and five-byte passport prefix."""
+    """Build a provisional 128-byte header and five-byte signature prefix."""
     decoded = signature_to_nibbles(signature)
     return profile.account_type + decoded[:123], decoded[123:128]
+
+
+def build_passport_header(
+    raw_length: int,
+    *,
+    profile: LoginProtocolProfile = DEFAULT_LOGIN_PROTOCOL_PROFILE,
+) -> bytes:
+    """Encode ``raw_length`` plus the captured PC kind/head-size metadata."""
+    if not 0 <= raw_length <= 0xFFFF:
+        raise ValueError(f"raw Passport64 length is out of range: {raw_length}")
+    if len(profile.account_type) != 5:
+        raise ValueError(
+            f"login profile {profile.name!r} has an invalid passport header template"
+        )
+    return struct.pack("<H", raw_length) + profile.account_type[2:]
 
 
 def parse_passport_fields(passport_bytes: bytes | str) -> dict[str, str]:
@@ -154,13 +161,28 @@ def build_passport64(
     fields = [
         field
         for field in passport_bytes.split(b"|")
-        if field.split(b"=", 1)[0]
+        if field
+        and field.split(b"=", 1)[0]
         .decode("gbk", errors="replace")
         .strip()
         not in PASSPORT_DROP_FIELDS
     ]
     payload = head128 + prefix_5b + b"\r\n".join(fields) + b"\r\n\x00"
+    # Captures from raw lengths 1256/1722/1726/1736 prove that bytes 0..1
+    # declare the complete decoded Passport64 length in little-endian order.
+    payload = build_passport_header(len(payload), profile=profile) + payload[5:]
     return base64.b64encode(payload).decode()
+
+
+def _computed_login_suffix(
+    fixed: bytes,
+    passport64: bytes,
+) -> bytes:
+    """Encode captured tail length: fixed + Passport64 + one separator byte."""
+    wire_tail_length = len(fixed) + len(passport64) + 1
+    if wire_tail_length > 0xFFFF:
+        raise ValueError(f"login wire tail is too large: {wire_tail_length}")
+    return struct.pack("<H", wire_tail_length)
 
 
 def build_login_body(
@@ -191,7 +213,7 @@ def build_login_body(
     elif identity is LoginIdentity.L2:
         # L2 push 通道（shlv2/szlv2）的 login 壳：2026-08-10 hexin 抓包字节级确认。
         # 无 UserName/Password，7 字段 + Passport64，与 BOARD+supports_manual_identity
-        # 结构相同但走 L2 行情服务器（非 fu4）。check 走通用 fallback（CHECK_K）。
+        # 结构相同但走 L2 行情服务器（非 fu4）。
         fields = [
             ("Ask", "login"),
             ("C-Version", profile.tcp_version),
@@ -209,10 +231,10 @@ def build_login_body(
         # 板块专用通道（fu4 服务器）的 login 壳，2026-08-01 双账号抓包字节级确认：
         #   - Level2 账号（PC_LEVEL2，supports_manual_identity=True）：
         #     **无 UserName/Password**，直接 VerifyType=1 + Mac64 + 版本行 +
-        #     Passport64；suffix = 计算 check 字节 + 0x09（抓包 ``aa 09``）。
+        #     Passport64；suffix 是后续 tail + 1-byte 分隔/终止符的小端 16 位长度。
         #   - 普通账号（PC_STANDARD，supports_manual_identity=False）：
         #     UserName=__manual/Password=__manual（\r\n\n 分隔），
-        #     suffix 固定 ``5e 07``（抓包字节；不同于 MAIN 的 ``58 07``）。
+        #     旧抓包为 ``5e 07``，同样由 fixed + Passport64 + newline 得出。
         if profile.supports_manual_identity:
             fields = [
                 ("Ask", "login"),
@@ -227,7 +249,6 @@ def build_login_body(
                 "\n".join(f"{key}={value}" for key, value in fields)
                 + "\nPassport64="
             ).encode("gbk")
-            suffix = bytes([(len(fixed) + CHECK_K) & 0xFF, 0x09])
         else:
             fixed = (
                 "Ask=login\n"
@@ -241,7 +262,6 @@ def build_login_body(
                 "C-SupPushDataVer=hq6.0\n"
                 "Passport64="
             ).encode("gbk")
-            suffix = b"\x5e\x07"
     else:
         fields = [
             ("Ask", "login"),
@@ -263,18 +283,14 @@ def build_login_body(
             + "\nPassport64="
         ).encode("gbk")
 
-    if identity is not LoginIdentity.BOARD:
-        suffix = profile.login_header_suffix
-    if suffix is None:
-        # check = (len(fixed) + CHECK_K) & 0xFF，CHECK_K 和 account_type[0] 配对。
-        # 见模块级 CHECK_K 注释和 HANDOFF_LOGIN_PROTOCOL_20260810.md。
-        suffix = bytes([(len(fixed) + CHECK_K) & 0xFF, 0x09])
+    passport_ascii = passport64.encode("ascii")
+    suffix = _computed_login_suffix(fixed, passport_ascii)
     prefix = (
         b"\x09\x41\x09\x00"
         + b"zh_CN.GBK"
         + suffix
     )
-    return prefix + fixed + passport64.encode("ascii")
+    return prefix + fixed + passport_ascii
 
 
 def build_standard_login_body(

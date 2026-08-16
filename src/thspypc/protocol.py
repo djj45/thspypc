@@ -588,11 +588,9 @@ C_VERSION_PC = DEFAULT_LOGIN_PROTOCOL_PROFILE.tcp_version
 # mainverify 的 qsid。PC 版 passport 的 M_qs=6800，推断 qsid=6800（Mac 是 7004）。
 QSID = DEFAULT_LOGIN_PROTOCOL_PROFILE.qsid
 
-# head128 的账号类型标签（5 字节前缀）。
-# Mac 版 (thspy): 44 04 2d 80 00；PC Level2 抓包实测: c8 06 06 80 00
-# （2026-08-10 hexin 8 帧 MAIN+L2 逐字节确认，8/8 一致）。
-# 旧值 be 06 06 80 00 只被宽松的 ifindhq 接受，main/shlv2/szlv2 等严格
-# 服务器校验 head128 时返回 VerifyCode=-1。
+# Passport64 的 5 字节结构头模板。前两字节由 build_passport64() 动态写成
+# 解码后完整 raw payload 长度的小端 uint16；后三字节是 PC kind=6、head size=128。
+# 例如 raw 1722/1736/1256 字节分别产生 ba 06 / c8 06 / e8 04。
 ACCOUNT_TYPE = DEFAULT_LOGIN_PROTOCOL_PROFILE.account_type
 
 

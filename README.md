@@ -7,7 +7,7 @@
 ## ✅ 已实现
 
 - HTTP 三步鉴权（RSA 公钥 → unified_login → mainverify）
-- head128 + passport64 构造（PC 版 ACCOUNT_TYPE 前缀）
+- head128 + passport64 构造（PC 版动态 raw 长度结构头）
 - PC 免费版 login 帧构造（8901 端口），VerifyCode=0 后直接复用 MAIN 长连接
 - **M_hqdns 动态域名解析**：从 passport 解析服务器域名 → DNS 查询拿最新 IP（不硬编码）
 - 多 IP 冗余连接 + 失败诊断
@@ -49,8 +49,9 @@
   空括号单请求，配合 stock_list + list_quotes 混合方案覆盖全市场。
 - **系统板块与板块行情**（`system_blocks` / `board_*`）：行业/概念板块发现、成分股、
   板块指数行情/分时/竞价，板块通道走 fu4，成分股走股票行情网关。
-- **板块统计**（`board_stats_*` / `board_calcext`）：9601 statscalc 独立统计节点 +
-  calcext 扩展计算。
+- **板块辅助计算**（`board_stats_*` / `board_calcext`）：9601 旧 `statscalc`
+  区间/涨跌停聚合 + `calcext` 扩展计算。注意它不是板块涨幅/涨速排行榜；当前
+  客户端排行走 8901 的 `pageid=12480/1334` 字段查询与排序。
 - **逐笔成交与超级盘口**（`superorder` / `snapshot_replay`）：7169 逐笔成交回放、
   4096 盘口快照回放，沪深通用。
 - **买一/卖一委托队列**（`order_queue` / `order_queues`）：7173/7174 Level2 专属，
@@ -215,7 +216,7 @@ imei 逆向过程见 `ths/HANDOFF_IMEI.md`（通过 hexin 内存 patch 捕获 MD
 | 1 | mainverify 参数 | `product=同花顺Mac至尊版` `qsid=7004` `version=macpro_3.5.2` | `product=E02` `securities=同花顺统一版` `qsid=6800` `version=9.60.20.0031` | passport 身份是 Mac，被 PC 网关拒（-6:） |
 | 2 | mainverify 的 imei | MAC 地址字符串的 base64 | **32 字符十六进制设备 ID**（`MD5(MAC+"0"*30)`） | passport 设备绑定错误 |
 | 3 | passport 字段截断 | 截断到 `userflag=`（丢 bind/sk/sv） | **不截断**，保留全部字段 | 丢失会话密钥 sk/sv，服务器拒（-6:） |
-| 4 | head128 ACCOUNT_TYPE | `44 04 2d 80 00` | `c8 06 06 80 00`（Level2，2026-08-10 抓包确认）/ `e8 04 06 80 00`（免费版） | head128 校验失败（-300:）；旧值 `be` 只被宽松的 ifindhq 接受 |
+| 4 | Passport64 结构头 | Mac 样本 kind=`2d` | PC：`uint16_le(raw长度) + 06 + 80 00`，如 1722→`ba 06 06 80 00` | raw 长度声明不一致时严格服务器直接拒绝 |
 
 ## 个股列表行情查询（`list_quotes`）
 
@@ -365,7 +366,7 @@ sz = [s["code"] for s in stocks if s["market"] == 33]   # 深市，直接喂 lis
 底层缓存函数（无需登录即可独立使用）：`save_stock_codes` / `load_stock_codes` /
 `is_stock_cache_expired` / `market_from_code` / `default_stock_cache_path`。
 
-### Passport64 生成 + login 帧校验（已复刻 hexin，无需抓包）
+### Passport64 生成 + login 帧校验
 
 > 完整字节级逆向见 [`docs/handoffs/HANDOFF_LOGIN_PROTOCOL_20260810.md`](docs/handoffs/HANDOFF_LOGIN_PROTOCOL_20260810.md)。
 
@@ -374,15 +375,19 @@ sz = [s["code"] for s in stocks if s["market"] == 33]   # 深市，直接喂 lis
 UploadSelfStock/signlength），保留含 sk/sv 的 **44 个身份/会话字段**（~2320 字符）。
 44 字段集和 hexin 抓包完全一致（2026-08-10 逐字段值对比确认）。
 
-`build_login_body`（`features/auth_protocol.py`）的帧头校验字节**动态计算**：
-`check = (len(fixed) + 13) & 0xFF`，其中 fixed = `Ask=login\n...Passport64=`（不含值）。
+`build_login_body`（`features/auth_protocol.py`）动态写入两字节小端长度：
+`suffix = uint16_le(len(fixed) + len(Passport64) + 1)`。过去所谓 K 只是
+`(len(Passport64)+1)&0xff`，不是版本或票据常量。
 
-**2026-08-10 五处协议修正**（hexin 8 帧字节级确认，7/7 服务器 VerifyCode=0）：
-- account_type `0xBE→0xC8`（旧值只被宽松的 ifindhq 接受，严格服务器拒）
-- passport 尾部 `0x20→0x00`
-- check 公式 `(len+1)&0xFF → (len+13)&0xFF`
+**当前协议要点**（2026-08-17 历史抓包 + 活网闭环）：
+- raw Passport64 前两字节动态声明完整 raw 长度；后三字节为 PC `06 80 00`
+- passport 尾部是 `\r\n\x00`，HTTP passport 的尾随 `|` 产生的空段必须过滤
+- login suffix 是完整 16 位 wire-tail 长度，不存在 K 或固定高字节
 - 新增 `LoginIdentity.L2`：L2 push 通道（shlv2/szlv2）用无 UserName 的 7 字段壳
-- BOARD(fu4) check 同样 `+1→+13`
+- 当前 2296 字符票据自然得到 STANDARD=`C4 09`、L2/BOARD=`A2 09`
+
+官方新鉴权样本中唯一 STANDARD 连接发往 shlv2，但目前样本不足，生产 MAIN 路由
+暂不因此修改。长度生成算法已经动态化，不再需要维护 account_type/K 配对表。
 
 > **sk/sv 必须保留**：thspypc 的 head128（移植自 thspy Mac 版 `signature_to_nibbles`）
 > 没有把 sk/sv 编码进 signature，必须保留 sk/sv 明文字段作为补偿。

@@ -1,5 +1,7 @@
 """Offline contracts for shared authentication material."""
 
+import base64
+
 import pytest
 
 from thspypc.features.auth_protocol import (
@@ -118,16 +120,29 @@ def test_verified_standard_signature_selects_captured_login_bytes():
 
     assert material.profile is PC_STANDARD_LOGIN_PROFILE
     assert service.profile is PC_STANDARD_LOGIN_PROFILE
-    assert material.passport64.startswith("6AQGgA")
+    raw = base64.b64decode(material.passport64)
+    assert int.from_bytes(raw[:2], "little") == len(raw)
+    assert raw[2:5] == b"\x06\x80\x00"
     assert (
         b"UserName=thsuser\nPassword=thsuser\nVerifyType=1"
         in body
     )
-    assert body[:15] == (
-        b"\x09\x41\x09\x00zh_CN.GBK\x58\x07"
-    )
+    assert int.from_bytes(body[13:15], "little") == len(body) - 14
     with pytest.raises(ValueError, match="does not support manual"):
         service.login_body(LoginIdentity.MANUAL)
+
+
+def test_passport_builder_drops_http_trailing_empty_segment():
+    payload = _auth_payload()
+    payload["passport_bytes"] += b"|"
+
+    raw = base64.b64decode(build_passport64(payload))
+
+    assert b"M_hq=" not in raw
+    assert b"signlength=" not in raw
+    assert raw.endswith(b"sk=one\r\n\x00")
+    assert not raw.endswith(b"\r\n\r\n\x00")
+    assert int.from_bytes(raw[:2], "little") == len(raw)
 
 
 def test_future_ordinary_profile_can_disable_manual_identity_explicitly():
@@ -138,7 +153,7 @@ def test_future_ordinary_profile_can_disable_manual_identity_explicitly():
         http_version="ordinary-http",
         tcp_version="ordinary-tcp",
         qsid="ordinary-qsid",
-        account_type=b"\x01\x02\x03\x04\x05",
+        account_type=b"\x00\x00\x03\x04\x05",
         supports_manual_identity=False,
     )
     service = AuthService(

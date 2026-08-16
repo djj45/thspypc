@@ -88,27 +88,33 @@
 
 ⚠️ **非交易日可用**：实测 8901 协议层不约束代码表查询（周日可登录、可发请求）。
 
-### 2. Passport64 生成 + login 帧校验字节（✅ 2026-08-10 字节级重逆向）
+### 2. Passport64 生成 + login 长度字段（✅ 2026-08-17 根因闭环）
 
 > **完整结论见** [`HANDOFF_LOGIN_PROTOCOL_20260810.md`](HANDOFF_LOGIN_PROTOCOL_20260810.md)。
-> 下面的 2026-07-23 旧分析已被 2026-08-10 的 hexin 抓包推翻（hexin 现在发 44 字段长
-> passport，不是旧记的 20 字段短 passport；check 公式是 `+13` 不是 `+1`；account_type
-> 是 `C8` 不是 `BE`；尾部是 `\x00` 不是空格）。
+> `BE/1`、`C8/13`、`BA/249` 不是配对表：raw 头前两字节是完整 raw 长度，
+> 所谓 K 是 `(base64长度+1)&0xff`。完整证据和四组样本见专项交接文档顶部。
 
-**2026-08-10 五处修正**（全部 hexin 8 帧字节级确认，7/7 服务器 VerifyCode=0）：
+**2026-08-17 当前修正**（历史抓包四种长度 + MAIN/L2 活网）：
 
-1. **account_type[0]** `0xBE→0xC8`（hexin MAIN+L2+fu4 8/8 帧一致）
-2. **passport 尾部** `0x20→0x00`（hexin = `\r\n\x00`）
-3. **check 字节公式** `(len+1)&0xFF → (len+13)&0xFF`（通用 fallback + BOARD 分支）
-4. **新增 `LoginIdentity.L2`**：L2 push 通道（shlv2/szlv2）用无 UserName 的 7 字段壳
-5. **BOARD(fu4) check** 同样 `+1→+13`
+1. raw Passport64 前五字节动态生成：`uint16_le(len(raw)) + 06 80 00`。
+2. `build_passport64()` 过滤 HTTP passport 尾随 `|` 产生的空段，恢复官方
+   `...sv=...\r\n\x00` 尾部。
+3. 删除 K/profile 配对；login suffix 统一为
+   `uint16_le(len(fixed)+len(Passport64)+1)`。
+4. `C4 09/A2 09`、`D8 09/B6 09`、`CC 09/AA 09` 都是该公式的自然结果。
+5. 官方新票据唯一 STANDARD 落在 shlv2，但样本不足，**暂不修改 MAIN 路由**。
+6. 全角色冒烟已 7/7 通过。L2 懒建连和后台预热现在把各自
+   `authenticate(force=True)` 返回的不可变 `AuthMaterial` 直传给 socket opener，
+   不再经由可能被并发覆盖的全局 current 取票。
 
 旧结论中仍然成立的部分：
 - **sk/sv 必须保留**：thspypc 的 head128（移植自 thspy Mac 版 `signature_to_nibbles`）
   没有把 sk/sv 编码进 signature，必须保留 sk/sv 明文。`PASSPORT_DROP_FIELDS` 只丢 10 个
   路由字段，保留 44 字段（含 sk/sv），和 hexin 一致。
 - **校验字节错误 → 0 字节 FIN**：check 字节算错时严格服务器直接断连。
-- **-1 不是连接频率问题**：-1 纯粹是 login 帧内容问题，连接治理是好实践但不是防 -1 的手段。
+- **-1 有两类来源**：帧结构/长度错误，以及已消费或被服务端拒绝的票据。后者应
+  重新 HTTP 鉴权并用新材料建新 socket，不能把同一 Passport64 串行登录多个 host。
+- 不存在需要继续逆向的 K 来源；后续票据字段变长/变短由长度编码自动适配。
 
 诊断工具：`tests/capture_login_compare.py`（抓包）、`tests/verify_all_logins.py`（全服务器
 登录冒烟）、`tests/verify_order_details_online.py`（L2 4214 挂单撤单端到端）。

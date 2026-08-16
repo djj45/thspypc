@@ -1,19 +1,15 @@
-"""probe_check_k — 从 hexin login pcap 反算 (account_type, K) 配对，验证一致性。
+"""probe_check_k — 历史兼容入口；验证 login 的两个动态长度字段。
 
 用途（playbook §13 oracle 类）：
-  - 从 login 请求帧反算 K = (check_byte - fixed_len) & 0xFF
-  - 从 Passport64 base64 解码出 account_type[0]（head128 前 5 字节）
-  - 验证 (account_type, K) 配对是否在已知合法集合里
+  - 验证 raw[:2] == uint16_le(len(raw Passport64))
+  - 验证 suffix == uint16_le(fixed_len + base64_len + 1)
+  - 同时输出旧算法反算的 K，便于阅读历史报告
 
-**根因背景**（见 HANDOFF_LOGIN_PROTOCOL_20260810.md "K 值根因调查"）：
-account_type[0] 和 K 是**客户端版本标识**，必须配对：
-  - BE / K=1   → 旧版 hexin 客户端
-  - C8 / K=13  → 新版 hexin 客户端 / thspypc
-服务器同时接受两种配对，但混搭（如 C8/K=1）会被拒。
+**2026-08-17 根因**：BE/C8/BA/E8 是 raw 长度的小端低字节；所谓 K 恒等于
+``(len(Passport64)+1)&0xff``，不是版本或票据状态。完整离线 oracle 见
+``tests/analyze_login_length_fields.py``。
 
-如果未来 thspypc 出现 -1 回归，跑本脚本对比 hexin 抓包，确认：
-  1. hexin 当前发的 (account_type, K) 配对
-  2. thspypc 的 C8/K=13 是否仍被服务器接受
+如果未来出现 -1 回归，先确认两个声明长度是否与最终 payload 一致。
 **不自动改代码**——避免探测错误导致静默故障。
 
 用法：
@@ -100,7 +96,7 @@ def parse_login_fields(body: bytes) -> dict[str, str]:
 
 
 def compute_k(login_body: bytes) -> tuple[int, int, int] | None:
-    """从 login body 反算 (check_byte, fixed_len, K)。
+    """返回历史展示用的 (suffix_low, fixed_len, legacy_K)。
 
     fixed = Ask=login 开头到 Passport64=（不含值）的 GBK 字节数。
     prefix: 09 41 09 00 'zh_CN.GBK' <check> 09
@@ -164,7 +160,7 @@ def main() -> int:
         "--target-k",
         type=lambda x: int(x, 0),
         default=None,
-        help="期望的 K 值（用于标出 init 帧里值匹配的字段）；不填则用反算 K",
+        help="历史兼容：标出 init 中等于旧 K 的字段；不填则使用反算值",
     )
     args = ap.parse_args()
 
@@ -184,9 +180,10 @@ def main() -> int:
 
     print(f"# 8901 流数: {len(streams)}\n")
 
-    # 对每个流反算 K + account_type，收集 init 字段
+    # 对每个流验证 raw/suffix 长度，并保留旧 K 输出供历史对照。
     k_values: list[int] = []
     account_types: list[str] = []  # account_type[0] hex 字符串
+    length_checks: list[bool] = []
     all_init_fields: dict[str, set[str]] = {}  # field -> set of values seen
     per_stream_init_fields: list[tuple[str, dict[str, str]]] = []
 
@@ -213,6 +210,7 @@ def main() -> int:
         k_values.append(k)
         # 从 Passport64 解出 account_type
         atype_hex = "?"
+        length_note = "length=unknown"
         fields = parse_login_fields(login_bodies[0])
         p64 = fields.get("Passport64", "")
         if p64:
@@ -221,6 +219,18 @@ def main() -> int:
                 praw = base64.b64decode(p64)
                 atype_hex = praw[:5].hex()
                 account_types.append(atype_hex[:2])  # 只取第一字节
+                raw_declared = int.from_bytes(praw[:2], "little")
+                suffix_value = int.from_bytes(login_bodies[0][13:15], "little")
+                expected_suffix = fixed_len + len(p64) + 1
+                length_ok = (
+                    raw_declared == len(praw)
+                    and suffix_value == expected_suffix
+                )
+                length_checks.append(length_ok)
+                length_note = (
+                    f"raw={len(praw)}/{raw_declared} "
+                    f"suffix={suffix_value}/{expected_suffix} ok={length_ok}"
+                )
             except Exception:
                 pass
         has_user = "UserName" in fields
@@ -234,8 +244,8 @@ def main() -> int:
                 if vm:
                     vc = vm.group(1)
                     break
-        print(f"→ {server_ip}:8901  account_type={atype_hex}  check=0x{check_byte:02x} "
-              f"K={k}  VerifyCode={vc}  ({identity})")
+        print(f"→ {server_ip}:8901  header={atype_hex}  suffix_low=0x{check_byte:02x} "
+              f"legacy_K={k}  {length_note} VerifyCode={vc}  ({identity})")
 
         # 扫该流的 init 响应帧
         for fl, body in s2c_frames:
@@ -253,8 +263,7 @@ def main() -> int:
                 for fk, fv in init_fields.items():
                     all_init_fields.setdefault(fk, set()).add(fv)
 
-    # (account_type, K) 配对汇总
-    print(f"\n# === (account_type, K) 配对汇总 ===")
+    print(f"\n# === 动态长度字段汇总 ===")
     if not k_values:
         print("#  ✗ 没有可反算的 login 帧")
         return 1
@@ -265,20 +274,11 @@ def main() -> int:
     consensus_at = at_counts.most_common(1)[0][0] if account_types else "?"
     print(f"#  account_type[0] 分布: {dict(at_counts)}")
     print(f"#  K 分布: {dict(k_counts)}")
-    print(f"#  ★ account_type[0]=0x{consensus_at.upper()}  K={consensus_k}")
-    # 已知合法配对
-    KNOWN_PAIRS = {"BE": 1, "C8": 13}
-    if consensus_at.upper() in KNOWN_PAIRS:
-        expected_k = KNOWN_PAIRS[consensus_at.upper()]
-        if consensus_k == expected_k:
-            print(f"#  ✅ 配对合法：0x{consensus_at.upper()}/K={consensus_k}"
-                  f"（已知配对 {consensus_at.upper()}/K={expected_k}）")
-        else:
-            print(f"#  ⚠ 配对异常：0x{consensus_at.upper()}/K={consensus_k}，"
-                  f"已知 0x{consensus_at.upper()} 应配 K={expected_k}")
+    print(f"#  历史显示：header_low=0x{consensus_at.upper()} legacy_K={consensus_k}")
+    if length_checks and all(length_checks):
+        print(f"#  ✅ {len(length_checks)}/{len(length_checks)} 个 login 的 raw/suffix 长度声明一致")
     else:
-        print(f"#  ⚠ 未知 account_type 0x{consensus_at.upper()}——"
-              f"不在已知集合 {{BE:1, C8:13}}，需调查")
+        print(f"#  ⚠ 长度声明不一致：{sum(length_checks)}/{len(length_checks)} 通过")
 
     target_k = args.target_k if args.target_k is not None else consensus_k
     print(f"\n# === init 帧字段扫描（标出值 == {target_k} 的字段）===")

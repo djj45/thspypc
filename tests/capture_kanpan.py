@@ -98,7 +98,16 @@ MARKET_HOSTS = {
     "122.9.202.190", "122.9.125.190", "116.63.108.136",
     "8.134.98.163", "121.37.31.87", "8.138.46.177", "8.145.212.55",
 }
-REALORDER_HOSTS = {"106.14.65.90"}  # 9601 短线精灵
+REALORDER_HOSTS = {
+    "106.14.65.90",
+    "106.15.55.146",
+    "116.63.67.140",
+}  # 9601 短线精灵/calcext（网关会轮换）
+BOARD_STATS_HOSTS = {
+    "8.132.233.77",
+    "8.132.233.78",
+    "116.205.182.140",
+}  # 9601 WDCS/stats 逻辑服务及 aly 网关
 
 # 板块指数代码前缀（行业 881xxx；概念 885xxx/30xxxx）
 BOARD_CODE_PREFIXES = ("881", "885", "301", "302", "303", "304", "305",
@@ -563,8 +572,12 @@ def _pageid_to_area(pid: str, info: dict) -> str:
 
 def _ip_role(ip: str, port: str) -> str:
     """按 IP/端口标注服务角色（粗判，IP 会轮换）。"""
-    if port == "9601" or ip in REALORDER_HOSTS:
-        return "9601短线精灵"
+    if ip in BOARD_STATS_HOSTS:
+        return "9601板块统计/WDCS"
+    if ip in REALORDER_HOSTS:
+        return "9601短线精灵/calcext"
+    if port == "9601":
+        return "9601网关(角色待按method确认)"
     if ip in MARKET_HOSTS:
         return "行情(MAIN?)"
     # 尝试 DNS 反查 fu4/shlv2/szlv2/main（带超时，失败即跳过）
@@ -607,7 +620,10 @@ def _section_overview(pcap_path, account: str):
     if not port_ips:
         print("  ✗ 未抓到任何 TCP 流量 — 可能没启动同花顺，或选错网卡")
         return
-    notes = {"8901": "← 行情/鉴权/代码表/盘口/板块/分时/K线", "9601": "← 短线精灵"}
+    notes = {
+        "8901": "← 行情/鉴权/代码表/盘口/板块/分时/K线",
+        "9601": "← 短线精灵/calcext/WDCS统计（按 method 区分）",
+    }
     for port in sorted(port_ips.keys(), key=lambda x: int(x) if x.isdigit() else 99999):
         ips = sorted(port_ips[port])
         shown = []

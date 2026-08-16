@@ -37,7 +37,7 @@ class ConnectionFactory:
         main_lock: Any,
         current_auth: Callable[[], dict | None],
         drop_main: Callable[[], None],
-        open_manual: Callable[[int], Any],
+        open_manual: Callable[[int, Any], Any],
         push_sockets: dict,
         push_lock: Any,
         push_initialized: set,
@@ -154,10 +154,13 @@ class ConnectionFactory:
                 # SZ_L2 每条新 socket 都使用独立的新一代通行证；刷新 HTTP 鉴权
                 # 不影响已经登录并保持心跳的 MAIN socket。
                 try:
-                    self._authenticate(force=True)
+                    material = self._authenticate(force=True)
                 except Exception as exc:
                     raise OSError(f"L2 HTTP 鉴权失败: {exc}") from exc
-                opened = self._open_manual(market)
+                # 将这一代不可变材料直接交给建连函数。若这里只刷新全局
+                # current 后再让 opener 读取，并发建连可能在两步之间覆盖它，
+                # 导致两条 socket 误用同一 Passport64。
+                opened = self._open_manual(market, material)
                 if opened is None:
                     raise OSError(f"L2[{key}] 建连或 init 失败")
                 with self._push_lock:

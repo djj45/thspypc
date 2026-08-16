@@ -60,11 +60,11 @@ def _normal_login() -> bytes:
 
 
 def test_board_login_l2_no_username_matches_capture():
-    """L2 板块 login：无 UserName/Password，suffix=计算 check+09（抓包 b6 09）。"""
+    """L2 板块 login：无 UserName/Password，suffix 动态声明 wire tail 长度。"""
     body = _l2_login()
-    assert body[:15] == b"\x09\x41\x09\x00" + b"zh_CN.GBK" + b"\xb6\x09"
+    assert int.from_bytes(body[13:15], "little") == len(body) - 14
     text = body.decode("gbk", "replace")
-    assert text.startswith("\tA\t\x00zh_CN.GBK�\tAsk=login")
+    assert body[15:].startswith(b"Ask=login")
     assert "UserName=" not in text
     assert "Password=" not in text
     assert "VerifyType=1" in text
@@ -74,9 +74,9 @@ def test_board_login_l2_no_username_matches_capture():
 
 
 def test_board_login_normal_manual_matches_capture():
-    """普通账号板块 login：__manual + \\r\\n\\n 分隔，suffix=5e 07（抓包字节）。"""
+    """普通账号板块 login：__manual + \\r\\n\\n，suffix 动态声明长度。"""
     body = _normal_login()
-    assert body[:15] == b"\x09\x41\x09\x00" + b"zh_CN.GBK" + b"\x5e\x07"
+    assert int.from_bytes(body[13:15], "little") == len(body) - 14
     text = body.decode("gbk", "replace")
     assert "UserName=__manual\r\n\nPassword=__manual\r\n\n" in text
     assert "VerifyType=1" in text

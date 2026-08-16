@@ -733,7 +733,13 @@ class ConnectionPrimitives:
 
         def _do_preheat():
             try:
-                sock = self._open_manual_push_connection(other_market)
+                # 预热线程持有自己这一代不可变材料，不能在建连时再读取可能被
+                # 其他线程覆盖的全局 current。
+                material = self.authenticate(force=True)
+                sock = self._open_manual_push_connection(
+                    other_market,
+                    material=material,
+                )
                 if sock is not None:
                     with self._push_lock:
                         if other not in self._push_socks:  # 防竞争（主线程可能已建）
@@ -852,9 +858,12 @@ class ConnectionPrimitives:
                     self._advance_l2_offset(key, tried, len(hosts))
                     return result
                 if result == "stale_passport":
-                    # 票据失效，剩余 IP 必然也失败，立即跳出重新鉴权
+                    # 服务端用“通行证有被修改的痕迹”拒绝当前登录。活网已观察到
+                    # 新鲜、独占的 Passport 也可能非必现地收到该通用文案，因此
+                    # 这里只把它解释为“当前票据/节点会话不可继续”，不声称本地
+                    # 确实修改了票据。剩余 IP 不再复用该票，立即重新鉴权。
                     stale = True
-                    logger.info("L2[%s] 票据失效（%s），跳过剩余 IP 直接重新鉴权",
+                    logger.info("L2[%s] 票据/会话被拒（%s），跳过剩余 IP 直接重新鉴权",
                                 key, host)
                     break
                 logger.info("L2[%s] IP %s 不可用，换下一个", key, host)
@@ -868,7 +877,8 @@ class ConnectionPrimitives:
             # 重新 full_http_auth 拿新鲜票据再试一轮。
             if stale or allow_refresh:
                 if stale:
-                    logger.warning("L2[%s] 票据失效，重新 HTTP 鉴权拿新鲜 Passport64...",
+                    logger.warning("L2[%s] 登录票据/节点会话被服务端拒绝，"
+                                   "重新 HTTP 鉴权拿新鲜 Passport64...",
                                    key)
                 else:
                     logger.warning("L2[%s] 全失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...",

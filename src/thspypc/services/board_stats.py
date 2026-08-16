@@ -19,6 +19,7 @@ from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import encode_frame
+from ..errors import ChannelUnavailableError
 from ..features.board_stats_protocol import (
     DATATYPE_INTERVAL_STAT,
     DATATYPE_MARKETCAP,
@@ -129,7 +130,7 @@ class BoardStatsService:
                 ConnectionRole.BOARD_STATS,
                 capability=Capability.BASIC_QUOTE,
             )
-        except OSError as exc:
+        except (OSError, ChannelUnavailableError) as exc:
             logger.warning("statscalc 通道建连失败，返回空（可降级 board_quotes）: %s", exc)
             return []
         try:
@@ -187,7 +188,7 @@ class BoardStatsService:
                 ConnectionRole.REALORDER,
                 capability=Capability.REALORDER,
             )
-        except OSError as exc:
+        except (OSError, ChannelUnavailableError) as exc:
             logger.warning("calcext 通道建连失败，返回空: %s", exc)
             return []
         try:

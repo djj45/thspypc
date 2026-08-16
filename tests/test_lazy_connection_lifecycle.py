@@ -136,6 +136,7 @@ def test_l2_service_opener_authenticates_without_main_login(monkeypatch):
     _install_http_auth(client, calls)
     l2_sock = FakeSocket()
     main_logins = []
+    opened = []
     monkeypatch.setattr(
         client,
         "connect_main",
@@ -144,7 +145,8 @@ def test_l2_service_opener_authenticates_without_main_login(monkeypatch):
     monkeypatch.setattr(
         client,
         "_open_manual_push_connection",
-        lambda market: l2_sock,
+        lambda market, *, material: opened.append((market, material))
+        or l2_sock,
     )
 
     manager = client.configure_service_context(
@@ -158,6 +160,7 @@ def test_l2_service_opener_authenticates_without_main_login(monkeypatch):
 
     assert connection.socket is l2_sock
     assert len(calls) == 1
+    assert opened == [(17, client.auth_material)]
     assert main_logins == []
     assert client._sock is None
 
@@ -171,6 +174,7 @@ def test_l2_service_opener_refreshes_passport_without_dropping_main(monkeypatch)
     l2_sock = FakeSocket()
     client._sock = main_sock
     dropped = []
+    opened = []
     monkeypatch.setattr(
         client,
         "_drop_connection",
@@ -179,7 +183,8 @@ def test_l2_service_opener_refreshes_passport_without_dropping_main(monkeypatch)
     monkeypatch.setattr(
         client,
         "_open_manual_push_connection",
-        lambda market: l2_sock,
+        lambda market, *, material: opened.append((market, material))
+        or l2_sock,
     )
     manager = client.configure_service_context(
         _level2_profile(),
@@ -193,6 +198,7 @@ def test_l2_service_opener_refreshes_passport_without_dropping_main(monkeypatch)
 
     assert connection.socket is l2_sock
     assert len(calls) == 2
+    assert opened == [(17, client.auth_material)]
     assert client._sock is main_sock
     assert not main_sock.closed
     assert dropped == []

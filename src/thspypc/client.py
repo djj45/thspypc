@@ -236,8 +236,9 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             main_lock=self._sock_lock,
             current_auth=lambda: self._auth,
             drop_main=lambda: self._drop_connection(),
-            open_manual=lambda market: self._open_manual_push_connection(
-                market
+            open_manual=lambda market, material: self._open_manual_push_connection(
+                market,
+                material=material,
             ),
             push_sockets=self._push_socks,
             push_lock=self._push_lock,
@@ -897,9 +898,11 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
     ) -> AuthMaterial:
         """只执行 HTTP 鉴权并缓存 Passport64，不建立任何行情 TCP 连接。
 
-        同一代 :class:`AuthMaterial` 可被 MAIN、SH_L2、SZ_L2 和 REALORDER
-        连接按需复用。默认已有材料时直接返回；``force=True`` 或显式传入账号
-        凭据时重新鉴权并原子替换当前 generation。
+        一代 :class:`AuthMaterial` 只能用于一条 socket 的首次登录（该次登录可以
+        并发竞速多个候选服务器并保留赢家）。已有 socket 成功后，新建另一条
+        socket 必须用 ``force=True`` 刷新一代材料。默认会返回当前材料，仅供读取
+        状态或尚未登录时使用；显式传入账号凭据时也会重新鉴权并原子替换当前
+        generation。
         """
         with self._auth_lock:
             current = self._auth_service.current

@@ -1,17 +1,18 @@
 #!/usr/bin/env python
 """全服务器登录冒烟验证（单 client、逐角色、不依赖交易时段）。
 
-验证 6 类连接角色在协议修复（account_type 0xC8 / K=13 配对 + L2 身份）后
+验证 6 类连接角色在协议修复（动态 raw/suffix 长度 + L2 身份）后
 都能 VerifyCode=0：
   MAIN         connect()          — main.123ths.com:8901
   SH_L2/SZ_L2  order_details      — shlv2/szlv2:8901（LoginIdentity.L2）
   REALORDER    dxjl_latest        — 106.14.65.90:9601（LoginIdentity.STANDARD）
   BOARD        board_timeline     — fu4.123ths.com:8901（LoginIdentity.BOARD）
   BOARD_CONST  board_constituents — shlv2/szlv2（SH=STANDARD, SZ=MANUAL）
-  BOARD_STATS  board_stats        — 8.132.233.77:9601（STANDARD）
+  BOARD_STATS_LEGACY board_stats  — 旧 statscalc 辅助通道（非板块排行）
 
-严格遵守 AGENTS.md：单 client、connect() 先建 MAIN（消费一次 passport），
-其余角色复用同一 passport（客户端内部治理 IP 轮换/冷却，见 live_check.py 模式）。
+每个新角色 socket 由当前 connection runtime 先执行独立 HTTP 鉴权；不得把 MAIN
+已经消费的 passport 直接用于后续角色。脚本只通过同一个 THSClient 的公开服务入口
+触发这些连接，已存在的 socket 由 client 复用。
 
 用法：
     py -u tests/verify_all_logins.py
@@ -28,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from thspypc import THSClient  # noqa: E402
 from thspypc.testing import load_env  # noqa: E402
+from thspypc.transport import ConnectionRole  # noqa: E402
 
 results: list[tuple[str, str, str]] = []  # (role, status, detail)
 
@@ -140,18 +142,38 @@ def main() -> int:
         else:
             _record("BOARD_CONSTITUENT", False, f"异常: {result}")
 
-        # ── BOARD_STATS（STANDARD, 8.132.233.77:9601）─────────
-        print("\n[BOARD_STATS] board_stats_interval → 8.132.233.77:9601",
+        # ── BOARD_STATS_LEGACY（旧 statscalc 辅助计算，不是板块排行）──
+        print("\n[BOARD_STATS_LEGACY] board_stats_interval "
+              "→ legacy statscalc:9601",
               flush=True)
         ok, result, dt = _safe_call(
-            "BOARD_STATS",
+            "BOARD_STATS_LEGACY",
             lambda: client.board_stats_interval(["881121"]),
         )
         if ok:
-            _record("BOARD_STATS", True,
-                    f"VerifyCode=0 统计={len(result)} {dt:.1f}s")
+            # statscalc 设计为网络错误/业务超时时返回 []，不能仅凭“未抛异常”
+            # 推断登录成功。显式检查 ConnectionManager 中只有 VerifyCode=0 后
+            # 才会收编的活动 socket，把登录结果与业务数据结果分开报告。
+            manager = client._service_connections
+            connection = (
+                manager.peek(ConnectionRole.BOARD_STATS)
+                if manager is not None
+                else None
+            )
+            login_ok = connection is not None and connection.active
+            business = (
+                f"统计={len(result)}"
+                if result
+                else "统计=0（业务空响应或超时）"
+            )
+            _record(
+                "BOARD_STATS_LEGACY",
+                login_ok,
+                f"login={'VerifyCode=0' if login_ok else '未建立'} "
+                f"{business} {dt:.1f}s",
+            )
         else:
-            _record("BOARD_STATS", False, f"异常: {result}")
+            _record("BOARD_STATS_LEGACY", False, f"异常: {result}")
 
     finally:
         client.disconnect()

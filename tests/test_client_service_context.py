@@ -1323,9 +1323,11 @@ def test_controlled_opener_builds_and_caches_borrowed_l2_socket(
     client.authenticate = lambda **_kwargs: object()
     sock = FakeSocket()
     opened_markets = []
+    materials = []
 
-    def open_manual(market):
+    def open_manual(market, *, material):
         opened_markets.append(market)
+        materials.append(material)
         return sock
 
     monkeypatch.setattr(
@@ -1349,6 +1351,7 @@ def test_controlled_opener_builds_and_caches_borrowed_l2_socket(
 
     assert first is second
     assert opened_markets == [33]
+    assert len(materials) == 1
     assert first.socket is sock
     assert not first.owns_socket
     assert first.init_complete
@@ -1396,7 +1399,7 @@ def test_controlled_opener_reports_l2_open_failure(monkeypatch):
     monkeypatch.setattr(
         client,
         "_open_manual_push_connection",
-        lambda _market: None,
+        lambda _market, *, material: None,
     )
     manager = client.configure_service_context(
         LEVEL2_PROFILE,
