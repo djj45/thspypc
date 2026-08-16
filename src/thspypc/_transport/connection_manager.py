@@ -145,14 +145,23 @@ class ConnectionManager:
         *,
         capability: Capability | None = None,
     ) -> ManagedConnection:
+        stale: ManagedConnection | None = None
         with self._lock:
             spec = self._validate_role(role, capability=capability)
             current = self._connections.get(role)
             if current is not None and current.active:
-                return current
+                if current.is_alive:
+                    return current
+                # 服务器已关闭该连接（例如 L2 预热 socket 空闲后被 FIN），
+                # 本地 socket 对象仍在；移除后走 opener 重建，避免业务请求
+                # 发到死连接上。
+                self._connections.pop(role, None)
+                stale = current
             try:
                 opened = self._opener(spec)
             except Exception as exc:
+                if stale is not None:
+                    stale.close()
                 raise ChannelUnavailableError(
                     role.value, str(exc)
                 ) from exc
@@ -180,7 +189,9 @@ class ConnectionManager:
                 initialized=initialized,
             )
             self._connections[role] = connection
-            return connection
+        if stale is not None:
+            stale.close()
+        return connection
 
     def adopt(
         self,

@@ -141,6 +141,24 @@ class ConnectionPrimitives:
                     passport_fields,
                 )
 
+            concurrent_errors = [
+                err for err in getattr(self, "_last_concurrent_login_errors", [])
+                if err
+            ]
+            if (
+                len(batch) >= 5
+                and concurrent_errors
+                and all(err == "连接已关闭" for err in concurrent_errors)
+            ):
+                # 所有并发 IP 都直接关闭 login 连接，通常是账号会话被服务端
+                # 临时限制，而不是某个 IP 不可达。继续串行打剩余 IP 只会
+                # 加重限制；直接结束本轮，交给外层刷新/等待重试。
+                logger.warning(
+                    "并发批次 %d 个 IP 全部返回连接关闭，跳过串行 fallback",
+                    len(batch),
+                )
+                return None
+
             # 并发全部失败，串行试剩余 IP（兼容 IP 列表短的情况）。
             # 加连续 -1 计数：单点登录会话冲突时所有 IP 秒回 -1，试更多 IP 无意义，
             # 串行 fallback：测速排序后的剩余可达 IP（跳过本次 batch），再补原始列表里
@@ -216,9 +234,25 @@ class ConnectionPrimitives:
         if result is not None:
             return result
 
+        first_errors = [
+            err for err in getattr(self, "_last_concurrent_login_errors", [])
+            if err
+        ]
+        if first_errors and all(err == "连接已关闭" for err in first_errors):
+            # 所有 IP 都是“连接已关闭”而不是 -1/超时：通常是服务端临时限制
+            # 新会话。此时刷新 passport 再立刻打一轮没有意义，还会加重限制；
+            # 直接失败，让上层冷却后重试。
+            logger.warning("MAIN 所有 IP 均直接关闭连接，等待上层冷却后重试")
+            return self._login_result_type(
+                success=False,
+                error="all_hosts_failed",
+                detail="服务端关闭了所有 login 连接（可能临时限制新会话），请稍后重试",
+            )
+
         # 全失败：重新 HTTP 鉴权拿新鲜 Passport64 重试一轮（和 L2/BOARD 通道一致）。
         # MAIN 服务器对过期 passport 静默返回 -1（无 PromptText），刷新后通常即恢复。
-        logger.warning("MAIN 全部 IP 失败，重新 HTTP 鉴权拿新鲜 Passport64 重试...")
+        logger.warning("MAIN 全部 IP 失败，2 秒后重新 HTTP 鉴权拿新鲜 Passport64 重试...")
+        time.sleep(2)
         try:
             fresh = self._refresh_auth_material()
             fresh_body = self._auth_service.login_body_for_passport(fresh.passport64)
@@ -622,7 +656,8 @@ class ConnectionPrimitives:
         for r in results:
             if r:
                 return r
-        # 全部失败，记录错误
+        # 全部失败，记录错误，并供调用方决定是否跳过串行 fallback。
+        self._last_concurrent_login_errors = list(errors)
         for i, h in enumerate(hosts):
             if errors[i]:
                 logger.warning("  %s: %s", h, errors[i])
@@ -1042,8 +1077,12 @@ class ConnectionPrimitives:
         if self._auth is None:
             self.authenticate()
 
-        def _try_round(material, allow_refresh: bool):
-            """用给定票据登录 fu4 + 引导；失败时可换票据和 IP 批次重试一次。"""
+        def _try_round(material, allow_refresh: bool, use_local_stocklink: bool = False):
+            """用给定票据登录 fu4 + 引导；失败时可换票据和 IP 批次重试一次。
+
+            ``use_local_stocklink=False`` 时优先用 ConfigVer=0 自行请求全量
+            版本表；只有该路径引导失败后，才回退本机 StockLink.ini 表。
+            """
             profile = material.profile
             passport64 = material.passport64
             level2 = profile.supports_manual_identity
@@ -1178,7 +1217,11 @@ class ConnectionPrimitives:
                         "板块通道：全部 fu4 IP 登录失败，重新 HTTP 鉴权拿新鲜票据重试"
                     )
                     fresh = self._refresh_auth_material()
-                    return _try_round(fresh, allow_refresh=False)
+                    return _try_round(
+                        fresh,
+                        allow_refresh=False,
+                        use_local_stocklink=use_local_stocklink,
+                    )
                 raise OSError("板块通道：全部 fu4 IP 登录失败")
 
             host, sock, _result = winner
@@ -1188,27 +1231,50 @@ class ConnectionPrimitives:
                     level2,
                     timeout=timeout,
                     constituent_side=constituent_side,
+                    use_local_stocklink=use_local_stocklink,
                 )
             except (OSError, ValueError) as exc:
                 try:
                     sock.close()
                 except OSError:
                     pass
+                if allow_refresh:
+                    # 自请求版本表被服务器拒绝/FIN 时，再退回本机表试一次。
+                    logger.warning(
+                        "板块通道：%s 自请求版本表引导失败（%s），"
+                        "刷新票据并回退本机 StockLink.ini 重试",
+                        host, exc,
+                    )
+                    fresh = self._refresh_auth_material()
+                    return _try_round(
+                        fresh,
+                        allow_refresh=False,
+                        use_local_stocklink=True,
+                    )
                 raise OSError(
                     f"板块通道引导失败（{host}）: {exc}"
                 ) from exc
-            if n_replies == 0 and allow_refresh:
-                # 引导零响应 = 当前连接未激活；换新票据和下一个 IP 重试一次。
-                logger.warning(
-                    "板块通道：%s 引导零响应，换票据/IP 重试",
-                    host,
+            if n_replies == 0:
+                if allow_refresh:
+                    # 引导零响应 = 当前连接未激活；下一轮优先用本机版本表。
+                    logger.warning(
+                        "板块通道：%s 自请求版本表引导零响应，"
+                        "刷新票据并回退本机 StockLink.ini 重试",
+                        host,
+                    )
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    fresh = self._refresh_auth_material()
+                    return _try_round(
+                        fresh,
+                        allow_refresh=False,
+                        use_local_stocklink=True,
+                    )
+                raise OSError(
+                    f"板块通道引导失败（{host}）：无响应"
                 )
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-                fresh = self._refresh_auth_material()
-                return _try_round(fresh, allow_refresh=False)
             if n_replies and constituent_side is not None:
                 # 成分股连接的成功引导本身就是 L2 市场通道证据：MKT_INIT
                 # 在 shlv2/szlv2 网关完成 = l2_market_init；深市 manual 身份
@@ -1237,6 +1303,7 @@ class ConnectionPrimitives:
         *,
         timeout: float = 12.0,
         constituent_side: str | None = None,
+        use_local_stocklink: bool = False,
     ) -> int:
         """按真实客户端的阶段和等待发送板块引导；返回读取的响应帧数。"""
         from ..features.system_blocks_protocol import (
@@ -1245,13 +1312,18 @@ class ConnectionPrimitives:
             load_local_board_stocklink_ver,
         )
 
-        stocklink_ver = load_local_board_stocklink_ver()
-        if stocklink_ver is None:
-            logger.warning(
-                "板块通道：未找到完整的本机 StockLink.ini 版本表，回退 ConfigVer=0"
-            )
+        if use_local_stocklink:
+            stocklink_ver = load_local_board_stocklink_ver()
+            if stocklink_ver is None:
+                logger.warning(
+                    "板块通道：未找到完整的本机 StockLink.ini 版本表，"
+                    "回退 ConfigVer=0"
+                )
+            else:
+                logger.info("板块通道：回退使用本机 StockLink.ini 的逐市场版本表")
         else:
-            logger.info("板块通道：使用本机 StockLink.ini 的逐市场版本表")
+            stocklink_ver = None
+            logger.info("板块通道：优先使用 ConfigVer=0 自行请求全量版本表")
         if constituent_side is None:
             stages = build_board_bootstrap_stages(
                 level2,

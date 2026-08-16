@@ -157,6 +157,28 @@ class ManagedConnection:
         return self._socket is not None
 
     @property
+    def is_alive(self) -> bool:
+        """Best-effort liveness probe for real TCP sockets.
+
+        Test doubles and other socket-like objects are treated as alive;
+        liveness enforcement is only meaningful for real market sockets.
+        """
+        sock = self._socket
+        if not isinstance(sock, socket.socket):
+            return True
+        try:
+            sock.setblocking(False)
+            try:
+                data = sock.recv(1, socket.MSG_PEEK)
+            finally:
+                sock.setblocking(True)
+            return data != b""
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
+    @property
     def socket(self) -> CloseableSocket | None:
         return self._socket
 

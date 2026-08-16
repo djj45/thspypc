@@ -116,3 +116,11 @@ lightweight-charts 是 **bar 等宽**模型（每个数据点占一个等宽列�
 ## .gitignore 修正
 
 根 `.gitignore` 的 `data/`（本意忽略顶层抓包目录）会匹配所有层级的 `data/`，误伤 `web/src/data/`。已改为 `/data/`（锚定根目录），语义不变。
+
+## 2026-08-17 运行态修复
+
+- `dev.sh` 对齐 `dev.bat`：前后端分别打开独立终端窗口，`--backend`/`--frontend`/`--check` 行为一致；macOS 用 Terminal `.command`，Windows Git Bash 用 cmd，无图形终端回退 `.dev-logs/`。
+- `SH_L2`/`SZ_L2` 预热连接增加 8901 心跳；连接管理器与 ConnectionFactory 增加真实 socket 存活探测，发现服务端 FIN 后自动重连，修复空闲后 4214 注册 `CodeListSize` 超时导致的 intraday 502。
+- 系统板块缓存：无本机 hexin 目录时首次自动从 `cloud.10jqka.com.cn` 全量下载 ZIP 到 `~/.thspypc/blockupdate`，之后每日后台检查版本；本机 `BlockUpdate` 仍优先。
+- 板块通道 StockLinkVer 策略调整：优先 `ConfigVer=0` 自行请求全量版本表；仅当该路径失败/零响应时，才回退本机 `StockLink.ini`。
+- 股票代码缓存格式 bump 到 version 2，Level2 全量代码表增加 `SH_L2` 的北交所 `151()` 查询，`920xxx` 等北交所股票名称可回填。

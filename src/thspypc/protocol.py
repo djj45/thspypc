@@ -605,9 +605,17 @@ ACCOUNT_TYPE = DEFAULT_LOGIN_PROTOCOL_PROFILE.account_type
 MAC64_HEADER = 0x18  # 固定头（= 24，表示后跟 24 字节 = 4×6 MAC）
 
 
-def _get_adapters_info():
-    """GetAdaptersInfo 公共封装，供 generate_mac64 / generate_imei 复用。"""
+def _get_adapters_info() -> list[bytes]:
+    """返回可用于 Mac64 / IMEI 的 6 字节 MAC 地址列表。
+
+    Windows 保持 GetAdaptersInfo 的顺序和过滤逻辑；非 Windows 平台从
+    ``ip link`` / ``ifconfig`` 读取物理地址，最后回退到 ``uuid.getnode()``。
+    """
     import ctypes
+    import os
+
+    if os.name != "nt":
+        return _get_unix_mac_addresses()
 
     class IP_ADAPTER_INFO(ctypes.Structure):
         pass
@@ -630,14 +638,66 @@ def _get_adapters_info():
     ret = iphlpapi.GetAdaptersInfo(buf, ctypes.byref(size))
     if ret != 0:
         raise OSError(f"GetAdaptersInfo 失败: error {ret}")
-    return ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_INFO)), IP_ADAPTER_INFO
+
+    ptr = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_INFO))
+    macs: list[bytes] = []
+    while ptr:
+        info = ptr.contents
+        if info.AddressLength == 6:
+            macs.append(bytes(info.Address[:6]))
+        ptr = info.Next
+    return macs
+
+
+def _parse_mac_text(text: str) -> bytes:
+    parts = text.replace("-", ":").split(":")
+    return bytes(int(part, 16) for part in parts)
+
+
+def _get_unix_mac_addresses() -> list[bytes]:
+    """非 Windows 下收集网卡 MAC；优先 ip/ifconfig，失败时回退 uuid。"""
+    import re
+    import shutil
+    import subprocess
+    import uuid
+
+    macs: list[bytes] = []
+
+    if shutil.which("ip"):
+        try:
+            proc = subprocess.run(
+                ["ip", "-o", "link"], capture_output=True, text=True, timeout=5
+            )
+            output = proc.stdout
+        except Exception:
+            output = ""
+        for text in re.findall(r"link/ether\s+([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", output):
+            macs.append(_parse_mac_text(text))
+
+    if not macs and shutil.which("ifconfig"):
+        try:
+            proc = subprocess.run(
+                ["ifconfig"], capture_output=True, text=True, timeout=5
+            )
+            output = proc.stdout
+        except Exception:
+            output = ""
+        for text in re.findall(r"(?:ether|HWaddr)\s+([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", output):
+            macs.append(_parse_mac_text(text))
+
+    if not macs:
+        node = uuid.getnode()
+        if node:
+            macs.append(node.to_bytes(6, "big"))
+
+    return macs
 
 
 def generate_mac64() -> str:
-    """用 GetAdaptersInfo 取前 4 个网卡 MAC，构造 login 帧的 Mac64 字段。
+    """取前 4 个网卡 MAC，构造 login 帧的 Mac64 字段。
 
-    返回 base64 字符串（与 hexin.exe 生成的一致）。
-    仅 Windows 可用（依赖 iphlpapi.dll）。
+    Windows 使用 GetAdaptersInfo（与 hexin.exe 一致）；非 Windows 使用
+    ip/ifconfig 或 uuid 回退。返回 base64 字符串。
 
     网卡不足 4 个时（如禁用了虚拟网卡/WiFi 断开），用已有 MAC 循环填充到 4 个，
     而非报错——Mac64 的 4 个槽位本质是固定长度填充物，服务器不强校验每个槽的
@@ -645,20 +705,13 @@ def generate_mac64() -> str:
     """
     import base64
 
-    ptr, _ = _get_adapters_info()
-    macs: list[bytes] = []
-    while ptr and len(macs) < 4:
-        info = ptr.contents
-        if info.AddressLength == 6:
-            macs.append(bytes(info.Address[:6]))
-        ptr = info.Next
-
+    macs = _get_adapters_info()
     if not macs:
-        raise RuntimeError("GetAdaptersInfo 未返回任何 6 字节 MAC 网卡，无法生成 Mac64")
+        raise RuntimeError("未找到任何 6 字节 MAC 网卡，无法生成 Mac64")
 
     # 不足 4 个时循环复用已有 MAC 补齐（保持 24 字节固定长度）
     while len(macs) < 4:
-        macs.append(macs[len(macs) % len(macs)] if macs else b"\x00" * 6)
+        macs.append(macs[len(macs) % len(macs)])
 
     raw = bytes([MAC64_HEADER]) + b"".join(macs[:4])
     return base64.b64encode(raw).decode()
@@ -689,22 +742,15 @@ def generate_imei() -> str:
     """生成同花顺 PC 版 mainverify 用的 imei 设备指纹（32 字符大写 hex）。
 
     算法：MD5( 第1个网卡MAC大写带连字符 + "0"*30 )，返回大写 hex。
-    仅 Windows 可用（依赖 iphlpapi.dll）。
+    Windows 使用 GetAdaptersInfo；非 Windows 使用 ip/ifconfig 或 uuid 回退。
     """
     import hashlib
 
-    ptr, _ = _get_adapters_info()
-    mac_str: str | None = None
-    while ptr:
-        info = ptr.contents
-        if info.AddressLength == 6:
-            mac_bytes = bytes(info.Address[:6])
-            mac_str = "-".join(f"{b:02X}" for b in mac_bytes)
-            break
-        ptr = info.Next
-    if mac_str is None:
+    macs = _get_adapters_info()
+    if not macs:
         raise RuntimeError("找不到 MAC 地址（无 AddressLength==6 的网卡）")
 
+    mac_str = "-".join(f"{b:02X}" for b in macs[0])
     payload = (mac_str + IMEI_BIOS_FALLBACK).encode("ascii")
     return hashlib.md5(payload).hexdigest().upper()
 

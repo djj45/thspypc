@@ -425,14 +425,19 @@ def _profile_level2():
     )
 
 
-def test_full_list_level2_merges_sz_table(monkeypatch):
+def test_full_list_level2_merges_sz_and_bse_tables(monkeypatch):
     main_sock = FakeSocket()
     sz_sock = FakeSocket()
+    sh_sock = FakeSocket()
     opened = []
 
     def opener(spec):
         opened.append(spec.role)
-        return sz_sock if spec.role is ConnectionRole.SZ_L2 else main_sock
+        if spec.role is ConnectionRole.SZ_L2:
+            return sz_sock
+        if spec.role is ConnectionRole.SH_L2:
+            return sh_sock
+        return main_sock
 
     manager = ConnectionManager(_profile_level2(), opener)
     recorder = AccountEvidenceRecorder()
@@ -447,6 +452,16 @@ def test_full_list_level2_merges_sz_table(monkeypatch):
                 "server_info": {},
                 "hd31_frames": [
                     {"pos": 0, "dc": 3274, "unk": 0x18, "hs": 71, "fc": 2}
+                ],
+            }
+        if body == b"bse-full-table":
+            return {
+                "stocks": [
+                    {"code": "920083", "name": "", "market": 0},
+                ],
+                "server_info": {},
+                "hd31_frames": [
+                    {"pos": 0, "dc": 335, "unk": 0x18, "hs": 71, "fc": 2}
                 ],
             }
         return {
@@ -467,7 +482,11 @@ def test_full_list_level2_merges_sz_table(monkeypatch):
     service = StockListService(
         manager,
         frame_reader=lambda sock: (
-            b"sz-full-table" if sock is sz_sock else b"main-full-table"
+            b"sz-full-table"
+            if sock is sz_sock
+            else b"bse-full-table"
+            if sock is sh_sock
+            else b"main-full-table"
         ),
         sleep=lambda _delay: None,
         evidence=recorder,
@@ -475,9 +494,12 @@ def test_full_list_level2_merges_sz_table(monkeypatch):
 
     result = service.full_list(settle_timeout=0)
 
-    assert [item["code"] for item in result] == ["600000", "000001", "300846"]
-    assert opened == [ConnectionRole.MAIN, ConnectionRole.SZ_L2]
+    assert [item["code"] for item in result] == [
+        "600000", "000001", "300846", "920083",
+    ]
+    assert opened == [ConnectionRole.MAIN, ConnectionRole.SZ_L2, ConnectionRole.SH_L2]
     assert b"CodeList=32();33();" in sz_sock.sent[0]
+    assert b"CodeList=151();" in sh_sock.sent[0]
     assert recorder.profile().supports(Capability.L2_MARKET_ACCESS)
 
 

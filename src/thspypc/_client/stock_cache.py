@@ -9,6 +9,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# 缓存格式版本：股票表增加北交所全量后 bump；旧格式读取时视为过期，
+# 下一次 /api/stocks2 会自动全量刷新并写回新格式。
+CACHE_VERSION = 2
+
 
 def default_stock_cache_path() -> str:
     """股票代码表缓存的默认路径（用户 home 目录，跨平台）。"""
@@ -68,6 +72,7 @@ def save_stock_codes(stocks: list[dict], path: str | None = None) -> str:
             "market": market_from_code(code),
         })
     data = {
+        "version": CACHE_VERSION,
         "saved_date": datetime.date.today().isoformat(),
         "saved_at": int(time.time()),
         "count": len(records),
@@ -100,6 +105,12 @@ def load_stock_codes(
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+            logger.info(
+                "股票代码表缓存版本过旧（version=%s），忽略并重新拉取",
+                data.get("version") if isinstance(data, dict) else None,
+            )
+            return None
         saved_date = data["saved_date"]
         stocks = data["stocks"]
     except (json.JSONDecodeError, KeyError, TypeError) as e:

@@ -475,8 +475,9 @@ class StockListService:
         Level2 账号的深市代码表不在 MAIN：MAIN 全量表只覆盖沪系市场
         （16/17/19/20/144-151；2026-08-14 实测 26356 行、无 00/30x 代码）。
         深市表需在 SZ_L2（szlv2）上用同一 DataType=[5],[55] 查询再取一次
-        （市场码 32/33；实测单帧 3274 行，覆盖全部深市 A 股），合并返回。
-        重放模式（replay_segments）保持 MAIN 单路，不复用抓包字节打 SZ。
+        （市场码 32/33；实测单帧 3274 行，覆盖全部深市 A 股）；北交所个股
+        （151）Level2 走 SH_L2（shlv2，与报价/分时/K线同通道），单独查一次
+        后合并。重放模式（replay_segments）保持 MAIN 单路，不复用抓包字节打 SZ/BSE。
         """
         stocks = self._full_list_on(
             ConnectionRole.MAIN,
@@ -545,6 +546,35 @@ class StockListService:
                         self._evidence.record_l2_init(Support.YES)
                     merged = {stock["code"]: stock for stock in stocks}
                     for stock in sz_stocks:
+                        merged.setdefault(stock["code"], stock)
+                    stocks = list(merged.values())
+
+            # Level2 北交所 151 与报价/分时/K线一致走 shlv2；MAIN 的
+            # 全量表不返回完整北交所代码，前端名称映射因此缺 920xxx。
+            try:
+                bse_stocks = self._full_list_on(
+                    ConnectionRole.SH_L2,
+                    (151,),
+                    capability=Capability.L2_MARKET_ACCESS,
+                    timeout=timeout,
+                    replay_delay=replay_delay,
+                    settle_timeout=settle_timeout,
+                    full_frame_min_dc=0,
+                )
+            except (
+                CapabilityUnavailableError,
+                UnsupportedAccountFeatureError,
+                ChannelUnavailableError,
+                ProtocolError,
+            ) as exc:
+                logger.warning(
+                    "full_list: SH_L2 北交所(151)代码表不可用，仅返回沪深: %s",
+                    exc,
+                )
+            else:
+                if bse_stocks:
+                    merged = {stock["code"]: stock for stock in stocks}
+                    for stock in bse_stocks:
                         merged.setdefault(stock["code"], stock)
                     stocks = list(merged.values())
         if self._evidence is not None and stocks:

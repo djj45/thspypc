@@ -1356,8 +1356,8 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         数据源为本机 hexin 安装目录的 ``BlockUpdate/block_*.ini`` 与
         ``industry.ini``（本地 block_hq 缓存域），不依赖登录、不走 8901。
         目录探测：``$THS_HEXIN_DIR`` → 常见安装路径（如
-        ``D:\\同花顺软件\\同花顺``）。未找到时抛
-        :class:`thspypc.services.system_blocks.SystemBlocksError`。
+        ``D:\\同花顺软件\\同花顺``）。未找到时自动从
+        ``cloud.10jqka.com.cn`` 全量下载板块 ZIP 到用户缓存目录。
         """
         if self._system_blocks is None:
             from .services.system_blocks import SystemBlocksService

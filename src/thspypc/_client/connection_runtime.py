@@ -20,6 +20,23 @@ from ..transport import ConnectionRole, OpenedConnection
 logger = logging.getLogger(__name__)
 
 
+def _real_socket_alive(sock: Any) -> bool:
+    """Probe a real TCP socket without consuming data; doubles count as alive."""
+    if not isinstance(sock, socket.socket):
+        return True
+    try:
+        sock.setblocking(False)
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+        finally:
+            sock.setblocking(True)
+        return data != b""
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
 class ConnectionFactory:
     """Create authenticated, initialized sockets for service connection roles."""
 
@@ -149,6 +166,20 @@ class ConnectionFactory:
             with self._push_lock:
                 current = self._push_sockets.get(key)
                 initialized = key in self._push_initialized
+            if current is not None and not _real_socket_alive(current):
+                logger.warning(
+                    "L2[%s] 预热 socket 已被服务端关闭，丢弃并重建", key
+                )
+                with self._push_lock:
+                    if self._push_sockets.get(key) is current:
+                        self._push_sockets.pop(key, None)
+                        self._push_initialized.discard(key)
+                try:
+                    current.close()
+                except OSError:
+                    pass
+                current = None
+                initialized = False
             if current is None:
                 # 一个 Passport64 在首次成功登录后即视为已消费。MAIN、SH_L2、
                 # SZ_L2 每条新 socket 都使用独立的新一代通行证；刷新 HTTP 鉴权
@@ -289,6 +320,7 @@ class ConnectionRuntime:
         self.heartbeat_seq_main = 0
         self.heartbeat_seq_realorder = 0
         self.heartbeat_seq_board_stats = 0
+        self.heartbeat_seq_push: dict[str, int] = {}
         self.snapshot_thread: threading.Thread | None = None
         self.snapshot_stop = threading.Event()
         self.snapshot_codes: set[str] = set()
@@ -572,6 +604,44 @@ class ConnectionRuntime:
                             "KLINE_FAST heartbeat failed: %s",
                             exc,
                         )
+            # 预热出来的 SH_L2/SZ_L2 也是裸 socket，之前没有心跳，服务器会
+            # 在空闲几十秒后主动 FIN；业务再使用时 4214 注册自然拿不到
+            # CodeListSize。现在与 MAIN/KLINE 一样每 3 秒保活，并检测死连接。
+            dead_l2: list[tuple[str, Any]] = []
+            for key, role in (
+                ("sh", ConnectionRole.SH_L2),
+                ("sz", ConnectionRole.SZ_L2),
+            ):
+                with self._push_lock:
+                    sock = self._push_sockets.get(key)
+                if sock is None:
+                    continue
+                if not _real_socket_alive(sock):
+                    dead_l2.append((key, sock))
+                    continue
+                seq = self.heartbeat_seq_push.get(key, 0) + 1
+                self.heartbeat_seq_push[key] = seq
+                try:
+                    with self._push_request_locks[key]:
+                        sock.sendall(build_main(seq) + b"\n")
+                except OSError as exc:
+                    logger.debug("L2[%s] 心跳发送失败：%s", key, exc)
+                    dead_l2.append((key, sock))
+            for key, sock in dead_l2:
+                with self._push_lock:
+                    if self._push_sockets.get(key) is sock:
+                        self._push_sockets.pop(key, None)
+                        self._push_initialized.discard(key)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                if manager is not None:
+                    manager.close(
+                        ConnectionRole.SH_L2
+                        if key == "sh"
+                        else ConnectionRole.SZ_L2
+                    )
             if tick % 10 == 0 and self._realorder_socket():
                 try:
                     self.heartbeat_seq_realorder += 1

@@ -1,6 +1,7 @@
 """单用户 THS 运行态：持有唯一 THSClient 并协调连接生命周期。"""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -9,6 +10,8 @@ from pathlib import Path
 
 from ..client import THSClient, LoginResult
 from .._transport.timing import add_request_timing
+
+logger = logging.getLogger(__name__)
 
 
 def load_env(path: str | Path | None = None) -> dict[str, str]:
@@ -172,18 +175,60 @@ class ThsRuntime:
             thread.start()
             return True
 
+    def _connect_with_retry(self, client: THSClient) -> LoginResult:
+        """登录 MAIN；all_hosts_failed 时等待后重试（服务器会话释放需要时间）。
+
+        首次失败后不立刻连打同一批 IP。常见触发场景：旧后端刚被关闭，
+        服务端还挂着旧会话，立即重启会让所有 8901 IP 直接关闭新登录连接。
+        等待一段时间再重试可显著降低“账号被临时限制”后反复撞墙的概率。
+
+        连接动作始终在 ``_lifecycle_lock`` 内执行（与其他首次登录调用互斥），
+        等待重试时释放锁，避免阻塞并发的 /api/status 或业务请求。
+        """
+        # 不要连续多轮轰炸：all_hosts_failed 通常是服务端会话限制，
+        # 等 30 秒再试一次；仍失败就交由后续 API 调用按需重连。
+        delays = (0.0, 30.0)
+        last: LoginResult | None = None
+        for attempt, delay in enumerate(delays):
+            if delay > 0:
+                logger.warning(
+                    "MAIN 登录失败，%d 秒后重试（第 %d 次）...",
+                    int(delay), attempt + 1,
+                )
+                time.sleep(delay)
+            with self._lifecycle_lock:
+                if self._connected_once:
+                    return LoginResult(
+                        success=True,
+                        error="already_connected",
+                        server=str(getattr(client, "_connected_ip", "") or ""),
+                    )
+                last = client.connect()
+                if last.success:
+                    self._connected_once = True
+            if last.success:
+                return last
+            if getattr(last, "error", "") != "all_hosts_failed":
+                return last
+        if last is not None:
+            return last
+        return LoginResult(
+            success=False,
+            error="all_hosts_failed",
+            detail="unknown login failure",
+        )
+
     def _preheat_worker(self) -> None:
         started = time.perf_counter()
         try:
             with self._lifecycle_lock:
                 client = self._get_client()
-                if not self._connected_once:
-                    result = client.connect()
-                    if not result.success:
-                        raise RuntimeError(
-                            f"登录失败: {getattr(result, 'error', '?')}"
-                        )
-                    self._connected_once = True
+            if not self._connected_once:
+                result = self._connect_with_retry(client)
+                if not result.success:
+                    raise RuntimeError(
+                        f"登录失败: {getattr(result, 'error', '?')}"
+                    )
             preheat = getattr(client, "preheat_service_connections", None)
             if preheat is None:
                 preheat = getattr(client, "preheat_l2_connections", None)

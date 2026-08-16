@@ -1,7 +1,8 @@
 """系统板块只读服务（行业/概念/地域/港股…）。
 
 数据源为 hexin PC 安装目录下的 ``BlockUpdate/block_*.ini`` 与
-``industry.ini``（本地 block_hq 缓存域），**不依赖登录、不走 8901**。
+``industry.ini``（本地 block_hq 缓存域）；本机没有 hexin 目录时，首次使用
+会自动从 ``cloud.10jqka.com.cn`` 全量下载板块 ZIP 到用户缓存目录。
 
 定位与约束（对齐 FEATURE_GAP_ROADMAP P0）：
 
@@ -18,7 +19,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
+import threading
 import time
 import datetime as dt
 from collections.abc import Callable
@@ -122,6 +125,221 @@ def default_hexin_dir() -> str | None:
     return None
 
 
+_BLOCKUPDATE_CACHE_DIR = os.path.join(
+    os.path.expanduser("~"), ".thspypc", "blockupdate"
+)
+_BLOCKUPDATE_LOCK = threading.Lock()
+_BLOCKUPDATE_REFRESH_RUNNING = False
+_BLOCK_FILE_RE = re.compile(r"^block_[0-9A-F]+\.ini$", re.IGNORECASE)
+
+
+def _blockupdate_has_files(block_update_dir: str) -> bool:
+    """目录中至少存在一个云同步包会提供的 block_*.ini。"""
+    try:
+        names = os.listdir(block_update_dir)
+    except OSError:
+        return False
+    return any(_BLOCK_FILE_RE.match(name) for name in names)
+
+
+def _synthesize_block_tree(block_update_dir: str) -> None:
+    """缓存目录缺少 block_tree.ini 时生成扁平板块树兜底。
+
+    当前云 ZIP 已包含 ``block_tree.ini``；此函数仅用于旧缓存/手工缓存目录
+    只有 ``block_*.ini`` 的场景。扁平树把所有文件作为根分类，足以支撑
+    分类发现和名称映射。
+    """
+    tree_path = os.path.join(block_update_dir, "block_tree.ini")
+    if os.path.exists(tree_path):
+        return
+    file_ids = sorted(
+        name[6:-4]
+        for name in os.listdir(block_update_dir)
+        if _BLOCK_FILE_RE.match(name)
+    )
+    lines = [
+        "[ConfigInfo]",
+        "ConfigName=stockblock_cloud",
+        "ConfigVer=0",
+        "",
+        "[BLOCK_TREE_ROOT]",
+        "1=@10001",
+        "",
+        "[@10001]",
+    ]
+    lines.extend(f"{file_id}={idx + 1}" for idx, file_id in enumerate(file_ids))
+    Path(tree_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _install_cloud_block_zip(zip_bytes: bytes, block_update_dir: str) -> None:
+    """解压 cloud.10jqka.com.cn 的系统板块 ZIP 到缓存目录。"""
+    import io
+    import zipfile
+
+    from ..features import blockupdate_cloud as cloud
+
+    manifest = cloud.parse_block_zip(zip_bytes)
+    if not manifest.files:
+        raise SystemBlocksError("系统板块云同步 ZIP 中没有 block_*.ini")
+
+    os.makedirs(block_update_dir, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(manifest.raw)) as zf:
+        for entry in manifest.files:
+            name = os.path.basename(entry.name)
+            if name != "block_tree.ini" and not _BLOCK_FILE_RE.match(name):
+                raise SystemBlocksError(f"系统板块云同步包含异常文件名: {entry.name}")
+            data = zf.read(entry.name)
+            tmp_path = os.path.join(block_update_dir, name + ".tmp")
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, os.path.join(block_update_dir, name))
+
+    entries_dir = os.path.join(block_update_dir, "__base_")
+    os.makedirs(entries_dir, exist_ok=True)
+    Path(os.path.join(entries_dir, "_entries")).write_text(
+        cloud.build_entries_text(manifest), encoding="utf-8"
+    )
+    _synthesize_block_tree(block_update_dir)
+    logger.info(
+        "系统板块云同步完成：%s（version=%s, files=%d）",
+        block_update_dir, manifest.max_version, len(manifest.files),
+    )
+
+
+def _bundled_blockupdate_dir() -> str | None:
+    """仓库内置的 BlockUpdate 基线（仅本仓库开发环境可用）。"""
+    repo_root = Path(__file__).resolve().parents[3]
+    bundled = repo_root / "tests" / "fixtures" / "blockupdate" / "204655"
+    return str(bundled) if bundled.is_dir() else None
+
+
+def _blockupdate_entries_dir(block_update_dir: str) -> str:
+    return os.path.join(block_update_dir, "__base_")
+
+
+def _blockupdate_checked_marker(block_update_dir: str) -> str:
+    return os.path.join(_blockupdate_entries_dir(block_update_dir), "_last_checked")
+
+
+def _blockupdate_checked_today(block_update_dir: str) -> bool:
+    """板块云同步是否今天已检查过（与股票缓存同样的自然日策略）。"""
+    marker = _blockupdate_checked_marker(block_update_dir)
+    try:
+        written = dt.date.fromtimestamp(os.path.getmtime(marker))
+    except OSError:
+        return False
+    return written == dt.date.today()
+
+
+def _mark_blockupdate_checked(block_update_dir: str) -> None:
+    try:
+        entries_dir = _blockupdate_entries_dir(block_update_dir)
+        os.makedirs(entries_dir, exist_ok=True)
+        Path(_blockupdate_checked_marker(block_update_dir)).write_text(
+            dt.date.today().isoformat(), encoding="ascii"
+        )
+    except OSError as exc:
+        logger.debug("无法写入板块更新检查标记：%s", exc)
+
+
+def _local_blockupdate_version(block_update_dir: str) -> int:
+    """读取 __base_/_entries 的 system.version，读不到按 0 触发全量。"""
+    entries_path = os.path.join(_blockupdate_entries_dir(block_update_dir), "_entries")
+    try:
+        text = Path(entries_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("version="):
+            try:
+                return int(line.split("=", 1)[1])
+            except ValueError:
+                return 0
+    return 0
+
+
+def _refresh_cloud_blockupdate_cache(block_update_dir: str) -> bool:
+    """按本地版本请求云 ZIP；无更新返回 True，失败时保留旧缓存。"""
+    from ..features import blockupdate_cloud as cloud
+
+    version = _local_blockupdate_version(block_update_dir)
+    try:
+        zip_bytes = cloud.fetch_block_zip(version, timeout=15)
+        _install_cloud_block_zip(zip_bytes, block_update_dir)
+    except cloud.BlockCloudUpToDate:
+        logger.info("系统板块缓存已是最新（version=%s）", version)
+    except Exception as exc:
+        logger.warning("系统板块云更新失败，继续使用本地缓存：%s", exc)
+        return False
+    _mark_blockupdate_checked(block_update_dir)
+    return True
+
+
+def _start_background_blockupdate_refresh(cache_dir: str) -> None:
+    """把每日版本检查放到后台，避免首个 /api/boards 阻塞在云请求上。"""
+    global _BLOCKUPDATE_REFRESH_RUNNING
+    if _BLOCKUPDATE_REFRESH_RUNNING:
+        return
+    _BLOCKUPDATE_REFRESH_RUNNING = True
+
+    def run() -> None:
+        global _BLOCKUPDATE_REFRESH_RUNNING
+        try:
+            # 先让当前进程用旧缓存完成首屏加载，再开始网络检查。
+            time.sleep(0.5)
+            _refresh_cloud_blockupdate_cache(cache_dir)
+        finally:
+            _BLOCKUPDATE_REFRESH_RUNNING = False
+
+    threading.Thread(
+        target=run,
+        name="ths-blockupdate-refresh",
+        daemon=True,
+    ).start()
+
+
+def _ensure_cloud_blockupdate_cache() -> str:
+    """首次使用全量拉取板块 ZIP，之后按自然日在后台做版本检查更新。"""
+    cache_dir = os.environ.get(
+        "THS_BLOCKUPDATE_CACHE_DIR", _BLOCKUPDATE_CACHE_DIR
+    )
+    with _BLOCKUPDATE_LOCK:
+        if _blockupdate_has_files(cache_dir):
+            _synthesize_block_tree(cache_dir)
+            if not _blockupdate_checked_today(cache_dir):
+                _start_background_blockupdate_refresh(cache_dir)
+            return cache_dir
+        try:
+            from ..features import blockupdate_cloud as cloud
+
+            zip_bytes = cloud.fetch_block_zip(0, timeout=15)
+            _install_cloud_block_zip(zip_bytes, cache_dir)
+            _mark_blockupdate_checked(cache_dir)
+            return cache_dir
+        except Exception as exc:
+            bundled = _bundled_blockupdate_dir()
+            if bundled is not None and _blockupdate_has_files(bundled):
+                logger.warning(
+                    "系统板块云同步失败，回退到仓库内置基线 %s（%s）",
+                    bundled, exc,
+                )
+                return bundled
+            raise SystemBlocksError(
+                "未找到本地 BlockUpdate，且系统板块云同步失败："
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+
+def _resolve_blockupdate_dir(local_hexin: str | None) -> str:
+    """按本地 hexin 目录优先，缺失时回退到云同步缓存。"""
+    if local_hexin:
+        candidate = os.path.join(local_hexin, "BlockUpdate")
+        if os.path.isdir(candidate) and _blockupdate_has_files(candidate):
+            return candidate
+    return _ensure_cloud_blockupdate_cache()
+
+
 class SystemBlocksService:
     """系统板块只读服务，进程内按需加载并缓存解析结果。"""
 
@@ -131,14 +349,12 @@ class SystemBlocksService:
         *,
         block_update_dir: str | None = None,
     ) -> None:
+        local_hexin = hexin_dir or default_hexin_dir()
         if block_update_dir is None:
-            hexin_dir = hexin_dir or default_hexin_dir()
-            if hexin_dir is None:
-                raise SystemBlocksError(
-                    "未找到 hexin 安装目录：设置 THS_HEXIN_DIR 或传 hexin_dir"
-                )
-            block_update_dir = os.path.join(hexin_dir, "BlockUpdate")
-        self._hexin_dir = hexin_dir
+            block_update_dir = os.environ.get("THS_BLOCKUPDATE_DIR") or None
+        if block_update_dir is None:
+            block_update_dir = _resolve_blockupdate_dir(local_hexin)
+        self._hexin_dir = local_hexin
         self._block_update_dir = block_update_dir
         self._industry: tuple[dict[str, str], dict[str, tuple[str, ...]]] | None = None
         self._tree: dict[str, dict[str, str]] | None = None

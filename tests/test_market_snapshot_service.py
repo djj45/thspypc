@@ -133,6 +133,8 @@ def test_snapshot_success_records_main_evidence():
 
 
 def test_captured_hfd1_snapshot_contract():
+    if not FIXTURE.exists():
+        pytest.skip("optional captured hfd1_0_response.bin is unavailable")
     sock = FakeSocket()
     manager = ConnectionManager(
         _profile(AccountKind.STANDARD),

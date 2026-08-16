@@ -359,9 +359,12 @@ sz = [s["code"] for s in stocks if s["market"] == 33]   # 深市，直接喂 lis
 
 **缓存细节**：
 - 路径 `~/.ths_stock_codes.json`（见 `default_stock_cache_path`），JSON 格式
+- 缓存格式带 `version` 字段；旧格式会被忽略并自动全量刷新
 - 失效口径：**按自然日**——写入的日期与查询日不同即失效（隔夜自动刷新）
-- 仅在拉取到有效结果（非空）时写盘，避免失败拉取被缓存一整天
+- 仅在拉取到有效结果（非空且名称覆盖足够）时写盘，避免失败拉取被缓存一整天
 - 缓存与账号无关（全市场代码表共享一个文件），换账号无需清缓存
+- Level2 账号会额外从 `SH_L2`（shlv2）拉取北交所 `151()` 代码表，合并后
+  `920xxx` / `43xxxx` / `83xxxx` / `87xxxx` 等北交所代码会带名称
 
 底层缓存函数（无需登录即可独立使用）：`save_stock_codes` / `load_stock_codes` /
 `is_stock_cache_expired` / `market_from_code` / `default_stock_cache_path`。
@@ -653,6 +656,32 @@ uv sync
 # 二维码登录额外需要（终端渲染，非必需）：
 uv pip install qrcode
 ```
+
+## 看盘前端一键启动
+
+仓库根目录提供两个启动脚本：
+
+```bash
+dev.bat   # Windows cmd
+./dev.sh  # macOS / Linux / Git Bash
+```
+
+两者行为对齐：
+
+- 检查 Python 3.14 与后端依赖、pnpm 与 `web/node_modules`；
+- 若 8765 端口已有旧后端，自动停止后重启；
+- 分别打开后端和前端两个终端窗口，日志分离；
+- `--backend` / `--frontend` 可只启动一侧，`--check` 只检查依赖。
+
+`dev.sh` 在 macOS 上使用 Terminal 窗口，Windows Git Bash 使用 cmd 窗口，
+无图形终端时回退到 `.dev-logs/` 日志文件。
+
+首次启动会自动：
+
+- `pnpm install`（如缺少 `web/node_modules`）；
+- 全量拉取股票代码表并写入 `~/.ths_stock_codes.json`（自然日缓存）；
+- 从 `cloud.10jqka.com.cn` 下载系统板块 ZIP 到 `~/.thspypc/blockupdate`
+  （之后每日在后台检查更新）。
 
 ## 项目结构
 
