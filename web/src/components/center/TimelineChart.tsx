@@ -7,17 +7,21 @@ import type { TimelinePoint } from '../../types'
 type IntradayPoint = TimelinePoint & { phase?: string; time?: string }
 
 // 真实时刻 -> 交易分钟 x（午休压缩）。
-// 早盘竞价 9:15-9:25 -> -15..-5；盘中 9:30-11:29 -> 0..119；
+// 早盘竞价 9:15-9:25 拉伸到 -15..-1（贴着 9:30 开盘段，跳过 9:25-9:30
+// 撮合空档，与同花顺一致）；盘中 9:30-11:29 -> 0..119；
 // 下午 13:00-14:56 -> 120..236；尾盘竞价 14:57-15:00 -> 237..240。
 function timeToX(iso?: string): number | null {
   if (!iso) return null
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return null
   const mins = d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60
-  if (mins < 570) return mins - 570
+  if (mins < 570) {
+    const t = Math.min(Math.max((mins - 555) / 10, 0), 1)
+    return -15 + t * 14
+  }
   if (mins <= 690) return mins - 570
   if (mins < 780) return 120
-  return mins - 660
+  return Math.min(mins - 660, 240)
 }
 
 function xToLabel(v: number): string {
@@ -82,8 +86,12 @@ export function TimelineChart() {
       grid: { left: 54, right: 10, top: 10, bottom: 26 },
       xAxis: {
         type: 'value',
-        min: -17,
-        max: 243,
+        // 数据范围即轴范围（-15=9:15 竞价首点，240=15:00），并固定刻度
+        // 间隔：显式 min/max 下 ECharts 会按 (max-min)/splitNumber 均分，
+        // 把 -17/243 之类的边界也打成标签（曾显示 09:13/15:03）。
+        min: -15,
+        max: 240,
+        interval: 60,
         axisLabel: {
           color: '#888',
           fontSize: 10,

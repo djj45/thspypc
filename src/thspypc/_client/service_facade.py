@@ -560,9 +560,9 @@ class ServiceFacade:
             logger.warning("stock_quote_fields: 封单额表拉取失败: %s", exc)
             return cache[1] if cache else {}
         table = {
-            str(r.get("code")): r.get("dt44")
+            str(r.get("code")): r["dt44"]
             for r in ranked
-            if r.get("dt44") is not None
+            if r.get("dt44")
         }
         self.__dict__["_seal_cache"] = (now, table)
         logger.info("封单额表已刷新: %d 只", len(table))
@@ -1801,9 +1801,10 @@ class ServiceFacade:
         全市场约 2899 只参与，非涨停股封单额为 0 排在末尾。
         dt200/dt150/dt44 经 ``tests/verify_sort_values_online.py`` 活网验证。
 
-        ⚠ 成交量/成交额**不能**通过本方法拿——它们不走 SortBy 路径，而是客户端
-        订阅行情推送（dt13/dt19）后本地排序。详见
-        docs/handoffs/HANDOFF_STOCKLIST_PUSH.md。
+        成交额榜 ``sort_by=19``（响应 dt19 元）/成交量榜 ``sort_by=13``（dt13 股）
+        于 2026-08-19 在 L2 排序路径活网验证可用。旧结论"成交量/成交额不能
+        SortBy"仅适用于早期普通账号观察（客户端确实也用推送本地排，见
+        docs/handoffs/HANDOFF_STOCKLIST_PUSH.md），L2 服务端排序本身支持。
 
         翻页机制（2026-07-23 抓包确认）：SortBegin 是游标（首次 0，翻页递增到
         已加载位置），每页 59 条（SortCount 恒 59）。``count`` 是想要的总条数，
