@@ -58,6 +58,8 @@ export function RankPanel() {
       speed4m: r.dt48 ?? q?.speed_4m ?? undefined,
       // 主力净额直查 0xc4 金额表（元）；排序响应的 dt250 今日不可靠
       mainInflow: q?.main_inflow ?? undefined,
+      // 封单额：排序时由排序值覆盖，平时走 265260 排序榜缓存
+      sealAmount: q?.seal_amount ?? undefined,
     }
     // 排序值本身就是该列的真值（服务端排序口径），有值时优先。
     // 主力列例外：592890 排序响应今日回 dt44（封单额），不再采信 r.value。

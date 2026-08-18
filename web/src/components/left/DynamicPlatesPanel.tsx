@@ -36,6 +36,7 @@ export function DynamicPlatesPanel() {
       amount: q?.amount ?? undefined,
       speed4m: q?.speed_4m ?? undefined,
       mainInflow: q?.main_inflow ?? undefined,
+      sealAmount: q?.seal_amount ?? undefined,
     }
   })
 

@@ -437,7 +437,8 @@ class ServiceFacade:
         2. 0xc4 金额表（pageid=1334 + ``MONEY_QUOTE_DATATYPE``，2026-08-18
            逆向）→ 主力净额 dt250(元)/DDE 主力 dt248(亿)/总市值 dt202(元)，
            失败仅记 warning 不影响基础列。
-        封单额不在两表（走排序榜 sort_by=265260）。
+        封单额 dt44 不在两表（客户端走 type-02 订阅式按列刷新，未逆向）；
+        由 265260 全量排序榜的 60s 缓存补全（``_seal_table``）。
 
         Args:
             codes: 股票代码列表（市场按前缀自动推断）。
@@ -447,7 +448,7 @@ class ServiceFacade:
         Returns:
             list[dict]，每项 ``{code, price, chg_pct, auction_chg_pct,
             auction_amount, amount, speed_4m, main_inflow, dde_main,
-            market_cap}``，停牌/缺昨收的派生列为 None。
+            market_cap, seal_amount}``，停牌/缺昨收的派生列为 None。
             单批失败跳过（记 warning），不影响其他批次。
         """
         if not codes:
@@ -526,7 +527,46 @@ class ServiceFacade:
                             rows[code][key] = money[key]
                     if rows[code].get("amount") is None and money.get("amount") is not None:
                         rows[code]["amount"] = money["amount"]
+
+        # 封单额：0xc4 金额表无 dt44，客户端走 type-02 订阅式按列刷新
+        # （未逆向）；用已验证的 265260 全量排序榜做 TTL 缓存补全
+        # （L2 SortCount 放大 ~0.1s，仅约 2899 只涨停/停牌参与股有值）。
+        seal_map = self._seal_table()
+        if seal_map:
+            for code in rows:
+                seal = seal_map.get(code)
+                if seal is not None:
+                    rows[code]["seal_amount"] = seal
         return [rows[code] for code in codes if code in rows]
+
+    _SEAL_TTL = 60.0
+
+    def _seal_table(self) -> dict[str, float]:
+        """code→dt44(封单额,元) 全市场表，60s 缓存；失败返回上次结果或空。"""
+        import time
+
+        now = time.monotonic()
+        cache = self.__dict__.get("_seal_cache")
+        if cache and now - cache[0] < self._SEAL_TTL:
+            return cache[1]
+        try:
+            ranked = self.stock_list_hot(
+                count=5400,
+                sort_by=265260,
+                sort_dir="D",
+                with_values=True,
+            )
+        except (ProtocolError, OSError, RuntimeError) as exc:
+            logger.warning("stock_quote_fields: 封单额表拉取失败: %s", exc)
+            return cache[1] if cache else {}
+        table = {
+            str(r.get("code")): r.get("dt44")
+            for r in ranked
+            if r.get("dt44") is not None
+        }
+        self.__dict__["_seal_cache"] = (now, table)
+        logger.info("封单额表已刷新: %d 只", len(table))
+        return table
 
     def depth_quote(
         self,

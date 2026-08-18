@@ -209,7 +209,8 @@ export const SORT_BY_DT: Record<number, string> = {
 }
 
 // 统一列表字段（/api/quotes_ext）：涨幅/竞价列由后端从 dt6/7/10/17 派生，
-// 主力/DDE/市值来自 0xc4 金额表（dt250 元 / dt248 亿 / dt202 元）。
+// 主力/DDE/市值来自 0xc4 金额表（dt250 元 / dt248 亿 / dt202 元），
+// 封单额来自 265260 排序榜缓存（dt44 元）。
 export interface QuoteExt {
   code: string
   price: number | null
@@ -221,4 +222,5 @@ export interface QuoteExt {
   main_inflow: number | null
   dde_main: number | null
   market_cap: number | null
+  seal_amount: number | null
 }
