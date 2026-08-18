@@ -15,26 +15,14 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ..transport import ConnectionRole, OpenedConnection
+from ..transport import ConnectionRole, OpenedConnection, probe_socket_alive
 
 logger = logging.getLogger(__name__)
 
 
 def _real_socket_alive(sock: Any) -> bool:
     """Probe a real TCP socket without consuming data; doubles count as alive."""
-    if not isinstance(sock, socket.socket):
-        return True
-    try:
-        sock.setblocking(False)
-        try:
-            data = sock.recv(1, socket.MSG_PEEK)
-        finally:
-            sock.setblocking(True)
-        return data != b""
-    except BlockingIOError:
-        return True
-    except OSError:
-        return False
+    return probe_socket_alive(sock)
 
 
 class ConnectionFactory:

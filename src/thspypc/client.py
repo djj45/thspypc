@@ -34,6 +34,7 @@ from .transport import (
     ConnectionRole,
     MarketSession,
     OpenedConnection,
+    probe_socket_alive,
 )
 from .protocol import (
     MARKET_HOSTS,
@@ -972,20 +973,9 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             sock = self._sock
             if sock is None:
                 return False
-            try:
-                # 设非阻塞探测；MSG_PEEK 不消费缓冲区数据
-                sock.setblocking(False)
-                try:
-                    data = sock.recv(1, socket.MSG_PEEK)
-                finally:
-                    sock.setblocking(True)
-                # 有数据=活着且待读；空 b""=对端 FIN
-                return data != b""
-            except BlockingIOError:
-                # 无数据可读=连接仍开着（最常见情况）
-                return True
-            except OSError:
-                return False
+            # 非破坏式探活：MSG_PEEK 不消费数据，且保留并发业务读正在
+            # 使用的读超时（见 transport.connection.probe_socket_alive）。
+            return probe_socket_alive(sock)
 
     def ensure_connected(self) -> bool:
         """查询前的健康检查：确认 8901 主连接仍可用。

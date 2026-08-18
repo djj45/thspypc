@@ -385,20 +385,148 @@ class ServiceFacade:
         self._ensure_main_connection()
         from ..errors import ProtocolError
 
-        try:
-            return self._run_default_service(
-                (Capability.BASIC_QUOTE,),
-                lambda: self._quote_service.list_quotes(
-                    codes,
-                    market=market,
-                    datatype=datatype,
-                    pageid=pageid,
-                    timeout=timeout,
-                ),
-            )
-        except ProtocolError as exc:
-            logger.warning("list_quotes: %s", exc)
+        def _query() -> list[dict]:
+            try:
+                return self._run_default_service(
+                    (Capability.BASIC_QUOTE,),
+                    lambda: self._quote_service.list_quotes(
+                        codes,
+                        market=market,
+                        datatype=datatype,
+                        pageid=pageid,
+                        timeout=timeout,
+                    ),
+                )
+            except ProtocolError as exc:
+                logger.warning("list_quotes: %s", exc)
+                return []
+            except OSError as exc:
+                # socket 硬死（对端关闭/本地 fd 失效）：与流不同步同样走
+                # 下面的重连重试，而不是把 500 抛给 web 层。
+                logger.warning("list_quotes: 传输异常 %s", exc)
+                return []
+
+        records = _query()
+        if records:
+            return records
+        # 空结果且 MAIN "活着"（探活只验证 TCP 未断，不验证服务端仍在应答）：
+        # 收盘后长时间空闲会让流不同步，服务端对该 socket 静默不回。此时
+        # connect_main() 走全新 HTTP 鉴权 + 新 Passport 重新登录（>20s 必重连，
+        # 不会复用僵死 socket），换新连接后重试一次。每次调用最多重连一次。
+        logger.warning(
+            "list_quotes: market=%s codes=%s 无数据，重连 MAIN 后重试",
+            market, codes[:3],
+        )
+        if self.connect_main().success:
+            return _query()
+        return []
+
+    def stock_quote_fields(
+        self,
+        codes: list[str],
+        *,
+        timeout: float = 10.0,
+        batch_size: int = 40,
+    ) -> list[dict]:
+        """批量查询统一列表字段（web 左栏 9 列全部可计算列）。
+
+        每批两路请求（同一连接流水线）：
+        1. 基础表 DataType=5,6,7,10,17,19,48 → 涨幅/竞价涨幅/竞价金额/
+           成交额/涨速（本地派生，见
+           :func:`thspypc.features.quote_protocol.derive_list_quote_fields`）；
+        2. 0xc4 金额表（pageid=1334 + ``MONEY_QUOTE_DATATYPE``，2026-08-18
+           逆向）→ 主力净额 dt250(元)/DDE 主力 dt248(亿)/总市值 dt202(元)，
+           失败仅记 warning 不影响基础列。
+        封单额不在两表（走排序榜 sort_by=265260）。
+
+        Args:
+            codes: 股票代码列表（市场按前缀自动推断）。
+            timeout: 单批 list_quotes 超时（秒）。
+            batch_size: 每批代码数。
+
+        Returns:
+            list[dict]，每项 ``{code, price, chg_pct, auction_chg_pct,
+            auction_amount, amount, speed_4m, main_inflow, dde_main,
+            market_cap}``，停牌/缺昨收的派生列为 None。
+            单批失败跳过（记 warning），不影响其他批次。
+        """
+        if not codes:
             return []
+        from ..errors import ProtocolError, UnsupportedAccountFeatureError
+        from ..features.quote_protocol import (
+            MONEY_QUOTE_DATATYPE,
+            STOCK_QUOTE_FIELDS_DATATYPE,
+            derive_list_quote_fields,
+        )
+
+        # 0xc4 金额表单代码请求服务器不应答：凑批时的填充码（结果按
+        # 请求 codes 过滤，填充码不会出现在返回里）。
+        money_filler = {
+            17: "600000", 16: "000001", 33: "000001",
+            32: "000001", 151: "920087",
+        }
+
+        self._ensure_main_connection()
+        groups: dict[int, list[str]] = {}
+        for code in codes:
+            groups.setdefault(self._market_for_code(code), []).append(code)
+
+        rows: dict[str, dict] = {}
+        for market, market_codes in groups.items():
+            for i in range(0, len(market_codes), batch_size):
+                chunk = market_codes[i : i + batch_size]
+                try:
+                    records = self.list_quotes(
+                        chunk,
+                        market=market,
+                        datatype=STOCK_QUOTE_FIELDS_DATATYPE,
+                        timeout=timeout,
+                    )
+                except ProtocolError as exc:
+                    logger.warning(
+                        "stock_quote_fields: market=%s 批次 %s 失败: %s",
+                        market, chunk[:3], exc,
+                    )
+                    continue
+                for record in records:
+                    code = str(record.get("code", ""))
+                    if code:
+                        rows[code] = derive_list_quote_fields(record)
+                # 0xc4 金额表补主力净额/DDE/总市值（北交所等未验证市场失败即跳过）
+                money_chunk = chunk
+                if len(money_chunk) == 1:
+                    filler = money_filler.get(market)
+                    if filler and filler != money_chunk[0]:
+                        money_chunk = [money_chunk[0], filler]
+                try:
+                    money_records = self.list_quotes(
+                        money_chunk,
+                        market=market,
+                        datatype=MONEY_QUOTE_DATATYPE,
+                        pageid=1334,
+                        timeout=timeout,
+                    )
+                except (
+                    ProtocolError,
+                    UnsupportedAccountFeatureError,
+                    OSError,
+                ) as exc:
+                    logger.warning(
+                        "stock_quote_fields: market=%s 金额表 %s 失败: %s",
+                        market, money_chunk[:3], exc,
+                    )
+                    money_records = []
+                for record in money_records:
+                    code = str(record.get("code", ""))
+                    if not code or code not in rows:
+                        continue
+                    money = derive_list_quote_fields(record)
+                    for key in ("main_inflow", "dde_main", "market_cap"):
+                        if money.get(key) is not None:
+                            rows[code][key] = money[key]
+                    if rows[code].get("amount") is None and money.get("amount") is not None:
+                        rows[code]["amount"] = money["amount"]
+        return [rows[code] for code in codes if code in rows]
 
     def depth_quote(
         self,
@@ -1575,16 +1703,31 @@ class ServiceFacade:
             if self.observed_account_profile.kind is AccountKind.LEVEL2
             else Capability.BASIC_QUOTE
         )
-        rows = self._run_default_service(
-            (capability,),
-            lambda: self._stock_list_service.dde_ranked(
-                count=count,
-                timeout=timeout,
-                sort_by=sort_by,
-                sort_dir=sort_dir,
-                max_pages=max_pages,
-            ),
-        )
+        # 页面刷新时 ranked 全量/quotes_ext 资金请求与本接口在同一对 L2 连接上
+        # 并发竞争，偶发超时（实测隔次恢复）：失败重试一次。
+        try:
+            rows = self._run_default_service(
+                (capability,),
+                lambda: self._stock_list_service.dde_ranked(
+                    count=count,
+                    timeout=timeout,
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                    max_pages=max_pages,
+                ),
+            )
+        except (OSError, ProtocolError) as exc:
+            logger.warning("dde_rank: 首次失败(%s)，重试一次", exc)
+            rows = self._run_default_service(
+                (capability,),
+                lambda: self._stock_list_service.dde_ranked(
+                    count=count,
+                    timeout=timeout,
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                    max_pages=max_pages,
+                ),
+            )
         if with_names and rows:
             name_map = self.fetch_stock_names_full()["names"]
             for row in rows:

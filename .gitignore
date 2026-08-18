@@ -37,3 +37,7 @@ tests/credentials*.json
 
 # ZCode 会话计划/缓存（工具生成，不纳入版本控制）
 .zcode/
+
+# 本地 dev 日志（dev.sh 之外的调试运行）
+.dev-backend.log
+.dev-frontend.log

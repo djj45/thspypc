@@ -59,6 +59,26 @@ def test_text_and_nul_terminated_segment_names_are_decoded():
     ]
 
 
+def test_push_like_binary_frame_decodes_to_empty():
+    # 盘中名称组/MAIN 连接上混入的行情推送帧是二进制 body；不巧以 0x0a
+    # 开头时（约 1/256）会被误当 8901 压缩流。decode_name_frame 必须把
+    # 解压失败按「非名称帧」返回空结果，而不是抛 ValueError 炸掉整次
+    # 名称同步（_collect_group 循环对此无捕获，2026-08-18 盘中分析）。
+    garbage_prefixed = (
+        bytes([0x0A])
+        + (0xFFFFFFFF).to_bytes(4, "big")  # 非法声明长度，必触发 ValueError
+        + bytes(range(0x00, 0xFF, 7)) * 8
+    )
+    plain_binary = bytes(range(0x20, 0x7F, 3)) * 8
+
+    for body in (garbage_prefixed, plain_binary):
+        result = decode_name_frame(body)
+        assert result["names"] == {}
+        assert result["by_segment"] == {}
+        assert result["skipped"] == []
+        assert result["segments"] == []
+
+
 def test_history_lines_are_skipped_and_current_name_wins():
     # 同一代码在响应里同时有 ``code=现名|别名@f`` 与历史行
     # ``code=旧名@h1|旧名2@h2|...``；历史行必须跳过，否则历史名会覆盖现名

@@ -291,3 +291,66 @@ def parse_depth_quote_response(body: bytes) -> DepthQuote:
             if key.startswith("dt")
         },
     }
+
+
+# 统一列表字段请求：dt5 代码 dt6 昨收 dt7 今开 dt10 最新 dt17 竞价量
+# dt19 成交额 dt48 4分钟涨速 dt66 涨幅。竞价/涨幅列由本地派生计算
+# （竞价金额 = dt17×dt7，涨幅 = (dt10-dt6)/dt6），与 list_quotes 既有
+# 口径一致（dt66 盘外恒 0，不可直接用）。
+STOCK_QUOTE_FIELDS_DATATYPE = [5, 6, 7, 10, 17, 19, 48, 66]
+
+# 0xc4 金额表请求字段集（2026-08-18 同花顺客户端抓包原文顺序，
+# captures_live/stocklist_page_20260818_185944.pcapng，pageid=1334）。
+# 响应为 hd3.1 变体 0xc4（大批量 BitRLE+64B 前导）或 hd1.0 同款小批量
+# 明文（60B 前导），字段 fmt 0x79/0x7B 与 0x70 同为 THS 定点浮点。
+# 已活网验证的响应字段：dt250=主力净额(元)、dt248=DDE 主力(亿，
+# 与 /api/dde_rank 逐码一致)、dt202=总市值(元)、dt13=成交量(股)。
+# ⚠ 单代码请求服务器不应答，调用方须保证每批 ≥2 个代码。
+MONEY_QUOTE_DATATYPE = [
+    7, 49, 13, 461256, 70, 27, 127, 48, 12, 69, 33,
+    1968584, 2942, 592890, 25, 10, 17, 24, 31, 9,
+    3541450, 592888, 2947, 30, 8, 6, 45, 66, 1111,
+]
+
+
+def derive_list_quote_fields(record: dict) -> dict:
+    """把 list_quotes 原始 dt 字段派生成统一列表行。
+
+    Args:
+        record: ``list_quotes`` 返回的单条记录（含 ``dt6/dt7/dt10/dt17/
+            dt19/dt48``，0xc4 金额表记录额外可含 ``dt250/dt248/dt202``）。
+
+    Returns:
+        ``{code, price, chg_pct, auction_chg_pct, auction_amount, amount,
+        speed_4m, main_inflow, dde_main, market_cap}``；昨收为 0/缺失
+        （停牌等）时派生列为 ``None``。成交额优先 dt19，缺失时用
+        dt13(成交量股)×dt10 本地计算（0xc4 表无 dt19）。
+    """
+
+    def pct(new, base) -> float | None:
+        if new is None or not base:
+            return None
+        return round((new - base) / base * 100, 2)
+
+    dt6 = record.get("dt6")
+    dt7 = record.get("dt7")
+    dt10 = record.get("dt10")
+    dt13 = record.get("dt13")
+    dt17 = record.get("dt17")
+    amount = record.get("dt19")
+    if amount is None and dt13 is not None and dt10 is not None:
+        amount = dt13 * dt10
+    return {
+        "code": record.get("code", ""),
+        "price": dt10,
+        "chg_pct": pct(dt10, dt6),
+        "auction_chg_pct": pct(dt7, dt6),
+        "auction_amount": (
+            dt17 * dt7 if dt17 is not None and dt7 is not None else None
+        ),
+        "amount": amount,
+        "speed_4m": record.get("dt48"),
+        "main_inflow": record.get("dt250"),
+        "dde_main": record.get("dt248"),
+        "market_cap": record.get("dt202"),
+    }

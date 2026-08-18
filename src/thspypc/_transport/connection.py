@@ -16,6 +16,31 @@ class CloseableSocket(SocketLike, Protocol):
     def close(self) -> None: ...
 
 
+def probe_socket_alive(sock: socket.socket) -> bool:
+    """非破坏式探活：peek 不消费数据，且**原样恢复**读超时。
+
+    ``setblocking(True)`` 等价于 ``settimeout(None)``，Windows 上会直接
+    清掉并发业务读正在依赖的 SO_RCVTIMEO，把有界读变成无限阻塞（2026-08-18
+    盘中实测：L2 保活线程每 3s 探活，stock_list 的 2s 读超时被清后干等
+    19s 直到杂帧到达）。探活必须用 gettimeout/settimeout 恢复原值。
+    非 socket 对象（测试替身）视为存活。
+    """
+    if not isinstance(sock, socket.socket):
+        return True
+    timeout = sock.gettimeout()
+    try:
+        sock.setblocking(False)
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+        finally:
+            sock.settimeout(timeout)
+        return data != b""
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
 class ConnectionRole(str, Enum):
     MAIN = "main"
     KLINE_FAST = "kline_fast"
@@ -166,17 +191,7 @@ class ManagedConnection:
         sock = self._socket
         if not isinstance(sock, socket.socket):
             return True
-        try:
-            sock.setblocking(False)
-            try:
-                data = sock.recv(1, socket.MSG_PEEK)
-            finally:
-                sock.setblocking(True)
-            return data != b""
-        except BlockingIOError:
-            return True
-        except OSError:
-            return False
+        return probe_socket_alive(sock)
 
     @property
     def socket(self) -> CloseableSocket | None:

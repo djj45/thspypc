@@ -233,7 +233,15 @@ def _collect_group(
             result["segments"].extend(decoded["segments"])
             config_vers.update(extract_config_vers(item))
             last_name_at = time.time()
-        elif (
+            continue
+        # 非名称帧。盘中沪深 L2 组的连接上有持续行情推送，socket 永不静默，
+        # ``except socket.timeout`` 分支里的 settle 检查永远走不到；此处对
+        # 推送帧同样判定：名称已到齐且超过 settle_timeout 没有新名称帧
+        # 即收工，否则每组都要干等到 45s deadline（实测 33k 名称 0.6s 传
+        # 完、却等满 45s）。
+        if result["names"] and time.time() - last_name_at >= settle_timeout:
+            break
+        if (
             not result["names"]
             and time.time() - last_activity_at >= no_name_timeout
         ):
@@ -418,7 +426,8 @@ def download_all_stock_names(
 
     Logs into all account-specific 123ths market groups concurrently (one
     socket per group), keeps the sessions alive with 3s 8901 heartbeats, then
-    replays each group's bootstrap and merges every ``[name_*]`` segment.
+    replays every group's bootstrap concurrently and merges every
+    ``[name_*]`` segment.
     Per-group txt caches live under ``~/.thspypc/stockname/``.
     """
     key = (
@@ -450,12 +459,15 @@ def download_all_stock_names(
     try:
         for group_key, (sock, lock) in sessions.items():
             heartbeats.append((_start_heartbeat(sock, lock), sock))
-        for group_key in groups:
-            session = sessions.get(group_key)
-            if session is None:
-                continue
-            sock, lock = session
-            part = _collect_group(
+
+        # 各组收集并行（hexin 冷启动同为并发）：每组传输 <1s，瓶颈是
+        # 3s settle 静默等待；串行时 8 组逐个排队要 ~45s，并行后总时长
+        # ≈ 最慢一组。每组独立 socket + send_lock，无共享状态。
+        alive_groups = [g for g in groups if g in sessions]
+
+        def collect(group_key: str) -> dict:
+            sock, lock = sessions[group_key]
+            return _collect_group(
                 sock,
                 group_key,
                 timeout=timeout,
@@ -464,6 +476,11 @@ def download_all_stock_names(
                 cache_path=str(group_cache_path(group_key)),
                 send_lock=lock,
             )
+
+        with ThreadPoolExecutor(max_workers=max(1, len(alive_groups))) as pool:
+            # pool.map 保序：合并顺序与原串行循环一致（后组覆盖前组）。
+            parts = list(pool.map(collect, alive_groups))
+        for part in parts:
             result["names"].update(part["names"])
             result["by_segment"].update(part["by_segment"])
             result["skipped"].extend(part["skipped"])

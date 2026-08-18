@@ -176,6 +176,12 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
 
         return _call(operation)
 
+    @app.get("/api/quotes_ext")
+    def quotes_ext(codes: str = Query(..., description="逗号分隔的股票代码")) -> list[dict]:
+        """统一列表字段（涨幅/竞价涨幅/竞价金额/成交额/4分钟涨速，批量）。"""
+        code_list = _split_codes(codes)
+        return _call(lambda client: client.stock_quote_fields(code_list))
+
     @app.get("/api/depth/{code}")
     def depth(code: str, levels: int = 5, market: int = 0) -> dict:
         if levels not in (5, 10):

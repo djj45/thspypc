@@ -7,6 +7,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
@@ -468,7 +469,6 @@ class StockListService:
         *,
         timeout: float = 30.0,
         replay_delay: float = 0.3,
-        settle_timeout: float = 3.0,
     ) -> list[dict]:
         """Request all configured markets and merge every code table.
 
@@ -478,6 +478,11 @@ class StockListService:
         （市场码 32/33；实测单帧 3274 行，覆盖全部深市 A 股）；北交所个股
         （151）Level2 走 SH_L2（shlv2，与报价/分时/K线同通道），单独查一次
         后合并。重放模式（replay_segments）保持 MAIN 单路，不复用抓包字节打 SZ/BSE。
+
+        拉取编排对齐 2026-08-17 抓包（kanpan_20260817_005402.pcap：官方
+        客户端板块/沪/深三条 8901 通道同时发请求）：MAIN(+ST) 与 SZ_L2、
+        SH_L2 三路并发，合并顺序固定为 MAIN → ST(22) → SZ → BSE。
+        全量表响应均为单帧自描述表（帧头 dc=行数），首帧即完成，无收尾等待。
         """
         stocks = self._full_list_on(
             ConnectionRole.MAIN,
@@ -485,98 +490,83 @@ class StockListService:
             capability=Capability.BASIC_QUOTE,
             timeout=timeout,
             replay_delay=replay_delay,
-            settle_timeout=settle_timeout,
             full_frame_min_dc=5000,
         )
-        if self._replay_segments is None:
+        if self._replay_segments is not None:
+            if self._evidence is not None and stocks:
+                self._evidence.record_main_ready()
+            return stocks
+
+        def aux(
+            role: ConnectionRole,
+            markets: tuple[int, ...],
+            capability: Capability,
+            label: str,
+        ) -> list[dict]:
             try:
-                st_stocks = self._full_list_on(
+                return self._full_list_on(
+                    role,
+                    markets,
+                    capability=capability,
+                    timeout=timeout,
+                    replay_delay=replay_delay,
+                    full_frame_min_dc=0,
+                )
+            except (
+                CapabilityUnavailableError,
+                UnsupportedAccountFeatureError,
+                ChannelUnavailableError,
+                ProtocolError,
+            ) as exc:
+                logger.warning("full_list: %s代码表不可用: %s", label, exc)
+                return []
+
+        is_level2 = (
+            self._connections.profile.kind is AccountKind.LEVEL2
+        )
+        if is_level2:
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                st_future = pool.submit(
+                    aux,
                     ConnectionRole.MAIN,
                     FULL_STOCK_LIST_ST_MARKETS,
-                    capability=Capability.BASIC_QUOTE,
-                    timeout=timeout,
-                    replay_delay=replay_delay,
-                    settle_timeout=settle_timeout,
-                    full_frame_min_dc=0,
+                    Capability.BASIC_QUOTE,
+                    "沪市风险警示板(22)",
                 )
-            except (
-                CapabilityUnavailableError,
-                UnsupportedAccountFeatureError,
-                ChannelUnavailableError,
-                ProtocolError,
-            ) as exc:
-                logger.warning(
-                    "full_list: 沪市风险警示板(22)代码表不可用: %s",
-                    exc,
-                )
-            else:
-                if st_stocks:
-                    merged = {stock["code"]: stock for stock in stocks}
-                    for stock in st_stocks:
-                        merged.setdefault(stock["code"], stock)
-                    stocks = list(merged.values())
-        if (
-            self._replay_segments is None
-            and self._connections.profile.kind is AccountKind.LEVEL2
-        ):
-            try:
-                sz_stocks = self._full_list_on(
+                sz_future = pool.submit(
+                    aux,
                     ConnectionRole.SZ_L2,
                     FULL_STOCK_LIST_SZ_MARKETS,
-                    capability=Capability.L2_MARKET_ACCESS,
-                    timeout=timeout,
-                    replay_delay=replay_delay,
-                    settle_timeout=settle_timeout,
-                    full_frame_min_dc=0,
+                    Capability.L2_MARKET_ACCESS,
+                    "SZ_L2 深市",
                 )
-            except (
-                CapabilityUnavailableError,
-                UnsupportedAccountFeatureError,
-                ChannelUnavailableError,
-                ProtocolError,
-            ) as exc:
-                # 深市表拿不到时退回沪系-only（旧行为），不拖垮整个股票表。
-                logger.warning(
-                    "full_list: SZ_L2 深市代码表不可用，仅返回沪系: %s",
-                    exc,
-                )
-            else:
-                if sz_stocks:
-                    if self._evidence is not None:
-                        self._evidence.record_l2_init(Support.YES)
-                    merged = {stock["code"]: stock for stock in stocks}
-                    for stock in sz_stocks:
-                        merged.setdefault(stock["code"], stock)
-                    stocks = list(merged.values())
-
-            # Level2 北交所 151 与报价/分时/K线一致走 shlv2；MAIN 的
-            # 全量表不返回完整北交所代码，前端名称映射因此缺 920xxx。
-            try:
-                bse_stocks = self._full_list_on(
+                bse_future = pool.submit(
+                    aux,
                     ConnectionRole.SH_L2,
                     (151,),
-                    capability=Capability.L2_MARKET_ACCESS,
-                    timeout=timeout,
-                    replay_delay=replay_delay,
-                    settle_timeout=settle_timeout,
-                    full_frame_min_dc=0,
+                    Capability.L2_MARKET_ACCESS,
+                    "SH_L2 北交所(151)",
                 )
-            except (
-                CapabilityUnavailableError,
-                UnsupportedAccountFeatureError,
-                ChannelUnavailableError,
-                ProtocolError,
-            ) as exc:
-                logger.warning(
-                    "full_list: SH_L2 北交所(151)代码表不可用，仅返回沪深: %s",
-                    exc,
-                )
-            else:
-                if bse_stocks:
-                    merged = {stock["code"]: stock for stock in stocks}
-                    for stock in bse_stocks:
-                        merged.setdefault(stock["code"], stock)
-                    stocks = list(merged.values())
+                st_stocks = st_future.result()
+                sz_stocks = sz_future.result()
+                bse_stocks = bse_future.result()
+            if sz_stocks and self._evidence is not None:
+                self._evidence.record_l2_init(Support.YES)
+        else:
+            st_stocks = aux(
+                ConnectionRole.MAIN,
+                FULL_STOCK_LIST_ST_MARKETS,
+                Capability.BASIC_QUOTE,
+                "沪市风险警示板(22)",
+            )
+            sz_stocks = []
+            bse_stocks = []
+
+        merged = {stock["code"]: stock for stock in stocks}
+        for extra in (st_stocks, sz_stocks, bse_stocks):
+            for stock in extra:
+                merged.setdefault(stock["code"], stock)
+        stocks = list(merged.values())
         if self._evidence is not None and stocks:
             self._evidence.record_main_ready()
         return stocks
@@ -589,7 +579,6 @@ class StockListService:
         capability: Capability,
         timeout: float,
         replay_delay: float,
-        settle_timeout: float,
         full_frame_min_dc: int,
     ) -> list[dict]:
         """Collect one market family's full code table on one connection."""
@@ -606,7 +595,6 @@ class StockListService:
 
         by_code: dict[str, dict] = {}
         started_at = self._clock()
-        full_table_at: float | None = None
         request_timeout = min(2.0, max(timeout, 0.1))
         with connection.request(
             segments[0],
@@ -620,16 +608,7 @@ class StockListService:
                 self._sleep(replay_delay)
 
             for _ in range(self._max_full_frames):
-                now = self._clock()
-                if (
-                    full_table_at is not None
-                    and now - full_table_at >= settle_timeout
-                ):
-                    break
-                if (
-                    full_table_at is None
-                    and now - started_at >= timeout
-                ):
+                if self._clock() - started_at >= timeout:
                     break
                 try:
                     response = self._read_frame(sock)
@@ -658,7 +637,10 @@ class StockListService:
                     if code:
                         by_code.setdefault(code, stock)
                 if full_frames:
-                    full_table_at = self._clock()
+                    # 全量表在所有抓包/活网观测中都是单帧自描述表：hd3.1
+                    # 帧头 dc=行数、长度前缀保证帧完整，官方客户端同样
+                    # 收到即用，不存在独立的结尾帧。首个全量帧即完成。
+                    break
 
         return list(by_code.values())
 

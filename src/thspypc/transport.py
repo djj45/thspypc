@@ -13,6 +13,7 @@ from ._transport import (
     DispatchDecision,
     DispatchRequest,
     ResponseDispatcher,
+    probe_socket_alive,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "DispatchDecision",
     "DispatchRequest",
     "ResponseDispatcher",
+    "probe_socket_alive",
 ]

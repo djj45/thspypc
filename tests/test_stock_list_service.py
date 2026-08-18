@@ -290,7 +290,6 @@ def test_full_list_replays_raw_segments_on_main(monkeypatch, kind):
     result = service.full_list(
         timeout=5.0,
         replay_delay=0.25,
-        settle_timeout=0,
     )
 
     assert result == expected
@@ -326,7 +325,7 @@ def test_full_list_distinguishes_large_table_parser_failure(monkeypatch):
     )
 
     with pytest.raises(ProtocolError):
-        service.full_list(settle_timeout=0)
+        service.full_list()
 
 
 def test_full_list_rejects_invalid_replay_before_sending():
@@ -370,7 +369,7 @@ def test_full_list_builds_one_minimum_query(monkeypatch):
         sleep=lambda _delay: None,
     )
 
-    assert service.full_list(settle_timeout=0) == expected
+    assert service.full_list() == expected
     # 常规市场表 + 沪市风险警示板(22) 两次查询，都在 MAIN 上。
     assert len(sock.sent) == 2
     assert len(sock.sent[0]) == 147
@@ -406,8 +405,8 @@ def test_full_list_rebuilds_minimum_query_with_newline_on_every_call(
         sleep=lambda _delay: None,
     )
 
-    assert service.full_list(settle_timeout=0) == expected
-    assert service.full_list(settle_timeout=0) == expected
+    assert service.full_list() == expected
+    assert service.full_list() == expected
     assert len(sock.sent) == 4
     assert len(sock.sent[0]) == 147 and len(sock.sent[2]) == 147
     assert b"CodeList=22();" in sock.sent[1]
@@ -492,12 +491,16 @@ def test_full_list_level2_merges_sz_and_bse_tables(monkeypatch):
         evidence=recorder,
     )
 
-    result = service.full_list(settle_timeout=0)
+    result = service.full_list()
 
     assert [item["code"] for item in result] == [
         "600000", "000001", "300846", "920083",
     ]
-    assert opened == [ConnectionRole.MAIN, ConnectionRole.SZ_L2, ConnectionRole.SH_L2]
+    # MAIN 同步先开，SZ_L2/SH_L2 并发拉取（顺序不定），ST 复用已开的 MAIN。
+    assert opened[0] is ConnectionRole.MAIN
+    assert set(opened) == {
+        ConnectionRole.MAIN, ConnectionRole.SZ_L2, ConnectionRole.SH_L2,
+    }
     assert b"CodeList=32();33();" in sz_sock.sent[0]
     assert b"CodeList=151();" in sh_sock.sent[0]
     assert recorder.profile().supports(Capability.L2_MARKET_ACCESS)
@@ -541,7 +544,7 @@ def test_full_list_merges_st_board_table(monkeypatch):
         sleep=lambda _delay: None,
     )
 
-    result = service.full_list(settle_timeout=0)
+    result = service.full_list()
 
     assert [item["code"] for item in result] == [
         "600000",
@@ -649,7 +652,7 @@ def test_full_list_level2_sz_gate_failure_falls_back_to_main():
         ],
     }
     try:
-        result = service.full_list(settle_timeout=0)
+        result = service.full_list()
     finally:
         module.parse_init_response = original
 

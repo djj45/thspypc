@@ -6,6 +6,7 @@ from .connection import (
     ConnectionSpec,
     LoginIdentity,
     ManagedConnection,
+    probe_socket_alive,
 )
 from .connection_manager import ConnectionManager, OpenedConnection
 from .session import MarketSession, SocketLike
@@ -24,4 +25,5 @@ __all__ = [
     "DispatchDecision",
     "DispatchRequest",
     "ResponseDispatcher",
+    "probe_socket_alive",
 ]

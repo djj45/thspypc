@@ -177,8 +177,23 @@ def decode_name_frame(body: bytes) -> dict:
     ``cmd=0x0a`` responses are LZ-expanded first (``name_16_*`` A-share
     streams arrive compressed); already-plaintext bodies pass through
     unchanged.
+
+    盘中名称组/MAIN 连接上会混入行情推送等二进制帧，其 body 碰巧以
+    ``0x0a`` 开头时（约 1/256）会被误当压缩流并在解压时抛
+    ``ValueError``——调用方（``_collect_group`` 等）对此无捕获，会炸掉
+    整次名称同步。与 ``parse_init_response`` 的处理对齐：解压失败按
+    「非名称帧」返回空结果，由调用方跳过。
     """
-    body = normalize_8901_response(body)
+    try:
+        body = normalize_8901_response(body)
+    except ValueError as exc:
+        logger.debug("decode_name_frame: 0x0a 解压失败，视为非名称帧: %s", exc)
+        return {
+            "names": {},
+            "by_segment": {},
+            "skipped": [],
+            "segments": [],
+        }
     result = {
         "names": {},
         "by_segment": {},
