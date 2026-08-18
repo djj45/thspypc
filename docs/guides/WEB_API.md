@@ -38,14 +38,24 @@ OpenAPI 文档。
 | GET | `/api/intraday_auctions/{code}` | 兼容接口；新前端不再使用 |
 | GET | `/api/stocks` | 全市场代码表（~7400 条，首次较慢） |
 | GET | `/api/hot?count=29&sort_by=199112&sort_dir=D` | 排序榜单 |
+| GET | `/api/stock_list_ranked?sort_by=199112&count=5400&sort_dir=D&with_values=1` | 全市场排序榜（L2 SortCount 放大一次拉全 ~0.1s；`sort_dir=A` 升序已实测） |
+| GET | `/api/quotes_ext?codes=600519,000001` | 批量统一列表字段：涨幅/竞价涨幅/竞价金额/成交额/涨速（本地派生）+ 主力净额/ DDE 主力/总市值（0xc4 金额表 dt250/dt248/dt202，元/亿/元） |
+| GET | `/api/dde_rank?sort_by=592888&count=58` | DDE 主力资金排行（value 单位亿，响应字段 248） |
+| GET | `/api/stocks2` | 全市场代码表（带磁盘缓存，自然日有效，含 code/name/market） |
 | GET | `/api/market_snapshot` | 全市场快照 |
 | GET | `/api/boards?category=industry` | 系统板块列表（本地 oracle） |
+| GET | `/api/board_categories` | 板块分类树（行业/概念/地域/同花顺一二级） |
+| GET | `/api/hot_boards` | 热点板块全量行情（pageid=12480，513 个板块含涨跌家数/主力） |
 | GET | `/api/board/{code}/constituents` | 板块成分股 |
 | GET | `/api/board/{code}/quotes` | 板块行情 |
 | GET | `/api/board/{code}/timeline?date=` | 板块指数分时 |
 | GET | `/api/board/{code}/auction?date=` | 板块集合竞价 |
 | GET | `/api/groups` | 自定义板块/分组列表 |
+| GET | `/api/groups/{name}?refresh=false` | 单个自定义板块成分股 |
+| GET | `/api/self_stocks` | 自选股（默认自选股分组） |
+| GET | `/api/dynamic_plates` | 动态板块列表（条件选股，HTTPS cookie 鉴权） |
 | GET | `/api/dxjl?pages=5` | 短线精灵历史（无推送） |
+| GET | `/api/dxjl/latest` | 短线精灵最新一页（前端轮询用） |
 
 ## 错误约定
 
