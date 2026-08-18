@@ -6,16 +6,28 @@ import { StockInfo } from './components/right/StockInfo'
 import { DepthPanel } from './components/right/DepthPanel'
 import { DxjlPanel } from './components/right/DxjlPanel'
 import { LeftGrid } from './components/left/LeftGrid'
+import { usePersistedWidth } from './components/left/shared'
+
+// 左栏总宽可拖拽（与中栏图表之间的分隔条），持久化。
+const LEFT_MIN = 560
+const LEFT_MAX = Math.max(LEFT_MIN + 100, window.innerWidth - 620)
 
 export default function App() {
+  const left = usePersistedWidth('ths.layout.leftW', 1040, LEFT_MIN, LEFT_MAX)
   return (
     <StockProvider>
       <div className="app">
         <Header />
-        <div className="body">
+        <div
+          className="body"
+          style={{
+            gridTemplateColumns: `${left.w}px 5px minmax(260px, 1fr) 280px`,
+          }}
+        >
           <div className="col">
-            <LeftGrid />
+            <LeftGrid leftW={left.w} />
           </div>
+          <div className="vsplit" onPointerDown={left.onPointerDown} />
           <div className="col center">
             <div className="panel" style={{ flex: 1, minHeight: 0 }}>
               <div className="panel-title">分时</div>

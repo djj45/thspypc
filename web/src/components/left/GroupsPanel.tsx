@@ -3,8 +3,8 @@ import { api } from '../../api/endpoints'
 import { useData } from '../../data/useData'
 import { useStockNames } from '../../data/useStockNames'
 import type { StockGroup } from '../../types'
-import { fmtNum, isQuoteable } from './format'
-import { Cell, StateBox, StockTable, type StockRowData } from './shared'
+import { isQuoteable } from './format'
+import { Cell, StateBox, StockTable, useQuoteExt, type StockRowData } from './shared'
 
 export function GroupsPanel() {
   const { data, loading, error } = useData<StockGroup[]>(() => api.groups(), [])
@@ -16,15 +16,26 @@ export function GroupsPanel() {
     [data],
   )
   const active = groups.find((g) => g.name === selected) ?? groups[0]
+  const items = useMemo(
+    () => (active?.items ?? []).filter((item) => isQuoteable(item.code)),
+    [active],
+  )
+  const [visibleCodes, setVisibleCodes] = useState<string[]>([])
+  const quotes = useQuoteExt(visibleCodes)
 
-  const rows: StockRowData[] = (active?.items ?? [])
-    .filter((item) => isQuoteable(item.code))
-    .map((item) => ({
+  const rows: StockRowData[] = items.map((item) => {
+    const q = quotes.get(item.code)
+    return {
       code: item.code,
       name: nameMap.get(item.code) ?? '',
-      value: fmtNum(item.price),
-      valueCls: 'flat',
-    }))
+      chgPct: q?.chg_pct ?? undefined,
+      auctionChgPct: q?.auction_chg_pct ?? undefined,
+      auctionAmount: q?.auction_amount ?? undefined,
+      amount: q?.amount ?? undefined,
+      speed4m: q?.speed_4m ?? undefined,
+      mainInflow: q?.main_inflow ?? undefined,
+    }
+  })
 
   return (
     <Cell title="自定义板块">
@@ -40,9 +51,9 @@ export function GroupsPanel() {
       <StateBox
         loading={loading}
         error={error}
-        empty={!active || active.items.length === 0}
+        empty={!active || items.length === 0}
       >
-        <StockTable key={active?.group_id ?? 'none'} rows={rows} />
+        <StockTable key={active?.group_id ?? 'none'} rows={rows} onVisible={setVisibleCodes} />
       </StateBox>
     </Cell>
   )

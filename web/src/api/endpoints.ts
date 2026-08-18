@@ -11,6 +11,7 @@ import type {
   SystemBlock,
   RankItem,
   StockListItem,
+  QuoteExt,
   Dxjl,
   StockGroup,
   MarketView,
@@ -19,6 +20,7 @@ import type {
 
 const marketViewInFlight = new Map<string, Promise<MarketView>>()
 const fastViewInFlight = new Map<string, Promise<MarketViewFast>>()
+const quotesExtInFlight = new Map<string, Promise<QuoteExt[]>>()
 const intradayInFlight = new Map<
   string,
   Promise<(AuctionPoint & TimelinePoint)[]>
@@ -194,6 +196,17 @@ export const api = {
   // 全市场代码表（磁盘缓存，自然日有效；供左栏名称回填）
   stocks2: () => getJson<StockListItem[]>('/api/stocks2'),
 
+  // 统一列表字段（涨幅/竞价涨幅/竞价金额/成交额/4分钟涨速，按代码批量）
+  quotesExt: (codes: string[]) =>
+    dedupe(
+      quotesExtInFlight,
+      codes.join(','),
+      () =>
+        getJson<QuoteExt[]>(
+          `/api/quotes_ext?codes=${encodeURIComponent(codes.join(','))}`,
+        ),
+    ),
+
   // 板块
   boardCategories: () => getJson<BoardCategory[]>('/api/board_categories'),
   boards: (category?: string) =>
@@ -203,9 +216,14 @@ export const api = {
   hotBoards: () => getJson<Board[]>('/api/hot_boards'),
 
   // 排序榜
-  stockListRanked: (sortBy: number, count = 59, withValues = false) =>
+  stockListRanked: (
+    sortBy: number,
+    count = 59,
+    withValues = false,
+    sortDir: 'D' | 'A' = 'D',
+  ) =>
     getJson<RankItem[]>(
-      `/api/stock_list_ranked?sort_by=${sortBy}&count=${count}&sort_dir=D&with_values=${withValues ? 1 : 0}`,
+      `/api/stock_list_ranked?sort_by=${sortBy}&count=${count}&sort_dir=${sortDir}&with_values=${withValues ? 1 : 0}`,
     ),
   ddeRank: (sortBy = 592888, count = 58) =>
     getJson<RankItem[]>(`/api/dde_rank?sort_by=${sortBy}&count=${count}`),

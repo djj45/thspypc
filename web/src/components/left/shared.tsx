@@ -1,5 +1,15 @@
-import { useState, type ReactNode } from 'react'
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type PointerEvent as RPointerEvent,
+  type ReactNode,
+} from 'react'
+import { api } from '../../api/endpoints'
+import type { QuoteExt } from '../../types'
 import { useStock } from '../../state/StockContext'
+import { clsOf, fmtAmt, fmtPct } from './format'
 
 export function Cell({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -30,55 +40,512 @@ export function StateBox({
 export interface StockRowData {
   code: string
   name?: string
-  value?: string
-  valueCls?: string
+  // 统一列（/api/quotes_ext 派生 + 面板自有排序值补主力/封单）
+  chgPct?: number
+  auctionChgPct?: number
+  auctionAmount?: number
+  amount?: number
+  speed4m?: number
+  mainInflow?: number
+  sealAmount?: number
 }
 
-// 可点选股票列表：点击行 → setCode；当前选中代码高亮；本地分页。
+// 批量统一字段：滚动的可视窗口代码传进来，返回 code→QuoteExt 映射。
+// 防抖吸收快速滚动的窗口抖动；新结果合并进旧 map（回滚时已看过的行
+// 立即显示缓存值，不闪 "-"）。空列表不发。
+export function useQuoteExt(
+  codes: string[],
+  debounceMs = 200,
+): Map<string, QuoteExt> {
+  const [map, setMap] = useState<Map<string, QuoteExt>>(new Map())
+  const key = codes.join(',')
+  useEffect(() => {
+    if (!key) return
+    const timer = setTimeout(() => {
+      api.quotesExt(key.split(','))
+        .then((rows) => {
+          setMap((prev) => {
+            const merged = new Map(prev)
+            for (const r of rows) merged.set(r.code, r)
+            return merged
+          })
+        })
+        .catch(() => {})
+    }, debounceMs)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, debounceMs])
+  return map
+}
+
+// ── 表头排序状态 ──
+
+export interface ColSort {
+  key: string
+  desc: boolean
+}
+
+export function sortRows<T>(rows: T[], sort: ColSort | null): T[] {
+  if (!sort) return rows
+  const key = sort.key as keyof T & string
+  const out = [...rows]
+  out.sort((a, b) => {
+    // 空值恒排末尾（与排序方向无关）
+    const va = a[key]
+    const vb = b[key]
+    if (va == null && vb == null) return 0
+    if (va == null) return 1
+    if (vb == null) return -1
+    const c = compareValues(va, vb)
+    return sort.desc ? -c : c
+  })
+  return out
+}
+
+function compareValues(va: unknown, vb: unknown): number {
+  if (typeof va === 'number' && typeof vb === 'number') return va - vb
+  return String(va).localeCompare(String(vb))
+}
+
+// ── 列宽拖拽（localStorage 持久化，模板尾部 1fr 弹性列吸收余量）──
+
+const COL_WIDTH_MIN = 30
+
+function useColumnWidths(storageKey: string, defaults: number[]) {
+  const [widths, setWidths] = useState<number[]>(() => {
+    try {
+      const saved = localStorage.getItem(storageKey)
+      if (saved) {
+        const arr: unknown = JSON.parse(saved)
+        if (
+          Array.isArray(arr) &&
+          arr.length === defaults.length &&
+          arr.every((n) => typeof n === 'number' && n >= COL_WIDTH_MIN)
+        ) {
+          return arr as number[]
+        }
+      }
+    } catch {
+      /* 损坏的缓存忽略 */
+    }
+    return defaults
+  })
+  const widthsRef = useRef(widths)
+  widthsRef.current = widths
+
+  const startResize = (index: number) => (e: RPointerEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startW = widthsRef.current[index]
+    document.body.style.userSelect = 'none'
+    // 同步追踪最新宽度：pointerup 时 React 状态可能尚未渲染回 ref
+    let latest = widthsRef.current
+    const move = (ev: PointerEvent) => {
+      const w = Math.max(COL_WIDTH_MIN, Math.round(startW + ev.clientX - startX))
+      latest = widthsRef.current.map((v, i) => (i === index ? w : v))
+      setWidths(latest)
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      document.body.style.userSelect = ''
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(latest))
+      } catch {
+        /* 存储失败忽略 */
+      }
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
+
+  return { widths, startResize }
+}
+
+// 面板变窄时自动隐藏放不下的列（右侧尾列先隐藏，前 keep 列恒显），
+// 与同花顺一致：窄列表少显示几列，而不是出横向滚动。
+const COL_GAP = 4
+const COL_PAD = 14
+
+function useVisibleColumns(
+  containerRef: { current: HTMLDivElement | null },
+  count: number,
+  widths: number[],
+  keep = 2,
+) {
+  const [boxW, setBoxW] = useState(0)
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) setBoxW(Math.round(e.contentRect.width))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [containerRef])
+  const avail = boxW > 0 ? boxW - COL_PAD : Number.POSITIVE_INFINITY
+  const vis: number[] = []
+  let used = 0
+  for (let i = 0; i < count; i++) {
+    used += widths[i] + COL_GAP
+    if (vis.length >= keep && used > avail) break
+    vis.push(i)
+  }
+  const template = `${vis.map((i) => `${widths[i]}px`).join(' ')} 1fr`
+  return { vis, template }
+}
+
+// 面板分隔条：拖动改宽度并持久化（同花顺式子窗口边界调整）。
+// min/max 在拖动时钳制；读取时若超界（如另一侧宽度后来变了）由调用方再夹一次。
+export function usePersistedWidth(
+  storageKey: string,
+  initial: number,
+  min = 100,
+  max = 4000,
+) {
+  const [w, setW] = useState(() => {
+    const saved = Number(localStorage.getItem(storageKey))
+    return Number.isFinite(saved) && saved >= min ? saved : initial
+  })
+  const ref = useRef(w)
+  ref.current = w
+  const onPointerDown = (e: RPointerEvent) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = ref.current
+    document.body.style.userSelect = 'none'
+    let latest = startW
+    const move = (ev: PointerEvent) => {
+      latest = Math.round(
+        Math.min(max, Math.max(min, startW + ev.clientX - startX)),
+      )
+      setW(latest)
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      document.body.style.userSelect = ''
+      try {
+        localStorage.setItem(storageKey, String(latest))
+      } catch {
+        /* 存储失败忽略 */
+      }
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
+  return { w, onPointerDown }
+}
+
+// 表头单元格：可点击排序（▼/▲ 指示）+ 右缘拖拽调宽
+function HeadCell({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  onResize,
+}: {
+  label: string
+  sortKey?: string
+  sort: ColSort | null
+  onSort: (key: string) => void
+  onResize?: (e: RPointerEvent) => void
+}) {
+  const active = !!sortKey && sort?.key === sortKey
+  const cls = active
+    ? 'hcell sorted'
+    : sortKey
+      ? 'hcell sortable'
+      : 'hcell'
+  return (
+    <span
+      className={cls}
+      onClick={sortKey ? () => onSort(sortKey) : undefined}
+    >
+      {label}
+      {active && <i className="sort-mark">{sort!.desc ? '▼' : '▲'}</i>}
+      {onResize && <i className="col-grip" onPointerDown={onResize} />}
+    </span>
+  )
+}
+
+// ── 虚拟滚动股票列表（表头点击排序 + 列宽拖拽）──
+
+const OVERSCAN = 8
+const FALLBACK_ROW_H = 21
+
+const STOCK_COLS: { label: string; sortKey?: string }[] = [
+  { label: '代码', sortKey: 'code' },
+  { label: '名称' },
+  { label: '涨幅', sortKey: 'chgPct' },
+  { label: '竞价涨幅', sortKey: 'auctionChgPct' },
+  { label: '竞价金额', sortKey: 'auctionAmount' },
+  { label: '成交额', sortKey: 'amount' },
+  { label: '涨速', sortKey: 'speed4m' },
+  { label: '主力净额', sortKey: 'mainInflow' },
+  { label: '封单额', sortKey: 'sealAmount' },
+]
+
+const STOCK_COL_WIDTHS = [44, 76, 54, 54, 50, 50, 50, 54, 50]
+
 export function StockTable({
   rows,
-  pageSize = 60,
+  onVisible,
+  sort,
+  onSortChange,
+  disabledSortKeys = [],
+  initialSort = null,
 }: {
   rows: StockRowData[]
-  pageSize?: number
+  onVisible?: (codes: string[]) => void
+  /** 受控排序（提供 onSortChange 时由父级负责排序数据，如全市场服务端排序） */
+  sort?: ColSort | null
+  onSortChange?: (s: ColSort) => void
+  /** 该列表无服务端排序键、本地排序又会误导的列（如全市场·成交额） */
+  disabledSortKeys?: string[]
+  initialSort?: ColSort | null
 }) {
   const { code, setCode } = useStock()
-  const [page, setPage] = useState(0)
-  const pages = Math.max(1, Math.ceil(rows.length / pageSize))
-  const cur = Math.min(page, pages - 1)
-  const slice = rows.slice(cur * pageSize, (cur + 1) * pageSize)
+  const listRef = useRef<HTMLDivElement>(null)
+  const measureRef = useRef<HTMLDivElement | null>(null)
+  const [rowH, setRowH] = useState(0)
+  const [range, setRange] = useState({ start: 0, end: 40 })
+  const [localSort, setLocalSort] = useState<ColSort | null>(initialSort)
+  const { widths, startResize } = useColumnWidths(
+    'ths.cols.stock',
+    STOCK_COL_WIDTHS,
+  )
+  const { vis, template } = useVisibleColumns(
+    listRef,
+    STOCK_COLS.length,
+    widths,
+  )
+
+  const controlled = onSortChange !== undefined
+  const effectiveSort = controlled ? (sort ?? null) : localSort
+  const display = controlled ? rows : sortRows(rows, effectiveSort)
+
+  const onSort = (key: string) => {
+    const cur = effectiveSort
+    const next =
+      cur && cur.key === key ? { key, desc: !cur.desc } : { key, desc: true }
+    if (controlled) onSortChange(next)
+    else setLocalSort(next)
+  }
+
+  useLayoutEffect(() => {
+    if (measureRef.current) {
+      const h = measureRef.current.getBoundingClientRect().height
+      if (h >= 12) setRowH(h)
+    }
+  }, [])
+
+  const h = rowH || FALLBACK_ROW_H
+
+  const updateRange = () => {
+    const el = listRef.current
+    if (!el) return
+    const first = Math.max(0, Math.floor(el.scrollTop / h) - OVERSCAN)
+    const last = Math.min(
+      display.length,
+      first + Math.ceil(el.clientHeight / h) + OVERSCAN * 2,
+    )
+    setRange((prev) =>
+      prev.start === first && prev.end === last ? prev : { start: first, end: last },
+    )
+  }
+
+  useEffect(() => {
+    updateRange()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowH, display.length])
+
+  const lastReported = useRef('')
+  useEffect(() => {
+    if (!onVisible) return
+    const codes = display.slice(range.start, range.end).map((r) => r.code)
+    const key = codes.join(',')
+    if (key === lastReported.current) return
+    lastReported.current = key
+    onVisible(codes)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range, display, onVisible])
+
+  const slice = display.slice(range.start, range.end)
+
+  const cellOf = (row: StockRowData, i: number) => {
+    switch (i) {
+      case 0:
+        return <span key={i} className="sc">{row.code}</span>
+      case 1:
+        return (
+          <span key={i} className="sn" title={row.name ?? ''}>
+            {row.name ?? ''}
+          </span>
+        )
+      case 2:
+        return <span key={i} className={clsOf(row.chgPct)}>{fmtPct(row.chgPct)}</span>
+      case 3:
+        return <span key={i} className={clsOf(row.auctionChgPct)}>{fmtPct(row.auctionChgPct)}</span>
+      case 4:
+        return <span key={i} className={clsOf(row.auctionAmount)}>{fmtAmt(row.auctionAmount)}</span>
+      case 5:
+        return <span key={i} className="flat">{fmtAmt(row.amount)}</span>
+      case 6:
+        return <span key={i} className={clsOf(row.speed4m)}>{fmtPct(row.speed4m)}</span>
+      case 7:
+        return <span key={i} className={clsOf(row.mainInflow)}>{fmtAmt(row.mainInflow)}</span>
+      default:
+        return <span key={i} className={clsOf(row.sealAmount)}>{fmtAmt(row.sealAmount)}</span>
+    }
+  }
 
   return (
-    <>
-      <div className="stock-list">
-        {slice.map((row) => (
+    <div
+      className="vlist"
+      ref={listRef}
+      onScroll={updateRange}
+      style={{ '--cols': template } as React.CSSProperties}
+    >
+      <div className="row-head cols-stock">
+        {STOCK_COLS.map((col, i) =>
+          vis.includes(i) ? (
+            <HeadCell
+              key={col.label}
+              label={col.label}
+              sortKey={
+                col.sortKey && !disabledSortKeys.includes(col.sortKey)
+                  ? col.sortKey
+                  : undefined
+              }
+              sort={effectiveSort}
+              onSort={onSort}
+              onResize={startResize(i)}
+            />
+          ) : null,
+        )}
+      </div>
+      <div style={{ position: 'relative', height: display.length * h }}>
+        {slice.map((row, i) => (
           <div
             key={row.code}
+            ref={i === 0 && rowH === 0 ? measureRef : undefined}
             className={row.code === code ? 'stock-row selected' : 'stock-row'}
+            style={{
+              position: 'absolute',
+              top: (range.start + i) * h,
+              left: 0,
+              right: 0,
+            }}
             onClick={() => setCode(row.code)}
           >
-            <span className="sc">{row.code}</span>
-            <span className="sn" title={row.name ?? ''}>{row.name ?? ''}</span>
-            <span className={row.valueCls ?? 'flat'}>{row.value ?? ''}</span>
+            {vis.map((ci) => cellOf(row, ci))}
           </div>
         ))}
       </div>
-      {pages > 1 && (
-        <div className="pager">
-          <button onClick={() => setPage(Math.max(0, cur - 1))} disabled={cur === 0}>
-            ‹
-          </button>
-          <span className="dim">
-            {cur + 1}/{pages}
+    </div>
+  )
+}
+
+// ── 板块列表（同样支持表头排序 + 列宽拖拽）──
+
+export interface BoardRowData {
+  code: string
+  name: string
+  chgPct?: number
+  speed4m?: number
+  mainInflow?: number
+  upCount?: number
+  downCount?: number
+  limitUp?: number
+}
+
+const BOARD_COLS: { label: string; sortKey?: string }[] = [
+  { label: '板块' },
+  { label: '涨幅', sortKey: 'chgPct' },
+  { label: '涨速', sortKey: 'speed4m' },
+  { label: '主力', sortKey: 'mainInflow' },
+  { label: '涨家', sortKey: 'upCount' },
+  { label: '跌家', sortKey: 'downCount' },
+  { label: '涨停', sortKey: 'limitUp' },
+]
+
+const BOARD_COL_WIDTHS = [90, 46, 40, 50, 34, 34, 34]
+
+export function BoardTable({
+  rows,
+  initialSort = null,
+}: {
+  rows: BoardRowData[]
+  initialSort?: ColSort | null
+}) {
+  const [sort, setSort] = useState<ColSort | null>(initialSort)
+  const listRef = useRef<HTMLDivElement>(null)
+  const { widths, startResize } = useColumnWidths(
+    'ths.cols.board',
+    BOARD_COL_WIDTHS,
+  )
+  const { vis, template } = useVisibleColumns(
+    listRef,
+    BOARD_COLS.length,
+    widths,
+  )
+  const display = sortRows(rows, sort)
+  const onSort = (key: string) => {
+    setSort((cur) =>
+      cur && cur.key === key ? { key, desc: !cur.desc } : { key, desc: true },
+    )
+  }
+  const cellOf = (b: BoardRowData, i: number) => {
+    switch (i) {
+      case 0:
+        return (
+          <span key={i} className="bn" title={`${b.code} ${b.name}`}>
+            {b.name}
           </span>
-          <button
-            onClick={() => setPage(Math.min(pages - 1, cur + 1))}
-            disabled={cur === pages - 1}
-          >
-            ›
-          </button>
-        </div>
-      )}
-    </>
+        )
+      case 1:
+        return <span key={i} className={clsOf(b.chgPct)}>{fmtPct(b.chgPct)}</span>
+      case 2:
+        return <span key={i} className={clsOf(b.speed4m)}>{fmtPct(b.speed4m)}</span>
+      case 3:
+        return <span key={i} className={clsOf(b.mainInflow)}>{fmtAmt(b.mainInflow)}</span>
+      case 4:
+        return <span key={i} className="up">{b.upCount != null ? String(Math.round(b.upCount)) : '-'}</span>
+      case 5:
+        return <span key={i} className="down">{b.downCount != null ? String(Math.round(b.downCount)) : '-'}</span>
+      default:
+        return <span key={i} className="up">{b.limitUp != null ? String(Math.round(b.limitUp)) : '-'}</span>
+    }
+  }
+  return (
+    <div
+      className="vlist"
+      ref={listRef}
+      style={{ '--cols': template } as React.CSSProperties}
+    >
+      <div className="row-head cols-board">
+        {BOARD_COLS.map((col, i) =>
+          vis.includes(i) ? (
+            <HeadCell
+              key={col.label}
+              label={col.label}
+              sortKey={col.sortKey}
+              sort={sort}
+              onSort={onSort}
+              onResize={startResize(i)}
+            />
+          ) : null,
+        )}
+      </div>
+      <div className="stock-list">
+        {display.map((b) => (
+          <div key={b.code} className="board-row">
+            {vis.map((ci) => cellOf(b, ci))}
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }

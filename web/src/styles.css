@@ -113,11 +113,19 @@ input {
   color: var(--text-dim);
 }
 
-/* 三栏 body：左 / 中 / 右 */
+/* 三栏 body：左 / 分隔条 / 中 / 右。左栏宽度由 App 内联控制（拖拽持久化），
+   中栏分时/日K自适应剩余宽度。 */
 .body {
   display: grid;
-  grid-template-columns: 360px 1fr 280px;
   overflow: hidden;
+}
+/* 可拖拽垂直分隔条（列表面板边缘调宽） */
+.vsplit {
+  cursor: col-resize;
+  background: var(--border);
+}
+.vsplit:hover {
+  background: #3a5a8a;
 }
 .col {
   display: flex;
@@ -195,15 +203,22 @@ tr.selected {
   background: #2a3a5a;
 }
 
-/* 左栏 2x3 格容器 */
+/* 左栏：两列各三格 + 中间可拖拽分隔条（宽度持久化，格子变窄自动隐藏尾列） */
 .left-grid {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.lcol {
   display: grid;
-  grid-template-columns: 1fr 1fr;
   grid-template-rows: 1fr 1fr 1fr;
   gap: 1px;
   background: var(--border);
-  flex: 1;
   min-height: 0;
+}
+.left-grid > .vsplit {
+  flex: 0 0 auto;
+  width: 5px;
 }
 .cell {
   background: var(--panel);
@@ -242,15 +257,16 @@ tr.selected {
   position: relative;
 }
 
-/* tag chips */
+/* tag chips：中栏 K 线周期/复权等选项行 */
 .chip {
   display: inline-block;
-  padding: 1px 6px;
-  font-size: 11px;
+  padding: 1px 3px;
+  font-size: 10px;
   border: 1px solid var(--border);
   border-radius: 2px;
   color: var(--text-dim);
   cursor: pointer;
+  white-space: nowrap;
 }
 .chip.active {
   color: #e8c36a;
@@ -258,17 +274,26 @@ tr.selected {
   background: #2a2510;
 }
 
-/* 左栏 2×3 格内嵌列表与分页 */
+/* 左栏 2×3 格内嵌列表：工具栏固定在顶部，列表区（.vlist）自己滚动。
+   滚轮直接滚全量列表（虚拟滚动），无分页按钮。 */
 .cell-body {
   flex: 1;
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   min-height: 0;
+}
+.vlist {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: auto;
 }
 .cell-toolbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 3px;
-  padding: 2px 4px;
+  gap: 2px;
+  padding: 2px 3px;
   border-bottom: 1px solid var(--border);
 }
 .cell-toolbar select {
@@ -280,17 +305,85 @@ tr.selected {
   padding: 1px 2px;
   border-radius: 2px;
 }
+
+/* 列表表头：与对应行布局用同一套 grid 列（列宽来自 .vlist 上的 --cols
+   变量，表头右缘可拖拽调宽，localStorage 持久化）。表头可点击排序。 */
+.row-head {
+  display: grid;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  user-select: none;
+  box-sizing: border-box;
+}
+.row-head.cols-stock {
+  grid-template-columns: var(
+    --cols,
+    44px minmax(52px, 1fr) 54px 54px 50px 50px 50px 54px 50px
+  );
+}
+.row-head.cols-board {
+  grid-template-columns: var(--cols, minmax(72px, 1fr) 46px 40px 50px 34px 34px 34px);
+}
+.row-head span:first-child,
+.row-head span:nth-child(2) {
+  text-align: left;
+}
+.row-head span:nth-child(n + 3) {
+  text-align: right;
+}
+.hcell {
+  position: relative;
+  white-space: nowrap;
+}
+.hcell.sortable {
+  cursor: pointer;
+}
+.hcell.sortable:hover {
+  color: var(--text);
+}
+.hcell.sorted {
+  color: #e8c36a;
+}
+.sort-mark {
+  font-style: normal;
+  margin-left: 1px;
+  font-size: 8px;
+}
+.col-grip {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  right: -5px;
+  width: 7px;
+  cursor: col-resize;
+  z-index: 2;
+}
+.col-grip:hover {
+  background: #3a5a8a;
+}
 .stock-list {
   min-height: 0;
 }
 .stock-row {
   display: grid;
-  grid-template-columns: 54px 1fr 1fr;
+  grid-template-columns: var(
+    --cols,
+    44px minmax(52px, 1fr) 54px 54px 50px 50px 50px 54px 50px
+  );
   gap: 4px;
   padding: 2px 6px;
   font-size: 11px;
   cursor: pointer;
   border-bottom: 1px solid #1f1f1f;
+  width: 100%;
+  box-sizing: border-box;
 }
 .stock-row:hover {
   background: #1f2530;
@@ -309,27 +402,30 @@ tr.selected {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.stock-row > span:last-child {
+.stock-row > span:nth-child(n + 3) {
   text-align: right;
   white-space: nowrap;
 }
-.pager {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 3px;
-  border-top: 1px solid var(--border);
-  position: sticky;
-  bottom: 0;
-  background: var(--panel);
-}
-.pager button {
-  padding: 0 7px;
-  line-height: 16px;
+.board-row {
+  display: grid;
+  grid-template-columns: var(--cols, minmax(72px, 1fr) 46px 40px 50px 34px 34px 34px);
+  gap: 4px;
+  padding: 2px 6px;
   font-size: 11px;
+  border-bottom: 1px solid #1f1f1f;
+  width: 100%;
+  box-sizing: border-box;
 }
-.pager button:disabled {
-  opacity: 0.35;
-  cursor: default;
+.board-row:hover {
+  background: #1f2530;
+}
+.board-row .bn {
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.board-row > span:nth-child(n + 2) {
+  text-align: right;
+  white-space: nowrap;
 }
