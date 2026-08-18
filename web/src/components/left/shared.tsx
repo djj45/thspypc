@@ -52,7 +52,8 @@ export interface StockRowData {
 
 // 批量统一字段：滚动的可视窗口代码传进来，返回 code→QuoteExt 映射。
 // 防抖吸收快速滚动的窗口抖动；新结果合并进旧 map（回滚时已看过的行
-// 立即显示缓存值，不闪 "-"）。空列表不发。
+// 立即显示缓存值，不闪 "-"）。窗口静止不重复请求（盘中实时更新待接入
+// 同花顺推送后实现）。空列表不发。
 export function useQuoteExt(
   codes: string[],
   debounceMs = 200,
@@ -61,9 +62,11 @@ export function useQuoteExt(
   const key = codes.join(',')
   useEffect(() => {
     if (!key) return
+    let alive = true
     const timer = setTimeout(() => {
       api.quotesExt(key.split(','))
         .then((rows) => {
+          if (!alive) return
           setMap((prev) => {
             const merged = new Map(prev)
             for (const r of rows) merged.set(r.code, r)
@@ -72,7 +75,10 @@ export function useQuoteExt(
         })
         .catch(() => {})
     }, debounceMs)
-    return () => clearTimeout(timer)
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, debounceMs])
   return map

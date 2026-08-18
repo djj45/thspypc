@@ -297,13 +297,25 @@ tr.selected {
   border-bottom: 1px solid var(--border);
 }
 .cell-toolbar select {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   background: #0a0a0a;
   color: var(--text);
   border: 1px solid var(--border);
   font-size: 11px;
   padding: 1px 2px;
   border-radius: 2px;
+}
+/* 动态板块问财实时刷新按钮 */
+.mini-btn {
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 18px;
+  border-radius: 2px;
+}
+.mini-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 /* 列表表头：与对应行布局用同一套 grid 列（列宽来自 .vlist 上的 --cols

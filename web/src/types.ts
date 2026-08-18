@@ -186,6 +186,13 @@ export interface StockGroup {
   is_dynamic: boolean
 }
 
+// 动态板块（条件选股）：question 为问财语句，items 为 "600519.SH" 形式
+export interface DynamicPlate {
+  name: string
+  question: string | null
+  items: string[]
+}
+
 // ── sort_by 常量（与后端 SORT_BY_VALUES 对应，活网验证）──
 export const SORT_BY = {
   chg: 199112, // 涨幅 → dt200
@@ -196,6 +203,8 @@ export const SORT_BY = {
   auction_amount: 68758, // 竞价金额 → dt150
   auction_chg: 68762, // 竞价涨幅 → dt154
   seal: 265260, // 封单额 → dt44
+  amount: 19, // 成交额(元) → dt19（2026-08-19 L2 排序路径实测）
+  volume: 13, // 成交量(股) → dt13（同上）
 } as const
 
 // sort_by → 响应里数值所在的 dt 字段名（with_values=True 时取值用）

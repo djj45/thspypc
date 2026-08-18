@@ -14,6 +14,7 @@ import type {
   QuoteExt,
   Dxjl,
   StockGroup,
+  DynamicPlate,
   MarketView,
   MarketViewFast,
 } from '../types'
@@ -232,8 +233,11 @@ export const api = {
   groups: () => getJson<StockGroup[]>('/api/groups'),
   group: (name: string) => getJson<StockGroup>(`/api/groups/${name}`),
   selfStocks: () => getJson<StockGroup>('/api/self_stocks'),
-  dynamicPlates: () =>
-    getJson<Record<string, string[]>>('/api/dynamic_plates'),
+  dynamicPlates: () => getJson<DynamicPlate[]>('/api/dynamic_plates'),
+  dynamicPlateRefresh: (name: string) =>
+    getJson<DynamicPlate>(
+      `/api/dynamic_plate_refresh?name=${encodeURIComponent(name)}`,
+    ),
 
   // 短线精灵
   dxjlLatest: () => getJson<Dxjl[]>('/api/dxjl/latest'),

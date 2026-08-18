@@ -133,6 +133,9 @@ class StockGroup:
     group_id: str
     items: list[StockItem] = field(default_factory=list)
     is_dynamic: bool = False
+    # 动态板块的问财语句（云端分组 attrs.question，如
+    # "非st;上上一交易日涨停;上一交易日未涨停"），刷新成分股用
+    question: str | None = None
 
 
 class StockEntry(NamedTuple):
@@ -539,7 +542,13 @@ class BlockManager:
                 for e in entries
             ]
             is_dyn = gid.startswith(_DYNAMIC_GROUP_PREFIX)
-            group = StockGroup(name=gname, group_id=gid, items=items, is_dynamic=is_dyn)
+            attrs = g.get("attrs") or {}
+            question = attrs.get("question") if isinstance(attrs, dict) else None
+            group = StockGroup(
+                name=gname, group_id=gid, items=items,
+                is_dynamic=is_dyn,
+                question=str(question) if question else None,
+            )
             result.append(group)
             self._groups_cache[gname] = group
 

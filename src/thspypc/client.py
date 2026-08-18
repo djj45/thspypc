@@ -1332,10 +1332,44 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._ensure_blocks()
         return self._blocks.query_dynamic_plate(condition, num)
 
-    def list_dynamic_plates(self):
-        """列出所有动态板块及其成分股（云端快照）。"""
+    def list_dynamic_plates(self) -> list[dict]:
+        """列出所有动态板块：``[{name, question, items}]``（云端快照）。
+
+        question 为问财选股语句（云端分组 attrs.question），供
+        :meth:`refresh_dynamic_plate` 实时重查成分股。
+        """
         self._ensure_blocks()
-        return self._blocks.list_dynamic_plates()
+        return [
+            {
+                "name": g.name,
+                "question": g.question,
+                "items": [
+                    f"{item.code}.{item.market}" for item in g.items if item.market
+                ],
+            }
+            for g in self._blocks.list_groups()
+            if g.is_dynamic
+        ]
+
+    def refresh_dynamic_plate(self, name: str) -> dict:
+        """按板块名用问财语句实时重查成分股（非云端快照）。
+
+        Returns:
+            ``{"name", "question", "items": ["600519.SH", ...]}``
+
+        Raises:
+            ValueError: 板块不存在、非动态板块或云端未带问财语句。
+        """
+        self._ensure_blocks()
+        for g in self._blocks.list_groups():
+            if g.name == name:
+                if not g.is_dynamic:
+                    raise ValueError(f"{name} 不是动态板块")
+                if not g.question:
+                    raise ValueError(f"动态板块 {name} 云端未提供问财语句")
+                items = self._blocks.query_dynamic_plate(g.question)
+                return {"name": name, "question": g.question, "items": items}
+        raise ValueError(f"找不到动态板块: {name}")
 
     # ── 系统板块（行业/概念/地域…，本地 block_hq 缓存，只读，无需登录）──
 

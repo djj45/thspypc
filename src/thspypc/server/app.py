@@ -489,9 +489,19 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         return _jsonable(_call(lambda client: client.hot_boards()))
 
     @app.get("/api/dynamic_plates")
-    def dynamic_plates() -> dict:
-        """动态板块列表（条件选股），走 HTTPS cookie 鉴权。"""
+    def dynamic_plates() -> list[dict]:
+        """动态板块列表（条件选股，云端快照），含问财语句 question。"""
         return _call(lambda client: client.list_dynamic_plates())
+
+    @app.get("/api/dynamic_plate_refresh")
+    def dynamic_plate_refresh(
+        name: str = Query(..., description="动态板块名"),
+    ) -> dict:
+        """按问财语句实时重查动态板块成分股（非云端快照）。"""
+        try:
+            return _call(lambda client: client.refresh_dynamic_plate(name))
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/groups/{name}")
     def group_detail(name: str, refresh: bool = False) -> dict:

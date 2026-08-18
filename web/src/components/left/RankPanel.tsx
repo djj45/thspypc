@@ -12,8 +12,8 @@ import {
   type StockRowData,
 } from './shared'
 
-// 表头排序键 → 服务端 SortBy。成交额无服务端排序键（客户端走推送本地排），
-// 在 StockTable disabledSortKeys 里禁用。
+// 表头排序键 → 服务端 SortBy（全部活网验证；19=成交额/13=成交量 为
+// 2026-08-19 L2 排序路径新验证，此前文档误以为成交额不可排）。
 const SERVER_SORT: Record<string, number> = {
   chgPct: SORT_BY.chg,
   speed4m: SORT_BY.speed,
@@ -21,6 +21,7 @@ const SERVER_SORT: Record<string, number> = {
   auctionAmount: SORT_BY.auction_amount,
   auctionChgPct: SORT_BY.auction_chg,
   sealAmount: SORT_BY.seal,
+  amount: SORT_BY.amount,
 }
 
 // 全市场榜一次拉全（L2 账号走 SortCount 放大单请求，约 0.1s），
@@ -59,7 +60,7 @@ export function RankPanel() {
       // 主力净额直查 0xc4 金额表（元）；排序响应的 dt250 今日不可靠
       mainInflow: q?.main_inflow ?? undefined,
       // 封单额：排序时由排序值覆盖，平时走 265260 排序榜缓存
-      sealAmount: q?.seal_amount ?? undefined,
+      sealAmount: q?.seal_amount || undefined,
     }
     // 排序值本身就是该列的真值（服务端排序口径），有值时优先。
     // 主力列例外：592890 排序响应今日回 dt44（封单额），不再采信 r.value。
@@ -69,7 +70,8 @@ export function RankPanel() {
       else if (sort.key === 'speed4m') row.speed4m = v
       else if (sort.key === 'auctionAmount') row.auctionAmount = v
       else if (sort.key === 'auctionChgPct') row.auctionChgPct = v
-      else if (sort.key === 'sealAmount') row.sealAmount = v
+      else if (sort.key === 'sealAmount') row.sealAmount = v || undefined
+      else if (sort.key === 'amount') row.amount = v
     }
     return row
   })
@@ -83,7 +85,6 @@ export function RankPanel() {
           onVisible={setVisibleCodes}
           sort={sort}
           onSortChange={setSort}
-          disabledSortKeys={['amount']}
         />
       </StateBox>
     </Cell>

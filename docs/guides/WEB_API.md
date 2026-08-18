@@ -53,7 +53,8 @@ OpenAPI 文档。
 | GET | `/api/groups` | 自定义板块/分组列表 |
 | GET | `/api/groups/{name}?refresh=false` | 单个自定义板块成分股 |
 | GET | `/api/self_stocks` | 自选股（默认自选股分组） |
-| GET | `/api/dynamic_plates` | 动态板块列表（条件选股，HTTPS cookie 鉴权） |
+| GET | `/api/dynamic_plates` | 动态板块列表 `[{name, question, items}]`（云端快照；question 为问财语句） |
+| GET | `/api/dynamic_plate_refresh?name=动态板块名` | 按问财语句实时重查成分股（非云端快照；404=板块不存在/无语句） |
 | GET | `/api/dxjl?pages=5` | 短线精灵历史（无推送） |
 | GET | `/api/dxjl/latest` | 短线精灵最新一页（前端轮询用） |
 
