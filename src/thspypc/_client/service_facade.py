@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from datetime import date as date_type, datetime
 
@@ -27,6 +28,13 @@ from .stock_cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+# MAIN 通道串行锁：quotes_ext（多个面板并发）与盘口 market_view_pipeline 同跑
+# 在一条 MAIN socket 上时，Windows 下并发读写会触发 WSAEWOULDBLOCK(10035)/
+# 10038 传输异常，空结果又各自引发 connect_main 重连风暴，部分批次彻底失败
+# （2026-08-19 日志实证：4 组并发批次全挂，前端对应行永远 "-"）。两类入口在
+# facade 层串行化，消除争抢；单批 ~100ms，排队代价可忽略。
+_MAIN_SERIAL_LOCK = threading.RLock()
 
 
 class ServiceFacade:
@@ -430,6 +438,23 @@ class ServiceFacade:
     ) -> list[dict]:
         """批量查询统一列表字段（web 左栏 9 列全部可计算列）。
 
+        并发安全：入口经 ``_MAIN_SERIAL_LOCK`` 串行化（多面板同时请求时
+        排队执行，不再并发踩 MAIN socket）。
+        """
+        with _MAIN_SERIAL_LOCK:
+            return self._stock_quote_fields_locked(
+                codes, timeout=timeout, batch_size=batch_size
+            )
+
+    def _stock_quote_fields_locked(
+        self,
+        codes: list[str],
+        *,
+        timeout: float = 10.0,
+        batch_size: int = 40,
+    ) -> list[dict]:
+        """批量查询统一列表字段（web 左栏 9 列全部可计算列）。
+
         每批两路请求（同一连接流水线）：
         1. 基础表 DataType=5,6,7,10,17,19,48 → 涨幅/竞价涨幅/竞价金额/
            成交额/涨速（本地派生，见
@@ -637,22 +662,27 @@ class ServiceFacade:
         market: int = 0,
         timeout: float = 12.0,
     ) -> tuple[dict | None, DepthQuote]:
-        """Return quote and five-level depth using one bounded MAIN pipeline."""
+        """Return quote and five-level depth using one bounded MAIN pipeline.
+
+        与 stock_quote_fields 共用 ``_MAIN_SERIAL_LOCK`` 串行化，避免多面板
+        quotes_ext 与切股盘口并发踩同一条 MAIN socket。
+        """
         if market == 0:
             market = self._market_for_code(code)
         self._ensure_main_connection()
-        try:
-            return self._run_default_service(
-                (Capability.BASIC_QUOTE,),
-                lambda: self._quote_service.market_view_pipeline(
-                    code,
-                    market=market,
-                    timeout=timeout,
-                ),
-            )
-        except ProtocolError as exc:
-            logger.warning("market_view_pipeline: %s", exc)
-            return None, {}
+        with _MAIN_SERIAL_LOCK:
+            try:
+                return self._run_default_service(
+                    (Capability.BASIC_QUOTE,),
+                    lambda: self._quote_service.market_view_pipeline(
+                        code,
+                        market=market,
+                        timeout=timeout,
+                    ),
+                )
+            except ProtocolError as exc:
+                logger.warning("market_view_pipeline: %s", exc)
+                return None, {}
 
     def kline(
         self,
@@ -1852,12 +1882,93 @@ class ServiceFacade:
                 with_values=with_values,
             ),
         )
+        stocks = self._anchor_correct_money_sort(
+            stocks, sort_by=sort_by, sort_dir=sort_dir,
+            with_values=with_values, timeout=timeout,
+        )
         if with_names and stocks:
             name_map = self.fetch_stock_names_full()["names"]
             for stock in stocks:
                 name = name_map.get(stock["code"], "")
                 if name:
                     stock["name"] = name
+        return stocks
+
+    # 金额类排序键 → (榜单值字段, 0xc4 锚定取值函数名)。
+    # 2026-08-20 实测 L2 排序(592890)注入真值×100 的虚值行（见
+    # services.stock_list._anchor_correct_ranked_values），其他金额键同理
+    # 可能中招；封单额 265260 的 dt44 不在 0xc4 表内、无法锚定，跳过。
+    _MONEY_SORT_ANCHORS: dict[int, tuple[str, str]] = {
+        592890: ("dt250", "main_inflow"),
+        19: ("dt19", "amount"),
+        13: ("dt13", "dt13"),
+        68758: ("dt150", "auction_amount"),
+    }
+
+    def _anchor_correct_money_sort(
+        self,
+        stocks: list[dict],
+        *,
+        sort_by: int,
+        sort_dir: str,
+        with_values: bool,
+        timeout: float,
+    ) -> list[dict]:
+        """用 0xc4 金额表锚定校正金额类排序的头部虚值行。"""
+        anchor = self._MONEY_SORT_ANCHORS.get(sort_by)
+        if not anchor or not with_values or not stocks:
+            return stocks
+        ranked_field, derive_key = anchor
+        top = [str(r.get("code", "")) for r in stocks[:120] if r.get("code")]
+        if not top:
+            return stocks
+        from ..features.quote_protocol import (
+            MONEY_QUOTE_DATATYPE,
+            derive_list_quote_fields,
+        )
+        from ..services.stock_list import _anchor_correct_ranked_values
+
+        groups: dict[int, list[str]] = {}
+        for code in top:
+            groups.setdefault(self._market_for_code(code), []).append(code)
+        anchors: dict[str, float] = {}
+        for market, codes in groups.items():
+            for i in range(0, len(codes), 40):
+                chunk = codes[i : i + 40]
+                try:
+                    records = self.list_quotes(
+                        chunk,
+                        market=market,
+                        datatype=MONEY_QUOTE_DATATYPE,
+                        pageid=1334,
+                        timeout=timeout,
+                    )
+                except (ProtocolError, OSError) as exc:
+                    logger.warning("money sort 锚定批失败 market=%s: %s", market, exc)
+                    continue
+                for record in records:
+                    code = str(record.get("code", ""))
+                    if not code:
+                        continue
+                    if derive_key in ("main_inflow", "amount", "auction_amount"):
+                        value = derive_list_quote_fields(record).get(derive_key)
+                    else:
+                        value = record.get(derive_key)
+                    if isinstance(value, (int, float)):
+                        anchors[code] = value
+        if not anchors:
+            return stocks
+        stocks, corrected = _anchor_correct_ranked_values(
+            stocks,
+            ranked_field=ranked_field,
+            anchors=anchors,
+            sort_dir=sort_dir,
+        )
+        if corrected:
+            logger.warning(
+                "money sort sort_by=%s 锚定校正 %d 行（服务端注入×100 虚值）",
+                sort_by, corrected,
+            )
         return stocks
 
     def stock_list(
@@ -2096,6 +2207,25 @@ class ServiceFacade:
             ),
         )
 
+    def _attach_dxjl_names(self, records: list[dict]) -> list[dict]:
+        """为短线精灵记录回填 名称（当日缓存的代码-名称表，热路径无网络）。
+
+        尽力而为：名称表不可用（未登录 123ths/网络失败）时返回原记录，
+        前端回退显示代码。
+        """
+        if not records:
+            return records
+        try:
+            name_map = self.fetch_stock_names_full()["names"]
+        except Exception:
+            logger.debug("dxjl 名称回填跳过：名称表不可用", exc_info=True)
+            return records
+        for record in records:
+            name = name_map.get(record.get("代码", ""))
+            if name:
+                record["名称"] = name
+        return records
+
     def dxjl_latest(self, markets: tuple = (32, 16)) -> list[dict]:
         """获取短线精灵最新一页（沪深）。
 
@@ -2103,14 +2233,20 @@ class ServiceFacade:
             markets: 市场元组，默认 (32, 16) = 深沪。
 
         Returns:
-            list[dict]，按时间倒序（最新在前）。非交易时段可能为空。
+            list[dict]，按时间倒序（最新在前），含 名称。非交易时段可能为空。
         """
-        return self._run_default_service(
+        records = self._run_default_service(
             (Capability.REALORDER,),
             lambda: self._realorder_service.dxjl_latest(markets=markets),
         )
+        return self._attach_dxjl_names(records)
 
-    def dxjl_history(self, pages: int = 5, markets: tuple = (32, 16)) -> list[dict]:
+    def dxjl_history(
+        self,
+        pages: int = 5,
+        markets: tuple = (32, 16),
+        endtime_us: int | None = None,
+    ) -> list[dict]:
         """翻页获取短线精灵历史数据（endtime 游标分页）。
 
         翻页机制：第 N+1 页的 endtime = 第 N 页最早记录的时间戳。
@@ -2118,17 +2254,21 @@ class ServiceFacade:
         Args:
             pages: 翻页数。
             markets: 市场元组，默认 (32, 16) = 深沪。
+            endtime_us: 起始游标（微秒时间戳）。None=从当前时刻向前翻；
+                前端上拉加载历史时传已加载最早一条的时间。
 
         Returns:
-            list[dict]，按时间倒序。
+            list[dict]，按时间倒序，含 名称。
         """
-        return self._run_default_service(
+        records = self._run_default_service(
             (Capability.REALORDER,),
             lambda: self._realorder_service.dxjl_history(
                 pages=pages,
                 markets=markets,
+                now_us=endtime_us,
             ),
         )
+        return self._attach_dxjl_names(records)
 
     def subscribe_realtime(self, markets: list[int] | None = None) -> None:
         """在 9601 上订阅异动推送（method=subrealorder）。

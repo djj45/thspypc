@@ -241,5 +241,8 @@ export const api = {
 
   // 短线精灵
   dxjlLatest: () => getJson<Dxjl[]>('/api/dxjl/latest'),
-  dxjlHistory: (pages = 5) => getJson<Dxjl[]>(`/api/dxjl?pages=${pages}`),
+  dxjlHistory: (pages = 5, endtime?: number) =>
+    getJson<Dxjl[]>(
+      `/api/dxjl?pages=${pages}${endtime != null ? `&endtime=${endtime}` : ''}`,
+    ),
 }

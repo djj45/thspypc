@@ -53,7 +53,8 @@ export interface StockRowData {
 // 批量统一字段：滚动的可视窗口代码传进来，返回 code→QuoteExt 映射。
 // 防抖吸收快速滚动的窗口抖动；新结果合并进旧 map（回滚时已看过的行
 // 立即显示缓存值，不闪 "-"）。窗口静止不重复请求（盘中实时更新待接入
-// 同花顺推送后实现）。空列表不发。
+// 同花顺推送后实现）。空列表不发。后端单批偶发缺行（冷启动争抢）时
+// 自动补拉缺失代码（最多 3 轮），保证初始可见区一定有数据。
 export function useQuoteExt(
   codes: string[],
   debounceMs = 200,
@@ -63,17 +64,25 @@ export function useQuoteExt(
   useEffect(() => {
     if (!key) return
     let alive = true
-    const timer = setTimeout(() => {
-      api.quotesExt(key.split(','))
-        .then((rows) => {
+    const timer = setTimeout(async () => {
+      let pending = key.split(',')
+      for (let attempt = 0; attempt < 3 && alive && pending.length; attempt++) {
+        try {
+          const rows = await api.quotesExt(pending)
           if (!alive) return
+          const got = new Set(rows.map((r) => r.code))
           setMap((prev) => {
             const merged = new Map(prev)
             for (const r of rows) merged.set(r.code, r)
             return merged
           })
-        })
-        .catch(() => {})
+          pending = pending.filter((c) => !got.has(c))
+          if (!pending.length) return
+        } catch {
+          /* 整批失败：下一轮重试 */
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
     }, debounceMs)
     return () => {
       alive = false
@@ -331,6 +340,9 @@ export function StockTable({
   const controlled = onSortChange !== undefined
   const effectiveSort = controlled ? (sort ?? null) : localSort
   const display = controlled ? rows : sortRows(rows, effectiveSort)
+  // 点击行时注册为键盘/滚轮切换的顺序源；用 ref 保证之后改排序也跟随最新顺序
+  const displayRef = useRef(display)
+  displayRef.current = display
 
   const onSort = (key: string) => {
     const cur = effectiveSort
@@ -444,7 +456,11 @@ export function StockTable({
               left: 0,
               right: 0,
             }}
-            onClick={() => setCode(row.code)}
+            onClick={() =>
+              setCode(row.code, {
+                getCodes: () => displayRef.current.map((r) => r.code),
+              })
+            }
           >
             {vis.map((ci) => cellOf(row, ci))}
           </div>

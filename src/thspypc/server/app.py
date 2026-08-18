@@ -471,8 +471,12 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
 
     # ── 短线精灵（历史，无推送）──
     @app.get("/api/dxjl")
-    def dxjl(pages: int = 5) -> list[dict]:
-        return _call(lambda client: client.dxjl_history(pages=pages))
+    def dxjl(pages: int = 5, endtime: int | None = None) -> list[dict]:
+        """短线精灵历史。endtime=微秒游标（已加载最早一条的时间），不传则从
+        当前时刻向前翻；前端上拉翻历史时传游标增量拉取。"""
+        return _call(
+            lambda client: client.dxjl_history(pages=pages, endtime_us=endtime)
+        )
 
     # ── 前端补充接口（板块分类/热点板块/排序榜/自选/动态板块/最新短线精灵）──
     # app.py 原 8/3 版本未暴露这些最近新增的 client 能力，这里统一补齐薄路由。

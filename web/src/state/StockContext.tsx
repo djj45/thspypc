@@ -50,9 +50,15 @@ interface TaggedKline {
   rows: Kline[]
 }
 
+/** 列表导航源：getCodes 返回该列表“当前”的完整代码顺序（点击后排序变化也跟随） */
+export interface StockNavSource {
+  getCodes: () => string[]
+}
+
 interface StockCtx {
   code: string
-  setCode: (code: string) => void
+  /** 选中股票；source=点击来源列表（注册为键盘/滚轮切换的顺序源） */
+  setCode: (code: string, source?: StockNavSource) => void
   period: KlinePeriod
   setPeriod: (period: KlinePeriod) => void
   fuquan: string
@@ -60,6 +66,10 @@ interface StockCtx {
   quote: QuoteInfo | null
   marketView: DataState<MarketView>
   klineState: DataState<Kline[]>
+  /** 上/下一只：有列表上下文按列表当前顺序（首尾循环），否则按全市场代码升序 */
+  navigate: (dir: 1 | -1) => void
+  /** 全市场代码（升序）注册口，RankPanel 加载后填充，供无列表上下文时回退 */
+  globalCodesRef: React.MutableRefObject<string[]>
 }
 
 const emptyMarketView: DataState<MarketView> = {
@@ -85,10 +95,36 @@ const Ctx = createContext<StockCtx>({
   quote: null,
   marketView: emptyMarketView,
   klineState: emptyKline,
+  navigate: () => {},
+  globalCodesRef: { current: [] },
 })
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+// 数据通道闸门：同一通道最多 1 个在途请求，快速连切时排队任务不断被
+// 最新代码替换 —— 后端 socket 不积压废请求，停下后必拉最终代码。
+function useLaneGate() {
+  const busyRef = useRef(false)
+  const taskRef = useRef<(() => Promise<void>) | null>(null)
+  return useCallback((task: () => Promise<void>) => {
+    taskRef.current = task
+    if (busyRef.current) return
+    const go = async () => {
+      busyRef.current = true
+      try {
+        while (taskRef.current) {
+          const t = taskRef.current
+          taskRef.current = null
+          await t()
+        }
+      } finally {
+        busyRef.current = false
+      }
+    }
+    void go()
+  }, [])
 }
 
 export function StockProvider({ children }: { children: ReactNode }) {
@@ -107,17 +143,57 @@ export function StockProvider({ children }: { children: ReactNode }) {
   const [intradayError, setIntradayError] = useState('')
   const [klineError, setKlineError] = useState('')
   const [refreshTick, setRefreshTick] = useState(0)
-  const marketGeneration = useRef(0)
-  const klineGeneration = useRef(0)
+  const codeRef = useRef(code)
+  codeRef.current = code
+  const fastLane = useLaneGate()
+  const intradayLane = useLaneGate()
+  const klineLane = useLaneGate()
+  // 键盘/滚轮切换股票：最近点击的列表（顺序源）+ 全市场代码（升序回退）
+  const navListRef = useRef<StockNavSource | null>(null)
+  const globalCodesRef = useRef<string[]>([])
+
+  const setCodeWithSource = useCallback(
+    (next: string, source?: StockNavSource) => {
+      if (source) navListRef.current = source
+      setCode(next)
+    },
+    [],
+  )
+
+  const navigate = useCallback(
+    (dir: 1 | -1) => {
+      const listCodes = navListRef.current?.getCodes() ?? []
+      const codes = listCodes.includes(code)
+        ? listCodes
+        : globalCodesRef.current
+      if (!codes.length) return
+      const i = codes.indexOf(code)
+      if (i < 0) {
+        // 当前代码不在序列中（如从短线精灵/板块指数切入）：按代码插入位就近取
+        const pos = codes.findIndex((c) => c > code)
+        const j =
+          dir > 0
+            ? pos < 0
+              ? 0
+              : pos
+            : pos <= 0
+              ? codes.length - 1
+              : pos - 1
+        setCode(codes[j])
+        return
+      }
+      setCode(codes[(i + dir + codes.length) % codes.length])
+    },
+    [code],
+  )
 
   const refresh = useCallback(() => setRefreshTick((value) => value + 1), [])
 
   // Quote/depth and the unified three-phase intraday request use independent
   // connections.  Start both immediately and let each dataset paint as soon
   // as it arrives; market_view_fast deliberately contains no timeline rows.
+  // 快速连切合并：防抖 + 通道闸门（在途最多 1 个，中间代码不占 socket）。
   useEffect(() => {
-    const requestGeneration = ++marketGeneration.current
-    let alive = true
     setFast(null)
     setIntraday(null)
     setFastLoading(true)
@@ -125,93 +201,81 @@ export function StockProvider({ children }: { children: ReactNode }) {
     setIntradayError('')
 
     const loadFast = async () => {
+      const target = codeRef.current
       try {
-        const firstPaint = await api.marketViewFast(code)
-        if (!alive || marketGeneration.current !== requestGeneration) return
-        setFast(firstPaint)
-      } catch (error) {
-        if (!alive || marketGeneration.current !== requestGeneration) return
-        setFastError(errorText(error))
-      } finally {
-        if (alive && marketGeneration.current === requestGeneration) {
-          setFastLoading(false)
+        const firstPaint = await api.marketViewFast(target)
+        if (target === codeRef.current) {
+          setFast(firstPaint)
+          setFastError('')
         }
+      } catch (error) {
+        if (target === codeRef.current) setFastError(errorText(error))
+      } finally {
+        if (target === codeRef.current) setFastLoading(false)
       }
     }
 
     const loadIntraday = async () => {
+      const target = codeRef.current
       try {
         // 等待后端预热就绪再走 L2，避免冷启动时请求排队等锁/超时。
         await api.preheatReady()
-        if (!alive || marketGeneration.current !== requestGeneration) return
-        const rows = await api.intraday(code)
-        if (!alive || marketGeneration.current !== requestGeneration) return
-        setIntraday({ code, rows })
+        if (target !== codeRef.current) return
+        const rows = await api.intraday(target)
+        if (target === codeRef.current) setIntraday({ code: target, rows })
       } catch (error) {
-        if (!alive || marketGeneration.current !== requestGeneration) return
-        setIntradayError(errorText(error))
+        if (target === codeRef.current) setIntradayError(errorText(error))
       }
     }
 
-    void loadFast()
-    void loadIntraday()
-    return () => {
-      alive = false
-    }
-  }, [code, refreshTick])
+    // 防抖窗口 > 滚轮节流档(120ms)：持续滚动/按住方向键期间完全不发请求，
+    // 停下后一次拉最终代码；闸门再保证在途最多 1 个。
+    const FAST_DEBOUNCE_MS = 150
+    const timer = setTimeout(() => {
+      fastLane(loadFast)
+      intradayLane(loadIntraday)
+    }, FAST_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [code, refreshTick, fastLane, intradayLane])
 
   // K-line has its own ifindhq socket and starts alongside the two requests
-  // above.  Period/fuquan changes only rerun this lane.
+  // above.  Period/fuquan changes only rerun this lane.  同样走闸门：连切时
+  // 最多 1 个在途 K 线请求。
   useEffect(() => {
-    const requestGeneration = ++klineGeneration.current
-    let alive = true
     setKline(null)
     setKlineLoading(true)
     setKlineError('')
     const load = async () => {
+      const target = codeRef.current
       try {
         // KLINE_FAST 也在预热范围内；等它就绪再发，避免与预热争建连。
         await api.preheatReady()
-        if (!alive || klineGeneration.current !== requestGeneration) return
+        if (target !== codeRef.current) return
         // 北交所走后端 auto：Level2 账号会在 shlv2 上用 pageid=1334 查 K线
         // （与 2026-08-15 客户端抓包一致）；沪深继续用独立 ifindhq_fast 通道。
         const channel =
-          code.startsWith('920') ||
-          code.startsWith('43') ||
-          code.startsWith('83') ||
-          code.startsWith('87')
+          target.startsWith('920') ||
+          target.startsWith('43') ||
+          target.startsWith('83') ||
+          target.startsWith('87')
             ? 'auto'
             : 'ifindhq_fast'
-        const rows = await api.kline(
-          code,
-          period,
-          320,
-          fuquan,
-          channel,
-        )
-        if (!alive || klineGeneration.current !== requestGeneration) return
-        setKline({ code, period, fuquan, rows })
-      } catch (error) {
-        if (!alive || klineGeneration.current !== requestGeneration) return
-        setKlineError(errorText(error))
-      } finally {
-        if (alive && klineGeneration.current === requestGeneration) {
-          setKlineLoading(false)
+        const rows = await api.kline(target, period, 320, fuquan, channel)
+        // 展示侧 validKline 还会按 code/period/fuquan 过滤，旧响应不会上屏
+        if (target === codeRef.current) {
+          setKline({ code: target, period, fuquan, rows })
         }
+      } catch (error) {
+        if (target === codeRef.current) setKlineError(errorText(error))
+      } finally {
+        if (target === codeRef.current) setKlineLoading(false)
       }
     }
-    // K 线延迟约 40ms 发出：合并连续切股。快速连续 setCode 时只保留最后一次
-    // 的 K 线请求，避免旧请求在唯一 KLINE_FAST socket 上排队（后端另有
-    // latest-wins 兜底，淘汰已排队但尚未发送的旧请求）。
+    // K 线延迟约 40ms 发出：合并连续切股（闸门再兜底堵 socket 队列）。
     const KLINE_DEBOUNCE_MS = 40
-    const timer = setTimeout(() => {
-      void load()
-    }, KLINE_DEBOUNCE_MS)
-    return () => {
-      alive = false
-      clearTimeout(timer)
-    }
-  }, [code, period, fuquan, refreshTick])
+    const timer = setTimeout(() => klineLane(load), KLINE_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [code, period, fuquan, refreshTick, klineLane])
 
   const validFast = fast?.code === code ? fast : null
   const validIntraday = intraday?.code === code ? intraday.rows : []
@@ -278,7 +342,7 @@ export function StockProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider
       value={{
         code,
-        setCode,
+        setCode: setCodeWithSource,
         period,
         setPeriod,
         fuquan,
@@ -286,6 +350,8 @@ export function StockProvider({ children }: { children: ReactNode }) {
         quote,
         marketView,
         klineState,
+        navigate,
+        globalCodesRef,
       }}
     >
       {children}

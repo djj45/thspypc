@@ -1,4 +1,5 @@
-import { StockProvider } from './state/StockContext'
+import { useEffect } from 'react'
+import { StockProvider, useStock } from './state/StockContext'
 import { Header } from './components/Header'
 import { TimelineChart } from './components/center/TimelineChart'
 import { KlineChart } from './components/center/KlineChart'
@@ -12,12 +13,58 @@ import { usePersistedWidth } from './components/left/shared'
 const LEFT_MIN = 560
 const LEFT_MAX = Math.max(LEFT_MIN + 100, window.innerWidth - 620)
 
+/** 键盘↑↓ + 分时/K线区域滚轮切换股票（顺序由 StockContext 决定）。 */
+function StockNav() {
+  const { navigate } = useStock()
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      if (
+        t &&
+        (t.tagName === 'INPUT' ||
+          t.tagName === 'TEXTAREA' ||
+          t.tagName === 'SELECT' ||
+          t.isContentEditable)
+      ) {
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        navigate(-1)
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        navigate(1)
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [navigate])
+
+  useEffect(() => {
+    let last = 0
+    const onWheel = (e: WheelEvent) => {
+      const t = e.target as HTMLElement | null
+      if (!t || !t.closest('.chart-host')) return
+      e.preventDefault()
+      if (Math.abs(e.deltaY) < 10) return
+      const now = performance.now()
+      if (now - last < 120) return
+      last = now
+      navigate(e.deltaY > 0 ? 1 : -1)
+    }
+    window.addEventListener('wheel', onWheel, { passive: false })
+    return () => window.removeEventListener('wheel', onWheel)
+  }, [navigate])
+  return null
+}
+
 export default function App() {
   const left = usePersistedWidth('ths.layout.leftW', 1040, LEFT_MIN, LEFT_MAX)
   return (
     <StockProvider>
       <div className="app">
         <Header />
+        <StockNav />
         <div
           className="body"
           style={{

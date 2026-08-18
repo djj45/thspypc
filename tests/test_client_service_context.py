@@ -1808,8 +1808,8 @@ def test_realorder_public_methods_delegate_in_service_context(monkeypatch):
             calls.append(("latest", markets))
             return [{"时间": 4}]
 
-        def dxjl_history(self, *, pages, markets):
-            calls.append(("history", pages, markets))
+        def dxjl_history(self, *, pages, markets, now_us=None):
+            calls.append(("history", pages, markets, now_us))
             return [{"时间": 2}]
 
         def subscribe_realtime(self, markets):
@@ -1848,6 +1848,8 @@ def test_realorder_public_methods_delegate_in_service_context(monkeypatch):
     assert client.dxjl_page(32, 123) == [{"时间": 3}]
     assert client.dxjl_latest((32,)) == [{"时间": 4}]
     assert client.dxjl_history(2, (16,)) == [{"时间": 2}]
+    # 前端上拉翻历史：endtime 游标透传为 now_us
+    assert client.dxjl_history(1, (32, 16), 1755475200_000000) == [{"时间": 2}]
     client.subscribe_realtime([16, 32])
     assert client.receive_pushes(timeout=6.0) == [{"代码": "000938"}]
     assert client.receive_pushes_locked(timeout=4.0) == 7
@@ -1855,7 +1857,8 @@ def test_realorder_public_methods_delegate_in_service_context(monkeypatch):
     assert calls == [
         ("page", 32, 123),
         ("latest", (32,)),
-        ("history", 2, (16,)),
+        ("history", 2, (16,), None),
+        ("history", 1, (32, 16), 1755475200_000000),
         ("subscribe", [16, 32]),
         ("receive", 6.0, None, None, False),
         ("receive", 4.0, None, None, True),

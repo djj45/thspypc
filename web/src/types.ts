@@ -166,6 +166,7 @@ export interface Dxjl {
   时间: number
   市场: string
   代码: string
+  名称?: string
   异动类型: string
   异动编码: number
   金额: number

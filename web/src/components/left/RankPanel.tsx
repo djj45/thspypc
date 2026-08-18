@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api } from '../../api/endpoints'
 import { useData } from '../../data/useData'
 import { useStockNames } from '../../data/useStockNames'
+import { useStock } from '../../state/StockContext'
 import { SORT_BY, type RankItem } from '../../types'
 import {
   Cell,
@@ -44,10 +45,23 @@ export function RankPanel() {
     1000,
   )
   const nameMap = useStockNames()
+  const { globalCodesRef } = useStock()
   const [visibleCodes, setVisibleCodes] = useState<string[]>([])
   const quotes = useQuoteExt(visibleCodes)
 
-  const rows: StockRowData[] = (data ?? []).map((r) => {
+  // 全市场代码（升序）注册给全局切换：未点过任何列表时，方向键/滚轮按代码
+  // 递增递减切换（首尾循环）。
+  useEffect(() => {
+    if (data?.length) {
+      globalCodesRef.current = data
+        .map((r) => r.code)
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    }
+  }, [data, globalCodesRef])
+
+  // 快速切股时 code 每秒变数十次，此处 5400 行映射必须 memo，避免每帧重建
+  const rows: StockRowData[] = useMemo(() => {
+    return (data ?? []).map((r) => {
     const q = quotes.get(r.code)
     const row: StockRowData = {
       code: r.code,
@@ -57,8 +71,8 @@ export function RankPanel() {
       auctionAmount: q?.auction_amount ?? undefined,
       amount: q?.amount ?? undefined,
       speed4m: r.dt48 ?? q?.speed_4m ?? undefined,
-      // 主力净额直查 0xc4 金额表（元）；排序响应的 dt250 今日不可靠
-      mainInflow: q?.main_inflow ?? undefined,
+      // 主力净额：0xc4 直查优先，排序响应 dt250 即时填充（后端有漂移守卫）
+      mainInflow: q?.main_inflow ?? r.dt250 ?? undefined,
       // 封单额：排序时由排序值覆盖，平时走 265260 排序榜缓存
       sealAmount: q?.seal_amount || undefined,
     }
@@ -74,7 +88,8 @@ export function RankPanel() {
       else if (sort.key === 'amount') row.amount = v
     }
     return row
-  })
+    })
+  }, [data, quotes, nameMap, sort.key])
 
   return (
     <Cell title="全市场">

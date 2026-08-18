@@ -162,6 +162,8 @@ class StockListService:
             all_rows: list[dict] = []
             seen: set[str] = set()
             sort_count = min(20, max(count, 20))
+            full_requested = False
+            drift_retried = False
             for _ in range(max_pages):
                 request = build_stock_list_query(
                     markets=markets,
@@ -186,6 +188,28 @@ class StockListService:
                     break
                 metadata = parse_stock_list_response(response)
                 page_stocks = metadata["stocks"]
+                if (
+                    with_values
+                    and not drift_retried
+                    and _rows_missing_value_field(page_stocks, response_field)
+                ):
+                    # 响应漂移（如 592890 回 dt44 表）：重连该 L2 角色取新鲜
+                    # 连接重试一次；仍漂移则按缺值行处理（排末尾），绝不能
+                    # 静默退化成整表代码序。仅 L2 路径（角色由连接管理器
+                    # 自管重连；MAIN 的自愈在 facade list_quotes）。
+                    drift_retried = True
+                    logger.warning(
+                        "排序响应漂移: sort_by=%s 期望 %s 实有 %s，重连 %s 重试",
+                        sort_by,
+                        response_field,
+                        sorted(k for k in page_stocks[0] if k.startswith("dt")),
+                        role.value,
+                    )
+                    self._connections.close(role)
+                    connection = self._connections.acquire(
+                        role, capability=Capability.L2_MARKET_ACCESS
+                    )
+                    continue
                 data_count = metadata["sort_data_count"]
                 if data_count > 0 and not page_stocks:
                     raise ProtocolError(
@@ -209,10 +233,14 @@ class StockListService:
                     or (sort_total > 0 and len(all_rows) >= sort_total)
                 ):
                     break
-                sort_count = max(
-                    sort_count * 4,
-                    min(len(all_rows) + 59, sort_total or 6000),
-                )
+                if full_requested:
+                    break  # 大请求后仍未拿满：不再增量翻页，保留已有结果
+                # 两步策略：探测页(20)拿 sort_total 后一次性大请求拉全。
+                # 不用增量放大梯子——2026-08-20 实测 320 档返回真值×100 的
+                # 虚值表，且多请求序列会触发服务端编码切换（后续页 ×0.01）；
+                # 单次大请求（2560/2900/5400 档）恒为真值编码。
+                sort_count = max(count, sort_total or count)
+                full_requested = True
             return all_rows
 
         sh_rows = fetch_all(ConnectionRole.SH_L2, (17, 22, 151))
@@ -686,6 +714,53 @@ def _merge_dde_rows(rows: list[dict], *, sort_dir: str) -> list[dict]:
 
     return sorted(unique.values(), key=key)
 
+
+
+def _rows_missing_value_field(rows: list[dict], field: str) -> bool:
+    """排序响应是否整体缺失期望的数值字段（如 592890 期望 dt250 却回 dt44）。
+
+    L2 长连接偶发响应错位（返回别的排序请求的表）或服务端变体，此时按
+    ``field`` 全局合并沪深两榜会整体退化为代码序（用户侧表现为主力净额
+    乱序：千万排在几亿上面）。
+    """
+    sample = rows[:8]
+    return bool(sample) and all(field not in row for row in sample)
+
+
+def _anchor_correct_ranked_values(
+    rows: list[dict],
+    *,
+    ranked_field: str,
+    anchors: dict[str, float],
+    sort_dir: str,
+) -> tuple[list[dict], int]:
+    """用 0xc4 直查真值锚定校正金额类排序值并整体重排。
+
+    2026-08-20 实测：L2 排序（592890）会注入真值×100 的虚值行（真值千万级
+    被抬到十亿级挤进榜首，且主力净额>成交额物理不可能），各放大页内部
+    自洽无法逐页检测。对头部行用 0xc4 金额表锚定，比值≈100 的行 ÷100，
+    校正后按真值全局重排。返回 (rows, 校正行数)。
+    """
+    corrected = 0
+    for row in rows:
+        anchor = anchors.get(row.get("code", ""))
+        value = row.get(ranked_field)
+        if (
+            not isinstance(anchor, (int, float))
+            or not anchor
+            or not isinstance(value, (int, float))
+        ):
+            continue
+        ratio = value / anchor
+        if 99.9 <= ratio <= 100.1:
+            row[ranked_field] = value / 100.0
+            corrected += 1
+    if not corrected:
+        return rows, 0
+    return (
+        _merge_ranked_rows(rows, sort_dir=sort_dir, value_field=ranked_field),
+        corrected,
+    )
 
 
 def _merge_ranked_rows(

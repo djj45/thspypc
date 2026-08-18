@@ -684,3 +684,155 @@ def test_normalize_rank_value_keeps_amount_fields():
     # 直接调用它模拟误用——金额不该传进来。此断言记录行为供回归。
     assert _normalize_rank_value(844234930.0) == 8.4423493
 
+
+
+def test_rows_missing_value_field_detector():
+    from thspypc.services.stock_list import _rows_missing_value_field
+
+    # 整体缺失（dt44 变体）：True
+    assert _rows_missing_value_field(
+        [{"code": "600000", "dt44": 1.0}, {"code": "600001", "dt44": 2.0}],
+        "dt250",
+    )
+    # 正常响应：False
+    assert not _rows_missing_value_field(
+        [{"code": "600000", "dt250": 9.0, "dt44": 1.0}], "dt250"
+    )
+    # 空表不算漂移
+    assert not _rows_missing_value_field([], "dt250")
+
+
+def test_ranked_l2_response_drift_reconnects_and_retries(monkeypatch):
+    """592890 回 dt44 表（响应漂移）时：重连该 L2 角色重试一次，最终按 dt250 全局有序。
+
+    若无守卫，两榜全缺 dt250 会退化为代码序（用户侧表现为主力净额乱序）。
+    """
+    opened = []
+    sh_socks = []
+
+    def make_sh_sock():
+        sock = FakeSocket()
+        sh_socks.append(sock)
+        # 第 1 条连接回漂移表（只有 dt44），重连后的连接回干净的 dt250 表
+        if len(sh_socks) == 1:
+            sock.reader = lambda: b"SortTotal=2 drifted"
+        else:
+            sock.reader = lambda: b"SortTotal=2 clean"
+        return sock
+
+    def make_sock(spec):
+        if spec.role is ConnectionRole.SH_L2:
+            sock = make_sh_sock()
+        elif spec.role is ConnectionRole.SZ_L2:
+            sock = FakeSocket()
+            sock.reader = lambda: b"SortTotal=1 sz-clean"
+        else:  # pragma: no cover - L2 路径不应触碰 MAIN
+            sock = FakeSocket()
+            sock.reader = lambda: b""
+        opened.append(spec.role)
+        return sock
+
+    manager = ConnectionManager(_profile_level2(), make_sock)
+    metadata = {
+        b"SortTotal=2 drifted": {
+            "sort_total": 2, "sort_begin": 0, "sort_count": 20,
+            "sort_data_count": 2,
+            "stocks": [
+                {"code": "600001", "name": "", "market": 17, "dt44": 2.0},
+                {"code": "600000", "name": "", "market": 17, "dt44": 1.0},
+            ],
+        },
+        b"SortTotal=2 clean": {
+            "sort_total": 2, "sort_begin": 0, "sort_count": 20,
+            "sort_data_count": 2,
+            "stocks": [
+                {"code": "600000", "name": "", "market": 17, "dt250": 9.0e8},
+                {"code": "600001", "name": "", "market": 17, "dt250": 5.0e8},
+            ],
+        },
+        b"SortTotal=1 sz-clean": {
+            "sort_total": 1, "sort_begin": 0, "sort_count": 20,
+            "sort_data_count": 1,
+            "stocks": [
+                {"code": "000001", "name": "", "market": 33, "dt250": 7.0e8},
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        "thspypc.services.stock_list.parse_stock_list_response",
+        metadata.__getitem__,
+    )
+    service = StockListService(
+        manager,
+        frame_reader=lambda s: s.reader(),
+        max_frames=2,
+    )
+    result = service.ranked(
+        count=10, timeout=4.0, sort_by=592890, with_values=True,
+    )
+    # 全局按 dt250 降序（9亿 > 7亿 > 5亿），而非代码序
+    assert [r["code"] for r in result] == ["600000", "000001", "600001"]
+    # SH_L2 打开两次（漂移→重连），旧连接被关闭
+    assert opened == [
+        ConnectionRole.SH_L2, ConnectionRole.SH_L2, ConnectionRole.SZ_L2,
+    ]
+    assert sh_socks[0].closed
+    assert not sh_socks[1].closed
+
+
+
+
+
+def test_anchor_correct_ranked_values_rescales_and_resorts():
+    from thspypc.services.stock_list import _anchor_correct_ranked_values
+
+    rows = [
+        {"code": "301607", "dt250": 1.246e9},   # 虚值 ×100（真 1246万）
+        {"code": "003019", "dt250": 1.242e9},   # 虚值 ×100
+        {"code": "000725", "dt250": 9.497e8},   # 正确（9.5亿）
+        {"code": "600707", "dt250": 6.753e8},   # 正确
+    ]
+    anchors = {
+        "301607": 1.246e7,
+        "003019": 1.242e7,
+        "000725": 9.497e8,
+        "600707": 6.753e8,
+    }
+    out, n = _anchor_correct_ranked_values(
+        rows, ranked_field="dt250", anchors=anchors, sort_dir="D",
+    )
+    assert n == 2
+    # 校正后真值全局降序：9.5亿 > 6.75亿 > 1246万 > 1242万
+    assert [r["code"] for r in out] == ["000725", "600707", "301607", "003019"]
+    assert out[2]["dt250"] == 1.246e7
+
+
+def test_anchor_correct_ranked_values_noop_when_clean():
+    from thspypc.services.stock_list import _anchor_correct_ranked_values
+
+    rows = [
+        {"code": "000725", "dt250": 9.497e8},
+        {"code": "600707", "dt250": 6.753e8},
+    ]
+    anchors = {"000725": 9.497e8, "600707": 6.753e8}
+    out, n = _anchor_correct_ranked_values(
+        rows, ranked_field="dt250", anchors=anchors, sort_dir="D",
+    )
+    assert n == 0
+    assert out is rows  # 无校正时原样返回
+
+
+def test_anchor_correct_ranked_values_partial_anchor():
+    from thspypc.services.stock_list import _anchor_correct_ranked_values
+
+    # 仅锚定到部分行：未锚定行保持原值参与重排
+    rows = [
+        {"code": "301607", "dt250": 1.246e9},
+        {"code": "000725", "dt250": 9.497e8},
+    ]
+    anchors = {"301607": 1.246e7}
+    out, n = _anchor_correct_ranked_values(
+        rows, ranked_field="dt250", anchors=anchors, sort_dir="D",
+    )
+    assert n == 1
+    assert [r["code"] for r in out] == ["000725", "301607"]

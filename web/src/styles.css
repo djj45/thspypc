@@ -289,6 +289,12 @@ tr.selected {
   overflow-y: auto;
   overflow-x: auto;
 }
+/* 短线精灵：最新贴底、上拉翻历史的自有滚动容器（panel-body 内占满） */
+.dxjl-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: auto;
+}
 .cell-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -440,4 +446,10 @@ tr.selected {
 .board-row > span:nth-child(n + 2) {
   text-align: right;
   white-space: nowrap;
+}
+
+/* lightweight-charts 默认渲染的 TradingView 归属标识（日K 左下角跳转链接），
+   本地看盘工具隐藏 */
+a[href*="tradingview.com"] {
+  display: none !important;
 }
