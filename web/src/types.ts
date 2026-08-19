@@ -151,6 +151,9 @@ export interface RankItem {
   dt150?: number // 竞价金额
   dt154?: number // 竞价涨幅
   dt44?: number // 封单额
+  dt19?: number // 成交额
+  dt13?: number // 成交量
+  auction_amount?: number // 后端锚定校准后的竞价金额；原始 dt150 不可直接展示
   [k: string]: number | string | undefined
 }
 

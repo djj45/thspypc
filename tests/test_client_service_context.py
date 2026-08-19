@@ -243,7 +243,7 @@ def test_preheat_l2_connections_skips_non_level2_profile():
     assert client._push_socks == {}
 
 
-def test_preheat_service_connections_opens_three_roles_in_parallel(monkeypatch):
+def test_preheat_service_connections_reuses_l2_roles_for_kline(monkeypatch):
     client = _client()
     client._account_evidence.record_l2_entitlement(Support.YES)
     client._account_evidence.record_manual_login(Support.YES)
@@ -253,12 +253,9 @@ def test_preheat_service_connections_opens_three_roles_in_parallel(monkeypatch):
     sockets = {
         "sh": FakeSocket(),
         "sz": FakeSocket(),
-        "kline": FakeSocket(),
     }
     auth_calls = []
     l2_calls = []
-
-    kline_calls = []
 
     class Material:
         passport64 = "passport-parallel"
@@ -274,34 +271,23 @@ def test_preheat_service_connections_opens_three_roles_in_parallel(monkeypatch):
         l2_calls.append(market)
         return sockets["sh"] if market == 17 else sockets["sz"]
 
-    def fake_open_kline(material=None):
-        assert material is not None
-        assert material.passport64 == "passport-parallel"
-        kline_calls.append(True)
-        return sockets["kline"]
-
     monkeypatch.setattr(client, "authenticate", fake_authenticate)
     monkeypatch.setattr(
         client,
         "_open_manual_push_connection",
         fake_open_manual,
     )
-    monkeypatch.setattr(
-        client,
-        "_open_independent_main_connection",
-        fake_open_kline,
-    )
-
     result = client.preheat_service_connections()
 
-    assert result["sh"]["ready"] and result["sz"]["ready"]
-    assert result["kline"]["ready"]
+    assert result == {
+        "sh": {"ready": True, "initialized": True},
+        "sz": {"ready": True, "initialized": True},
+    }
     assert sorted(l2_calls) == [17, 33]
-    assert kline_calls == [True]
-    assert len(auth_calls) == 3  # sh / sz / kline 各自独立一代 Passport
+    assert len(auth_calls) == 2  # sh / sz 各自独立一代 Passport
     assert manager.peek(ConnectionRole.SH_L2).socket is sockets["sh"]
     assert manager.peek(ConnectionRole.SZ_L2).socket is sockets["sz"]
-    assert manager.peek(ConnectionRole.KLINE_FAST).socket is sockets["kline"]
+    assert manager.peek(ConnectionRole.KLINE_FAST) is None
     assert client._push_socks == {
         "sh": sockets["sh"],
         "sz": sockets["sz"],
@@ -655,9 +641,10 @@ def test_kline_opt_in_delegates_without_l2(monkeypatch):
                 "count": 20,
                 "anchor": 0,
                 "fuquan": "H",
-                "timeout": 5.0,
-                "channel": "auto",
-            },
+                    "timeout": 5.0,
+                    "channel": "auto",
+                    "latest": False,
+                },
         )
     ]
     assert manager.peek(ConnectionRole.SH_L2) is None
@@ -740,6 +727,44 @@ def test_stock_list_hot_opt_in_delegates_without_l2(monkeypatch):
     ]
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert manager.peek(ConnectionRole.SZ_L2) is None
+
+
+def test_auction_amount_anchor_calibrates_rows_beyond_old_top_120(monkeypatch):
+    client = _client()
+    anchors: dict[str, float] = {}
+    rows = []
+    for index in range(130):
+        code = f"{600000 + index:06d}"
+        amount = float(200_000_000 - index * 1_000_000)
+        anchors[code] = amount
+        rows.append({"code": code, "market": 17, "dt150": amount})
+    target = rows[129]["code"]
+    rows[129]["dt150"] = anchors[target] * 1e8
+    calls = []
+
+    def fake_list_quotes(codes, *, market, datatype, pageid, timeout):
+        calls.append((list(codes), market, list(datatype), pageid, timeout))
+        return [
+            {"code": code, "dt7": 1.0, "dt17": anchors[code]}
+            for code in codes
+        ]
+
+    monkeypatch.setattr(client, "list_quotes", fake_list_quotes)
+
+    result = client._anchor_correct_money_sort(
+        rows,
+        sort_by=68758,
+        sort_dir="D",
+        with_values=True,
+        timeout=2.0,
+    )
+
+    corrected = next(row for row in result if row["code"] == target)
+    assert corrected["dt150"] == anchors[target]
+    assert corrected["auction_amount"] == anchors[target]
+    assert len(calls) == 1
+    assert len(calls[0][0]) == 130
+    assert calls[0][2] == [5, 7, 17]
 
 
 def test_stock_list_opt_in_delegates_full_replay(monkeypatch):
@@ -1200,6 +1225,30 @@ def test_level2_historical_intraday_uses_one_service_workflow(monkeypatch):
     assert calls == [
         (
             "603118",
+            {"market": 17, "trade_date": "2026-07-24", "timeout": 6.0},
+        )
+    ]
+
+
+def test_st_intraday_uses_base_shanghai_l2_market(monkeypatch):
+    client = _client()
+    client.configure_service_context(LEVEL2_PROFILE)
+    calls = []
+    monkeypatch.setattr(client, "_market_for_code", lambda _code: 22)
+    monkeypatch.setattr(
+        client._auction_service,
+        "intraday",
+        lambda code, **kwargs: calls.append((code, kwargs)) or [],
+    )
+
+    assert client.intraday(
+        "600745",
+        trade_date="2026-07-24",
+        timeout=6.0,
+    ) == []
+    assert calls == [
+        (
+            "600745",
             {"market": 17, "trade_date": "2026-07-24", "timeout": 6.0},
         )
     ]

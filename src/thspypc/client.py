@@ -189,6 +189,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         self._service_auto_profile = False
         self._account_evidence = AccountEvidenceRecorder()
         self._service_subscriptions = None
+        self._list_bucket_service = None
         self._kline_service = None
         self._market_snapshot_service = None
         self._quote_service = None
@@ -369,6 +370,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
                 BoardStatsService,
                 KlineService,
                 L2SubscriptionCoordinator,
+                ListBucketCoordinator,
                 MarketSnapshotService,
                 QuoteService,
                 RealOrderService,
@@ -380,6 +382,9 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
             self._service_subscriptions = L2SubscriptionCoordinator(
                 evidence=self._account_evidence,
+            )
+            self._list_bucket_service = ListBucketCoordinator(
+                unsolicited=self._connection_runtime.deliver_market_push,
             )
             self._kline_service = KlineService(
                 self._service_connections,
@@ -500,11 +505,11 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         )
 
     def preheat_service_connections(self) -> dict[str, dict[str, object]]:
-        """Pre-open the L2 lanes and the optional fast K-line lane.
+        """Pre-open the market lanes used by the current account profile.
 
-        三条通道并行建连，把冷启动耗时压到最长单路而非三者之和。每条 L2 与
-        KLINE_FAST 都持有自己独立的一代 Passport64（一票一连接），不会出现
-        并发线程共享全局最新通行证导致 VerifyCode=-1 的问题。
+        Level2 Web K线复用 SH_L2/SZ_L2 的 pageid=1334，不再预建独立的
+        BASIC/MAIN KLINE_FAST；普通账号没有 L2，仍预建 KLINE_FAST。
+        并行 L2 建连时每条连接各取一代 Passport64（一票一连接）。
         """
         profile = self.observed_account_profile
         skipped = {"ready": False, "skipped": True}
@@ -537,7 +542,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
             if manager is None:
                 raise RuntimeError("service context 尚未初始化")
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=3,
+                max_workers=2,
                 thread_name_prefix="ths-preheat-role",
             ) as executor:
                 futures = {
@@ -554,10 +559,6 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
                         "sz",
                         ConnectionRole.SZ_L2,
                         33,
-                    ),
-                    "kline": executor.submit(
-                        self._preheat_kline_role,
-                        manager,
                     ),
                 }
                 return {key: future.result() for key, future in futures.items()}

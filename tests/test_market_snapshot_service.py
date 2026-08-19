@@ -63,7 +63,7 @@ def test_snapshot_uses_only_main_and_skips_notifications(kind):
     assert opened == [ConnectionRole.MAIN]
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert manager.peek(ConnectionRole.SZ_L2) is None
-    assert sock.timeout == 4.0
+    assert sock.timeout == pytest.approx(4.0, abs=0.05)
     assert sock.sent == [
         build_market_snapshot_query(markets=[16, 151]) + b"\n"
     ]

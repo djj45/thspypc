@@ -56,13 +56,19 @@ def _hd_field_ids(body: bytes) -> set[int]:
     }
 
 
-def _repair_short_record(sock, body: bytes) -> bytes:
+def _repair_short_record(
+    sock,
+    body: bytes,
+    *,
+    record_prefix_size: int = 0,
+) -> bytes:
     """服务端 hd1.0 响应帧体比记录区少 1 字节（末记录末字节落在帧外）。
 
     2026-08-03 活网实测：十档盘口帧（dc=1/hs=191 但记录区 190B）与
     list_quotes hd1.0 单码/双码帧（dc=1~2，记录区比 dc*hs 少 1B）都存在
     此怪癖；缺失的 1 字节（末记录末字节）随后到达 socket。读取它补回 body，
-    避免最后记录/档位丢失。
+    避免最后记录/档位丢失。``record_prefix_size`` 用于 K 线等在字段表与记录区
+    之间带固定股票壳的 hd1.0 变体。
     """
     pos = body.find(b"hd1.0")
     if pos < 0:
@@ -74,7 +80,8 @@ def _repair_short_record(sock, body: bytes) -> bytes:
     fc = struct.unpack("<H", body[base + 8:base + 10])[0]
     field_end = base + 10 + fc * 4
     dc = struct.unpack("<I", body[base:base + 4])[0]
-    if len(body) - field_end != dc * hs - 1:
+    records_start = field_end + record_prefix_size
+    if len(body) - records_start != dc * hs - 1:
         return body
     try:
         sock.settimeout(1.0)

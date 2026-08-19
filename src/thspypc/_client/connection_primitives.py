@@ -333,7 +333,8 @@ class ConnectionPrimitives:
 
         hexin 客户端 login 后紧跟 init 请求（subtype 0x0001），服务器据此
         激活该连接的行情查询通道。不发 init 直接查 K线会超时
-        （list_quotes 走 hd1.0/hd3.1 不强依赖 init，但 K线 hd3.1 flag=0x0042/0x0046
+        （list_quotes 走 hd1.0/hd3.1 不强依赖 init，但 K线 hd1.0/hd3.1
+        flag=0x0042/0x0046
         要求 init 激活通道才响应——实测 MAIN login 跳过 init 后 kline 全超时，
         list_quotes 仍正常，故 init 缺失会被 list_quotes 的成功掩盖）。
 

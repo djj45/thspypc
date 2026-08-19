@@ -736,10 +736,10 @@ def _anchor_correct_ranked_values(
 ) -> tuple[list[dict], int]:
     """用 0xc4 直查真值锚定校正金额类排序值并整体重排。
 
-    2026-08-20 实测：L2 排序（592890）会注入真值×100 的虚值行（真值千万级
-    被抬到十亿级挤进榜首，且主力净额>成交额物理不可能），各放大页内部
-    自洽无法逐页检测。对头部行用 0xc4 金额表锚定，比值≈100 的行 ÷100，
-    校正后按真值全局重排。返回 (rows, 校正行数)。
+    L2 放大排序响应会把部分金额写成真值乘十进制偶次幂。主力净额实测
+    出现 ×100；竞价金额全量榜现场出现 ×1e4/×1e6/×1e8，导致几千元的
+    小额记录挤到亿元记录前面。用独立行情真值识别这些倍率，校正后按真值
+    全局重排。返回 (rows, 校正行数)。
     """
     corrected = 0
     for row in rows:
@@ -752,9 +752,13 @@ def _anchor_correct_ranked_values(
         ):
             continue
         ratio = value / anchor
-        if 99.9 <= ratio <= 100.1:
-            row[ranked_field] = value / 100.0
-            corrected += 1
+        for scale in (1e2, 1e4, 1e6, 1e8):
+            if abs(ratio - scale) <= scale * 0.001:
+                # 直接采用独立查询的锚点，避免乘除后的浮点尾差继续影响
+                # 相邻同额记录的稳定排序。
+                row[ranked_field] = float(anchor)
+                corrected += 1
+                break
     if not corrected:
         return rows, 0
     return (

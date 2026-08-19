@@ -298,7 +298,7 @@ def test_full_list_replays_raw_segments_on_main(monkeypatch, kind):
     assert manager.peek(ConnectionRole.SZ_L2) is None
     assert sock.sent == [b"segment-one", b"segment-two"]
     assert sleeps == [0.25, 0.25]
-    assert sock.timeout == 2.0
+    assert sock.timeout == pytest.approx(2.0, abs=0.05)
 
 
 def test_full_list_distinguishes_large_table_parser_failure(monkeypatch):
@@ -805,6 +805,38 @@ def test_anchor_correct_ranked_values_rescales_and_resorts():
     # 校正后真值全局降序：9.5亿 > 6.75亿 > 1246万 > 1242万
     assert [r["code"] for r in out] == ["000725", "600707", "301607", "003019"]
     assert out[2]["dt250"] == 1.246e7
+
+
+def test_anchor_correct_ranked_values_handles_auction_scale_ladder():
+    from thspypc.services.stock_list import _anchor_correct_ranked_values
+
+    rows = [
+        {"code": "920717", "dt150": 1.3344e12},  # 13344 × 1e8
+        {"code": "002656", "dt150": 1.341e11},   # 134100 × 1e6
+        {"code": "000089", "dt150": 1.34368e9},  # 134368 × 1e4
+        {"code": "688836", "dt150": 1.4883242e9},  # 已是真值
+    ]
+    anchors = {
+        "920717": 13_344.0,
+        "002656": 134_100.0,
+        "000089": 134_368.0,
+        "688836": 1_488_324_200.0,
+    }
+
+    out, corrected = _anchor_correct_ranked_values(
+        rows,
+        ranked_field="dt150",
+        anchors=anchors,
+        sort_dir="D",
+    )
+
+    assert corrected == 3
+    assert [row["code"] for row in out] == [
+        "688836", "000089", "002656", "920717",
+    ]
+    assert [row["dt150"] for row in out] == [
+        1_488_324_200.0, 134_368.0, 134_100.0, 13_344.0,
+    ]
 
 
 def test_anchor_correct_ranked_values_noop_when_clean():

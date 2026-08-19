@@ -67,14 +67,16 @@ export function RankPanel() {
       code: r.code,
       name: nameMap.get(r.code) ?? r.name ?? '',
       chgPct: r.dt200 ?? q?.chg_pct ?? undefined,
-      auctionChgPct: q?.auction_chg_pct ?? undefined,
-      auctionAmount: q?.auction_amount ?? undefined,
-      amount: q?.amount ?? undefined,
+      auctionChgPct: r.dt154 ?? q?.auction_chg_pct ?? undefined,
+      // 排序榜自身的字段已经由后端按独立行情真值校准；排序列必须优先
+      // 显示同一口径，不能再被稍后返回的可视区行情造成“顺序和值不符”。
+      auctionAmount: r.auction_amount ?? q?.auction_amount ?? undefined,
+      amount: r.dt19 ?? q?.amount ?? undefined,
       speed4m: r.dt48 ?? q?.speed_4m ?? undefined,
       // 主力净额：0xc4 直查优先，排序响应 dt250 即时填充（后端有漂移守卫）
       mainInflow: q?.main_inflow ?? r.dt250 ?? undefined,
       // 封单额：排序时由排序值覆盖，平时走 265260 排序榜缓存
-      sealAmount: q?.seal_amount || undefined,
+      sealAmount: (r.dt44 ?? q?.seal_amount) || undefined,
     }
     // 排序值本身就是该列的真值（服务端排序口径），有值时优先。
     // 主力列例外：592890 排序响应今日回 dt44（封单额），不再采信 r.value。

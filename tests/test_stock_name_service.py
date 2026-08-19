@@ -71,7 +71,7 @@ def test_fetch_uses_only_main_and_merges_partial_results(kind):
     assert opened == [ConnectionRole.MAIN]
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert manager.peek(ConnectionRole.SZ_L2) is None
-    assert sock.timeout == 2.0
+    assert sock.timeout == pytest.approx(2.0, abs=0.05)
     assert sock.sent == [
         (
             b"\x09instid=65536\nmethod=upstockname\nmarket=URS\n"

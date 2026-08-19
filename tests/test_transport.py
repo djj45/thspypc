@@ -74,14 +74,49 @@ class MarketSessionTest(unittest.TestCase):
     def test_request_sets_timeout_and_appends_newline(self) -> None:
         with self.session.request(b"query", timeout=3.5) as sock:
             self.assertIs(sock, self.sock)
-            self.assertEqual(self.sock.timeout, 3.5)
+            self.assertAlmostEqual(self.sock.timeout, 3.5, delta=0.05)
             self.assertEqual(self.sock.sent, [b"query\n"])
 
     def test_request_latest_sends_newest(self) -> None:
         with self.session.request_latest(b"query", gate=10, timeout=3.5) as sock:
             self.assertIs(sock, self.sock)
-            self.assertEqual(self.sock.timeout, 3.5)
+            self.assertAlmostEqual(self.sock.timeout, 3.5, delta=0.05)
             self.assertEqual(self.sock.sent, [b"query\n"])
+
+    def test_request_lock_wait_is_bounded_by_request_timeout(self) -> None:
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_lane() -> None:
+            self.lock.acquire()
+            held.set()
+            release.wait(timeout=2.0)
+            self.lock.release()
+
+        holder = threading.Thread(target=hold_lane)
+        holder.start()
+        self.assertTrue(held.wait(timeout=1.0))
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "lane wait"):
+                with self.session.request(b"blocked", timeout=0.05):
+                    self.fail("blocked request must not enter the socket lane")
+        finally:
+            release.set()
+            holder.join(timeout=1.0)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(self.sock.sent, [])
+
+    def test_request_dispatcher_idle_wait_is_bounded(self) -> None:
+        original = self.session._dispatcher.wait_idle
+        self.session._dispatcher.wait_idle = lambda timeout=None: False
+        try:
+            with self.assertRaisesRegex(TimeoutError, "dispatcher idle"):
+                with self.session.request(b"blocked", timeout=0.05):
+                    self.fail("busy dispatcher must not allow a socket send")
+        finally:
+            self.session._dispatcher.wait_idle = original
+        self.assertEqual(self.sock.sent, [])
 
     def test_request_latest_skips_superseded_request(self) -> None:
         with self.session._gate_lock:

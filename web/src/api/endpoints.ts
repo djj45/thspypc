@@ -103,12 +103,15 @@ function waitForPreheat(): Promise<void> {
       try {
         const status = await getJson<Status>('/api/status')
         const state = status.preheat?.state
+        // 前台业务可能在后台预热的30s重试窗口内先完成 MAIN 登录。
+        // 此时业务接口可以按需懒建 L2，绝不能因 preheat 仍是 running
+        // 继续空等。ConnectionManager 会串行化同角色建连，不会重复登录。
+        if (status.connected) return
         // ready/skipped=可安全发请求；partial/error=继续等只会让页面一直卡住，
         // 直接放行由各接口自身报错或成功。
         if (state === 'ready' || state === 'skipped' || state === 'partial' || state === 'error') {
           return
         }
-        if (!status.preheat && status.connected) return
       } catch {
         // 后端暂时不可达：直接放行，让业务请求暴露具体错误。
         return

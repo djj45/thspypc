@@ -18,6 +18,11 @@ from ..protocol import LIST_QUOTE_DATATYPE_DEFAULT, pick_l2_market
 from ..features.auth_protocol import LoginIdentity
 from ..features.stock_name_bootstrap import STOCK_NAME_GROUPS, name_group_login_identity
 from ..features.trade_calendar import latest_trade_date
+from ..features.list_subscription_protocol import (
+    RANKING_LIST_COMMAND,
+    RANKING_LIST_DATATYPE,
+    RANKING_LIST_PAGEID,
+)
 from ..services.stock_name import download_all_stock_names
 from ..transport import ConnectionRole
 from .stock_cache import (
@@ -35,6 +40,16 @@ logger = logging.getLogger(__name__)
 # （2026-08-19 日志实证：4 组并发批次全挂，前端对应行永远 "-"）。两类入口在
 # facade 层串行化，消除争抢；单批 ~100ms，排队代价可忽略。
 _MAIN_SERIAL_LOCK = threading.RLock()
+
+
+def _intraday_market(market: int) -> int:
+    """Map quote-only board markets to the base L2 intraday market.
+
+    Shanghai ST quotes use the dedicated CodeList market 22, but the
+    4214/4417 auction and history-timeline protocols still run on SH_L2 with
+    market 17.  Passing 22 into AuctionService is therefore always invalid.
+    """
+    return 17 if market == 22 else market
 
 
 class ServiceFacade:
@@ -695,11 +710,13 @@ class ServiceFacade:
         timeout: float = 12.0,
         retries: int = 3,
         channel: str = "auto",
+        latest: bool = False,
     ) -> list[dict]:
         """查 K线（复用登录后的 8901 长连接，复刻 hexin 单连接连发模式）。
 
-        发送 ``build_kline_query`` 构造的 K线请求，解析 ``parse_kline_hd3_response``
-        返回的 hd3.1 变体响应（flag=0x0042/0x0046），返回 OHLCV 记录列表。
+        发送 ``build_kline_query`` 构造的 K线请求，解析 hd1.0/hd3.1
+        变体响应（flag=0x0042/0x0046），返回 OHLCV 记录列表。新股首日等
+        短历史由服务端返回 hd1.0，批量历史返回 hd3.1。
 
         **连接复用**（关键）：抓包确认 hexin 在**同一条 TCP 长连接**上连发日/周/
         月/5分K 请求（不轮换 IP）。本方法复用 ``self._sock``，首次调用触发 connect()，
@@ -760,7 +777,10 @@ class ServiceFacade:
         for attempt in range(retries + 1):
             # ensure_connected 对从未登录会 raise；这里统一用 is_connected 判断，
             # 连接不在则 connect()（首次登录 + 断线重连都走这里，IP 轮换取新连接）
-            if not self.is_connected:
+            # KLINE_FAST has its own managed connection.  Probing MAIN here
+            # couples an independent K-line retry to a possibly busy quote
+            # socket and can freeze /api/status plus the final stock request.
+            if channel != "ifindhq_fast" and not self.is_connected:
                 logger.info("kline: 连接不可用，connect（attempt %d/%d，IP 轮换）",
                             attempt + 1, retries)
                 lr = self.connect()
@@ -782,6 +802,7 @@ class ServiceFacade:
                             fuquan=fuquan,
                             timeout=timeout,
                             channel=channel,
+                            latest=latest,
                         ),
                     )
                 except ProtocolError as exc:
@@ -897,6 +918,7 @@ class ServiceFacade:
 
         if market == 0:
             market = self._market_for_code(code)
+        market = _intraday_market(market)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -984,6 +1006,7 @@ class ServiceFacade:
 
         if market == 0:
             market = self._market_for_code(code)
+        market = _intraday_market(market)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -1349,6 +1372,7 @@ class ServiceFacade:
         """
         if market == 0:
             market = self._market_for_code(code)
+        market = _intraday_market(market)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
         profile = (
@@ -1396,6 +1420,7 @@ class ServiceFacade:
         """
         if market == 0:
             market = self._market_for_code(code)
+        market = _intraday_market(market)
         value = trade_date
         if isinstance(value, str):
             value = date_type.fromisoformat(value)
@@ -1535,6 +1560,7 @@ class ServiceFacade:
         """Return auction phases used to supplement the fast live timeline."""
         if market == 0:
             market = self._market_for_code(code)
+        market = _intraday_market(market)
         # 北交所竞价协议未实现，不存在可补全的竞价段。
         if market == 151:
             return []
@@ -1641,6 +1667,7 @@ class ServiceFacade:
         """
         if market == 0:
             market = self._market_for_code(code)
+        market = _intraday_market(market)
         from ..errors import ChannelUnavailableError
 
         if (
@@ -1914,13 +1941,21 @@ class ServiceFacade:
         with_values: bool,
         timeout: float,
     ) -> list[dict]:
-        """用 0xc4 金额表锚定校正金额类排序的头部虚值行。"""
+        """用独立行情真值锚定校正金额类排序的缩放虚值。"""
         anchor = self._MONEY_SORT_ANCHORS.get(sort_by)
         if not anchor or not with_values or not stocks:
             return stocks
         ranked_field, derive_key = anchor
-        top = [str(r.get("code", "")) for r in stocks[:120] if r.get("code")]
-        if not top:
+        # 68758 的大 SortCount 响应会在整张表里混入 ×1e4/×1e6/×1e8
+        # 的 dt150。只校正头 120 行会让下一批虚值在重排后再次冒到榜首，
+        # 因此竞价金额必须全表锚定。它只需 dt7+dt17，400 码/批即可；其他
+        # 0xc4 金额键响应更大，仍只检查最可能污染榜首的 120 行。
+        full_auction_amount = sort_by == 68758
+        candidates = stocks if full_auction_amount else stocks[:120]
+        codes_to_anchor = [
+            str(r.get("code", "")) for r in candidates if r.get("code")
+        ]
+        if not codes_to_anchor:
             return stocks
         from ..features.quote_protocol import (
             MONEY_QUOTE_DATATYPE,
@@ -1929,17 +1964,19 @@ class ServiceFacade:
         from ..services.stock_list import _anchor_correct_ranked_values
 
         groups: dict[int, list[str]] = {}
-        for code in top:
+        for code in codes_to_anchor:
             groups.setdefault(self._market_for_code(code), []).append(code)
         anchors: dict[str, float] = {}
+        datatype = [5, 7, 17] if full_auction_amount else MONEY_QUOTE_DATATYPE
+        batch_size = 400 if full_auction_amount else 40
         for market, codes in groups.items():
-            for i in range(0, len(codes), 40):
-                chunk = codes[i : i + 40]
+            for i in range(0, len(codes), batch_size):
+                chunk = codes[i : i + batch_size]
                 try:
                     records = self.list_quotes(
                         chunk,
                         market=market,
-                        datatype=MONEY_QUOTE_DATATYPE,
+                        datatype=datatype,
                         pageid=1334,
                         timeout=timeout,
                     )
@@ -1964,9 +2001,16 @@ class ServiceFacade:
             anchors=anchors,
             sort_dir=sort_dir,
         )
+        if full_auction_amount:
+            # 给 Web 一个明确的“已校准”字段。旧后端只返回原始 dt150，前端
+            # 绝不能把它当真值显示，否则热更新期间会出现几万亿。
+            for stock in stocks:
+                value = stock.get(ranked_field)
+                if isinstance(value, (int, float)):
+                    stock["auction_amount"] = value
         if corrected:
             logger.warning(
-                "money sort sort_by=%s 锚定校正 %d 行（服务端注入×100 虚值）",
+                "money sort sort_by=%s 锚定校正 %d 行（服务端缩放虚值）",
                 sort_by, corrected,
             )
         return stocks
@@ -2155,6 +2199,166 @@ class ServiceFacade:
             return False
         self._connection_runtime.activate_depth(code, market, callback)
         return True
+
+    def ranking_depth_subscribe(
+        self,
+        codes,
+        *,
+        market: int | None = None,
+        callback=None,
+        query_datatype=RANKING_LIST_DATATYPE,
+        timeout: float = 5.0,
+    ) -> int:
+        """Register a page-982 ranking CodeList on an existing L2 lane.
+
+        This is the bulk counterpart to :meth:`depth_subscribe`.  It reuses the
+        same managed SH_L2/SZ_L2 socket and depth reader; it never performs a
+        second login.  The default field query matches the official client's
+        2026-08-19 ``0x5f`` ranking capture.
+
+        Returns the server's acknowledged ``CodeListSize``.  Live delivery is
+        consumed through :meth:`receive_depth`, :meth:`latest_depth`, or the
+        per-record callback.
+        """
+        raw_codes = (codes,) if isinstance(codes, str) else codes
+        normalized = tuple(
+            dict.fromkeys(
+                str(code).strip() for code in raw_codes if str(code).strip()
+            )
+        )
+        if not normalized or any(not code.isdigit() for code in normalized):
+            raise ValueError("codes 必须包含至少一个纯数字股票代码")
+        if market is None:
+            inferred = {17 if code.startswith("6") else 33 for code in normalized}
+            if len(inferred) != 1:
+                raise ValueError("沪深代码必须按市场分别调用 ranking_depth_subscribe")
+            market = inferred.pop()
+        key = pick_l2_market(market)
+        wire_market = 17 if key == "sh" else 33
+
+        def register() -> int:
+            role = ConnectionRole.SH_L2 if key == "sh" else ConnectionRole.SZ_L2
+            connection = self._service_connections.acquire(
+                role,
+                capability=Capability.L2_SNAPSHOT_PUSH,
+            )
+            size = self._list_bucket_service.replace_codes(
+                connection,
+                {wire_market: normalized},
+                command=RANKING_LIST_COMMAND,
+                pageid=RANKING_LIST_PAGEID,
+                timeout=timeout,
+            )
+            if query_datatype:
+                wire_seq = self._next_request_instance() & 0xFFFF or 1
+                self._list_bucket_service.query(
+                    connection,
+                    {wire_market: normalized},
+                    query_datatype,
+                    command=RANKING_LIST_COMMAND,
+                    pageid=RANKING_LIST_PAGEID,
+                    wire_seq=wire_seq,
+                    timeout=timeout,
+                )
+            for code in normalized:
+                self._connection_runtime.activate_ranking_depth(
+                    code,
+                    wire_market,
+                    callback,
+                )
+            return size
+
+        return self._run_default_service(
+            (Capability.L2_SNAPSHOT_PUSH,),
+            register,
+        )
+
+    def ranking_depth_update(
+        self,
+        *,
+        add=(),
+        remove=(),
+        market: int,
+        callback=None,
+        query_datatype=RANKING_LIST_DATATYPE,
+        timeout: float = 5.0,
+    ) -> int:
+        """Apply the captured mode-5 ranking delta on the existing L2 lane."""
+        raw_add = (add,) if isinstance(add, str) else add
+        raw_remove = (remove,) if isinstance(remove, str) else remove
+        add_codes = tuple(dict.fromkeys(str(code).strip() for code in raw_add))
+        remove_codes = tuple(dict.fromkeys(str(code).strip() for code in raw_remove))
+        if not add_codes and not remove_codes:
+            raise ValueError("add/remove 不能同时为空")
+        if any(not code.isdigit() for code in (*add_codes, *remove_codes)):
+            raise ValueError("add/remove 只能包含纯数字股票代码")
+        key = pick_l2_market(market)
+        wire_market = 17 if key == "sh" else 33
+
+        def update() -> int:
+            role = ConnectionRole.SH_L2 if key == "sh" else ConnectionRole.SZ_L2
+            connection = self._service_connections.acquire(
+                role,
+                capability=Capability.L2_SNAPSHOT_PUSH,
+            )
+            size = self._list_bucket_service.apply_delta(
+                connection,
+                command=RANKING_LIST_COMMAND,
+                pageid=RANKING_LIST_PAGEID,
+                add={wire_market: add_codes} if add_codes else {},
+                remove={wire_market: remove_codes} if remove_codes else {},
+                timeout=timeout,
+            )
+            if add_codes and query_datatype:
+                wire_seq = self._next_request_instance() & 0xFFFF or 1
+                self._list_bucket_service.query(
+                    connection,
+                    {wire_market: add_codes},
+                    query_datatype,
+                    command=RANKING_LIST_COMMAND,
+                    pageid=RANKING_LIST_PAGEID,
+                    wire_seq=wire_seq,
+                    timeout=timeout,
+                )
+            for code in add_codes:
+                self._connection_runtime.activate_ranking_depth(
+                    code,
+                    wire_market,
+                    callback,
+                )
+            for code in remove_codes:
+                self._connection_runtime.deactivate_ranking_depth(code)
+            return size
+
+        return self._run_default_service(
+            (Capability.L2_SNAPSHOT_PUSH,),
+            update,
+        )
+
+    def ranking_depth_clear(
+        self,
+        *,
+        market: int,
+        timeout: float = 5.0,
+    ) -> int:
+        """Clear the page-982 ranking bucket and local depth deliveries."""
+        key = pick_l2_market(market)
+        role = ConnectionRole.SH_L2 if key == "sh" else ConnectionRole.SZ_L2
+        manager = self._service_connections
+        if manager is None:
+            return 0
+        connection = manager.peek(role)
+        if connection is None or self._list_bucket_service is None:
+            return 0
+        size, prior = self._list_bucket_service.clear(
+            connection,
+            command=RANKING_LIST_COMMAND,
+            pageid=RANKING_LIST_PAGEID,
+            timeout=timeout,
+        )
+        for code in prior:
+            self._connection_runtime.deactivate_ranking_depth(code)
+        return size
 
     def depth_unsubscribe(self, code: str, *, clear_latest: bool = True) -> bool:
         """停止一只股票的本地十档事件交付。

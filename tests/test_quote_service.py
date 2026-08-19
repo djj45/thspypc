@@ -59,7 +59,7 @@ def test_list_quotes_uses_main_and_skips_notifications(monkeypatch):
 
     assert result == expected
     assert manager.peek(ConnectionRole.MAIN) is not None
-    assert sock.timeout == 3.0
+    assert sock.timeout == pytest.approx(3.0, abs=0.05)
     assert len(sock.sent) == 1
     assert sock.sent[0].endswith(b"\n")
 
@@ -134,7 +134,7 @@ def test_depth_quote_matches_first_recognized_response(monkeypatch):
 
     assert result == expected
     assert manager.peek(ConnectionRole.MAIN) is not None
-    assert sock.timeout == 4.0
+    assert sock.timeout == pytest.approx(4.0, abs=0.05)
     assert len(sock.sent) == 1
 
 

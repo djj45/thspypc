@@ -209,7 +209,7 @@ def test_level2_workflow_uses_selected_role_and_matches_response(monkeypatch):
 
     assert result == expected
     assert opened == [ConnectionRole.SZ_L2]
-    assert sock.timeout == 6.0
+    assert sock.timeout == pytest.approx(6.0, abs=0.05)
     assert len(sock.sent) == 2
     assert b"CodeList=33(000938,);" in sock.sent[0]
     assert b"pageid=1334" in sock.sent[1]
@@ -331,7 +331,7 @@ def test_level2_history_uses_market_role_and_matches_compressed_response(
 
     assert result == expected
     assert opened == [ConnectionRole.SZ_L2]
-    assert sock.timeout == 7.0
+    assert sock.timeout == pytest.approx(7.0, abs=0.05)
     assert len(sock.sent) == 1
     assert b"pageid=4417" in sock.sent[0]
 

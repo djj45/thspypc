@@ -137,7 +137,7 @@ def test_level2_connection_is_cached_and_owns_single_flight_session():
     with first.request(b"query", timeout=2.5):
         pass
     assert first.socket.sent == [b"query\n"]
-    assert first.socket.timeout == 2.5
+    assert first.socket.timeout == pytest.approx(2.5, abs=0.05)
 
 
 def test_structured_opener_applies_borrowed_lifecycle_metadata():

@@ -12,9 +12,11 @@ from ..features.account_profile import AccountEvidenceRecorder
 from ..features.kline_protocol import (
     build_kline_l2_query,
     build_kline_query,
+    parse_kline_hd1_response,
     parse_kline_hd3_response,
 )
 from ..models import AccountKind, Capability, Support
+from .quote import _repair_short_record
 
 
 FrameReader = Callable[[SocketLike], bytes]
@@ -70,6 +72,7 @@ class KlineService:
         fuquan: str = "Q",
         timeout: float = 12.0,
         channel: str = "auto",
+        latest: bool = False,
     ) -> list[dict]:
         """Return all K-line data frames belonging to one request."""
         if channel not in ("auto", "level2", "ifindhq_fast"):
@@ -141,9 +144,25 @@ class KlineService:
                         break
                     continue
 
+                # 新股首日的单根 K 线走 hd1.0，实测也会出现通用行情同型的
+                # “帧体少末记录 1B、该字节紧随帧后到达”现象。K 线字段表后
+                # 固定多一个 22B 股票壳，复用 quote 的补尾逻辑时显式计入。
+                response = _repair_short_record(
+                    sock,
+                    response,
+                    record_prefix_size=22,
+                )
+
                 if b"hd3.1\x00" in response:
                     saw_kline_frame = True
                     parsed = parse_kline_hd3_response(response)
+                elif b"hd1.0\x00" in response:
+                    saw_kline_frame = True
+                    parsed = parse_kline_hd1_response(response)
+                else:
+                    parsed = None
+
+                if parsed is not None:
                     if parsed:
                         records.extend(parsed)
                         # DateTime={period}(-count-anchor) 返回窗口包含终点，正常
@@ -157,9 +176,10 @@ class KlineService:
                 if records:
                     break
 
-        if channel == "ifindhq_fast":
-            # KLINE_FAST 是唯一 socket：快速切股会让旧请求串行排队。领递增 gate，
-            # 用 latest-wins——排到 socket 时若已被更新的请求取代则直接淘汰。
+        if channel == "ifindhq_fast" or latest:
+            # Web 快速切股会让旧请求在共享 socket 后排队。领递增 gate，
+            # 排到 socket 时若已被更新的请求取代则直接淘汰。公共
+            # Python API 默认 latest=False，仍保留“每个调用都返回”的语义。
             with self._kline_gate_lock:
                 self._kline_gate += 1
                 gate = self._kline_gate

@@ -361,6 +361,30 @@ export function StockTable({
 
   const h = rowH || FALLBACK_ROW_H
 
+  // 虚拟列表只渲染当前滚动窗口。键盘/图表滚轮切股时，除了更新 code，
+  // 还必须先把目标索引滚进窗口，随后 onScroll 才会渲染并高亮对应行。
+  const revealCode = (nextCode: string) => {
+    const el = listRef.current
+    if (!el) return
+    const index = displayRef.current.findIndex((row) => row.code === nextCode)
+    if (index < 0) return
+
+    const headerH =
+      el.querySelector<HTMLElement>(':scope > .row-head')?.offsetHeight ?? 0
+    // 内容层紧跟表头；不能使用它的 offsetTop，因为 offsetParent 可能是
+    // 左栏外层网格，得到的是页面坐标而不是 vlist 内部的滚动坐标。
+    const rowTop = headerH + index * h
+    const rowBottom = rowTop + h
+    const visibleTop = el.scrollTop + headerH
+    const visibleBottom = el.scrollTop + el.clientHeight
+
+    if (rowTop < visibleTop) {
+      el.scrollTop = Math.max(0, rowTop - headerH)
+    } else if (rowBottom > visibleBottom) {
+      el.scrollTop = rowBottom - el.clientHeight
+    }
+  }
+
   const updateRange = () => {
     const el = listRef.current
     if (!el) return
@@ -459,6 +483,7 @@ export function StockTable({
             onClick={() =>
               setCode(row.code, {
                 getCodes: () => displayRef.current.map((r) => r.code),
+                revealCode,
               })
             }
           >

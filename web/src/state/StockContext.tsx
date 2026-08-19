@@ -50,9 +50,13 @@ interface TaggedKline {
   rows: Kline[]
 }
 
-/** 列表导航源：getCodes 返回该列表“当前”的完整代码顺序（点击后排序变化也跟随） */
+/**
+ * 列表导航源：getCodes 返回该列表“当前”的完整代码顺序（点击后排序变化也跟随）；
+ * revealCode 负责让虚拟列表把键盘/滚轮切到的目标行滚进可视区。
+ */
 export interface StockNavSource {
   getCodes: () => string[]
+  revealCode?: (code: string) => void
 }
 
 interface StockCtx {
@@ -65,6 +69,7 @@ interface StockCtx {
   setFuquan: (fuquan: string) => void
   quote: QuoteInfo | null
   marketView: DataState<MarketView>
+  intradayState: DataState<IntradayPoint[]>
   klineState: DataState<Kline[]>
   /** 上/下一只：有列表上下文按列表当前顺序（首尾循环），否则按全市场代码升序 */
   navigate: (dir: 1 | -1) => void
@@ -94,6 +99,12 @@ const Ctx = createContext<StockCtx>({
   setFuquan: () => {},
   quote: null,
   marketView: emptyMarketView,
+  intradayState: {
+    data: null,
+    loading: true,
+    error: '',
+    refresh: () => {},
+  },
   klineState: emptyKline,
   navigate: () => {},
   globalCodesRef: { current: [] },
@@ -101,6 +112,52 @@ const Ctx = createContext<StockCtx>({
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function isRecoverableRequestError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === 'TimeoutError' ||
+      /signal timed out|failed to fetch|HTTP 502/i.test(error.message))
+  )
+}
+
+// 只恢复最终停留的股票。后端 Web 路由会把单次协议工作限制在浏览器超时以内，
+// 这里再用退避处理短暂的 502/网络超时；已经切走的旧任务绝不重试。
+async function retryCurrentRequest<T>(
+  request: () => Promise<T>,
+  isCurrent: () => boolean,
+): Promise<T> {
+  const retryDelays = [1_500, 4_000]
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await request()
+    } catch (error) {
+      if (
+        attempt >= retryDelays.length ||
+        !isRecoverableRequestError(error) ||
+        !isCurrent()
+      ) {
+        throw error
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, retryDelays[attempt]),
+      )
+      if (!isCurrent()) throw error
+    }
+  }
+}
+
+// 盘口和 K 线用于首屏，切股后立即发起。分时返回更大，且与 K 线
+// 共用市场 L2 socket，只保留一个人无感的短合并窗口。
+const INTRADAY_SWITCH_COALESCE_MS = 60
+
+// 同花顺会优先用本地图表数据绘制再后台刷新。Web 保留最近看过的
+// 股票/周期/复权组合，避免切回时先清空图表。
+const KLINE_CACHE_LIMIT = 128
+
+function klineCacheKey(code: string, period: KlinePeriod, fuquan: string) {
+  return `${code}\u0000${period}\u0000${fuquan}`
 }
 
 // 数据通道闸门：同一通道最多 1 个在途请求，快速连切时排队任务不断被
@@ -138,6 +195,7 @@ export function StockProvider({ children }: { children: ReactNode }) {
   } | null>(null)
   const [kline, setKline] = useState<TaggedKline | null>(null)
   const [fastLoading, setFastLoading] = useState(true)
+  const [intradayLoading, setIntradayLoading] = useState(true)
   const [klineLoading, setKlineLoading] = useState(true)
   const [fastError, setFastError] = useState('')
   const [intradayError, setIntradayError] = useState('')
@@ -148,6 +206,7 @@ export function StockProvider({ children }: { children: ReactNode }) {
   const fastLane = useLaneGate()
   const intradayLane = useLaneGate()
   const klineLane = useLaneGate()
+  const klineCacheRef = useRef(new Map<string, TaggedKline>())
   // 键盘/滚轮切换股票：最近点击的列表（顺序源）+ 全市场代码（升序回退）
   const navListRef = useRef<StockNavSource | null>(null)
   const globalCodesRef = useRef<string[]>([])
@@ -162,12 +221,13 @@ export function StockProvider({ children }: { children: ReactNode }) {
 
   const navigate = useCallback(
     (dir: 1 | -1) => {
-      const listCodes = navListRef.current?.getCodes() ?? []
-      const codes = listCodes.includes(code)
-        ? listCodes
-        : globalCodesRef.current
+      const source = navListRef.current
+      const listCodes = source?.getCodes() ?? []
+      const usesList = listCodes.includes(code)
+      const codes = usesList ? listCodes : globalCodesRef.current
       if (!codes.length) return
       const i = codes.indexOf(code)
+      let next: string
       if (i < 0) {
         // 当前代码不在序列中（如从短线精灵/板块指数切入）：按代码插入位就近取
         const pos = codes.findIndex((c) => c > code)
@@ -179,31 +239,37 @@ export function StockProvider({ children }: { children: ReactNode }) {
             : pos <= 0
               ? codes.length - 1
               : pos - 1
-        setCode(codes[j])
-        return
+        next = codes[j]
+      } else {
+        next = codes[(i + dir + codes.length) % codes.length]
       }
-      setCode(codes[(i + dir + codes.length) % codes.length])
+      setCode(next)
+      if (usesList) source?.revealCode?.(next)
     },
     [code],
   )
 
   const refresh = useCallback(() => setRefreshTick((value) => value + 1), [])
 
-  // Quote/depth and the unified three-phase intraday request use independent
-  // connections.  Start both immediately and let each dataset paint as soon
-  // as it arrives; market_view_fast deliberately contains no timeline rows.
-  // 快速连切合并：防抖 + 通道闸门（在途最多 1 个，中间代码不占 socket）。
+  // Quote/depth uses MAIN while the unified three-phase intraday request uses
+  // the market L2 connection.  Quote/depth starts immediately; intraday gets
+  // only a short coalescing window.  The lane gate bounds each lane to the
+  // current request plus the latest queued stock.
   useEffect(() => {
     setFast(null)
     setIntraday(null)
     setFastLoading(true)
+    setIntradayLoading(true)
     setFastError('')
     setIntradayError('')
 
     const loadFast = async () => {
       const target = codeRef.current
       try {
-        const firstPaint = await api.marketViewFast(target)
+        const firstPaint = await retryCurrentRequest(
+          () => api.marketViewFast(target),
+          () => target === codeRef.current,
+        )
         if (target === codeRef.current) {
           setFast(firstPaint)
           setFastError('')
@@ -221,28 +287,39 @@ export function StockProvider({ children }: { children: ReactNode }) {
         // 等待后端预热就绪再走 L2，避免冷启动时请求排队等锁/超时。
         await api.preheatReady()
         if (target !== codeRef.current) return
-        const rows = await api.intraday(target)
+        const rows = await retryCurrentRequest(
+          () => api.intraday(target),
+          () => target === codeRef.current,
+        )
         if (target === codeRef.current) setIntraday({ code: target, rows })
       } catch (error) {
         if (target === codeRef.current) setIntradayError(errorText(error))
+      } finally {
+        if (target === codeRef.current) setIntradayLoading(false)
       }
     }
 
-    // 防抖窗口 > 滚轮节流档(120ms)：持续滚动/按住方向键期间完全不发请求，
-    // 停下后一次拉最终代码；闸门再保证在途最多 1 个。
-    const FAST_DEBOUNCE_MS = 150
+    fastLane(loadFast)
     const timer = setTimeout(() => {
-      fastLane(loadFast)
       intradayLane(loadIntraday)
-    }, FAST_DEBOUNCE_MS)
+    }, INTRADAY_SWITCH_COALESCE_MS)
     return () => clearTimeout(timer)
   }, [code, refreshTick, fastLane, intradayLane])
 
-  // K-line has its own ifindhq socket and starts alongside the two requests
-  // above.  Period/fuquan changes only rerun this lane.  同样走闸门：连切时
-  // 最多 1 个在途 K 线请求。
+  // K-line starts immediately on the selected market's L2 connection.
+  // Period/fuquan changes only rerun this lane.  Cached rows remain visible
+  // while the lane refreshes them in the background.
   useEffect(() => {
-    setKline(null)
+    const cacheKey = klineCacheKey(code, period, fuquan)
+    const cached = klineCacheRef.current.get(cacheKey)
+    if (cached) {
+      // Map insertion order is the LRU order; touching moves this entry last.
+      klineCacheRef.current.delete(cacheKey)
+      klineCacheRef.current.set(cacheKey, cached)
+      setKline(cached)
+    } else {
+      setKline(null)
+    }
     setKlineLoading(true)
     setKlineError('')
     const load = async () => {
@@ -251,19 +328,25 @@ export function StockProvider({ children }: { children: ReactNode }) {
         // KLINE_FAST 也在预热范围内；等它就绪再发，避免与预热争建连。
         await api.preheatReady()
         if (target !== codeRef.current) return
-        // 北交所走后端 auto：Level2 账号会在 shlv2 上用 pageid=1334 查 K线
-        // （与 2026-08-15 客户端抓包一致）；沪深继续用独立 ifindhq_fast 通道。
-        const channel =
-          target.startsWith('920') ||
-          target.startsWith('43') ||
-          target.startsWith('83') ||
-          target.startsWith('87')
-            ? 'auto'
-            : 'ifindhq_fast'
-        const rows = await api.kline(target, period, 320, fuquan, channel)
+        // Web 看盘固定复用 Level2 市场连接：沪/北走 SH_L2、深走 SZ_L2，
+        // pageid=1334。不要使用 ifindhq_fast；它是独立 BASIC/MAIN 连接。
+        const channel = 'level2'
+        const rows = await retryCurrentRequest(
+          () => api.kline(target, period, 320, fuquan, channel),
+          () => target === codeRef.current,
+        )
         // 展示侧 validKline 还会按 code/period/fuquan 过滤，旧响应不会上屏
         if (target === codeRef.current) {
-          setKline({ code: target, period, fuquan, rows })
+          const tagged = { code: target, period, fuquan, rows }
+          const targetKey = klineCacheKey(target, period, fuquan)
+          klineCacheRef.current.delete(targetKey)
+          klineCacheRef.current.set(targetKey, tagged)
+          while (klineCacheRef.current.size > KLINE_CACHE_LIMIT) {
+            const oldest = klineCacheRef.current.keys().next().value
+            if (oldest === undefined) break
+            klineCacheRef.current.delete(oldest)
+          }
+          setKline(tagged)
         }
       } catch (error) {
         if (target === codeRef.current) setKlineError(errorText(error))
@@ -271,14 +354,11 @@ export function StockProvider({ children }: { children: ReactNode }) {
         if (target === codeRef.current) setKlineLoading(false)
       }
     }
-    // K 线延迟约 40ms 发出：合并连续切股（闸门再兜底堵 socket 队列）。
-    const KLINE_DEBOUNCE_MS = 40
-    const timer = setTimeout(() => klineLane(load), KLINE_DEBOUNCE_MS)
-    return () => clearTimeout(timer)
+    klineLane(load)
   }, [code, period, fuquan, refreshTick, klineLane])
 
   const validFast = fast?.code === code ? fast : null
-  const validIntraday = intraday?.code === code ? intraday.rows : []
+  const validIntraday = intraday?.code === code ? intraday.rows : null
   const validKline =
     kline?.code === code &&
     kline.period === period &&
@@ -294,7 +374,7 @@ export function StockProvider({ children }: { children: ReactNode }) {
       fuquan,
       quote: validFast.quote,
       depth: validFast.depth,
-      intraday: validIntraday,
+      intraday: validIntraday ?? [],
       kline: validKline ?? [],
     }
   }, [code, period, fuquan, validFast, validIntraday, validKline])
@@ -303,10 +383,19 @@ export function StockProvider({ children }: { children: ReactNode }) {
     () => ({
       data,
       loading: fastLoading,
-      error: [fastError, intradayError].filter(Boolean).join('; '),
+      error: fastError,
       refresh,
     }),
-    [data, fastLoading, fastError, intradayError, refresh],
+    [data, fastLoading, fastError, refresh],
+  )
+  const intradayState = useMemo<DataState<IntradayPoint[]>>(
+    () => ({
+      data: validIntraday,
+      loading: intradayLoading,
+      error: intradayError,
+      refresh,
+    }),
+    [validIntraday, intradayLoading, intradayError, refresh],
   )
   const klineState = useMemo<DataState<Kline[]>>(
     () => ({
@@ -349,6 +438,7 @@ export function StockProvider({ children }: { children: ReactNode }) {
         setFuquan,
         quote,
         marketView,
+        intradayState,
         klineState,
         navigate,
         globalCodesRef,

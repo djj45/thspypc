@@ -158,6 +158,56 @@ def test_kline_level2_uses_l2_role_and_pageid_1334(monkeypatch):
     assert evidence.profile().supports(Capability.L2_TIMELINE)
 
 
+def test_kline_level2_latest_uses_monotonic_request_gate(monkeypatch):
+    """Web opt-in uses request_latest; public calls keep request() by default."""
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: sock,
+    )
+    connection = manager.acquire(
+        ConnectionRole.SH_L2,
+        capability=Capability.L2_TIMELINE,
+    )
+    gates = []
+    original = connection.request_latest
+
+    def record_latest(frame, *, gate, timeout, trailing_newline=True):
+        gates.append(gate)
+        return original(
+            frame,
+            gate=gate,
+            timeout=timeout,
+            trailing_newline=trailing_newline,
+        )
+
+    monkeypatch.setattr(connection, "request_latest", record_latest)
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd3_response",
+        lambda _body: [{"code": "600519"}],
+    )
+    service = KlineService(
+        manager,
+        frame_reader=lambda _sock: b"hd3.1\x00data",
+        max_frames=1,
+    )
+
+    assert service.kline(
+        "600519",
+        market=17,
+        period=KLINE_PERIOD_DAY,
+        latest=True,
+    ) == [{"code": "600519"}]
+    assert service.kline(
+        "600519",
+        market=17,
+        period=KLINE_PERIOD_DAY,
+        latest=True,
+    ) == [{"code": "600519"}]
+
+    assert gates == [1, 2]
+
+
 def test_kline_beijing_level2_uses_sh_l2(monkeypatch):
     """北交所 Level2 K线走 shlv2 pageid=1334（2026-08-15 抓包对齐）。"""
     sock = FakeSocket()
@@ -254,6 +304,37 @@ def test_kline_timeout_after_data_finishes_successfully(monkeypatch):
     ) == [{"code": "000001"}]
 
 
+def test_kline_accepts_hd1_single_bar_for_new_listing(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: sock,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd1_response",
+        lambda _body: [{"code": "688836", "close": 845.0}],
+    )
+    monkeypatch.setattr(
+        "thspypc.services.kline.parse_kline_hd3_response",
+        lambda _body: (_ for _ in ()).throw(
+            AssertionError("hd1.0 response must not use the hd3.1 parser")
+        ),
+    )
+    service = KlineService(
+        manager,
+        frame_reader=lambda _sock: b"hd1.0\x00new-listing",
+        max_frames=1,
+    )
+
+    assert service.kline(
+        "688836",
+        market=17,
+        period=KLINE_PERIOD_DAY,
+        count=320,
+    ) == [{"code": "688836", "close": 845.0}]
+    assert sock.timeout == KLINE_FRAGMENT_TAIL_TIMEOUT
+
+
 def test_kline_complete_window_returns_without_tail_read(monkeypatch):
     """完整的 count+1 根响应应立即返回，不再固定等待尾读超时。"""
     sock = FakeSocket()
@@ -290,7 +371,7 @@ def test_kline_complete_window_returns_without_tail_read(monkeypatch):
 
     assert len(result) == 3
     assert read_count == 1
-    assert sock.timeout == 4.0
+    assert sock.timeout == pytest.approx(4.0, abs=0.05)
 
 
 def test_kline_timeout_before_data_remains_transport_failure():

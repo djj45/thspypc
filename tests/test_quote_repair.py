@@ -1,6 +1,7 @@
 """list_quotes hd1.0 服务端截尾修复回归（2026-08-03 活网发现）。"""
 
 from pathlib import Path
+import struct
 
 from thspypc.codecs.hd import parse_hd1_response
 from thspypc.services.quote import _repair_short_record
@@ -45,3 +46,22 @@ def test_repair_two_records_truncated_tail():
     records = parse_hd1_response(repaired)
 
     assert [r.get("code") for r in records] == ["600519", "601318"]
+
+
+def test_repair_truncated_tail_after_kline_symbol_shell():
+    """K 线 hd1.0 在字段表后有 22B 壳，末记录仍可能少 1B。"""
+    full = (
+        b"hd1.0\x00"
+        + struct.pack("<IHHH", 1, 0x0042, 4, 1)
+        + b"\x01\x30\x00\x04"
+        + b"\x00" * 22
+        + b"\x01\x02\x03\x04"
+    )
+
+    repaired = _repair_short_record(
+        TailSocket(b"\x04"),
+        full[:-1],
+        record_prefix_size=22,
+    )
+
+    assert repaired == full

@@ -184,7 +184,7 @@ def test_level2_uses_market_role_and_matches_response(
 
     assert result == expected
     assert opened == [expected_role]
-    assert sock.timeout == 6.0
+    assert sock.timeout == pytest.approx(6.0, abs=0.05)
     assert len(sock.sent) == 2
     assert b"CodeList=" in sock.sent[0]
     assert b"pageid=1334" in sock.sent[1]

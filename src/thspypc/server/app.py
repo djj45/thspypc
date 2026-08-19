@@ -26,6 +26,12 @@ from .._transport.timing import (
 )
 
 
+# 官方客户端抓包中切股 K 线/分时完整响应的 P95 约 26ms。Web 交互路由
+# 用 2s 慢尾上界：正常抖动仍有充足余量，而旧股票不再最长占住共享 socket 6s。
+# 底层公共 Python API 仍保留原超时/重试语义。
+_WEB_PROTOCOL_TIMEOUT = 2.0
+
+
 def _market_for_code(code: str) -> int:
     """按代码前缀推断市场码（与 client.THSClient._market_for_code 保持一致）。
 
@@ -134,6 +140,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         key: tuple,
         ttl: float,
         operation: Callable[[object], object],
+        *,
+        cache_if: Callable[[object], bool] | None = None,
     ) -> object:
         now = time.monotonic()
         with _cache_lock:
@@ -141,6 +149,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             if entry is not None and now - entry[0] < ttl:
                 return entry[1]
         result = _call(operation)
+        if cache_if is not None and not cache_if(result):
+            return result
         with _cache_lock:
             if len(_response_cache) >= _cache_max_entries:
                 oldest = min(
@@ -220,7 +230,13 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 fuquan=fuquan,
                 market=market,
                 channel=channel,
+                timeout=_WEB_PROTOCOL_TIMEOUT,
+                retries=0,
+                latest=True,
             ),
+            # ``latest-wins`` 淘汰旧切股请求时返回 []；协议合法空结果同样是 []。
+            # 二者都不能污染同一股票后续 15 秒的 K 线缓存。
+            cache_if=bool,
         )
 
     @app.get("/api/timeline/{code}")
@@ -275,6 +291,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                     code,
                     market=market,
                     trade_date=trade_date,
+                    timeout=_WEB_PROTOCOL_TIMEOUT,
+                    retries=0,
                 ),
             )
         )
@@ -312,6 +330,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 quote_row, depth_row = client.market_view_pipeline(
                     code,
                     market=resolved_market,
+                    timeout=_WEB_PROTOCOL_TIMEOUT,
                 )
             else:
                 rows = client.list_quotes([code], market=resolved_market)

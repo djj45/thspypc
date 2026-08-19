@@ -52,8 +52,9 @@ from .protocol import (
     build_depth_quote_query, build_depth_ten_query,
     parse_depth_quote_response,
     DEPTH_QUOTE_DATATYPE, DEPTH_QUOTE_DATATYPE_10,
-    # K线（hd3.1 变体，flag=0x0042/0x0046）
-    parse_kline_hd3_response, build_kline_query, KLINE_DATATYPE,
+    # K线（hd1.0/hd3.1 变体，flag=0x0042/0x0046）
+    parse_kline_hd1_response, parse_kline_hd3_response,
+    build_kline_query, KLINE_DATATYPE,
     KLINE_PERIOD_1MIN, KLINE_PERIOD_5MIN, KLINE_PERIOD_15MIN,
     KLINE_PERIOD_30MIN, KLINE_PERIOD_60MIN,
     KLINE_PERIOD_DAY, KLINE_PERIOD_WEEK, KLINE_PERIOD_MONTH,
@@ -88,6 +89,14 @@ from .protocol import (
     SNAPSHOT_PAGEID, SNAPSHOT_DATATYPE,
     # 全市场快照（空括号单请求，hfd1.0 格式）
     build_market_snapshot_query, MARKET_SNAPSHOT_MARKETS, MARKET_SNAPSHOT_DATATYPE,
+    # pageid=1334 列表订阅桶（纯协议层，尚未接 service/socket）
+    build_list_subscription_codes, build_list_subscription_delta,
+    build_list_subscription_clear,
+    build_list_subscription_query, parse_list_subscription_response,
+    LIST_SUBSCRIPTION_PAGEID, LIST_SUBTYPE_MANAGE, LIST_SUBTYPE_QUERY,
+    RANKING_LIST_COMMAND, RANKING_LIST_DATATYPE, RANKING_LIST_PAGEID,
+    LIST_MODE_GROUP_0, LIST_MODE_QUERY, LIST_MODE_GROUP_2, LIST_MODE_GROUP_3,
+    LIST_MODE_CLEAR, LIST_MODE_DELTA, ListSubscriptionResponse,
 
     # 股票列表（全市场代码表）
     build_full_stock_list_query, build_stock_list_query,
@@ -131,7 +140,8 @@ __all__ = [
     "build_depth_quote_query", "build_depth_ten_query",
     "parse_depth_quote_response",
     "DEPTH_QUOTE_DATATYPE", "DEPTH_QUOTE_DATATYPE_10",
-    "parse_kline_hd3_response", "build_kline_query", "KLINE_DATATYPE",
+    "parse_kline_hd1_response", "parse_kline_hd3_response",
+    "build_kline_query", "KLINE_DATATYPE",
     "KLINE_PERIOD_1MIN", "KLINE_PERIOD_5MIN", "KLINE_PERIOD_15MIN",
     "KLINE_PERIOD_30MIN", "KLINE_PERIOD_60MIN",
     "KLINE_PERIOD_DAY", "KLINE_PERIOD_WEEK", "KLINE_PERIOD_MONTH",
@@ -163,6 +173,13 @@ __all__ = [
     "CLOSING_AUCTION_PERIOD", "CLOSING_AUCTION_DATATYPE",
     "INDEX_AUCTION_PAGEID", "INDEX_CLOSING_AUCTION_CODES",
     "build_market_snapshot_query", "MARKET_SNAPSHOT_MARKETS", "MARKET_SNAPSHOT_DATATYPE",
+    "build_list_subscription_codes", "build_list_subscription_delta",
+    "build_list_subscription_clear",
+    "build_list_subscription_query", "parse_list_subscription_response",
+    "LIST_SUBSCRIPTION_PAGEID", "LIST_SUBTYPE_MANAGE", "LIST_SUBTYPE_QUERY",
+    "RANKING_LIST_COMMAND", "RANKING_LIST_DATATYPE", "RANKING_LIST_PAGEID",
+    "LIST_MODE_GROUP_0", "LIST_MODE_QUERY", "LIST_MODE_GROUP_2", "LIST_MODE_GROUP_3",
+    "LIST_MODE_CLEAR", "LIST_MODE_DELTA", "ListSubscriptionResponse",
     "parse_hfd1_response",
     "build_full_stock_list_query", "build_stock_list_query",
     "build_dde_query", "parse_dde_response",

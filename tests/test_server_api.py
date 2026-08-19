@@ -65,6 +65,9 @@ class FakeClient:
         fuquan="Q",
         market=0,
         channel="auto",
+        timeout=12.0,
+        retries=3,
+        latest=False,
     ):
         self.calls.append(
             ("kline", code, period, count, anchor, fuquan, market, channel)
@@ -87,7 +90,14 @@ class FakeClient:
         self.calls.append(("closing_auction", code, market, trade_date))
         return []
 
-    def intraday(self, code, market=0, trade_date=None):
+    def intraday(
+        self,
+        code,
+        market=0,
+        trade_date=None,
+        timeout=12.0,
+        retries=3,
+    ):
         self.calls.append(("intraday", code, market, trade_date))
         return []
 
@@ -204,6 +214,69 @@ def test_kline_anchor_passthrough(client_and_app):
     assert (
         "kline", "000938", "day", 1938, 20180727, "Q", 0, "auto"
     ) in fake.calls
+
+
+def test_kline_empty_result_is_not_cached(env_file):
+    class EmptyThenDataClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.kline_calls = 0
+
+        def kline(self, code, **kwargs):
+            self.kline_calls += 1
+            if self.kline_calls == 1:
+                return []
+            return [{"code": code, "time": "2026-08-19"}]
+
+    fake = EmptyThenDataClient()
+    fake.is_connected = True
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+    runtime._client = fake
+    runtime._connected_once = True
+    client = TestClient(create_app(runtime))
+
+    assert client.get("/api/kline/688836").json() == []
+    expected = [{"code": "688836", "time": "2026-08-19"}]
+    assert client.get("/api/kline/688836").json() == expected
+    assert client.get("/api/kline/688836").json() == expected
+    assert fake.kline_calls == 2
+
+
+def test_interactive_routes_bound_protocol_work_below_browser_timeout(env_file):
+    seen = {}
+
+    class BoundedFakeClient(FakeClient):
+        def kline(self, code, **kwargs):
+            seen["kline"] = (
+                kwargs["timeout"],
+                kwargs["retries"],
+                kwargs["latest"],
+            )
+            return []
+
+        def intraday(self, code, **kwargs):
+            seen["intraday"] = (kwargs["timeout"], kwargs["retries"])
+            return []
+
+        def market_view_pipeline(self, code, **kwargs):
+            seen["market_view_fast"] = kwargs["timeout"]
+            return ({"code": code}, {"code": code, "buy": [], "sell": []})
+
+    fake = BoundedFakeClient()
+    fake.is_connected = True
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+    runtime._client = fake
+    runtime._connected_once = True
+    client = TestClient(create_app(runtime))
+
+    assert client.get("/api/kline/000938").status_code == 200
+    assert client.get("/api/intraday/000938").status_code == 200
+    assert client.get("/api/market_view_fast/000938").status_code == 200
+    assert seen == {
+        "kline": (2.0, 0, True),
+        "intraday": (2.0, 0),
+        "market_view_fast": 2.0,
+    }
 
 
 def test_market_view_returns_four_datasets_and_forwards_options(client_and_app):
@@ -423,6 +496,40 @@ def test_runtime_background_preheat_runs_once_and_reports_markets(env_file):
     assert status["preheat"]["markets"]["sh"]["ready"]
     assert status["preheat"]["markets"]["sz"]["ready"]
     assert fake.preheat_count == 1
+
+
+def test_preheat_retry_stops_when_foreground_login_succeeds(
+    env_file,
+    monkeypatch,
+):
+    """The 30s preheat backoff must not outlive a successful foreground login."""
+
+    class FirstLoginFailsClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.connect_count = 0
+
+        def connect(self):
+            self.connect_count += 1
+            return _Result(success=False, error="all_hosts_failed")
+
+    fake = FirstLoginFailsClient()
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+    runtime._client = fake
+    sleeps = []
+
+    def foreground_connects(delay):
+        sleeps.append(delay)
+        runtime._connected_once = True
+
+    monkeypatch.setattr("thspypc.server.runtime.time.sleep", foreground_connects)
+
+    result = runtime._connect_with_retry(fake)
+
+    assert result.success is True
+    assert result.error == "already_connected"
+    assert fake.connect_count == 1
+    assert sleeps == [0.25]
 
 
 def test_runtime_reconnects_after_transport_failure_marks_main_dead(env_file):

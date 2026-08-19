@@ -93,6 +93,17 @@ def test_kline_time_helpers_cover_wire_encodings():
 
 
 def test_kline_parser_rejects_non_kline_payloads():
+    assert kline_protocol.parse_kline_hd1_response(b"") == []
+    assert (
+        kline_protocol.parse_kline_hd1_response(
+            b"hd1.0\x00"
+            b"\x01\x00\x00\x00"
+            b"\x34\x12"
+            b"\x04\x00"
+            b"\x01\x00"
+        )
+        == []
+    )
     assert kline_protocol.parse_kline_hd3_response(b"") == []
     assert (
         kline_protocol.parse_kline_hd3_response(
@@ -106,8 +117,48 @@ def test_kline_parser_rejects_non_kline_payloads():
     )
 
 
+def test_kline_hd1_parser_decodes_captured_688836_first_day_bar():
+    """2026-08-19 新股首日只有一根时，L2 返回 hd1.0 而非 hd3.1。"""
+    response = bytes.fromhex(
+        "6864312e3000"  # hd1.0\0
+        "0100000042001c000700"  # dc=1, flag=0x42, hs=28, fc=7
+        "01300004"  # dt1: YYYYMMDD
+        "07700004"  # dt7: open
+        "08700004"  # dt8: high
+        "09700004"  # dt9: low
+        "0b700004"  # dt11: close
+        "0d700004"  # dt13: volume
+        "13700004"  # dt19: amount
+        "16000100113638383833360000000000000000000100"  # 22B shell
+        "d3273501"  # 20260819
+        "e0c810b0"  # 1100.00
+        "e0c810b0"  # 1100.00
+        "50350cb0"  # 800.08
+        "c8e40cb0"  # 845.00
+        "4f828701"  # 25,657,935
+        "ef626131"  # 23,159,535,000
+    )
+
+    assert kline_protocol.parse_kline_hd1_response(response) == [
+        {
+            "code": "688836",
+            "time": datetime.datetime(2026, 8, 19),
+            "open": 1100.0,
+            "high": 1100.0,
+            "low": 800.08,
+            "close": 845.0,
+            "volume": 25_657_935.0,
+            "amount": 23_159_535_000.0,
+        }
+    ]
+
+
 def test_protocol_reexports_kline_implementations():
     assert protocol.build_kline_query is kline_protocol.build_kline_query
+    assert (
+        protocol.parse_kline_hd1_response
+        is kline_protocol.parse_kline_hd1_response
+    )
     assert (
         protocol.parse_kline_hd3_response
         is kline_protocol.parse_kline_hd3_response

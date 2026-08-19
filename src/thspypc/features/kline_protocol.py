@@ -10,7 +10,7 @@ from ..codecs.compression import (
     _transpose_bitplane_0x1763410,
 )
 from ..codecs.framing import encode_frame
-from ..codecs.hd import _parse_hd_field_table
+from ..codecs.hd import _parse_hd_field_table, parse_hd1_response
 from ..codecs.numeric import decode_ths_float
 
 
@@ -98,7 +98,8 @@ def build_kline_l2_query(
     2026-08-05 抓包（``kanpan_20260805_001523.pcap``）确认 Level2 账号的日K
     请求用 pageid=1334、route=0x0100，走 L2 连接（shlv2/szlv2），DataType 仍为
     基础 OHLCV（7,8,9,11,13,19），不含 L2 增强字段。响应仍是 hd3.1（flag
-    0x0042/0x0046），由 ``parse_kline_hd3_response`` 解析（与普通账号同解析器）。
+    0x0042/0x0046）；历史较多时是 ``hd3.1``，新股等短历史可返回
+    ``hd1.0``，分别由对应 K 线解析器处理。
 
     普通账号仍用 ``build_kline_query``（pageid=9355, MAIN）。
     """
@@ -139,6 +140,95 @@ def _kline_dt1_is_bar_index(tv: int) -> bool:
     except (OSError, ValueError, OverflowError):
         return True
     return decoded.year < 1990
+
+
+def parse_kline_hd1_response(body: bytes) -> list[dict]:
+    """Parse the row-major ``hd1.0`` K-line response used for short history.
+
+    A newly listed stock can have only one daily bar.  In that case the server
+    returns the same field table and fixed rows as :func:`parse_hd1_response`,
+    with a 22-byte per-symbol shell inserted between the field table and rows.
+    Strip only that shell and delegate all field/numeric decoding to the shared
+    ``hd1.0`` codec.
+    """
+    pos = body.find(b"hd1.0\x00")
+    if pos < 0:
+        return []
+    base = pos + 6
+    if len(body) < base + 10:
+        return []
+
+    record_count = struct.unpack("<I", body[base : base + 4])[0]
+    flag = struct.unpack("<H", body[base + 4 : base + 6])[0]
+    record_size = struct.unpack("<H", body[base + 6 : base + 8])[0]
+    field_count = struct.unpack("<H", body[base + 8 : base + 10])[0]
+    if (
+        record_count == 0
+        or record_size == 0
+        or field_count == 0
+        or field_count > 50
+    ):
+        return []
+    if flag not in (0x0042, 0x0046):
+        logger.debug("kline hd1.0 non-kline flag=0x%x", flag)
+        return []
+
+    shell_offset = base + 10 + field_count * 4
+    shell_size = 22
+    if len(body) < shell_offset + shell_size:
+        return []
+    shell = body[shell_offset : shell_offset + shell_size]
+    if shell[:4] != b"\x16\x00\x01\x00":
+        return []
+    code_bytes = shell[5:11]
+    code = (
+        code_bytes.decode("ascii")
+        if len(code_bytes) == 6 and code_bytes.isdigit()
+        else ""
+    )
+
+    row_offset = shell_offset + shell_size
+    expected_rows_size = record_count * record_size
+    if len(body) < row_offset + expected_rows_size:
+        return []
+
+    # ``parse_hd1_response`` expects rows immediately after the field table.
+    decoded_rows = parse_hd1_response(
+        body[:shell_offset] + body[row_offset:]
+    )
+    records: list[dict] = []
+    standard_fields = (
+        ("open", KLINE_DT_OPEN),
+        ("high", KLINE_DT_HIGH),
+        ("low", KLINE_DT_LOW),
+        ("close", KLINE_DT_CLOSE),
+        ("volume", KLINE_DT_VOL),
+        ("amount", KLINE_DT_AMT),
+    )
+    standard_keys = {f"dt{datatype}" for _, datatype in standard_fields}
+
+    for decoded in decoded_rows:
+        record: dict = {"code": code}
+        raw_time = decoded.get("dt1_raw")
+        if isinstance(raw_time, (bytes, bytearray)) and len(raw_time) >= 4:
+            tv = struct.unpack("<I", raw_time[:4])[0]
+            if _kline_dt1_is_bar_index(tv):
+                record["time"] = None
+                record["bar_index"] = tv
+            else:
+                record["time"] = _kline_decode_time(tv)
+
+        for name, datatype in standard_fields:
+            key = f"dt{datatype}"
+            if key in decoded:
+                record[name] = decoded[key]
+
+        for key, value in decoded.items():
+            if key == "dt1_raw" or key in standard_keys:
+                continue
+            record[key] = value
+        records.append(record)
+    return records
 
 
 def parse_kline_hd3_response(body: bytes) -> list[dict]:

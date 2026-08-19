@@ -28,6 +28,32 @@ class MarketSession:
         self._gate_lock = threading.Lock()
         self._latest_gate = 0
 
+    def _acquire_request_lock(self, deadline: float) -> float:
+        """Acquire the socket lane within the caller's total time budget."""
+        waiting_started = time.perf_counter()
+        remaining = deadline - time.monotonic()
+        acquired_lock = (
+            remaining > 0
+            and self._request_lock.acquire(timeout=remaining)
+        )
+        acquired = time.perf_counter()
+        add_request_timing(
+            f"{self._timing_name}_wait",
+            (acquired - waiting_started) * 1000,
+        )
+        if not acquired_lock:
+            raise TimeoutError(
+                f"{self._timing_name} request lane wait timed out"
+            )
+        return acquired
+
+    @staticmethod
+    def _remaining(deadline: float, *, phase: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"request timed out while {phase}")
+        return remaining
+
     @contextmanager
     def request(
         self,
@@ -36,19 +62,18 @@ class MarketSession:
         timeout: float,
         trailing_newline: bool = True,
     ) -> Iterator[SocketLike]:
-        waiting_started = time.perf_counter()
-        self._request_lock.acquire()
-        acquired = time.perf_counter()
-        add_request_timing(
-            f"{self._timing_name}_wait",
-            (acquired - waiting_started) * 1000,
-        )
+        deadline = time.monotonic() + timeout
+        acquired = self._acquire_request_lock(deadline)
         try:
-            self._dispatcher.wait_idle()
+            remaining = self._remaining(deadline, phase="waiting for dispatcher")
+            if not self._dispatcher.wait_idle(timeout=remaining):
+                raise TimeoutError("dispatcher idle wait timed out")
             sock = self._socket_getter()
             if sock is None:
                 raise ConnectionError("连接已关闭")
-            sock.settimeout(timeout)
+            sock.settimeout(
+                self._remaining(deadline, phase="starting socket request")
+            )
             sock.sendall(frame + (b"\n" if trailing_newline else b""))
             yield sock
         finally:
@@ -79,15 +104,12 @@ class MarketSession:
         """
         with self._gate_lock:
             self._latest_gate = max(self._latest_gate, gate)
-        waiting_started = time.perf_counter()
-        self._request_lock.acquire()
-        acquired = time.perf_counter()
-        add_request_timing(
-            f"{self._timing_name}_wait",
-            (acquired - waiting_started) * 1000,
-        )
+        deadline = time.monotonic() + timeout
+        acquired = self._acquire_request_lock(deadline)
         try:
-            self._dispatcher.wait_idle()
+            remaining = self._remaining(deadline, phase="waiting for dispatcher")
+            if not self._dispatcher.wait_idle(timeout=remaining):
+                raise TimeoutError("dispatcher idle wait timed out")
             with self._gate_lock:
                 superseded = gate != self._latest_gate
             if superseded:
@@ -95,7 +117,9 @@ class MarketSession:
             sock = self._socket_getter()
             if sock is None:
                 raise ConnectionError("连接已关闭")
-            sock.settimeout(timeout)
+            sock.settimeout(
+                self._remaining(deadline, phase="starting latest request")
+            )
             sock.sendall(frame + (b"\n" if trailing_newline else b""))
             yield sock
         finally:
@@ -108,19 +132,18 @@ class MarketSession:
     @contextmanager
     def receive(self, *, timeout: float) -> Iterator[SocketLike]:
         """Own response reading without sending a request first."""
-        waiting_started = time.perf_counter()
-        self._request_lock.acquire()
-        acquired = time.perf_counter()
-        add_request_timing(
-            f"{self._timing_name}_wait",
-            (acquired - waiting_started) * 1000,
-        )
+        deadline = time.monotonic() + timeout
+        acquired = self._acquire_request_lock(deadline)
         try:
-            self._dispatcher.wait_idle()
+            remaining = self._remaining(deadline, phase="waiting for dispatcher")
+            if not self._dispatcher.wait_idle(timeout=remaining):
+                raise TimeoutError("dispatcher idle wait timed out")
             sock = self._socket_getter()
             if sock is None:
                 raise ConnectionError("连接已关闭")
-            sock.settimeout(timeout)
+            sock.settimeout(
+                self._remaining(deadline, phase="starting socket receive")
+            )
             yield sock
         finally:
             add_request_timing(
@@ -157,31 +180,34 @@ class MarketSession:
         max_frames: int = 32,
     ) -> list[Any]:
         """Run a bounded multi-flight bundle under this connection's lock."""
-        waiting_started = time.perf_counter()
-        self._request_lock.acquire()
-        acquired = time.perf_counter()
-        add_request_timing(
-            f"{self._timing_name}_wait",
-            (acquired - waiting_started) * 1000,
-        )
+        deadline = time.monotonic() + timeout
+        acquired = self._acquire_request_lock(deadline)
         try:
             futures = self._dispatcher.submit(
                 requests,
                 frame_reader=frame_reader,
-                timeout=timeout,
+                timeout=self._remaining(
+                    deadline,
+                    phase="submitting dispatched request",
+                ),
                 max_frames=max_frames,
             )
         finally:
             self._request_lock.release()
 
         try:
-            result = [
-                future.result(timeout=timeout + 0.5)
-                for future in futures
-            ]
+            result = []
+            for future in futures:
+                remaining = self._remaining(
+                    deadline,
+                    phase="waiting for dispatched response",
+                )
+                result.append(future.result(timeout=remaining + 0.05))
             sock = self._socket_getter()
             if sock is not None:
-                sock.settimeout(timeout)
+                sock.settimeout(
+                    max(deadline - time.monotonic(), 0.001)
+                )
             return result
         finally:
             add_request_timing(

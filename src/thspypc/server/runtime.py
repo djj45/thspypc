@@ -81,7 +81,16 @@ class ThsRuntime:
                 "markets": dict(self._preheat_state.get("markets", {})),
             }
             return {
-                "connected": bool(client.is_connected),
+                # status 必须永远是轻量查询。client.is_connected 会取得 MAIN
+                # 请求锁；MAIN 协议请求超时时它会连带卡住 /api/status，令前端
+                # 误判整个后端已死。真实传输异常仍由 call() 路径更新此标志。
+                "connected": bool(
+                    self._connected_once
+                    and (
+                        not hasattr(client, "_sock")
+                        or getattr(client, "_sock", None) is not None
+                    )
+                ),
                 "server": getattr(client, "_connected_ip", None),
                 "account_kind": kind,
                 "credentials": bool(self._env.get("THS_USERNAME")),
@@ -195,7 +204,23 @@ class ThsRuntime:
                     "MAIN 登录失败，%d 秒后重试（第 %d 次）...",
                     int(delay), attempt + 1,
                 )
-                time.sleep(delay)
+                # 退避期间前台 API 可能已经成功登录。用可中断等待代替
+                # 一次性 sleep(30)，避免 preheat 继续显示 running 并拖住前端。
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    with self._lifecycle_lock:
+                        if self._connected_once:
+                            return LoginResult(
+                                success=True,
+                                error="already_connected",
+                                server=str(
+                                    getattr(client, "_connected_ip", "") or ""
+                                ),
+                            )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.25, remaining))
             with self._lifecycle_lock:
                 if self._connected_once:
                     return LoginResult(

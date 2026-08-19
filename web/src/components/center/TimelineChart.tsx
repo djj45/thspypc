@@ -7,8 +7,8 @@ import type { TimelinePoint } from '../../types'
 type IntradayPoint = TimelinePoint & { phase?: string; time?: string }
 
 // 真实时刻 -> 交易分钟 x（午休压缩）。
-// 早盘竞价 9:15-9:25 拉伸到 -15..-1（贴着 9:30 开盘段，跳过 9:25-9:30
-// 撮合空档，与同花顺一致）；盘中 9:30-11:29 -> 0..119；
+// 早盘竞价 9:15-9:25 拉伸到 -15..0（竞价末点与 9:30 分时首点在边界
+// 衔接，同时压缩 9:25-9:30 撮合空档）；盘中 9:30-11:29 -> 0..119；
 // 下午 13:00-14:56 -> 120..236；尾盘竞价 14:57-15:00 -> 237..240。
 function timeToX(iso?: string): number | null {
   if (!iso) return null
@@ -17,7 +17,7 @@ function timeToX(iso?: string): number | null {
   const mins = d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60
   if (mins < 570) {
     const t = Math.min(Math.max((mins - 555) / 10, 0), 1)
-    return -15 + t * 14
+    return -15 + t * 15
   }
   if (mins <= 690) return mins - 570
   if (mins < 780) return 120
@@ -34,11 +34,7 @@ function xToLabel(v: number): string {
 export function TimelineChart() {
   const hostRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<ECharts | null>(null)
-  const { marketView } = useStock()
-  const intraday = {
-    ...marketView,
-    data: (marketView.data?.intraday ?? null) as IntradayPoint[] | null,
-  }
+  const { intradayState: intraday } = useStock()
 
   useEffect(() => {
     const el = hostRef.current
@@ -65,7 +61,13 @@ export function TimelineChart() {
 
     const contData: [number, number][] = []
     const avgData: [number, number][] = []
-    continuous.forEach((p, i) => {
+    // 完整分时接口固定返回 241 个分钟点，其中下标 237..240 对应
+    // 14:57..15:00。保留 237 作为蓝色分时到尾盘竞价的边界锚点；竞价
+    // 存在时只裁掉 238..240，避免重复绘制又不会在 14:56 后断开。
+    const continuousPoints = closing.length
+      ? continuous.slice(0, 238)
+      : continuous
+    continuousPoints.forEach((p, i) => {
       if (p.dt10 != null) contData.push([i, p.dt10])
       if (p.lead_price != null) avgData.push([i, p.lead_price])
     })

@@ -317,6 +317,8 @@ class ConnectionRuntime:
         self.latest_depth: dict[str, dict] = {}
         self.depth_codes: set[str] = set()
         self.depth_callbacks: dict[str, Callable[[dict], None]] = {}
+        self.ranking_depth_codes: set[str] = set()
+        self.ranking_depth_callbacks: dict[str, Callable[[dict], None]] = {}
         self.depth_events: queue.Queue[dict] = queue.Queue(maxsize=1024)
 
     def start_heartbeat(self) -> None:
@@ -355,6 +357,15 @@ class ConnectionRuntime:
         self._ensure_snapshot_reader()
         logger.info("depth_subscribe: 已订阅 %s（market=%d）", code, market)
 
+    def activate_ranking_depth(self, code: str, market: int, callback) -> None:
+        """Activate list-bucket delivery without stealing per-code ownership."""
+        with self._push_lock:
+            self.ranking_depth_codes.add(code)
+            if callback is not None:
+                self.ranking_depth_callbacks[code] = callback
+        self._ensure_snapshot_reader()
+        logger.info("ranking_depth: 已订阅 %s（market=%d）", code, market)
+
     def deactivate_depth(self, code: str, *, clear_latest: bool = True) -> bool:
         """Stop local depth delivery; close L2 readers when no consumer remains.
 
@@ -369,7 +380,33 @@ class ConnectionRuntime:
             self.depth_callbacks.pop(code, None)
             if clear_latest:
                 self.latest_depth.pop(code, None)
-            should_stop = not self.depth_codes and not self.snapshot_codes
+            should_stop = (
+                not self.depth_codes
+                and not self.ranking_depth_codes
+                and not self.snapshot_codes
+            )
+        if should_stop:
+            self.stop_snapshot()
+        return active
+
+    def deactivate_ranking_depth(
+        self,
+        code: str,
+        *,
+        clear_latest: bool = True,
+    ) -> bool:
+        """Stop list-bucket delivery while preserving per-code subscriptions."""
+        with self._push_lock:
+            active = code in self.ranking_depth_codes
+            self.ranking_depth_codes.discard(code)
+            self.ranking_depth_callbacks.pop(code, None)
+            if clear_latest and code not in self.depth_codes:
+                self.latest_depth.pop(code, None)
+            should_stop = (
+                not self.depth_codes
+                and not self.ranking_depth_codes
+                and not self.snapshot_codes
+            )
         if should_stop:
             self.stop_snapshot()
         return active
@@ -384,7 +421,10 @@ class ConnectionRuntime:
             except queue.Empty:
                 return None
             with self._push_lock:
-                if record.get("code") in self.depth_codes:
+                if (
+                    record.get("code") in self.depth_codes
+                    or record.get("code") in self.ranking_depth_codes
+                ):
                     return record
             if deadline is not None and time.monotonic() >= deadline:
                 return None
@@ -420,6 +460,8 @@ class ConnectionRuntime:
             self.snapshot_callback = None
             self.depth_codes.clear()
             self.depth_callbacks.clear()
+            self.ranking_depth_codes.clear()
+            self.ranking_depth_callbacks.clear()
             while True:
                 try:
                     self.depth_events.get_nowait()
@@ -440,19 +482,9 @@ class ConnectionRuntime:
         parse_depth_push_records: Callable[[bytes], list[dict]] | None = None,
     ) -> None:
         import select
-        from ..protocol import (
-            is_depth_push as default_is_depth_push,
-            is_snapshot_push as default_is_snapshot_push,
-            parse_depth_push_records as default_parse_depth_push_records,
-            parse_snapshot_push as default_parse_snapshot_push,
-            read_frame as default_read_frame,
-        )
+        from ..protocol import read_frame as default_read_frame
 
         read = read_frame or default_read_frame
-        matches = is_snapshot_push or default_is_snapshot_push
-        parse = parse_snapshot_push or default_parse_snapshot_push
-        depth_matches = is_depth_push or default_is_depth_push
-        depth_parse_records = parse_depth_push_records or default_parse_depth_push_records
         while not self.snapshot_stop.is_set():
             with self._push_lock:
                 socket_items = [
@@ -491,65 +523,112 @@ class ConnectionRuntime:
                         body = read(sock)
                     except (socket.timeout, OSError, ValueError):
                         continue
-                # 优先匹配 71B 逐笔；否则尝试 549B 十档盘口推送
-                if matches(body):
-                    record = parse(body)
-                    records = [record] if record is not None else []
-                elif depth_matches(body):
-                    if parse_depth_push_records is not None or parse_depth_push is None:
-                        records = depth_parse_records(body)
-                    else:
-                        record = parse_depth_push(body)
-                        records = [record] if record is not None else []
-                else:
-                    continue
-                for record in records:
-                    code = record["code"]
-                    if "price" in record:
-                        self.latest_prices[code] = record["price"]
-                    is_depth_record = "bids" in record or record.get("phase") == "auction"
-                    with self._push_lock:
-                        depth_active = is_depth_record and code in self.depth_codes
-                        cache_depth = is_depth_record and (
-                            code in self.depth_codes or code in self.snapshot_codes
-                        )
-                        depth_callback = self.depth_callbacks.get(code)
-                        # Preserve the legacy global callback contract: callers
-                        # that set it directly receive parsed records even when
-                        # they did not populate snapshot_codes themselves.
-                        snapshot_active = (
-                            code in self.snapshot_codes
-                            or self.snapshot_callback is not None
-                        )
-                    if cache_depth:
-                        self.latest_depth[code] = record
-                    if depth_active:
-                        try:
-                            self.depth_events.put_nowait(record)
-                        except queue.Full:
-                            try:
-                                self.depth_events.get_nowait()
-                            except queue.Empty:
-                                pass
-                            try:
-                                self.depth_events.put_nowait(record)
-                            except queue.Full:
-                                pass
-                        if depth_callback is not None:
-                            try:
-                                depth_callback(record)
-                            except Exception as exc:
-                                logger.warning("depth 回调异常: %s", exc)
-                    if snapshot_active and self.snapshot_callback is not None:
-                        try:
-                            self.snapshot_callback(
-                                code,
-                                record["market"],
-                                record.get("price", 0.0),
-                                record.get("volume", 0),
-                            )
-                        except Exception as exc:
-                            logger.warning("snapshot 回调异常: %s", exc)
+                self.deliver_market_push(
+                    body,
+                    is_snapshot_push=is_snapshot_push,
+                    parse_snapshot_push=parse_snapshot_push,
+                    is_depth_push=is_depth_push,
+                    parse_depth_push=parse_depth_push,
+                    parse_depth_push_records=parse_depth_push_records,
+                )
+
+    def deliver_market_push(
+        self,
+        body: bytes,
+        *,
+        is_snapshot_push: Callable[[bytes], bool] | None = None,
+        parse_snapshot_push: Callable[[bytes], dict | None] | None = None,
+        is_depth_push: Callable[[bytes], bool] | None = None,
+        parse_depth_push: Callable[[bytes], dict | None] | None = None,
+        parse_depth_push_records: Callable[[bytes], list[dict]] | None = None,
+    ) -> bool:
+        """Parse and deliver one unsolicited 8901 market-data body.
+
+        Request coordinators call this when a depth frame arrives before their
+        matching ACK/response, so changing a list bucket does not silently drop
+        a concurrent ``0x0f7f`` update.
+        """
+        from ..protocol import (
+            is_depth_push as default_is_depth_push,
+            is_snapshot_push as default_is_snapshot_push,
+            parse_depth_push_records as default_parse_depth_push_records,
+            parse_snapshot_push as default_parse_snapshot_push,
+        )
+
+        matches = is_snapshot_push or default_is_snapshot_push
+        parse = parse_snapshot_push or default_parse_snapshot_push
+        depth_matches = is_depth_push or default_is_depth_push
+        depth_parse_records = (
+            parse_depth_push_records or default_parse_depth_push_records
+        )
+        # 优先匹配 71B 逐笔；否则尝试 0x0f7f 十档盘口推送。
+        if matches(body):
+            record = parse(body)
+            records = [record] if record is not None else []
+        elif depth_matches(body):
+            if parse_depth_push_records is not None or parse_depth_push is None:
+                records = depth_parse_records(body)
+            else:
+                record = parse_depth_push(body)
+                records = [record] if record is not None else []
+        else:
+            return False
+        for record in records:
+            code = record["code"]
+            if "price" in record:
+                self.latest_prices[code] = record["price"]
+            is_depth_record = "bids" in record or record.get("phase") == "auction"
+            with self._push_lock:
+                depth_active = is_depth_record and (
+                    code in self.depth_codes or code in self.ranking_depth_codes
+                )
+                cache_depth = is_depth_record and (
+                    code in self.depth_codes
+                    or code in self.ranking_depth_codes
+                    or code in self.snapshot_codes
+                )
+                depth_callback = self.depth_callbacks.get(code)
+                ranking_callback = self.ranking_depth_callbacks.get(code)
+                snapshot_active = (
+                    code in self.snapshot_codes
+                    or self.snapshot_callback is not None
+                )
+            if cache_depth:
+                self.latest_depth[code] = record
+            if depth_active:
+                try:
+                    self.depth_events.put_nowait(record)
+                except queue.Full:
+                    try:
+                        self.depth_events.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.depth_events.put_nowait(record)
+                    except queue.Full:
+                        pass
+                callbacks = []
+                for callback in (depth_callback, ranking_callback):
+                    if callback is not None and all(
+                        callback is not current for current in callbacks
+                    ):
+                        callbacks.append(callback)
+                for callback in callbacks:
+                    try:
+                        callback(record)
+                    except Exception as exc:
+                        logger.warning("depth 回调异常: %s", exc)
+            if snapshot_active and self.snapshot_callback is not None:
+                try:
+                    self.snapshot_callback(
+                        code,
+                        record["market"],
+                        record.get("price", 0.0),
+                        record.get("volume", 0),
+                    )
+                except Exception as exc:
+                    logger.warning("snapshot 回调异常: %s", exc)
+        return bool(records)
 
     def heartbeat_loop(
         self,

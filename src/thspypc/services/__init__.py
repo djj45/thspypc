@@ -4,6 +4,7 @@ from .auth import AuthMaterial, AuthService
 from .auction import AuctionService
 from .board_stats import BoardStatsService
 from .kline import KlineService
+from .list_subscription import ListBucketCoordinator
 from .market_snapshot import MarketSnapshotService
 from .quote import QuoteService
 from .realorder import RealOrderService
@@ -32,6 +33,7 @@ __all__ = [
     "AuctionService",
     "BoardStatsService",
     "KlineService",
+    "ListBucketCoordinator",
     "L2SubscriptionCoordinator",
     "MarketSnapshotService",
     "QuoteService",
