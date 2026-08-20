@@ -15,9 +15,12 @@ export class ApiError extends Error {
   }
 }
 
-export async function getJson<T>(path: string): Promise<T> {
+export async function getJson<T>(
+  path: string,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<T> {
   const r = await fetch(path, {
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   })
   if (!r.ok) {
     const body = await r.text().catch(() => '')

@@ -67,6 +67,21 @@ def test_registration_accepts_positive_status_and_is_reused():
     )
 
 
+def test_registration_delivers_push_seen_before_ack():
+    sock = FakeSocket()
+    manager = ConnectionManager(PROFILE, lambda _spec: sock)
+    connection = manager.acquire(ConnectionRole.SH_L2)
+    responses = iter([b"market-push", b"CodeListSize=1"])
+    unsolicited = []
+    coordinator = L2SubscriptionCoordinator(
+        frame_reader=lambda _sock: next(responses),
+        unsolicited=unsolicited.append,
+    )
+
+    assert coordinator.ensure_registered(connection, "603334", market=17)
+    assert unsolicited == [b"market-push"]
+
+
 def test_zero_status_is_not_remembered():
     sock = FakeSocket()
     manager = ConnectionManager(PROFILE, lambda _spec: sock)

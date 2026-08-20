@@ -16,14 +16,36 @@ function fmtVol(n: number | undefined) {
   return n.toFixed(0)
 }
 
-// 盘口上方的股票信息条（参考同花顺盘口界面）
-export function StockInfo() {
-  const { code, quote } = useStock()
-  const pc = quote?.prevClose
+// 盘口上方的股票信息条（参考同花顺盘口界面）。历史超级盘口传tradeDate后，
+// 高低额量必须取对应日K，不能混用当前报价或用三秒4096快照估算瞬时极值。
+export function StockInfo({
+  tradeDate,
+  selectedPrice,
+}: {
+  tradeDate?: string
+  selectedPrice?: number
+} = {}) {
+  const { code, quote, marketView } = useStock()
+  const dailyRows = marketView.data?.kline ?? []
+  const dayIndex = tradeDate == null
+    ? -1
+    : dailyRows.findIndex((row) => row.time.slice(0, 10) === tradeDate)
+  const dayBar = dayIndex >= 0 ? dailyRows[dayIndex] : undefined
+  const previousBar = dayIndex > 0 ? dailyRows[dayIndex - 1] : undefined
+  const historical = dayBar != null
+  const price = historical ? selectedPrice ?? dayBar.close : quote?.price
+  const pc = historical ? previousBar?.close : quote?.prevClose
+  const open = historical ? dayBar.open : quote?.open
+  const high = historical ? dayBar.high : quote?.high
+  const low = historical ? dayBar.low : quote?.low
+  const volume = historical ? dayBar.volume : quote?.vol
+  const amount = historical ? dayBar.amount : quote?.amount
+  const chg = price != null && pc != null ? price - pc : quote?.chg
+  const chgPct = chg != null && pc ? (chg / pc) * 100 : quote?.chgPct
   // 今开/最高/最低相对昨收着色
-  const openChg = quote?.open != null && pc ? quote.open - pc : undefined
-  const highChg = quote?.high != null && pc ? quote.high - pc : undefined
-  const lowChg = quote?.low != null && pc ? quote.low - pc : undefined
+  const openChg = open != null && pc ? open - pc : undefined
+  const highChg = high != null && pc ? high - pc : undefined
+  const lowChg = low != null && pc ? low - pc : undefined
 
   return (
     <div style={{ padding: '4px 8px', borderBottom: '1px solid #2a2a2a' }}>
@@ -36,15 +58,15 @@ export function StockInfo() {
         }}
       >
         <span style={{ fontSize: 14, fontWeight: 600 }}>{code}</span>
-        <span className={`price ${cls(quote?.chg)}`} style={{ fontSize: 15, fontWeight: 600 }}>
-          {fmt(quote?.price)}
+        <span className={`price ${cls(chg)}`} style={{ fontSize: 15, fontWeight: 600 }}>
+          {fmt(price)}
         </span>
-        <span className={cls(quote?.chg)}>
-          {quote?.chg != null ? (quote.chg > 0 ? '+' : '') + quote.chg.toFixed(2) : '--'}
+        <span className={cls(chg)}>
+          {chg != null ? (chg > 0 ? '+' : '') + chg.toFixed(2) : '--'}
         </span>
-        <span className={cls(quote?.chg)}>
-          {quote?.chgPct != null
-            ? (quote.chgPct > 0 ? '+' : '') + quote.chgPct.toFixed(2) + '%'
+        <span className={cls(chg)}>
+          {chgPct != null
+            ? (chgPct > 0 ? '+' : '') + chgPct.toFixed(2) + '%'
             : '--'}
         </span>
       </div>
@@ -56,12 +78,12 @@ export function StockInfo() {
           fontSize: 12,
         }}
       >
-        <Row label="今开" value={fmt(quote?.open)} cls={cls(openChg)} />
+        <Row label={historical ? '开盘' : '今开'} value={fmt(open)} cls={cls(openChg)} />
         <Row label="昨收" value={fmt(pc)} cls="flat" />
-        <Row label="最高" value={fmt(quote?.high)} cls={cls(highChg)} />
-        <Row label="最低" value={fmt(quote?.low)} cls={cls(lowChg)} />
-        <Row label="总量" value={fmtVol(quote?.vol)} cls="flat" />
-        <Row label="总额" value={fmtVol(quote?.amount)} cls="flat" />
+        <Row label="最高" value={fmt(high)} cls={cls(highChg)} />
+        <Row label="最低" value={fmt(low)} cls={cls(lowChg)} />
+        <Row label="总量" value={fmtVol(volume)} cls="flat" />
+        <Row label="总额" value={fmtVol(amount)} cls="flat" />
       </div>
     </div>
   )

@@ -1,10 +1,12 @@
 """Offline contracts for role-aware connection management."""
 
+import socket
 import threading
 
 import pytest
 
 import thspypc.transport as transport
+import thspypc._transport.connection as connection_module
 from thspypc._transport import (
     ConnectionManager,
     ConnectionRole,
@@ -456,6 +458,58 @@ def test_profile_downgrade_waits_for_in_flight_request():
     assert refresh_done.is_set()
     assert manager.peek(ConnectionRole.SH_L2) is None
     assert sock.closed
+
+
+def test_liveness_probe_waits_for_in_flight_request(monkeypatch):
+    """A Windows non-blocking probe must never overlap a business recv."""
+    sock, peer = socket.socketpair()
+    manager = ConnectionManager(
+        _profile(
+            AccountKind.LEVEL2,
+            L2_MARKET_ACCESS="YES",
+        ),
+        lambda _spec: sock,
+    )
+    connection = manager.acquire(ConnectionRole.SH_L2)
+    request_started = threading.Event()
+    release_request = threading.Event()
+    probe_called = threading.Event()
+
+    def hold_request():
+        with connection.request(b"query", timeout=1.0):
+            request_started.set()
+            assert release_request.wait(1.0)
+
+    request_thread = threading.Thread(target=hold_request)
+    request_thread.start()
+    assert request_started.wait(1.0)
+
+    monkeypatch.setattr(
+        connection_module,
+        "probe_socket_alive",
+        lambda _sock: probe_called.set() or True,
+    )
+    acquire_done = threading.Event()
+
+    def acquire_again():
+        assert manager.acquire(ConnectionRole.SH_L2) is connection
+        acquire_done.set()
+
+    acquire_thread = threading.Thread(target=acquire_again)
+    acquire_thread.start()
+    assert not probe_called.wait(0.05)
+    assert not acquire_done.is_set()
+
+    release_request.set()
+    request_thread.join(1.0)
+    acquire_thread.join(1.0)
+
+    assert not request_thread.is_alive()
+    assert not acquire_thread.is_alive()
+    assert probe_called.is_set()
+    assert acquire_done.is_set()
+    manager.close_all()
+    peer.close()
 
 
 def test_transport_compatibility_exports_internal_implementations():

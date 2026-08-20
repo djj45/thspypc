@@ -382,6 +382,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
             self._service_subscriptions = L2SubscriptionCoordinator(
                 evidence=self._account_evidence,
+                unsolicited=self._connection_runtime.deliver_market_push,
             )
             self._list_bucket_service = ListBucketCoordinator(
                 unsolicited=self._connection_runtime.deliver_market_push,
@@ -421,6 +422,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
                 self._service_connections,
                 subscriptions=self._service_subscriptions,
                 evidence=self._account_evidence,
+                unsolicited=self._connection_runtime.deliver_market_push,
             )
             self._realorder_service = RealOrderService(
                 self._service_connections,
@@ -1459,7 +1461,7 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
 
 
     def _snapshot_loop(self) -> None:
-        """后台读取沪深两条 L2 推送连接的 71B 快照帧，更新现价/触发回调。
+        """后台读取沪深两条 L2 推送连接的逐笔/盘口帧，更新现价/触发回调。
 
         用 ``select`` 同时等待 ``self._push_socks`` 里的连接（最多沪深两条），
         可读的就 ``read_frame``。遇到非快照帧（心跳响应、注册响应等）直接丢弃。

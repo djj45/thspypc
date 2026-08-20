@@ -187,11 +187,17 @@ class ManagedConnection:
 
         Test doubles and other socket-like objects are treated as alive;
         liveness enforcement is only meaningful for real market sockets.
+
+        The Windows probe temporarily switches a real socket to non-blocking
+        mode.  It must therefore share the connection request lock with every
+        reader; otherwise a concurrent ``recv`` can observe WSAEWOULDBLOCK
+        (10035) during that short window.
         """
-        sock = self._socket
-        if not isinstance(sock, socket.socket):
-            return True
-        return probe_socket_alive(sock)
+        with self._lock:
+            sock = self._socket
+            if not isinstance(sock, socket.socket):
+                return True
+            return probe_socket_alive(sock)
 
     @property
     def socket(self) -> CloseableSocket | None:

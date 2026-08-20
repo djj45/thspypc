@@ -17,11 +17,17 @@ import type {
   DynamicPlate,
   MarketView,
   MarketViewFast,
+  OrderQueues,
+  ReplayIndex,
+  ReplaySnapshot,
+  SuperorderWindow,
+  MarketEvent,
 } from '../types'
 
 const marketViewInFlight = new Map<string, Promise<MarketView>>()
 const fastViewInFlight = new Map<string, Promise<MarketViewFast>>()
 const quotesExtInFlight = new Map<string, Promise<QuoteExt[]>>()
+const rankInFlight = new Map<string, Promise<RankItem[]>>()
 const intradayInFlight = new Map<
   string,
   Promise<(AuctionPoint & TimelinePoint)[]>
@@ -42,6 +48,7 @@ interface CacheEntry<T> {
 }
 
 const fastViewCache = new Map<string, CacheEntry<MarketViewFast>>()
+const quotesExtCache = new Map<string, CacheEntry<QuoteExt[]>>()
 const intradayCache = new Map<string, CacheEntry<(AuctionPoint & TimelinePoint)[]>>()
 const klineCache = new Map<string, CacheEntry<Kline[]>>()
 
@@ -95,21 +102,24 @@ function dedupe<T>(
 // 后端预热完成前，K线/分时先在浏览器侧等待，避免与预热抢锁/超时；
 // 盘口（MAIN）不需要等待，仍立即发出保证首屏。
 let preheatReadyPromise: Promise<void> | null = null
+let preheatReadyUntil = 0
 function waitForPreheat(): Promise<void> {
+  if (Date.now() < preheatReadyUntil) return Promise.resolve()
   if (preheatReadyPromise) return preheatReadyPromise
+  let reachedTerminalState = false
   const polling = (async () => {
     const deadline = Date.now() + 20_000
     while (Date.now() < deadline) {
       try {
         const status = await getJson<Status>('/api/status')
         const state = status.preheat?.state
-        // 前台业务可能在后台预热的30s重试窗口内先完成 MAIN 登录。
-        // 此时业务接口可以按需懒建 L2，绝不能因 preheat 仍是 running
-        // 继续空等。ConnectionManager 会串行化同角色建连，不会重复登录。
-        if (status.connected) return
+        // connected 只表示 MAIN 已登录；此时后台可能仍在并行预建 SH/SZ
+        // L2。若立即由页面再懒建同一市场连接，会同时消费两代 Passport，
+        // 偶发 VerifyCode=-1。必须等预热终态后再开放 L2 页面请求。
         // ready/skipped=可安全发请求；partial/error=继续等只会让页面一直卡住，
-        // 直接放行由各接口自身报错或成功。
+        // 直接放行，由各接口复用已成功的角色或按需补建失败角色。
         if (state === 'ready' || state === 'skipped' || state === 'partial' || state === 'error') {
+          reachedTerminalState = true
           return
         }
       } catch {
@@ -120,8 +130,10 @@ function waitForPreheat(): Promise<void> {
     }
   })()
   preheatReadyPromise = polling
-  // 下次切换/刷新重新检查状态，后端单独重启时不会一直复用旧的 resolved 结果。
+  // 快速切股期间复用终态，避免每只股票重复 /api/status；30 秒后重查，
+  // 后端单独重启时也不会长期复用旧状态。
   void polling.finally(() => {
+    if (reachedTerminalState) preheatReadyUntil = Date.now() + 30_000
     preheatReadyPromise = null
   })
   return polling
@@ -155,7 +167,10 @@ export const api = {
   quote: (codes: string[]) =>
     getJson<Quote[]>(`/api/quote?codes=${codes.join(',')}`),
   depth: (code: string, levels: 5 | 10 = 5) =>
-    getJson<Depth>(`/api/depth/${code}?levels=${levels}`),
+    getJson<Depth>(
+      `/api/depth/${code}?levels=${levels}`,
+      levels === 10 ? 20_000 : 6_000,
+    ),
   kline: (
     code: string,
     period = 'day',
@@ -182,7 +197,10 @@ export const api = {
     getJson<AuctionPoint[]>(`/api/closing_auction/${code}`),
   intraday: (code: string) =>
     ttlCached(intradayCache, intradayInFlight, code, INTRADAY_TTL_MS, () =>
-      getJson<(AuctionPoint & TimelinePoint)[]>(`/api/intraday/${code}`),
+      getJson<(AuctionPoint & TimelinePoint)[]>(
+        `/api/intraday/${code}`,
+        20_000,
+      ),
     ),
   marketView: (code: string, period = 'day', count = 320, fuquan = 'Q') =>
     getMarketView(code, period, count, fuquan),
@@ -196,15 +214,57 @@ export const api = {
         `/api/intraday_auctions/${code}`,
       ),
     ),
+  orderQueues: (code: string, tradeDate?: string) =>
+    getJson<OrderQueues>(
+      `/api/order-queues/${code}${tradeDate ? `?trade_date=${encodeURIComponent(tradeDate)}` : ''}`,
+      60_000,
+    ),
+  superorderReplay: (code: string, tradeDate?: string) =>
+    getJson<ReplayIndex>(
+      `/api/superorder-replay/${code}${tradeDate ? `?trade_date=${encodeURIComponent(tradeDate)}` : ''}`,
+      90_000,
+    ),
+  superorderSnapshot: (code: string, ts: number, tradeDate?: string) =>
+    getJson<ReplaySnapshot>(
+      `/api/superorder-replay/${code}/snapshot?ts=${ts}${tradeDate ? `&trade_date=${encodeURIComponent(tradeDate)}` : ''}`,
+      40_000,
+    ),
+  superorderWindow: (code: string, start: string, end: string) =>
+    getJson<SuperorderWindow>(
+      `/api/superorder-window/${code}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`,
+      60_000,
+    ),
+  superorderTrades: (code: string, start: string, end: string) =>
+    getJson<MarketEvent[]>(
+      `/api/superorder/${code}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&pageid=4214`,
+      25_000,
+    ),
+  stockStreamUrl: (code: string) => {
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const market = code.startsWith('6')
+      ? 17
+      : code.startsWith('1A') || code.startsWith('1B')
+        ? 16
+        : code.startsWith('39')
+          ? 32
+          : code.startsWith('899')
+            ? 144
+            : code.startsWith('43') || code.startsWith('83') || code.startsWith('87') || code.startsWith('920')
+              ? 151
+              : 33
+    return `${scheme}://${window.location.host}/api/stock-stream/${code}?market=${market}`
+  },
 
   // 全市场代码表（磁盘缓存，自然日有效；供左栏名称回填）
   stocks2: () => getJson<StockListItem[]>('/api/stocks2'),
 
   // 统一列表字段（涨幅/竞价涨幅/竞价金额/成交额/4分钟涨速，按代码批量）
   quotesExt: (codes: string[]) =>
-    dedupe(
+    ttlCached(
+      quotesExtCache,
       quotesExtInFlight,
       codes.join(','),
+      3_000,
       () =>
         getJson<QuoteExt[]>(
           `/api/quotes_ext?codes=${encodeURIComponent(codes.join(','))}`,
@@ -225,10 +285,18 @@ export const api = {
     count = 59,
     withValues = false,
     sortDir: 'D' | 'A' = 'D',
-  ) =>
-    getJson<RankItem[]>(
-      `/api/stock_list_ranked?sort_by=${sortBy}&count=${count}&sort_dir=${sortDir}&with_values=${withValues ? 1 : 0}`,
-    ),
+  ) => {
+    const key = `${sortBy}|${count}|${sortDir}|${withValues ? 1 : 0}`
+    return dedupe(rankInFlight, key, () =>
+      // 5400 条全市场榜在冷启动时会排在 K线/分时的同市场 L2 lane 后面。
+      // 服务端正常完成并返回 200 仍可能超过轻量接口统一的 6s 预算，因此大榜
+      // 使用独立的 30s 上限；相同参数在 React 重挂载时只保留一个在途请求。
+      getJson<RankItem[]>(
+        `/api/stock_list_ranked?sort_by=${sortBy}&count=${count}&sort_dir=${sortDir}&with_values=${withValues ? 1 : 0}`,
+        count > 1000 ? 30_000 : 10_000,
+      ),
+    )
+  },
   ddeRank: (sortBy = 592888, count = 58) =>
     getJson<RankItem[]>(`/api/dde_rank?sort_by=${sortBy}&count=${count}`),
 

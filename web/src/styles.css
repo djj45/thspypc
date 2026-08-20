@@ -74,6 +74,30 @@ input {
   color: var(--text-dim);
   white-space: nowrap;
 }
+.page-tabs {
+  display: flex;
+  align-self: stretch;
+}
+.page-tabs button {
+  border: 0;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  padding: 0 14px;
+  background: transparent;
+  color: var(--text-dim);
+}
+.page-tabs button:last-child {
+  border-right: 1px solid var(--border);
+}
+.page-tabs button:hover {
+  background: #202631;
+  color: var(--text);
+}
+.page-tabs button.active {
+  color: #e8c36a;
+  background: #272411;
+  box-shadow: inset 0 -2px #b6973e;
+}
 .header .stock-name {
   font-size: 15px;
   font-weight: 600;
@@ -452,4 +476,185 @@ tr.selected {
    本地看盘工具隐藏 */
 a[href*="tradingview.com"] {
   display: none !important;
+}
+
+/* 分时 / 超级盘口子页面 */
+.subpage {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--border);
+  gap: 1px;
+}
+.timeline-page {
+  display: grid;
+  grid-template-columns: minmax(520px, 1fr) 520px;
+}
+.timeline-main,
+.replay-chart-panel,
+.replay-details {
+  min-width: 0;
+  min-height: 0;
+}
+.subpage-side {
+  display: grid;
+  grid-template-rows: minmax(300px, 47%) minmax(220px, 53%);
+  min-height: 0;
+  gap: 1px;
+  background: var(--border);
+}
+.stream-state {
+  margin-left: auto;
+  color: #7ca2cf;
+  font-size: 11px;
+}
+.quote-book .panel-body {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(250px, 1.2fr);
+  overflow: hidden;
+}
+.ten-book {
+  overflow: auto;
+  border-left: 1px solid var(--border);
+  padding: 3px 0;
+}
+.tick-tape td,
+.tick-tape th,
+.details-table td,
+.details-table th {
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+.empty-state {
+  padding: 14px 10px;
+}
+
+.superorder-page {
+  display: grid;
+  grid-template-columns: minmax(600px, 1fr) 450px;
+  grid-template-rows: minmax(360px, 58%) minmax(230px, 42%);
+}
+.replay-chart-panel {
+  grid-column: 1;
+  grid-row: 1;
+}
+.superorder-side {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: grid;
+  grid-template-rows: auto minmax(320px, 1fr) minmax(190px, .72fr);
+  min-height: 0;
+  gap: 1px;
+  background: var(--border);
+}
+.replay-details {
+  grid-column: 1;
+  grid-row: 2;
+}
+.replay-toolbar {
+  white-space: nowrap;
+}
+.replay-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+}
+.replay-toolbar input {
+  padding: 1px 5px;
+  color-scheme: dark;
+}
+.stock-summary .panel-body {
+  overflow: hidden;
+}
+.snapshot-panel .panel-body,
+.queues-panel .panel-body {
+  overflow: auto;
+}
+.replay-price {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.replay-price strong {
+  color: var(--text);
+  font-size: 15px;
+}
+.replay-level {
+  display: grid;
+  grid-template-columns: 42px 1fr 1fr;
+  gap: 8px;
+  padding: 2px 10px;
+  text-align: right;
+  font-size: 11px;
+}
+.replay-level span:first-child {
+  text-align: left;
+  color: var(--text-dim);
+}
+.book-divider {
+  border-top: 1px solid #3a3a3a;
+  margin: 3px 0;
+}
+.queue-body {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  overflow: hidden !important;
+}
+.queue-card {
+  min-height: 0;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  overflow: auto;
+}
+.queue-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+.queue-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.queue-strip span {
+  min-width: 31px;
+  padding: 2px 4px;
+  border: 1px solid #313b48;
+  background: #19202a;
+  text-align: right;
+  font-size: 10px;
+}
+.queue-strip span.major {
+  color: #ffd36b;
+  border-color: #7d6530;
+  background: #332a14;
+}
+.detail-tabs button {
+  padding: 1px 9px;
+  background: transparent;
+  border-color: #3b4655;
+  color: var(--text-dim);
+}
+.detail-tabs button.active {
+  color: #e8c36a;
+  border-color: #7d6530;
+  background: #2a2510;
+}
+
+@media (max-width: 1180px) {
+  .header .title,
+  .header .status-dot {
+    display: none;
+  }
+  .timeline-page {
+    grid-template-columns: minmax(440px, 1fr) 420px;
+  }
+  .superorder-page {
+    grid-template-columns: minmax(520px, 1fr) 390px;
+  }
 }

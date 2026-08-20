@@ -105,24 +105,43 @@ def build_snapshot_subscribe(
     return encode_frame(bytes(header) + outer_text + inner_frame)
 
 
-def parse_snapshot_push(body: bytes) -> dict | None:
-    """Parse the 71-byte Level2 tick-by-tick push frame.
+def parse_trade_tick_push(body: bytes) -> dict | None:
+    """Parse a Level2 tick-by-tick trade push frame (single record).
 
-    2026-08-07 盘中抓包破译（002384 东山精密 ~197 元对照确认）::
+    Two compatible wire layouts are known:
+
+    * 2026-08-07 ``0x7f`` / 71-byte layout (002384);
+    * 2026-08-20 ``0x60/0x04`` / 71-byte core layout (603334), optionally
+      followed by one ``0x7d`` delimiter byte outside the frame length
+      header.  The live runtime (``read_frame``) yields the 71-byte core;
+      legacy stream splitters that cut on the magic delimiter yield 72
+      bytes, so both extents are accepted.
+
+    The ``0x60/0x04`` layout was captured immediately after the PC client
+    requested the ``period=7169`` trade replay.  Its time, price, volume,
+    direction, order ids, sequence and trade number align exactly with the
+    7169 field table, proving that it is the live continuation of the
+    visible trade list.
+
+    Shared field offsets::
 
         [0]     0x09            帧类型标记
-        [1-4]   09 7b d0 01     魔数（推送帧头）
         [28]    市场标记         0x11=沪 0x21=深
         [29-34] ASCII 代码       6 位股票代码
-        [39-42] u32 LE           序号（递增）
         [47-50] ths_float        **成交价格**
-        [51-52] u16 LE           **成交量（股）**
-        [55]    1/5              **方向**（1=主动买 5=主动卖）
-        [59-62] u32 LE           被动方序号
 
-    帧间隔平均 0.11 秒（真逐笔），非定时快照。
+    The ``0x60/0x04`` layout additionally exposes Unix ``time`` at 43,
+    32-bit volume and direction at 51/55, delegate ids at 59/63, and
+    sequence at 67.  The value at 39 was originally named ``trade_no``;
+    interval truth proves that it is the *previous* record's 7169 ``dt18``.
+    ``previous_trade_no`` is therefore authoritative, while ``trade_no`` is
+    retained as a compatibility alias for the same wire value.
+
+    Batch frames (multiple records) are recognised by
+    :func:`is_trade_tick_batch_push` and parsed by
+    :func:`parse_trade_tick_batch_push`.
     """
-    if not is_snapshot_push(body):
+    if not is_trade_tick_push(body):
         return None
 
     code = body[29:35].decode("ascii")
@@ -134,19 +153,44 @@ def parse_snapshot_push(body: bytes) -> dict | None:
         if market_flag == 0x21
         else f"?{market_flag:#x}"
     )
-    return {
+    result = {
         "code": code,
         "market": market,
         "price": decode_ths_float(struct.unpack("<I", body[47:51])[0]),
-        "volume": struct.unpack("<H", body[51:53])[0],
-        "direction": body[55],
-        "seq": struct.unpack("<I", body[39:43])[0],
         "raw_len": len(body),
     }
+    if _is_realtime_trade_tick_push(body):
+        traded_timestamp = struct.unpack_from("<I", body, 43)[0]
+        result.update(
+            {
+                "event": "trade",
+                "time": datetime.fromtimestamp(traded_timestamp),
+                "timestamp": traded_timestamp,
+                "volume": struct.unpack_from("<I", body, 51)[0],
+                "direction": struct.unpack_from("<I", body, 55)[0],
+                "delegate_a": struct.unpack_from("<I", body, 59)[0],
+                "delegate_b": struct.unpack_from("<I", body, 63)[0],
+                "seq": struct.unpack_from("<I", body, 67)[0],
+                "previous_trade_no": struct.unpack_from("<I", body, 39)[0],
+                # Backward-compatible alias.  This is not the current trade's
+                # 7169 dt18; see ``previous_trade_no`` above.
+                "trade_no": struct.unpack_from("<I", body, 39)[0],
+                "wire_subtype": "0x60/0x04",
+            }
+        )
+    else:
+        result.update(
+            {
+                "volume": struct.unpack_from("<H", body, 51)[0],
+                "direction": body[55],
+                "seq": struct.unpack_from("<I", body, 39)[0],
+                "wire_subtype": "0x7f",
+            }
+        )
+    return result
 
 
-def is_snapshot_push(body: bytes) -> bool:
-    """Return whether ``body`` matches the 71-byte tick push shape."""
+def _is_legacy_trade_tick_push(body: bytes) -> bool:
     return (
         len(body) == 71
         and body[0] == 0x09
@@ -155,67 +199,579 @@ def is_snapshot_push(body: bytes) -> bool:
     )
 
 
-_AUCTION_CANCEL_SIDES = {0x08: "buy", 0x0C: "sell"}
+def _strip_trade_tick_delimiter(body: bytes) -> bytes:
+    """Drop the optional trailing 0x7d delimiter byte.
 
-
-def is_auction_cancel_push(body: bytes) -> bool:
-    """Return whether ``body`` is a 71-byte opening-auction cancel push.
-
-    The ``0x60`` subtype is distinct from the ``0x7f`` trade-tick subtype.
-    Its two embedded code markers must agree; this prevents an adjacent or
-    truncated 71-byte payload from being accepted accidentally.
+    The 8901 frame length header excludes the delimiter, so the live
+    ``read_frame`` path yields bodies without it while legacy
+    magic-splitting capture tooling yields bodies with it appended.
     """
+    return body[:-1] if body.endswith(b"\x7d") else body
+
+
+def _is_realtime_trade_tick_push(body: bytes) -> bool:
+    core = _strip_trade_tick_delimiter(body)
     return (
-        len(body) == 71
-        and body[0:5] == b"\x09\x7b\xd0\x01\x60"
-        and body[5] in _AUCTION_CANCEL_SIDES
-        and body[28] in (0x11, 0x21)
-        and body[43] == body[28]
-        and body[29:35] == body[44:50]
-        and body[29:35].isdigit()
-        and body[-1] == 0x7D
+        len(core) == 71
+        and core[0:7] == b"\x09\x7b\xd0\x01\x60\x04\x00"
+        and core[28] in (0x11, 0x21)
+        and core[29:35].isdigit()
+        and struct.unpack_from("<I", core, 55)[0] in (1, 5)
     )
 
 
-def parse_auction_cancel_push(body: bytes) -> dict | None:
-    """Parse one 71-byte opening-auction order-cancellation event.
+def is_trade_tick_push(body: bytes) -> bool:
+    """Return whether ``body`` is a verified live trade-tick layout."""
+    return _is_legacy_trade_tick_push(body) or _is_realtime_trade_tick_push(body)
+
+
+# ── 0x60/0x04 变长批量逐笔推送（2026-08-20 603334 抓包破译）──
+#
+# 同一 ``09 7b d0 01 60 04 00`` 子类型还承载"一次多条成交"的批量帧。
+# 结构（603334 全部 8 个批量帧, 8/8 验证）::
+#
+#     [0:39]  与单笔帧完全相同的头部(市场/代码/帧计数)
+#     [36:38] 记录数 n (LE16), [38] = 0x80|n 回显校验
+#     [39:..] n+1 个前缀 token（首值随帧长变化、第二个=-1、余下=0）
+#     随后    8 个字段列；每列 = 4B LE 基值 + (n-1) 个有符号 delta token
+#             列序为 previous_tno/time/price/vol/dir/a/b/seq
+#     尾部    seq 的 (n-1) 个 +1 token（0x81）+ 2B 校验
+#
+# 与单笔帧拼接后, 603334 抓包的推送覆盖 7465→7508 全部序号, 缺口仅
+# 7463/7464 两条未被推送 —— 与"批量帧记录总数 vs 单笔序号缺口"计数吻合。
+# 7169 区间真值最终确认 token 是大端 7-bit 有符号补码：每字节低 7 位为
+# payload，最高位表示终止；例如 00 e4=+100、7f 9c=-100、78 8d=-1011。
+# 8/8 批量帧的 time/price/vol/dir/a/b/seq 均逐条匹配回放真值。
+_TRADE_TICK_PREFIX = b"\x09\x7b\xd0\x01\x60\x04\x00"
+_TRADE_TICK_BATCH_MAX_COUNT = 127
+
+
+def _trade_batch_core(body: bytes) -> tuple[bytes, int] | None:
+    """Validate a batch frame's structural invariants; return (core, n)."""
+    candidates = (body, body[:-1]) if body.endswith(b"\x7d") else (body,)
+    for core in candidates:
+        if len(core) <= 71 or core[0:7] != _TRADE_TICK_PREFIX:
+            continue
+        if core[28] not in (0x11, 0x21) or not core[29:35].isdigit():
+            continue
+        count = struct.unpack_from("<H", core, 36)[0]
+        if not 2 <= count <= _TRADE_TICK_BATCH_MAX_COUNT:
+            continue
+        if core[38] != (0x80 | count):
+            continue
+        length = len(core)
+        ones_start = length - 2 - (count - 1)
+        if (
+            ones_start >= 39
+            and core[ones_start : length - 2] == b"\x81" * (count - 1)
+        ):
+            return core, count
+    return None
+
+
+def is_trade_tick_batch_push(body: bytes) -> bool:
+    """Return whether ``body`` is a multi-record ``0x60/0x04`` batch frame."""
+    return _trade_batch_core(body) is not None
+
+
+def _read_trade_batch_delta(
+    data: bytes,
+    position: int,
+    limit: int,
+) -> tuple[int, int]:
+    """Read one signed big-end 7-bit delta terminated by a high bit."""
+    unsigned = 0
+    bits = 0
+    while position < limit and bits < 35:
+        value = data[position]
+        position += 1
+        unsigned = (unsigned << 7) | (value & 0x7F)
+        bits += 7
+        if value & 0x80:
+            sign_bit = 1 << (bits - 1)
+            if unsigned & sign_bit:
+                unsigned -= 1 << bits
+            return unsigned, position
+    raise ValueError("unterminated trade-batch delta")
+
+
+def _decode_trade_batch_columns(
+    core: bytes,
+    count: int,
+) -> dict[str, list[int]] | None:
+    """Decode the eight verified column-major fields in a batch frame."""
+    limit = len(core) - 2
+    position = 39
+    try:
+        prefix = []
+        for _ in range(count + 1):
+            value, position = _read_trade_batch_delta(core, position, limit)
+            prefix.append(value)
+        if prefix[1] != -1 or any(prefix[2:]):
+            return None
+
+        columns: dict[str, list[int]] = {}
+        for name in (
+            "previous_trade_no",
+            "timestamp",
+            "price_raw",
+            "volume",
+            "direction",
+            "delegate_a",
+            "delegate_b",
+            "seq",
+        ):
+            if position + 4 > limit:
+                return None
+            base = struct.unpack_from("<I", core, position)[0]
+            position += 4
+            values = [base]
+            for _ in range(count - 1):
+                delta, position = _read_trade_batch_delta(
+                    core,
+                    position,
+                    limit,
+                )
+                current = values[-1] + delta
+                if not 0 <= current <= 0xFFFFFFFF:
+                    return None
+                values.append(current)
+            columns[name] = values
+    except (IndexError, struct.error, ValueError):
+        return None
+
+    if position != limit:
+        return None
+    seqs = columns["seq"]
+    if seqs != list(range(seqs[0], seqs[0] + count)):
+        return None
+    if any(value not in (1, 5) for value in columns["direction"]):
+        return None
+    return columns
+
+
+def parse_trade_tick_batch_push(body: bytes) -> dict | None:
+    """Parse one multi-record trade-tick batch push.
+
+    The returned ``records`` use the same public fields as a single
+    ``0x60/0x04`` trade push.  All eight captured batch variants were checked
+    row-by-row against a 7169 replay of the same sequence interval.
+    """
+    located = _trade_batch_core(body)
+    if located is None:
+        return None
+    core, count = located
+    columns = _decode_trade_batch_columns(core, count)
+    if columns is None:
+        return None
+    code = core[29:35].decode("ascii")
+    market = "SH" if core[28] == 0x11 else "SZ"
+    records = []
+    try:
+        for index in range(count):
+            timestamp = columns["timestamp"][index]
+            previous_trade_no = columns["previous_trade_no"][index]
+            records.append(
+                {
+                    "code": code,
+                    "market": market,
+                    "event": "trade",
+                    "time": datetime.fromtimestamp(timestamp),
+                    "timestamp": timestamp,
+                    "price": decode_ths_float(columns["price_raw"][index]),
+                    "volume": columns["volume"][index],
+                    "direction": columns["direction"][index],
+                    "delegate_a": columns["delegate_a"][index],
+                    "delegate_b": columns["delegate_b"][index],
+                    "seq": columns["seq"][index],
+                    "previous_trade_no": previous_trade_no,
+                    # Compatibility alias; see parse_trade_tick_push().
+                    "trade_no": previous_trade_no,
+                    "wire_subtype": "0x60/0x04-batch",
+                }
+            )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+    seq_start = columns["seq"][0]
+    return {
+        "code": code,
+        "market": market,
+        "event": "trade_batch",
+        "count": count,
+        "seq_start": seq_start,
+        "seq_end": seq_start + count - 1,
+        "seqs": list(range(seq_start, seq_start + count)),
+        "records": records,
+        "records_resolved": True,
+        "wire_subtype": "0x60/0x04-batch",
+        "raw_len": len(body),
+    }
+
+
+def parse_snapshot_push(body: bytes) -> dict | None:
+    """Compatibility name for :func:`parse_trade_tick_push`."""
+    return parse_trade_tick_push(body)
+
+
+def is_snapshot_push(body: bytes) -> bool:
+    """Compatibility name for :func:`is_trade_tick_push`."""
+    return is_trade_tick_push(body)
+
+
+_ORDER_CANCEL_SIDES = {0x08: "buy", 0x0C: "sell"}
+_ORDER_QUEUE_SIDES = {0x14: "buy", 0x18: "sell"}
+
+
+def _market_name(marker: int) -> str:
+    return "SH" if marker == 0x11 else "SZ"
+
+
+def _order_cancel_single_core(body: bytes) -> bytes | None:
+    core = _strip_trade_tick_delimiter(body)
+    if (
+        len(core) == 70
+        and core[0:5] == b"\x09\x7b\xd0\x01\x60"
+        and core[5] in _ORDER_CANCEL_SIDES
+        and core[28] in (0x11, 0x21)
+        and core[43] == core[28]
+        and core[29:35] == core[44:50]
+        and core[29:35].isdigit()
+    ):
+        return core
+    return None
+
+
+def is_order_cancel_push(body: bytes) -> bool:
+    """Return whether ``body`` is one single-record real-time cancel push.
+
+    The ``0x60/0x08`` and ``0x60/0x0c`` shapes are distinct from both the
+    legacy ``0x7f`` and current ``0x60/0x04`` trade-tick shapes.  Their two
+    embedded code markers must agree; this prevents an adjacent or truncated
+    payload from being accepted accidentally.  The live core is 70 bytes;
+    capture splitters may append one out-of-length ``0x7d`` delimiter.
+
+    The layout was first verified during the opening auction, but the
+    2026-08-20 ``603334`` capture proves that the same subtype remains active
+    during continuous trading.  It must therefore not be classified by
+    session phase.
+    """
+    return _order_cancel_single_core(body) is not None
+
+
+def parse_order_cancel_push(body: bytes) -> dict | None:
+    """Parse one real-time order-cancellation event.
 
     Verified against the PC client's order/cancel view for ``002428`` on
     2026-08-10.  The UI's ``买撤``/``卖撤`` rows map to marker ``0x08``/
     ``0x0c`` respectively.  The UI suffix beside the cancel side is exactly
     ``cancelled_at - placed_at`` (for example ``30s`` or ``4m``).
 
+    A continuous-session capture for ``603334`` on 2026-08-20 uses the same
+    wire layout between 13:19:19 and 13:19:34.  ``event`` is consequently the
+    phase-neutral ``order_cancel``.
+
     ``volume`` is expressed in shares, matching the rest of the public quote
     parsers; ``lots`` exposes the PC view's 100-share 手 unit.
     """
-    if not is_auction_cancel_push(body):
+    core = _order_cancel_single_core(body)
+    if core is None:
         return None
 
-    market_flag = body[43]
-    placed_timestamp = struct.unpack_from("<I", body, 50)[0]
-    cancelled_timestamp = struct.unpack_from("<I", body, 54)[0]
-    volume = struct.unpack_from("<I", body, 62)[0]
-    side_raw = body[5]
+    market_flag = core[43]
+    placed_timestamp = struct.unpack_from("<I", core, 50)[0]
+    cancelled_timestamp = struct.unpack_from("<I", core, 54)[0]
+    price_raw = struct.unpack_from("<I", core, 58)[0]
+    volume = struct.unpack_from("<I", core, 62)[0]
+    order_id = struct.unpack_from("<I", core, 66)[0]
+    cancel_id = struct.unpack_from("<I", core, 39)[0]
+    side_raw = core[5]
     return {
-        "code": body[44:50].decode("ascii"),
-        "market": "SH" if market_flag == 0x11 else "SZ",
-        "event": "auction_cancel",
-        "side": _AUCTION_CANCEL_SIDES[side_raw],
+        "code": core[44:50].decode("ascii"),
+        "market": _market_name(market_flag),
+        "event": "order_cancel",
+        "side": _ORDER_CANCEL_SIDES[side_raw],
         "side_raw": side_raw,
         "placed_at": datetime.fromtimestamp(placed_timestamp),
         "cancelled_at": datetime.fromtimestamp(cancelled_timestamp),
         "placed_timestamp": placed_timestamp,
         "cancelled_timestamp": cancelled_timestamp,
         "lifetime_seconds": cancelled_timestamp - placed_timestamp,
-        "price": decode_ths_float(struct.unpack_from("<I", body, 58)[0]),
+        "price": decode_ths_float(price_raw),
+        "price_raw": price_raw,
         "volume": volume,
         "lots": volume / 100,
-        # The PC view used for side/price/volume truth does not display this
-        # value.  Preserve it without over-claiming its exact order-ID role.
-        "aux_id": struct.unpack_from("<I", body, 66)[0],
-        "seq": struct.unpack_from("<I", body, 39)[0],
+        # 7170/7171 truth proves this is dt37, the original order ID.
+        "order_id": order_id,
+        "aux_id": order_id,
+        "cancel_id": cancel_id,
+        "seq": cancel_id,
+        "wire_subtype": f"0x60/0x{side_raw:02x}",
         "raw_len": len(body),
     }
+
+
+def _order_cancel_batch_core(body: bytes) -> tuple[bytes, int] | None:
+    candidates = (body, body[:-1]) if body.endswith(b"\x7d") else (body,)
+    for core in candidates:
+        if (
+            len(core) <= 70
+            or core[0:5] != b"\x09\x7b\xd0\x01\x60"
+            or core[5] not in _ORDER_CANCEL_SIDES
+            or core[28] not in (0x11, 0x21)
+            or not core[29:35].isdigit()
+        ):
+            continue
+        count = struct.unpack_from("<H", core, 36)[0]
+        if 2 <= count <= 64 and core[38] == (0x80 | count):
+            return core, count
+    return None
+
+
+def is_order_cancel_batch_push(body: bytes) -> bool:
+    """Return whether ``body`` is a column-delta cancel batch."""
+    return parse_order_cancel_batch_push(body) is not None
+
+
+def parse_order_cancel_batch_push(body: bytes) -> dict | None:
+    """Expand a variable-length ``0x60/08`` or ``0x60/0c`` cancel batch.
+
+    The column order and signed big-endian 7-bit deltas were verified against
+    7170/7171 truth.  ``order_id`` is the original 7175 dt1 referenced by the
+    cancellation row's dt37; ``cancel_id`` is the 7170/7171 dt1.
+    """
+    located = _order_cancel_batch_core(body)
+    if located is None:
+        return None
+    core, count = located
+    limit = len(core) - 2
+    position = 39
+    try:
+        # Per-record prefix metadata is not exposed by the PC truth table.
+        for _ in range(count):
+            _unused, position = _read_trade_batch_delta(
+                core, position, limit
+            )
+
+        if position + 4 > limit:
+            return None
+        cancel_ids = [struct.unpack_from("<I", core, position)[0]]
+        position += 4
+        for _ in range(count - 1):
+            delta, position = _read_trade_batch_delta(
+                core, position, limit
+            )
+            cancel_ids.append(cancel_ids[-1] + delta)
+
+        if position + 7 > limit:
+            return None
+        marker = core[position]
+        code_bytes = core[position + 1 : position + 7]
+        position += 7
+        if marker not in (0x11, 0x21) or not code_bytes.isdigit():
+            return None
+        for _ in range(count - 1):
+            context_delta, position = _read_trade_batch_delta(
+                core, position, limit
+            )
+            if context_delta != 0:
+                return None
+
+        columns: dict[str, list[int]] = {}
+        for name in (
+            "placed_timestamp",
+            "cancelled_timestamp",
+            "price_raw",
+            "volume",
+            "order_id",
+        ):
+            if position + 4 > limit:
+                return None
+            values = [struct.unpack_from("<I", core, position)[0]]
+            position += 4
+            for _ in range(count - 1):
+                delta, position = _read_trade_batch_delta(
+                    core, position, limit
+                )
+                value = values[-1] + delta
+                if not 0 <= value <= 0xFFFFFFFF:
+                    return None
+                values.append(value)
+            columns[name] = values
+    except (IndexError, OSError, OverflowError, struct.error, ValueError):
+        return None
+    if position != limit:
+        return None
+
+    side_raw = core[5]
+    code = code_bytes.decode("ascii")
+    market = _market_name(marker)
+    records = []
+    try:
+        for index, cancel_id in enumerate(cancel_ids):
+            placed_timestamp = columns["placed_timestamp"][index]
+            cancelled_timestamp = columns["cancelled_timestamp"][index]
+            order_id = columns["order_id"][index]
+            volume = columns["volume"][index]
+            price_raw = columns["price_raw"][index]
+            records.append({
+                "code": code,
+                "market": market,
+                "event": "order_cancel",
+                "side": _ORDER_CANCEL_SIDES[side_raw],
+                "side_raw": side_raw,
+                "placed_at": datetime.fromtimestamp(placed_timestamp),
+                "cancelled_at": datetime.fromtimestamp(cancelled_timestamp),
+                "placed_timestamp": placed_timestamp,
+                "cancelled_timestamp": cancelled_timestamp,
+                "lifetime_seconds": cancelled_timestamp - placed_timestamp,
+                "price": decode_ths_float(price_raw),
+                "price_raw": price_raw,
+                "volume": volume,
+                "lots": volume / 100,
+                "order_id": order_id,
+                "aux_id": order_id,
+                "cancel_id": cancel_id,
+                "seq": cancel_id,
+                "wire_subtype": f"0x60/0x{side_raw:02x}-batch",
+            })
+    except (OSError, OverflowError, ValueError):
+        return None
+    if cancel_ids != list(range(cancel_ids[0], cancel_ids[0] + count)):
+        return None
+    return {
+        "code": code,
+        "market": market,
+        "event": "order_cancel_batch",
+        "side": _ORDER_CANCEL_SIDES[side_raw],
+        "side_raw": side_raw,
+        "count": count,
+        "cancel_id_start": cancel_ids[0],
+        "cancel_id_end": cancel_ids[-1],
+        "records": records,
+        "records_resolved": True,
+        "wire_subtype": f"0x60/0x{side_raw:02x}-batch",
+        "raw_len": len(body),
+    }
+
+
+def parse_order_cancel_records(body: bytes) -> list[dict]:
+    """Return zero or more normalized cancellation records from one push."""
+    single = parse_order_cancel_push(body)
+    if single is not None:
+        return [single]
+    batch = parse_order_cancel_batch_push(body)
+    return batch["records"] if batch is not None else []
+
+
+def _order_queue_core(body: bytes) -> tuple[bytes, int] | None:
+    candidates = (body, body[:-1]) if body.endswith(b"\x7d") else (body,)
+    for core in candidates:
+        if (
+            len(core) < 63
+            or core[0:5] != b"\x09\x7b\xd0\x01\x60"
+            or core[5] not in _ORDER_QUEUE_SIDES
+            or core[28] not in (0x11, 0x21)
+            or not core[29:35].isdigit()
+            or core[35] != 0xC8
+            or core[51:53] != b"\x00\x00"
+            or core[54] != 0x10
+            or struct.unpack_from("<I", core, 59)[0] != 0x0101
+        ):
+            continue
+        visible_count = core[53]
+        encoded_count = visible_count + 6
+        if (
+            len(core) == 63 + visible_count * 4
+            and struct.unpack_from("<H", core, 36)[0] == encoded_count
+            and core[38] == (0x80 | encoded_count)
+        ):
+            return core, visible_count
+    return None
+
+
+def is_order_queue_push(body: bytes) -> bool:
+    """Return whether ``body`` is a compact best-price order queue update."""
+    return _order_queue_core(body) is not None
+
+
+def parse_order_queue_push(body: bytes) -> dict | None:
+    """Parse ``0x60/0x14`` buy or ``0x60/0x18`` sell queue updates.
+
+    The result mirrors :func:`parse_order_queue_response`: ``entries`` is the
+    visible queue only, while ``total_order_count`` counts all orders at the
+    current best price.  ``meta_value`` remains raw because its exact business
+    label is not exposed by the client UI.
+    """
+    located = _order_queue_core(body)
+    if located is None:
+        return None
+    core, visible_count = located
+    timestamp = struct.unpack_from("<I", core, 39)[0]
+    price_raw = struct.unpack_from("<I", core, 43)[0]
+    meta_value = struct.unpack_from("<I", core, 47)[0]
+    total_order_count = struct.unpack_from("<I", core, 55)[0]
+    entries = []
+    for index in range(visible_count):
+        raw = struct.unpack_from("<I", core, 63 + index * 4)[0]
+        shares = raw & 0x07FFFFFF
+        entries.append({
+            "index": index + 1,
+            "raw": raw,
+            "shares": shares,
+            "hands": (shares + 50) // 100,
+            "is_major": bool(raw & 0x08000000),
+        })
+    major_entries = [entry for entry in entries if entry["is_major"]]
+    major_shares = sum(entry["shares"] for entry in major_entries)
+    side_raw = core[5]
+    return {
+        "code": core[29:35].decode("ascii"),
+        "market": _market_name(core[28]),
+        "market_marker": core[28],
+        "event": "order_queue",
+        "side": _ORDER_QUEUE_SIDES[side_raw],
+        "side_raw": side_raw,
+        "period": 7173 if side_raw == 0x14 else 7174,
+        "time": datetime.fromtimestamp(timestamp),
+        "ts": timestamp,
+        "price": round(decode_ths_float(price_raw), 3),
+        "price_raw": price_raw,
+        "meta_value": meta_value,
+        "display_limit": visible_count,
+        "total_order_count": total_order_count,
+        "visible_count": visible_count,
+        "truncated": total_order_count > visible_count,
+        "entries": entries,
+        "visible_major_order_count": len(major_entries),
+        "visible_major_shares": major_shares,
+        "visible_major_hands": major_shares / 100.0,
+        "wire_subtype": f"0x60/0x{side_raw:02x}",
+        "raw_len": len(body),
+    }
+
+
+def is_auction_cancel_push(body: bytes) -> bool:
+    """Compatibility alias for :func:`is_order_cancel_push`.
+
+    The historical name describes where the layout was first discovered,
+    not a restriction on the trading phase.
+    """
+    return is_order_cancel_push(body)
+
+
+def parse_auction_cancel_push(body: bytes) -> dict | None:
+    """Compatibility wrapper preserving the legacy ``event`` value.
+
+    New callers should use :func:`parse_order_cancel_push`, whose event name
+    is valid in both auction and continuous sessions.
+    """
+    result = parse_order_cancel_push(body)
+    if result is None:
+        return None
+    legacy = dict(result)
+    legacy["event"] = "auction_cancel"
+    return legacy
 
 
 # ── 550B 十档盘口推送（2026-08-07 盘中破译）──
@@ -235,9 +791,13 @@ _DEPTH_PUSH_MAGIC = b"\x7b\xd0\x0f\x7f"
 _DEPTH_PUSH_MARKETS = {0x11: "SH", 0x21: "SZ"}
 _AUCTION_IMBALANCE_SELL = 0x08000000
 _AUCTION_IMBALANCE_MASK = 0x07FFFFFF
-# A complete continuous-book record ends 505 bytes after the first code byte:
-# code at 45 in a 550B frame, or at 213 in a 718B prefixed frame.
-_CONTINUOUS_DEPTH_RECORD_END = 505
+# A complete continuous-book record originally ended 505 bytes after the
+# first code byte (code at 45 in a 550B frame, or at 213 in a 718B prefixed
+# frame).  The 2026-08-20 page4417/page4214 capture added a verified 614B
+# variant: code at 61, the same quote/book offsets, plus a 48B suffix.  Keep
+# the accepted extents explicit so compact/concatenated envelopes are not
+# accidentally decoded with fixed offsets.
+_CONTINUOUS_DEPTH_RECORD_ENDS = frozenset((505, 553))
 
 
 def _find_depth_code(body: bytes) -> tuple[int, int, str] | None:
@@ -292,7 +852,7 @@ def _is_continuous_depth_block(body: bytes, code_pos: int) -> bool:
     finding a stock code is not enough: applying the ten-level offsets to
     those variants produced impossible prices in the 2026-08-10 capture.
     """
-    if len(body) != code_pos + _CONTINUOUS_DEPTH_RECORD_END:
+    if len(body) - code_pos not in _CONTINUOUS_DEPTH_RECORD_ENDS:
         return False
     shift = code_pos - 45
     prev_close = _depth_float(body, shift + 51)
@@ -701,9 +1261,20 @@ __all__ = [
     "SNAPSHOT_SUBTYPE",
     "build_market_snapshot_query",
     "build_snapshot_subscribe",
+    "is_order_cancel_push",
+    "is_order_cancel_batch_push",
+    "is_order_queue_push",
     "is_auction_cancel_push",
+    "is_trade_tick_push",
+    "is_trade_tick_batch_push",
     "is_snapshot_push",
+    "parse_order_cancel_push",
+    "parse_order_cancel_batch_push",
+    "parse_order_cancel_records",
+    "parse_order_queue_push",
     "parse_auction_cancel_push",
+    "parse_trade_tick_push",
+    "parse_trade_tick_batch_push",
     "parse_snapshot_push",
     "is_stock_depth_envelope",
     "is_auction_depth_push",

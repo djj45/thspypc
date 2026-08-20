@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 from collections.abc import Callable
@@ -51,6 +52,17 @@ class ThsRuntime:
             "state": "not_started",
             "markets": {},
         }
+        # 浏览器连接只是唯一 THSClient 事件流的进程内订阅者。相同股票的多个
+        # WebSocket 共用一次 4214 注册，由回调扇出，绝不新建客户端或登录。
+        self._stream_lock = threading.RLock()
+        self._stream_subscribers: dict[str, set[queue.Queue]] = {}
+        self._stream_markets: dict[str, int] = {}
+        self._stream_active_codes: set[str] = set()
+        self._stream_release_timers: dict[
+            str,
+            tuple[threading.Timer, object],
+        ] = {}
+        self._stream_release_delay = 2.0
 
     @property
     def env(self) -> dict[str, str]:
@@ -166,6 +178,128 @@ class ThsRuntime:
                 "app",
                 (time.perf_counter() - operation_started) * 1000,
             )
+
+    def _publish_stock_event(self, code: str, event: dict) -> None:
+        """Fan one normalized client event out to every browser subscriber."""
+        with self._stream_lock:
+            subscribers = tuple(self._stream_subscribers.get(code, ()))
+        for subscriber in subscribers:
+            try:
+                subscriber.put_nowait(event)
+            except queue.Full:
+                try:
+                    subscriber.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    subscriber.put_nowait(event)
+                except queue.Full:
+                    pass
+
+    def subscribe_stock_stream(
+        self,
+        code: str,
+        *,
+        market: int = 0,
+    ) -> queue.Queue:
+        """Subscribe one browser queue to the shared trade/depth/order stream."""
+        subscriber: queue.Queue = queue.Queue(maxsize=1024)
+        with self._stream_lock:
+            pending_release = self._stream_release_timers.pop(code, None)
+            if pending_release is not None:
+                pending_release[0].cancel()
+            current = self._stream_subscribers.setdefault(code, set())
+            needs_activate = code not in self._stream_active_codes
+            current.add(subscriber)
+            if needs_activate:
+                self._stream_markets[code] = market
+                try:
+                    active = self.call(
+                        lambda client: client.market_events_subscribe(
+                            code,
+                            market=market,
+                            callback=lambda event: self._publish_stock_event(
+                                code,
+                                event,
+                            ),
+                        )
+                    )
+                except Exception:
+                    current.discard(subscriber)
+                    if not current:
+                        self._stream_subscribers.pop(code, None)
+                        self._stream_markets.pop(code, None)
+                    raise
+                if not active:
+                    current.discard(subscriber)
+                    if not current:
+                        self._stream_subscribers.pop(code, None)
+                        self._stream_markets.pop(code, None)
+                    raise RuntimeError(f"{code} 市场事件订阅失败")
+                self._stream_active_codes.add(code)
+        return subscriber
+
+    def unsubscribe_stock_stream(self, code: str, subscriber: queue.Queue) -> None:
+        """Remove a browser queue and release the client subscription at refcount 0."""
+        last = False
+        with self._stream_lock:
+            current = self._stream_subscribers.get(code)
+            if current is None:
+                return
+            current.discard(subscriber)
+            if not current:
+                self._stream_subscribers.pop(code, None)
+                last = True
+        if last:
+            token = object()
+            timer = threading.Timer(
+                self._stream_release_delay,
+                self._release_stock_stream,
+                args=(code, token),
+            )
+            timer.daemon = True
+            with self._stream_lock:
+                previous = self._stream_release_timers.get(code)
+                if previous is not None:
+                    previous[0].cancel()
+                self._stream_release_timers[code] = (timer, token)
+            timer.start()
+
+    def _release_stock_stream(self, code: str, token: object) -> None:
+        """Release a client subscription after the browser reconnect grace."""
+        with self._stream_lock:
+            pending = self._stream_release_timers.get(code)
+            if pending is None or pending[1] is not token:
+                return
+            if self._stream_subscribers.get(code):
+                self._stream_release_timers.pop(code, None)
+                return
+            self._stream_release_timers.pop(code, None)
+            self._stream_markets.pop(code, None)
+            if code not in self._stream_active_codes:
+                return
+            self._stream_active_codes.discard(code)
+            try:
+                self.call(lambda client: client.market_events_unsubscribe(code))
+            except Exception as exc:
+                logger.warning("%s 市场事件退订失败: %s", code, exc)
+
+    def close(self) -> None:
+        """Release the single client and all sockets during server shutdown."""
+        with self._stream_lock:
+            for timer, _token in self._stream_release_timers.values():
+                timer.cancel()
+            self._stream_release_timers.clear()
+            self._stream_subscribers.clear()
+            self._stream_active_codes.clear()
+            self._stream_markets.clear()
+        with self._lifecycle_lock:
+            client = self._client
+            self._connected_once = False
+        if client is not None:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
 
     def start_preheat(self) -> bool:
         """后台登录 MAIN 并预建 SH/SZ L2；重复调用不会创建第二个任务。"""

@@ -34,6 +34,16 @@ from .subscription import L2SubscriptionCoordinator
 logger = logging.getLogger(__name__)
 FrameReader = Callable[[SocketLike], bytes]
 
+# The compact list quote is sufficient for rankings, but the stock header also
+# displays today's high/low and turnover.  Keep those fields scoped to the
+# single-stock first-paint pipeline so bulk quote payloads do not grow.
+MARKET_VIEW_QUOTE_DATATYPE = [
+    *LIST_QUOTE_DATATYPE_DEFAULT,
+    8,
+    9,
+    19,
+]
+
 
 def _hd_field_ids(body: bytes) -> set[int]:
     """Return the hd field ids without touching the socket or record bytes."""
@@ -254,7 +264,7 @@ class QuoteService:
         quote_frame = build_list_quote_query(
             [code],
             market=market,
-            datatype=LIST_QUOTE_DATATYPE_DEFAULT,
+            datatype=MARKET_VIEW_QUOTE_DATATYPE,
             pageid=quote_pageid,
         )
         depth_frame = build_depth_quote_query(

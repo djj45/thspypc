@@ -7,7 +7,8 @@
 ``capture_kanpan.py`` 是请求中心（分类客户端请求，找未实现协议），但**不解析服务端
 推送帧**。本脚本补这个缺口，专门抓「看盘界面保持不动时，服务端持续推送的实时数据」：
 
-  - **8901 pageid=4214 L2 逐笔推送**（71 字节 ``0x7f`` 帧）
+  - **8901 pageid=4214 L2 逐笔推送**（旧版 71B ``0x7f``；本轮 72B
+    ``0x60/0x04``）
   - **8901 ``0x0f7f`` 盘口推送**（竞价三行变长布局 / 连续竞价十档布局）
   - **9601 pushrealorder 短线精灵实时异动推送**（含异动类型/金额/涨跌幅）—— 短线
     精灵面板的生命线，盘中等秒级推送
@@ -60,13 +61,19 @@ from thspypc.features.realorder_protocol import (  # noqa: E402
     parse_pushrealorder_response,
 )
 from thspypc.features.snapshot_protocol import (  # noqa: E402
-    is_auction_cancel_push,
     is_depth_push,
+    is_order_cancel_batch_push,
+    is_order_cancel_push,
+    is_order_queue_push,
     is_snapshot_push,
     is_stock_depth_envelope,
-    parse_auction_cancel_push,
+    is_trade_tick_batch_push,
     parse_depth_push_records,
+    parse_order_cancel_batch_push,
+    parse_order_cancel_push,
+    parse_order_queue_push,
     parse_snapshot_push,
+    parse_trade_tick_batch_push,
 )
 from thspypc.features.index_push_protocol import (  # noqa: E402
     is_index_push,
@@ -272,8 +279,10 @@ def classify_server_frame(body, srcport):
 
     kind:
       - "index_push": 09 7b d0 0f 指数实时推送（五大指数点位）
-      - "snapshot4214": 71 字节 L2 逐笔推送
-      - "auction_cancel": 71 字节集合竞价买撤/卖撤推送
+      - "snapshot4214": L2 逐笔成交推送（71B 0x7f / 72B 0x60-04）
+      - "order_cancel": 单条实时买撤/卖撤推送
+      - "order_cancel_batch": 变长批量买撤/卖撤推送
+      - "order_queue": 买一/卖一委托队列更新
       - "auction_depth": 集合竞价三行虚拟盘口
       - "depth4214": 连续竞价十档盘口
       - "pushrealorder": 9601 短线精灵实时异动推送
@@ -286,13 +295,24 @@ def classify_server_frame(body, srcport):
     # 心跳
     if len(body) <= 5 and (body[:1] == b"\x09" or body[-1:] == b"\x07"):
         return ("heartbeat", {})
-    # 4214 逐笔推送（71 字节 0x7f 定长；0x60 是另一种竞价委托布局）
+    # 4214 逐笔成交：旧版 71B/0x7f，本轮分时页为 71B核心(±0x7d分隔)/0x60-04。
+    # 0x60-08/0c 则是实时撤单，必须由严格的长度/子类型识别器区分。
+    # 同子类型的变长批量帧（一次多条成交）单独分类，报告覆盖序号区间。
+    if is_trade_tick_batch_push(body):
+        parsed = parse_trade_tick_batch_push(body)
+        return ("snapshot4214_batch", parsed or {})
     if is_snapshot_push(body):
         parsed = parse_snapshot_push(body)
         return ("snapshot4214", parsed or {})
-    if is_auction_cancel_push(body):
-        parsed = parse_auction_cancel_push(body)
-        return ("auction_cancel", parsed or {})
+    if is_order_cancel_batch_push(body):
+        parsed = parse_order_cancel_batch_push(body)
+        return ("order_cancel_batch", parsed or {})
+    if is_order_cancel_push(body):
+        parsed = parse_order_cancel_push(body)
+        return ("order_cancel", parsed or {})
+    if is_order_queue_push(body):
+        parsed = parse_order_queue_push(body)
+        return ("order_queue", parsed or {})
     # 个股 0x0f7f 必须先于指数 0x0f 分类；两者共享外层魔数。
     if is_depth_push(body):
         records = parse_depth_push_records(body)
@@ -400,8 +420,11 @@ def analyze(pcap_path):
 
     kind_labels = {
         "index_push": "★ 指数实时推送（五大指数点位）",
-        "snapshot4214": "★ 4214 逐笔推送（71B/0x7f）",
-        "auction_cancel": "★ 集合竞价撤单推送（71B/0x60）",
+        "snapshot4214": "★ 4214 逐笔成交推送（71B/0x7f 或71B±0x7d/0x60-04）",
+        "snapshot4214_batch": "★ 4214 逐笔成交批量推送（0x60-04 变长多条）",
+        "order_cancel": "★ 实时撤单单条推送（0x60-08/0c）",
+        "order_cancel_batch": "★ 实时撤单批量推送（0x60-08/0c变长）",
+        "order_queue": "★ 买一/卖一委托队列推送（0x60-14/18）",
         "auction_depth": "★ 集合竞价三行盘口推送（0x0f7f）",
         "depth4214": "★ 连续竞价十档盘口推送（0x0f7f）",
         "depth_unknown": "股票盘口未知变长布局（0x0f7f）",
@@ -416,8 +439,9 @@ def analyze(pcap_path):
         label = kind_labels.get(kind, kind)
         print(f"  {label}: {cnt} 帧, {kind_bytes[kind]:,}B")
     if not any(kind_counter.get(kind) for kind in (
-        "snapshot4214", "auction_cancel", "auction_depth", "depth4214",
-        "pushrealorder",
+        "snapshot4214", "snapshot4214_batch", "order_cancel",
+        "order_cancel_batch", "order_queue",
+        "auction_depth", "depth4214", "pushrealorder",
     )):
         print("  ⚠ 未抓到 4214/pushrealorder 推送——可能没在看盘界面/没开 L2/盘外")
 
@@ -426,7 +450,8 @@ def analyze(pcap_path):
     print("【2】推送节奏（5s 桶，看 snapshot4214/pushrealorder 是否持续推送）")
     print(f"{'='*64}")
     push_kinds = {
-        "index_push", "snapshot4214", "auction_cancel", "auction_depth",
+        "index_push", "snapshot4214", "snapshot4214_batch", "order_cancel",
+        "order_cancel_batch", "order_queue", "auction_depth",
         "depth4214", "pushrealorder",
     }
     buckets: dict[int, Counter] = defaultdict(Counter)
@@ -443,8 +468,8 @@ def analyze(pcap_path):
         for b in sorted(buckets):
             c = buckets[b]
             idx = c.get("index_push", 0)
-            snap = c.get("snapshot4214", 0)
-            cancel = c.get("auction_cancel", 0)
+            snap = c.get("snapshot4214", 0) + c.get("snapshot4214_batch", 0)
+            cancel = c.get("order_cancel", 0) + c.get("order_cancel_batch", 0)
             auction = c.get("auction_depth", 0)
             depth = c.get("depth4214", 0)
             dxjl = c.get("pushrealorder", 0)
@@ -509,12 +534,12 @@ def analyze(pcap_path):
 
     # ── 报告 5：4214 推送解码示例 ──
     snapshots = [(t, detail) for t, kind, detail, body, srcport in classified
-                 if kind == "snapshot4214" and detail]
+                 if kind in ("snapshot4214", "snapshot4214_batch") and detail]
     print(f"\n{'='*64}")
     print("【5】4214 逐笔与盘口推送解码示例")
     print(f"{'='*64}")
     if not snapshots:
-        print("  未抓到 71B/0x7f 逐笔推送。")
+        print("  未抓到逐笔成交推送（71B/0x7f 或72B/0x60-04）。")
     else:
         codes_seen = Counter()
         for t, d in snapshots:
@@ -589,7 +614,9 @@ def _dump_samples(classified, pcap_path):
     samples: dict[str, list[bytes]] = defaultdict(list)
     for t, kind, detail, body, srcport in classified:
         if kind in (
-            "snapshot4214", "auction_cancel", "auction_depth", "depth4214",
+            "snapshot4214", "snapshot4214_batch", "order_cancel",
+            "order_cancel_batch", "order_queue",
+            "auction_depth", "depth4214",
             "depth_unknown", "pushrealorder", "subreal_ack",
         ) and body:
             if len(samples[kind]) < 50:

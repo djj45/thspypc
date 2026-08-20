@@ -1,6 +1,7 @@
 """Contracts for borrowing legacy THSClient sockets into services."""
 
 import concurrent.futures
+from pathlib import Path
 import threading
 
 import pytest
@@ -1016,7 +1017,7 @@ def test_auction_opt_in_rejects_uninitialized_l2_socket():
     assert sock.sent == []
 
 
-def test_auction_opt_in_rejects_competing_snapshot_reader():
+def test_auction_opt_in_shares_lane_with_snapshot_reader(monkeypatch):
     client = _client()
     client._push_socks["sz"] = FakeSocket()
     client._push_initialized.add("sz")
@@ -1027,9 +1028,15 @@ def test_auction_opt_in_rejects_competing_snapshot_reader():
             return True
 
     client._snapshot_thread = ActiveThread()
+    monkeypatch.setattr(
+        client._auction_service,
+        "auction",
+        lambda code, **kwargs: [{"code": code, "time": "09:15"}],
+    )
 
-    with pytest.raises(ChannelUnavailableError, match="后台快照线程"):
-        client.auction("000938")
+    assert client.auction("000938") == [
+        {"code": "000938", "time": "09:15"}
+    ]
 
 
 def test_timeline_opt_in_delegates_with_inferred_market(monkeypatch):
@@ -1118,7 +1125,7 @@ def test_timeline_opt_in_rejects_uninitialized_l2_socket():
     assert sock.sent == []
 
 
-def test_timeline_opt_in_rejects_competing_snapshot_reader():
+def test_timeline_opt_in_shares_lane_with_snapshot_reader(monkeypatch):
     client = _client()
     client._push_socks["sz"] = FakeSocket()
     client._push_initialized.add("sz")
@@ -1129,9 +1136,15 @@ def test_timeline_opt_in_rejects_competing_snapshot_reader():
             return True
 
     client._snapshot_thread = ActiveThread()
+    monkeypatch.setattr(
+        client._timeline_service,
+        "timeline",
+        lambda code, **kwargs: [{"code": code, "dt10": 12.34}],
+    )
 
-    with pytest.raises(ChannelUnavailableError, match="后台快照线程"):
-        client.timeline("000938")
+    assert client.timeline("000938") == [
+        {"code": "000938", "dt10": 12.34}
+    ]
 
 
 def test_intraday_combines_historical_phases_in_display_order(
@@ -1185,6 +1198,15 @@ def test_intraday_combines_historical_phases_in_display_order(
 def test_level2_historical_intraday_uses_one_service_workflow(monkeypatch):
     client = _client()
     client.configure_service_context(LEVEL2_PROFILE)
+
+    class ActiveThread:
+        def is_alive(self):
+            return True
+
+    # The WebSocket push reader may already be running when the page requests
+    # its initial three-phase timeline.  Both paths must share the market lane
+    # instead of rejecting the HTTP request.
+    client._snapshot_thread = ActiveThread()
     expected = [
         {"phase": "opening_auction", "time": "09:15"},
         {"phase": "continuous", "bar_index": 0},
@@ -1539,7 +1561,7 @@ def test_history_timeline_opt_in_rejects_uninitialized_l2_socket():
     assert sock.sent == []
 
 
-def test_history_timeline_opt_in_rejects_competing_snapshot_reader():
+def test_history_timeline_opt_in_shares_lane_with_snapshot_reader(monkeypatch):
     client = _client()
     client._push_socks["sz"] = FakeSocket()
     client._push_initialized.add("sz")
@@ -1550,9 +1572,15 @@ def test_history_timeline_opt_in_rejects_competing_snapshot_reader():
             return True
 
     client._snapshot_thread = ActiveThread()
+    monkeypatch.setattr(
+        client._timeline_service,
+        "history_timeline",
+        lambda code, **kwargs: [{"code": code, "bar_index": 0}],
+    )
 
-    with pytest.raises(ChannelUnavailableError, match="后台快照线程"):
-        client.history_timeline("000938", "2026-07-24")
+    assert client.history_timeline("000938", "2026-07-24") == [
+        {"code": "000938", "bar_index": 0}
+    ]
 
 
 def test_snapshot_subscribe_opt_in_registers_and_starts_one_reader(
@@ -1708,6 +1736,54 @@ def test_snapshot_loop_reads_under_market_request_lock(monkeypatch):
     assert callbacks == [("000938", "sz", 12.34, 100)]
 
 
+def test_l2_heartbeat_skips_probe_while_request_lane_is_busy(monkeypatch):
+    """The Windows liveness probe must not toggle a socket used by recv."""
+    client = _client()
+    sock = FakeSocket()
+    client._push_socks["sh"] = sock
+
+    class BusyLock:
+        def __init__(self):
+            self.acquire_calls = 0
+
+        def acquire(self, *, blocking=True):
+            assert blocking is False
+            self.acquire_calls += 1
+            return False
+
+        def release(self):
+            raise AssertionError("an unacquired busy lane cannot be released")
+
+    class OneBeat:
+        def __init__(self):
+            self.wait_calls = 0
+
+        def is_set(self):
+            return self.wait_calls > 0
+
+        def wait(self, _timeout):
+            self.wait_calls += 1
+            return False
+
+    lock = BusyLock()
+    client._push_request_locks["sh"] = lock
+    client._connection_runtime._push_request_locks["sh"] = lock
+    client._connection_runtime.heartbeat_stop = OneBeat()
+    monkeypatch.setattr(
+        "thspypc._client.connection_runtime._real_socket_alive",
+        lambda _sock: (_ for _ in ()).throw(
+            AssertionError("busy request lane must skip socket probing")
+        ),
+    )
+
+    client._connection_runtime.heartbeat_loop(
+        build_main_heartbeat=lambda _seq: b"heartbeat"
+    )
+
+    assert lock.acquire_calls == 1
+    assert sock.sent == []
+
+
 def test_depth_subscribe_multi_market_and_local_unsubscribe_lifecycle(monkeypatch):
     client = _client()
     sh = FakeSocket()
@@ -1826,6 +1902,61 @@ def test_snapshot_loop_dispatches_every_record_in_batched_depth_frame(monkeypatc
     assert client.receive_depth(timeout=0) == records[0]
     assert client.receive_depth(timeout=0) == records[1]
     assert client.receive_depth(timeout=0) is None
+
+
+def test_market_push_dispatches_every_trade_in_batch_frame():
+    client = _client()
+    runtime = client._connection_runtime
+    body = bytes.fromhex(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "depth_push"
+            / "trade_batch_603334_174.hex"
+        ).read_text(encoding="ascii")
+    )
+    callbacks = []
+    runtime.snapshot_codes.add("603334")
+    runtime.snapshot_callback = lambda *args: callbacks.append(args)
+
+    assert runtime.deliver_market_push(body)
+
+    assert len(callbacks) == 11
+    assert callbacks[0] == ("603334", "SH", 34.85, 100)
+    assert callbacks[-1] == ("603334", "SH", 34.85, 100)
+    assert runtime.latest_prices["603334"] == 34.85
+
+
+def test_market_event_stream_delivers_queue_and_cancel_without_price_pollution():
+    client = _client()
+    runtime = client._connection_runtime
+    fixtures = Path(__file__).parent / "fixtures" / "depth_push"
+    callbacks = []
+    runtime.market_event_codes.add("603334")
+    runtime.market_event_callbacks["603334"] = callbacks.append
+
+    cancel = bytes.fromhex(
+        (fixtures / "order_cancel_sell_batch_603334_87.hex").read_text(
+            encoding="ascii"
+        )
+    )
+    order_queue = bytes.fromhex(
+        (fixtures / "order_queue_buy_603334_75.hex").read_text(
+            encoding="ascii"
+        )
+    )
+
+    assert runtime.deliver_market_push(cancel)
+    assert runtime.deliver_market_push(order_queue)
+
+    events = [client.receive_market_event(timeout=0) for _ in range(3)]
+    assert [event["event"] for event in events] == [
+        "cancel",
+        "cancel",
+        "order_queue",
+    ]
+    assert callbacks == events
+    assert "603334" not in runtime.latest_prices
 
 
 def test_context_borrows_realorder_socket():

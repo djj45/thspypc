@@ -10,7 +10,7 @@ from thspypc._transport import (
 from thspypc.codecs.framing import encode_frame
 from thspypc.features.quote_protocol import LIST_QUOTE_DATATYPE_DEFAULT
 from thspypc.models import AccountKind, AccountProfile, Capability, Support
-from thspypc.services.quote import QuoteService
+from thspypc.services.quote import MARKET_VIEW_QUOTE_DATATYPE, QuoteService
 
 
 class FakeSocket:
@@ -57,14 +57,17 @@ def test_market_view_pipeline_sends_both_before_reading_and_dispatches():
         profile,
         lambda spec: OpenedConnection(sock, initialized=True),
     )
-    quote_fields = [5, *LIST_QUOTE_DATATYPE_DEFAULT]
+    quote_fields = [5, *MARKET_VIEW_QUOTE_DATATYPE]
     quote = encode_frame(
         hd1(
             quote_fields,
             {
                 5: b"!000001",
                 6: struct.pack("<I", 123400),
+                8: struct.pack("<I", 127800),
+                9: struct.pack("<I", 122100),
                 10: struct.pack("<I", 125600),
+                19: struct.pack("<I", 98765432),
             },
         )
     )
@@ -88,6 +91,7 @@ def test_market_view_pipeline_sends_both_before_reading_and_dispatches():
         assert len(sock.sent) == 1
         assert b"pageid=1335" in sock.sent[0]
         assert b"pageid=1333" in sock.sent[0]
+        assert b"DataType=7,49,13,48,10,17,6,66,1111,8,9,19," in sock.sent[0]
         return next(frames)
 
     service = QuoteService(manager, frame_reader=read_frame)
@@ -99,6 +103,8 @@ def test_market_view_pipeline_sends_both_before_reading_and_dispatches():
     assert b"pageid=1335" in sock.sent[0]
     assert b"pageid=1333" in sock.sent[0]
     assert quote_row is not None and quote_row["code"] == "000001"
+    assert quote_row["dt8"] > quote_row["dt9"]
+    assert quote_row["dt19"] > 0
     assert depth_row["code"] == "000001"
     assert depth_row["buy"] and depth_row["sell"]
     assert manager.peek(ConnectionRole.MAIN) is not None

@@ -252,7 +252,8 @@ def get_client(env_path: str | os.PathLike[str] = ".env"):
                 raise LoginFailed(
                     f"THS_USERNAME/THS_PASSWORD missing in {env_path}"
                 )
-            client = THSClient(username, password)
+            imei = os.environ.get("THS_IMEI", "").strip() or None
+            client = THSClient(username, password, imei=imei)
             _clients[key] = client
         if not client.is_connected:
             result = client.connect()

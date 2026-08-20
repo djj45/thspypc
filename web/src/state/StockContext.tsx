@@ -150,7 +150,8 @@ async function retryCurrentRequest<T>(
 
 // 盘口和 K 线用于首屏，切股后立即发起。分时返回更大，且与 K 线
 // 共用市场 L2 socket，只保留一个人无感的短合并窗口。
-const INTRADAY_SWITCH_COALESCE_MS = 60
+const INTRADAY_SWITCH_COALESCE_MS = 100
+const KLINE_SWITCH_COALESCE_MS = 180
 
 // 同花顺会优先用本地图表数据绘制再后台刷新。Web 保留最近看过的
 // 股票/周期/复权组合，避免切回时先清空图表。
@@ -184,8 +185,30 @@ function useLaneGate() {
   }, [])
 }
 
-export function StockProvider({ children }: { children: ReactNode }) {
-  const [code, setCode] = useState('600519')
+export type StockPageMode = 'kanpan' | 'timeline' | 'superorder'
+
+export function normalizeStockCode(
+  value: string | null | undefined,
+  fallback = '600519',
+): string {
+  const text = value?.trim().toUpperCase() ?? ''
+  const match = text.match(/^(?:\d{6}|1[AB]\d{4})/)
+  return match?.[0] ?? fallback
+}
+
+export function StockProvider({
+  children,
+  mode = 'kanpan',
+}: {
+  children: ReactNode
+  mode?: StockPageMode
+}) {
+  const [code, setCode] = useState(
+    () =>
+      normalizeStockCode(
+        new URLSearchParams(window.location.search).get('code'),
+      ),
+  )
   const [period, setPeriod] = useState<KlinePeriod>('day')
   const [fuquan, setFuquan] = useState('Q')
   const [fast, setFast] = useState<MarketViewFast | null>(null)
@@ -214,7 +237,7 @@ export function StockProvider({ children }: { children: ReactNode }) {
   const setCodeWithSource = useCallback(
     (next: string, source?: StockNavSource) => {
       if (source) navListRef.current = source
-      setCode(next)
+      setCode((current) => normalizeStockCode(next, current))
     },
     [],
   )
@@ -259,7 +282,8 @@ export function StockProvider({ children }: { children: ReactNode }) {
     setFast(null)
     setIntraday(null)
     setFastLoading(true)
-    setIntradayLoading(true)
+    const needsIntraday = mode !== 'superorder'
+    setIntradayLoading(needsIntraday)
     setFastError('')
     setIntradayError('')
 
@@ -300,16 +324,21 @@ export function StockProvider({ children }: { children: ReactNode }) {
     }
 
     fastLane(loadFast)
+    if (!needsIntraday) return
     const timer = setTimeout(() => {
       intradayLane(loadIntraday)
     }, INTRADAY_SWITCH_COALESCE_MS)
     return () => clearTimeout(timer)
-  }, [code, refreshTick, fastLane, intradayLane])
+  }, [code, mode, refreshTick, fastLane, intradayLane])
 
   // K-line starts immediately on the selected market's L2 connection.
   // Period/fuquan changes only rerun this lane.  Cached rows remain visible
   // while the lane refreshes them in the background.
   useEffect(() => {
+    if (mode !== 'kanpan') {
+      setKlineLoading(false)
+      return
+    }
     const cacheKey = klineCacheKey(code, period, fuquan)
     const cached = klineCacheRef.current.get(cacheKey)
     if (cached) {
@@ -354,8 +383,13 @@ export function StockProvider({ children }: { children: ReactNode }) {
         if (target === codeRef.current) setKlineLoading(false)
       }
     }
-    klineLane(load)
-  }, [code, period, fuquan, refreshTick, klineLane])
+    // 切股时先让轻量盘口和上方分时抢到首屏；快速连续滚动只为最终停留
+    // 股票发 K 线，避免每个中间代码都占一次 L2 lane。
+    const timer = setTimeout(() => {
+      klineLane(load)
+    }, KLINE_SWITCH_COALESCE_MS)
+    return () => clearTimeout(timer)
+  }, [code, mode, period, fuquan, refreshTick, klineLane])
 
   const validFast = fast?.code === code ? fast : null
   const validIntraday = intraday?.code === code ? intraday.rows : null
@@ -410,6 +444,11 @@ export function StockProvider({ children }: { children: ReactNode }) {
   const q = validFast?.quote
   const quote = useMemo<QuoteInfo | null>(() => {
     if (!q) return null
+    const dailyRows =
+      period === 'day'
+        ? validKline
+        : klineCacheRef.current.get(klineCacheKey(code, 'day', fuquan))?.rows
+    const todayBar = dailyRows?.[dailyRows.length - 1]
     const price = q.dt10
     const prevClose = q.dt6
     const chg = price != null && prevClose != null ? price - prevClose : undefined
@@ -417,15 +456,15 @@ export function StockProvider({ children }: { children: ReactNode }) {
     return {
       price,
       prevClose,
-      open: q.dt7,
-      high: q.dt8,
-      low: q.dt9,
+      open: q.dt7 ?? todayBar?.open,
+      high: q.dt8 ?? todayBar?.high,
+      low: q.dt9 ?? todayBar?.low,
       vol: q.dt13,
-      amount: q.dt19,
+      amount: q.dt19 ?? todayBar?.amount,
       chg,
       chgPct,
     }
-  }, [q])
+  }, [q, code, period, fuquan, validKline])
 
   return (
     <Ctx.Provider

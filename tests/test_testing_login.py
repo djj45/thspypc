@@ -139,3 +139,41 @@ def test_get_client_reuses_cached_connected_instance(tmp_path, monkeypatch):
     assert first is second
     assert calls == []
 
+
+def test_get_client_forwards_configured_imei(tmp_path, monkeypatch):
+    created = []
+
+    class Result:
+        success = True
+        error = ""
+        detail = ""
+
+    class FakeClient:
+        def __init__(self, username, password, *, imei=None):
+            created.append((username, password, imei))
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+            return Result()
+
+        def disconnect(self):
+            pass
+
+    env_path = tmp_path / "account.env"
+    env_path.write_text(
+        "THS_USERNAME=fixture-user\n"
+        "THS_PASSWORD=fixture-password\n"
+        "THS_IMEI=fixture-imei\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("THS_USERNAME", raising=False)
+    monkeypatch.delenv("THS_PASSWORD", raising=False)
+    monkeypatch.delenv("THS_IMEI", raising=False)
+    monkeypatch.setattr("thspypc.client.THSClient", FakeClient)
+
+    client = testing.get_client(env_path)
+
+    assert client.is_connected is True
+    assert created == [("fixture-user", "fixture-password", "fixture-imei")]
+

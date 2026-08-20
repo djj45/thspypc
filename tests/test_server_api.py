@@ -1,6 +1,7 @@
 """Web API 服务层离线契约（FastAPI 路由 + 错误映射，不联网）。"""
 
 import concurrent.futures
+from datetime import datetime
 import threading
 import time
 
@@ -30,6 +31,7 @@ class FakeClient:
     def __init__(self):
         self.is_connected = False
         self.calls = []
+        self.stream_callback = None
 
     def connect(self):
         self.calls.append(("connect",))
@@ -104,6 +106,97 @@ class FakeClient:
     def intraday_auctions(self, code, market=0, trade_date=None):
         self.calls.append(("intraday_auctions", code, market, trade_date))
         return [{"phase": "opening_auction", "dt10": 12.2}]
+
+    def superorder(
+        self,
+        code,
+        start,
+        end,
+        market=0,
+        pageid=4214,
+        timeout=25.0,
+    ):
+        self.calls.append(
+            ("superorder", code, start, end, market, pageid, timeout)
+        )
+        return [
+            {
+                "code": code,
+                "seq": 7508,
+                "dt1": int(start.timestamp()),
+                "dt56_raw": b"private-wire-bytes",
+            }
+        ]
+
+    def order_details(
+        self,
+        code,
+        start,
+        end,
+        market=0,
+        timeout=25.0,
+    ):
+        self.calls.append(
+            ("order_details", code, start, end, market, timeout)
+        )
+        return {
+            "code": code,
+            "orders": [],
+            "sell_cancels": [{"order_id": 11_761_615}],
+        }
+
+    def order_queues(self, code, market=0, trade_date=None, timeout=25.0):
+        self.calls.append(
+            ("order_queues", code, market, trade_date, timeout)
+        )
+        return {
+            "buy": {"side": "buy", "entries": [1200, 800]},
+            "sell": {"side": "sell", "entries": [500]},
+        }
+
+    def snapshot_replay(
+        self,
+        code,
+        market=0,
+        start=None,
+        end=None,
+        timeout=30.0,
+    ):
+        self.calls.append(
+            ("snapshot_replay", code, market, start, end, timeout)
+        )
+        return [
+            {
+                "time": "09:30:00",
+                "ts": 1_776_646_200,
+                "price": 34.86,
+                "dt13": 1000,
+                "dt24": 34.85,
+                "dt25": 4900,
+                "dt30": 34.86,
+                "dt31": 100,
+            },
+            {
+                "time": "09:30:03",
+                "ts": 1_776_646_203,
+                "price": 34.87,
+                "dt13": 1200,
+                "dt24": 34.86,
+                "dt25": 5100,
+                "dt30": 34.87,
+                "dt31": 200,
+            },
+        ]
+
+    def market_events_subscribe(self, code, market=0, callback=None):
+        self.calls.append(("market_events_subscribe", code, market))
+        self.stream_callback = callback
+        return True
+
+    def market_events_unsubscribe(self, code):
+        self.calls.append(("market_events_unsubscribe", code))
+        self.stream_callback = None
+        return True
 
     def stock_list(self, with_names=False):
         self.calls.append(("stock_list", with_names))
@@ -360,6 +453,209 @@ def test_intraday_auctions_endpoint(client_and_app):
 
     assert body == [{"phase": "opening_auction", "dt10": 12.2}]
     assert ("intraday_auctions", "600519", 0, None) in fake.calls
+
+
+def test_superorder_reuses_runtime_client_and_forwards_interval(client_and_app):
+    fake, client = client_and_app
+    start = datetime(2026, 8, 20, 13, 19, 14)
+    end = datetime(2026, 8, 20, 13, 19, 37)
+
+    response = client.get(
+        "/api/superorder/603334",
+        params={
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "market": 17,
+            "pageid": 4214,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"code": "603334", "seq": 7508, "dt1": int(start.timestamp())}
+    ]
+    assert (
+        "superorder",
+        "603334",
+        start,
+        end,
+        17,
+        4214,
+        25.0,
+    ) in fake.calls
+
+
+def test_superorder_rejects_invalid_interval_without_client_call(client_and_app):
+    fake, client = client_and_app
+
+    response = client.get(
+        "/api/superorder/603334",
+        params={
+            "start": "2026-08-20T13:20:00",
+            "end": "2026-08-20T13:19:00",
+        },
+    )
+
+    assert response.status_code == 400
+    assert not any(call[0] == "superorder" for call in fake.calls)
+
+
+def test_order_details_reuses_runtime_client_and_forwards_interval(client_and_app):
+    fake, client = client_and_app
+    start = datetime(2026, 8, 20, 13, 17, 0)
+    end = datetime(2026, 8, 20, 13, 20, 0)
+
+    response = client.get(
+        "/api/order-details/603334",
+        params={
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "market": 17,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sell_cancels"] == [{"order_id": 11_761_615}]
+    assert (
+        "order_details",
+        "603334",
+        start,
+        end,
+        17,
+        25.0,
+    ) in fake.calls
+
+
+def test_order_details_rejects_invalid_interval_without_client_call(
+    client_and_app,
+):
+    fake, client = client_and_app
+
+    response = client.get(
+        "/api/order-details/603334",
+        params={
+            "start": "2026-08-20T13:20:00",
+            "end": "2026-08-20T13:19:00",
+        },
+    )
+
+    assert response.status_code == 400
+    assert not any(call[0] == "order_details" for call in fake.calls)
+
+
+def test_order_queues_reuses_runtime_client(client_and_app):
+    fake, client = client_and_app
+
+    response = client.get(
+        "/api/order-queues/603334",
+        params={"trade_date": "2026-08-20", "market": 17},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["buy"]["entries"] == [1200, 800]
+    assert (
+        "order_queues", "603334", 17, "2026-08-20", 25.0
+    ) in fake.calls
+
+
+def test_superorder_replay_index_and_snapshot_share_cache(client_and_app):
+    fake, client = client_and_app
+
+    replay = client.get(
+        "/api/superorder-replay/603334",
+        params={"trade_date": "2026-08-20", "market": 17},
+    )
+    snapshot = client.get(
+        "/api/superorder-replay/603334/snapshot",
+        params={
+            "trade_date": "2026-08-20",
+            "market": 17,
+            "ts": 1_776_646_202,
+        },
+    )
+
+    assert replay.status_code == 200
+    assert replay.json()["count"] == 2
+    assert replay.json()["index"][0]["buy1_price"] == 34.85
+    assert snapshot.status_code == 200
+    assert snapshot.json()["snapshot"]["price"] == 34.87
+    assert snapshot.json()["snapshot"]["bids"][0] == {
+        "level": 1,
+        "price": 34.86,
+        "volume": 5100,
+    }
+    assert sum(call[0] == "snapshot_replay" for call in fake.calls) == 1
+
+
+def test_superorder_window_serially_aggregates_truth(client_and_app):
+    fake, client = client_and_app
+    start = datetime(2026, 8, 20, 13, 19, 0)
+    end = datetime(2026, 8, 20, 13, 20, 0)
+
+    response = client.get(
+        "/api/superorder-window/603334",
+        params={"start": start.isoformat(), "end": end.isoformat(), "market": 17},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["trades"][0]["seq"] == 7508
+    assert response.json()["details"]["sell_cancels"][0]["order_id"] == 11_761_615
+    names = [call[0] for call in fake.calls]
+    assert names.index("superorder") < names.index("order_details")
+
+
+def test_stock_stream_fans_out_shared_client_events(client_and_app):
+    fake, client = client_and_app
+    client.app.state.runtime._stream_release_delay = 0.0
+
+    with client.websocket_connect(
+        "/api/stock-stream/603334?market=17"
+    ) as websocket:
+        assert websocket.receive_json() == {
+            "event": "status",
+            "code": "603334",
+            "state": "subscribed",
+        }
+        assert fake.stream_callback is not None
+        fake.stream_callback(
+            {
+                "event": "trade",
+                "code": "603334",
+                "price": 34.86,
+                "volume": 100,
+            }
+        )
+        assert websocket.receive_json()["event"] == "trade"
+
+    assert ("market_events_subscribe", "603334", 17) in fake.calls
+    deadline = time.monotonic() + 1.0
+    while (
+        ("market_events_unsubscribe", "603334") not in fake.calls
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert ("market_events_unsubscribe", "603334") in fake.calls
+
+
+def test_stock_stream_reconnect_grace_reuses_client_subscription(env_file):
+    fake = FakeClient()
+    fake.is_connected = True
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+    runtime._client = fake
+    runtime._connected_once = True
+    runtime._stream_release_delay = 0.05
+
+    first = runtime.subscribe_stock_stream("603334", market=17)
+    runtime.unsubscribe_stock_stream("603334", first)
+    second = runtime.subscribe_stock_stream("603334", market=17)
+    time.sleep(0.08)
+
+    assert sum(call[0] == "market_events_subscribe" for call in fake.calls) == 1
+    assert not any(call[0] == "market_events_unsubscribe" for call in fake.calls)
+
+    runtime.unsubscribe_stock_stream("603334", second)
+    time.sleep(0.08)
+    assert sum(call[0] == "market_events_unsubscribe" for call in fake.calls) == 1
 
 
 def test_market_view_runs_main_and_market_lanes_concurrently(env_file):

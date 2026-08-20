@@ -1,15 +1,21 @@
-"""FastAPI REST 接口（单用户、请求-响应；实时推送待盘中核对后另加 WebSocket）。"""
+"""FastAPI HTTP/WebSocket API backed by one shared THSClient."""
 from __future__ import annotations
 
+import asyncio
+from bisect import bisect_left
+from collections import OrderedDict
 from collections.abc import Callable
 import concurrent.futures
 from contextlib import asynccontextmanager
 import contextvars
 from dataclasses import asdict, is_dataclass
+from datetime import date as date_type
+from datetime import datetime, time as datetime_time
+import queue
 import threading
 import time
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..errors import (
@@ -89,7 +95,10 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         runtime.start_preheat()
-        yield
+        try:
+            yield
+        finally:
+            runtime.close()
 
     app = FastAPI(
         title="thspypc Web API",
@@ -135,6 +144,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     _cache_lock = threading.Lock()
     _response_cache: dict[tuple, tuple[float, object]] = {}
     _cache_max_entries = 64
+    _replay_cache: OrderedDict[tuple, tuple[float, list[dict]]] = OrderedDict()
+    _replay_cache_max_entries = 8
 
     def _cached(
         key: tuple,
@@ -160,6 +171,86 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 _response_cache.pop(oldest, None)
             _response_cache[key] = (time.monotonic(), result)
         return result
+
+    def _replay_range(trade_date: str | None) -> tuple[datetime, datetime] | None:
+        if trade_date is None:
+            return None
+        try:
+            day = date_type.fromisoformat(trade_date)
+        except ValueError as exc:
+            raise HTTPException(400, "trade_date 必须是 YYYY-MM-DD") from exc
+        return (
+            datetime.combine(day, datetime_time(9, 10)),
+            datetime.combine(day, datetime_time(15, 1)),
+        )
+
+    def _load_replay(
+        code: str,
+        *,
+        trade_date: str | None,
+        market: int,
+    ) -> list[dict]:
+        key = (code, trade_date or "today", market)
+        # 当日回放由 WebSocket 增量补充；一分钟内重复切页/点光标无需重新
+        # 下载约 500KB 的 4096 全表，更不能与 717x 请求反复争用 L2 lane。
+        ttl = 60.0 if trade_date is None else 3600.0
+        now = time.monotonic()
+        with _cache_lock:
+            hit = _replay_cache.get(key)
+            if hit is not None and now - hit[0] < ttl:
+                _replay_cache.move_to_end(key)
+                return hit[1]
+        interval = _replay_range(trade_date)
+
+        def operation(client) -> list[dict]:
+            kwargs = {"market": market, "timeout": 30.0}
+            if interval is not None:
+                kwargs.update({"start": interval[0], "end": interval[1]})
+            return client.snapshot_replay(code, **kwargs)
+
+        records = _call(operation)
+        with _cache_lock:
+            _replay_cache[key] = (time.monotonic(), records)
+            _replay_cache.move_to_end(key)
+            while len(_replay_cache) > _replay_cache_max_entries:
+                _replay_cache.popitem(last=False)
+        return records
+
+    @staticmethod
+    def _replay_index_row(record: dict) -> dict:
+        return {
+            "ts": record.get("ts"),
+            "time": record.get("time"),
+            "price": record.get("price"),
+            "volume": record.get("dt13"),
+            "buy1_price": record.get("dt24"),
+            "buy1_volume": record.get("dt25"),
+            "sell1_price": record.get("dt30"),
+            "sell1_volume": record.get("dt31"),
+        }
+
+    @staticmethod
+    def _snapshot_with_levels(record: dict) -> dict:
+        buy_fields = (
+            (24, 25), (26, 27), (28, 29), (150, 151), (154, 155),
+            (102, 103), (106, 107), (110, 111), (114, 115), (118, 119),
+        )
+        sell_fields = (
+            (30, 31), (32, 33), (34, 35), (152, 153), (156, 157),
+            (104, 105), (108, 109), (112, 113), (116, 117), (120, 121),
+        )
+
+        def levels(fields) -> list[dict]:
+            return [
+                {
+                    "level": index,
+                    "price": record.get(f"dt{price_field}"),
+                    "volume": record.get(f"dt{volume_field}"),
+                }
+                for index, (price_field, volume_field) in enumerate(fields, 1)
+            ]
+
+        return {**record, "bids": levels(buy_fields), "asks": levels(sell_fields)}
 
     # ── 连接 / 状态 ──
     @app.get("/api/status")
@@ -296,6 +387,228 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 ),
             )
         )
+
+    @app.get("/api/superorder/{code}")
+    def superorder(
+        code: str,
+        start: datetime,
+        end: datetime,
+        market: int = 0,
+        pageid: int = 4214,
+    ) -> list[dict]:
+        """Return Level2 tick replay through the runtime's shared client.
+
+        This route intentionally is not cached: callers use it to obtain an
+        exact 7169 interval as protocol truth.  Going through ``runtime`` is
+        also important because a standalone diagnostic process would create a
+        second THSClient and compete with the Web backend's existing sessions.
+        """
+        if end < start:
+            raise HTTPException(400, "end 不能早于 start")
+        if pageid not in (4214, 4260):
+            raise HTTPException(400, "pageid 只能是 4214 或 4260")
+        return _jsonable(
+            _call(
+                lambda client: client.superorder(
+                    code,
+                    start,
+                    end,
+                    market=market,
+                    pageid=pageid,
+                    timeout=25.0,
+                )
+            )
+        )
+
+    @app.get("/api/order-details/{code}")
+    def order_details(
+        code: str,
+        start: datetime,
+        end: datetime,
+        market: int = 0,
+    ) -> dict:
+        """Return 7175/7170/7171 truth through the shared runtime client."""
+        if end < start:
+            raise HTTPException(400, "end 不能早于 start")
+        return _jsonable(
+            _call(
+                lambda client: client.order_details(
+                    code,
+                    start,
+                    end,
+                    market=market,
+                    timeout=25.0,
+                )
+            )
+        )
+
+    @app.get("/api/order-queues/{code}")
+    def order_queues(
+        code: str,
+        trade_date: str | None = None,
+        market: int = 0,
+    ) -> dict:
+        """Return buy-one and sell-one queues from 7173/7174."""
+        if trade_date is not None:
+            _replay_range(trade_date)
+        return _jsonable(
+            _call(
+                lambda client: client.order_queues(
+                    code,
+                    market=market,
+                    trade_date=trade_date,
+                    timeout=25.0,
+                )
+            )
+        )
+
+    @app.get("/api/superorder-replay/{code}")
+    def superorder_replay(
+        code: str,
+        trade_date: str | None = None,
+        market: int = 0,
+    ) -> dict:
+        """Return a lightweight time/price/volume index for 4096 replay."""
+        records = _load_replay(code, trade_date=trade_date, market=market)
+        return _jsonable(
+            {
+                "code": code,
+                "market": market or _market_for_code(code),
+                "trade_date": trade_date,
+                "count": len(records),
+                "index": [_replay_index_row(record) for record in records],
+            }
+        )
+
+    @app.get("/api/superorder-replay/{code}/snapshot")
+    def superorder_replay_snapshot(
+        code: str,
+        ts: int,
+        trade_date: str | None = None,
+        market: int = 0,
+    ) -> dict:
+        """Return the complete ten-level snapshot nearest to ``ts``."""
+        records = _load_replay(code, trade_date=trade_date, market=market)
+        if not records:
+            raise HTTPException(404, "该区间没有盘口回放数据")
+        timestamps = [int(record.get("ts", 0)) for record in records]
+        position = bisect_left(timestamps, ts)
+        candidates = [min(position, len(records) - 1)]
+        if position > 0:
+            candidates.append(position - 1)
+        index = min(candidates, key=lambda item: abs(timestamps[item] - ts))
+        return _jsonable(
+            {
+                "code": code,
+                "requested_ts": ts,
+                "index": index,
+                "snapshot": _snapshot_with_levels(records[index]),
+            }
+        )
+
+    @app.get("/api/superorder-window/{code}")
+    def superorder_window(
+        code: str,
+        start: datetime,
+        end: datetime,
+        market: int = 0,
+    ) -> dict:
+        """Serially aggregate 7169 trades with 7175/7170/7171 details."""
+        if end < start:
+            raise HTTPException(400, "end 不能早于 start")
+        if (end - start).total_seconds() > 300:
+            raise HTTPException(400, "超级盘口明细窗口不能超过 300 秒")
+
+        def operation(client) -> dict:
+            trades = client.superorder(
+                code,
+                start,
+                end,
+                market=market,
+                pageid=4260,
+                timeout=25.0,
+            )
+            details = client.order_details(
+                code,
+                start,
+                end,
+                market=market,
+                timeout=25.0,
+            )
+            return {
+                "code": code,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "trades": trades,
+                "details": details,
+            }
+
+        return _jsonable(_call(operation))
+
+    @app.websocket("/api/stock-stream/{code}")
+    async def stock_stream(websocket: WebSocket, code: str, market: int = 0) -> None:
+        """Fan normalized market events from the shared L2 socket to a browser."""
+        await websocket.accept()
+        subscriber = None
+        disconnect_task = None
+        try:
+            subscriber = await asyncio.to_thread(
+                runtime.subscribe_stock_stream,
+                code,
+                market=market,
+            )
+            await websocket.send_json(
+                {"event": "status", "code": code, "state": "subscribed"}
+            )
+            disconnect_task = asyncio.create_task(websocket.receive())
+            while True:
+                event_task = asyncio.create_task(
+                    asyncio.to_thread(subscriber.get, True, 1.0)
+                )
+                done, _pending = await asyncio.wait(
+                    {disconnect_task, event_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if disconnect_task in done:
+                    message = disconnect_task.result()
+                    if not event_task.done():
+                        event_task.cancel()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    disconnect_task = asyncio.create_task(websocket.receive())
+                    continue
+                try:
+                    event = event_task.result()
+                except queue.Empty:
+                    await websocket.send_json(
+                        {"event": "status", "code": code, "state": "idle"}
+                    )
+                    continue
+                await websocket.send_json(_jsonable(event))
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            try:
+                await websocket.send_json(
+                    {
+                        "event": "status",
+                        "code": code,
+                        "state": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+        finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+            if subscriber is not None:
+                await asyncio.to_thread(
+                    runtime.unsubscribe_stock_stream,
+                    code,
+                    subscriber,
+                )
 
     @app.get("/api/intraday_auctions/{code}")
     def intraday_auctions(

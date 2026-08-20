@@ -192,14 +192,15 @@ def test_captured_auction_cancel_push_contract(
 ):
     body = _captured_depth_push(fixture)
 
+    assert snapshot_protocol.is_order_cancel_push(body)
     assert snapshot_protocol.is_auction_cancel_push(body)
     assert not snapshot_protocol.is_snapshot_push(body)
-    result = snapshot_protocol.parse_auction_cancel_push(body)
+    result = snapshot_protocol.parse_order_cancel_push(body)
 
     assert result is not None
     assert result["code"] == "002428"
     assert result["market"] == "SZ"
-    assert result["event"] == "auction_cancel"
+    assert result["event"] == "order_cancel"
     assert result["side"] == side
     assert result["side_raw"] == (0x08 if side == "buy" else 0x0C)
     assert result["placed_at"] == placed
@@ -213,6 +214,347 @@ def test_captured_auction_cancel_push_contract(
     assert result["aux_id"] == aux_id
     assert result["raw_len"] == 71
 
+    legacy = snapshot_protocol.parse_auction_cancel_push(body)
+    assert legacy is not None
+    assert legacy["event"] == "auction_cancel"
+    assert {**legacy, "event": "order_cancel"} == result
+
+
+def test_realtime_trade_tick_matches_7169_replay_fields():
+    body = _captured_depth_push("trade_tick_sell_603334.hex")
+
+    assert snapshot_protocol.is_trade_tick_push(body)
+    assert snapshot_protocol.is_snapshot_push(body)
+    result = snapshot_protocol.parse_trade_tick_push(body)
+    assert result == snapshot_protocol.parse_snapshot_push(body)
+    assert result is not None
+    assert result["event"] == "trade"
+    assert result["wire_subtype"] == "0x60/0x04"
+    assert result["code"] == "603334"
+    assert result["market"] == "SH"
+    assert result["time"] == datetime(2026, 8, 20, 13, 19, 22)
+    assert result["timestamp"] == 1_787_203_162
+    assert result["price"] == 34.86
+    assert result["volume"] == 200
+    assert result["direction"] == 5
+    assert result["delegate_a"] == 11_868_730
+    assert result["delegate_b"] == 11_857_651
+    assert result["seq"] == 7_467
+    assert result["previous_trade_no"] == 19_881_819
+    assert result["trade_no"] == 19_881_819
+    assert result["raw_len"] == 72
+
+
+def test_trade_tick_canonical_api_keeps_legacy_0x7f_support():
+    body = _snapshot_push()
+
+    assert snapshot_protocol.is_trade_tick_push(body)
+    result = snapshot_protocol.parse_trade_tick_push(body)
+    assert result is not None
+    assert result["wire_subtype"] == "0x7f"
+    assert result["price"] == 36.0
+    assert result["volume"] == 300
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_len", "expected_hash"),
+    [
+        (
+            "trade_batch_603334_174.hex",
+            174,
+            "76dadc2149f053b3bc77de7b371f2f59e9776094bc405b6594bf476db528d76d",
+        ),
+        (
+            "trade_batch_603334_84.hex",
+            84,
+            "844f356db2a1df08169086b82c4651502e3c5efa16d4ec71baf5950520fdbd42",
+        ),
+    ],
+)
+def test_trade_batch_fixture_integrity(name, expected_len, expected_hash):
+    body = _captured_depth_push(name)
+
+    assert len(body) == expected_len
+    assert hashlib.sha256(body).hexdigest() == expected_hash
+
+
+def test_realtime_trade_tick_accepts_runtime_core_without_delimiter():
+    """read_frame 按长度头返回 71B 核心（0x7d 是长度头之外的帧分隔符）。"""
+    body = _captured_depth_push("trade_tick_sell_603334.hex")
+    core = body[:-1]
+
+    assert len(core) == 71
+    assert snapshot_protocol.is_trade_tick_push(core)
+    result = snapshot_protocol.parse_trade_tick_push(core)
+    assert result is not None
+    assert result["seq"] == 7_467
+    assert result["previous_trade_no"] == 19_881_819
+    assert result["trade_no"] == 19_881_819
+    assert result["raw_len"] == 71
+    # 两种形态产出一致的字段（除 raw_len）
+    with_delimiter = snapshot_protocol.parse_trade_tick_push(body)
+    core_view = {k: v for k, v in result.items() if k != "raw_len"}
+    delimiter_view = {
+        k: v for k, v in with_delimiter.items() if k != "raw_len"
+    }
+    assert core_view == delimiter_view
+
+
+def test_trade_tick_batch_push_174_byte_contract():
+    body = _captured_depth_push("trade_batch_603334_174.hex")
+
+    assert snapshot_protocol.is_trade_tick_batch_push(body)
+    # 批量帧不属于单笔形态；单笔识别器必须拒绝
+    assert not snapshot_protocol.is_trade_tick_push(body)
+
+    result = snapshot_protocol.parse_trade_tick_batch_push(body)
+    assert result is not None
+    assert result["code"] == "603334"
+    assert result["market"] == "SH"
+    assert result["event"] == "trade_batch"
+    assert result["wire_subtype"] == "0x60/0x04-batch"
+    assert result["count"] == 11
+    assert result["seq_start"] == 7_469
+    assert result["seq_end"] == 7_479
+    assert result["seqs"] == list(range(7_469, 7_480))
+    assert result["records_resolved"] is True
+    assert len(result["records"]) == 11
+    assert [row["volume"] for row in result["records"]] == [
+        100, 200, 100, 200, 100, 100, 200, 200, 100, 200, 100,
+    ]
+    assert [row["delegate_b"] for row in result["records"]] == [
+        11_869_653,
+        11_869_654,
+        11_869_655,
+        11_869_656,
+        11_869_657,
+        11_869_660,
+        11_869_668,
+        11_869_669,
+        11_869_670,
+        11_869_671,
+        11_869_676,
+    ]
+    assert result["records"][0] == {
+        "code": "603334",
+        "market": "SH",
+        "event": "trade",
+        "time": datetime(2026, 8, 20, 13, 19, 24),
+        "timestamp": 1_787_203_164,
+        "price": 34.85,
+        "volume": 100,
+        "direction": 1,
+        "delegate_a": 11_868_045,
+        "delegate_b": 11_869_653,
+        "seq": 7_469,
+        "previous_trade_no": 19_883_425,
+        "trade_no": 19_883_425,
+        "wire_subtype": "0x60/0x04-batch",
+    }
+    assert result["raw_len"] == 174
+
+
+def test_trade_tick_batch_push_84_byte_contract():
+    body = _captured_depth_push("trade_batch_603334_84.hex")
+
+    result = snapshot_protocol.parse_trade_tick_batch_push(body)
+    assert result is not None
+    assert result["count"] == 2
+    assert result["seq_start"] == 7_480
+    assert result["seq_end"] == 7_481
+    assert [
+        (row["seq"], row["volume"], row["delegate_b"])
+        for row in result["records"]
+    ] == [
+        (7_480, 100, 11_869_716),
+        (7_481, 100, 11_869_717),
+    ]
+
+
+def test_trade_tick_batch_push_accepts_0x7d_delimiter_variant():
+    for name in ("trade_batch_603334_174.hex", "trade_batch_603334_84.hex"):
+        body = _captured_depth_push(name)
+
+        variant = body + b"\x7d"
+        assert snapshot_protocol.is_trade_tick_batch_push(variant)
+        result = snapshot_protocol.parse_trade_tick_batch_push(variant)
+        assert result is not None
+        assert result["raw_len"] == len(body) + 1
+        assert result["seqs"][0] == snapshot_protocol.parse_trade_tick_batch_push(
+            body
+        )["seqs"][0]
+
+
+def test_trade_tick_batch_push_rejects_structural_damage():
+    body = bytearray(_captured_depth_push("trade_batch_603334_174.hex"))
+
+    # 破坏 count 回显
+    damaged = bytearray(body)
+    damaged[38] = 0x0A
+    assert not snapshot_protocol.is_trade_tick_batch_push(bytes(damaged))
+    assert snapshot_protocol.parse_trade_tick_batch_push(bytes(damaged)) is None
+
+    # 破坏尾部 (n-1)×0x81 模式
+    damaged = bytearray(body)
+    damaged[-3] = 0x00
+    assert not snapshot_protocol.is_trade_tick_batch_push(bytes(damaged))
+
+    # 单笔帧不是批量
+    single = _captured_depth_push("trade_tick_sell_603334.hex")
+    assert not snapshot_protocol.is_trade_tick_batch_push(single)
+
+
+def test_thspypc_exports_trade_tick_batch_api():
+    import thspypc
+
+    assert (
+        thspypc.is_trade_tick_batch_push
+        is snapshot_protocol.is_trade_tick_batch_push
+    )
+    assert (
+        thspypc.parse_trade_tick_batch_push
+        is snapshot_protocol.parse_trade_tick_batch_push
+    )
+
+
+def test_continuous_session_order_cancel_uses_phase_neutral_event():
+    body = _captured_depth_push("order_cancel_sell_603334.hex")
+
+    assert snapshot_protocol.is_order_cancel_push(body)
+    result = snapshot_protocol.parse_order_cancel_push(body)
+
+    assert result is not None
+    assert result["code"] == "603334"
+    assert result["market"] == "SH"
+    assert result["event"] == "order_cancel"
+    assert result["side"] == "sell"
+    assert result["placed_at"] == datetime(2026, 8, 20, 13, 19, 12)
+    assert result["cancelled_at"] == datetime(2026, 8, 20, 13, 19, 19)
+    assert result["lifetime_seconds"] == 7
+    assert result["price"] == 35.49
+    assert result["volume"] == 500
+    assert result["lots"] == 5
+    assert result["seq"] == 3474
+    assert result["cancel_id"] == 3474
+    assert result["order_id"] == 11_860_871
+    assert result["aux_id"] == result["order_id"]
+    assert result["wire_subtype"] == "0x60/0x0c"
+
+
+def test_order_cancel_accepts_live_core_without_capture_delimiter():
+    captured = _captured_depth_push("order_cancel_sell_603334.hex")
+    assert captured[-1] == 0x7D
+
+    result = snapshot_protocol.parse_order_cancel_push(captured[:-1])
+
+    assert result is not None
+    assert result["cancel_id"] == 3474
+    assert result["raw_len"] == 70
+
+
+def test_order_cancel_batch_matches_7171_truth():
+    body = _captured_depth_push("order_cancel_sell_batch_603334_87.hex")
+
+    assert snapshot_protocol.is_order_cancel_batch_push(body)
+    assert not snapshot_protocol.is_order_cancel_push(body)
+    result = snapshot_protocol.parse_order_cancel_batch_push(body)
+
+    assert result is not None
+    assert result["event"] == "order_cancel_batch"
+    assert result["side"] == "sell"
+    assert result["count"] == 2
+    assert (result["cancel_id_start"], result["cancel_id_end"]) == (3477, 3478)
+    assert result["records_resolved"] is True
+    assert snapshot_protocol.parse_order_cancel_records(body) == result["records"]
+    assert [
+        {
+            "cancel_id": row["cancel_id"],
+            "order_id": row["order_id"],
+            "placed_timestamp": row["placed_timestamp"],
+            "cancelled_timestamp": row["cancelled_timestamp"],
+            "price_raw": row["price_raw"],
+            "volume": row["volume"],
+        }
+        for row in result["records"]
+    ] == [
+        {
+            "cancel_id": 3477,
+            "order_id": 11_761_615,
+            "placed_timestamp": 1_787_203_039,
+            "cancelled_timestamp": 1_787_203_162,
+            "price_raw": 2_952_825_506,
+            "volume": 300,
+        },
+        {
+            "cancel_id": 3478,
+            "order_id": 11_839_106,
+            "placed_timestamp": 1_787_203_127,
+            "cancelled_timestamp": 1_787_203_162,
+            "price_raw": 2_952_825_096,
+            "volume": 500,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("fixture", "side", "period", "price", "meta", "total", "entries"),
+    [
+        (
+            "order_queue_buy_603334_75.hex",
+            "buy",
+            7173,
+            34.85,
+            189_200,
+            3,
+            [600, 100, 1000],
+        ),
+        (
+            "order_queue_sell_603334_71.hex",
+            "sell",
+            7174,
+            34.86,
+            252_878,
+            2,
+            [900, 300],
+        ),
+    ],
+)
+def test_order_queue_push_matches_7173_7174_layout(
+    fixture,
+    side,
+    period,
+    price,
+    meta,
+    total,
+    entries,
+):
+    body = _captured_depth_push(fixture)
+
+    assert snapshot_protocol.is_order_queue_push(body)
+    result = snapshot_protocol.parse_order_queue_push(body)
+
+    assert result is not None
+    assert result["code"] == "603334"
+    assert result["market"] == "SH"
+    assert result["event"] == "order_queue"
+    assert result["side"] == side
+    assert result["period"] == period
+    assert result["price"] == price
+    assert result["meta_value"] == meta
+    assert result["total_order_count"] == total
+    assert result["visible_count"] == len(entries)
+    assert [row["shares"] for row in result["entries"]] == entries
+    assert result["truncated"] is False
+
+
+def test_order_queue_push_accepts_optional_capture_delimiter():
+    body = _captured_depth_push("order_queue_buy_603334_75.hex")
+
+    parsed = snapshot_protocol.parse_order_queue_push(body + b"\x7d")
+
+    assert parsed is not None
+    assert parsed["raw_len"] == len(body) + 1
+
 
 def test_auction_cancel_push_rejects_mismatched_context_code():
     body = bytearray(
@@ -220,6 +562,8 @@ def test_auction_cancel_push_rejects_mismatched_context_code():
     )
     body[29:35] = b"002429"
 
+    assert not snapshot_protocol.is_order_cancel_push(bytes(body))
+    assert snapshot_protocol.parse_order_cancel_push(bytes(body)) is None
     assert not snapshot_protocol.is_auction_cancel_push(bytes(body))
     assert snapshot_protocol.parse_auction_cancel_push(bytes(body)) is None
 
@@ -241,6 +585,42 @@ def test_protocol_reexports_snapshot_builder_and_constants():
     )
     assert protocol.parse_snapshot_push is snapshot_protocol.parse_snapshot_push
     assert protocol.is_snapshot_push is snapshot_protocol.is_snapshot_push
+    assert (
+        protocol.parse_trade_tick_push
+        is snapshot_protocol.parse_trade_tick_push
+    )
+    assert (
+        protocol.is_trade_tick_push
+        is snapshot_protocol.is_trade_tick_push
+    )
+    assert (
+        protocol.parse_order_cancel_push
+        is snapshot_protocol.parse_order_cancel_push
+    )
+    assert (
+        protocol.is_order_cancel_push
+        is snapshot_protocol.is_order_cancel_push
+    )
+    assert (
+        protocol.parse_order_cancel_batch_push
+        is snapshot_protocol.parse_order_cancel_batch_push
+    )
+    assert (
+        protocol.is_order_cancel_batch_push
+        is snapshot_protocol.is_order_cancel_batch_push
+    )
+    assert (
+        protocol.parse_order_cancel_records
+        is snapshot_protocol.parse_order_cancel_records
+    )
+    assert (
+        protocol.parse_order_queue_push
+        is snapshot_protocol.parse_order_queue_push
+    )
+    assert (
+        protocol.is_order_queue_push
+        is snapshot_protocol.is_order_queue_push
+    )
     assert (
         protocol.parse_auction_cancel_push
         is snapshot_protocol.parse_auction_cancel_push
@@ -407,6 +787,31 @@ def test_continuous_depth_push_keeps_existing_ten_level_layout():
             550,
             "dc3fabfdfaf87dcb43c27c587459efe5952f5e4be16536f3b3a161d5c0bbd050",
         ),
+        (
+            "continuous_603334_614.hex",
+            614,
+            "a6d41a151bc6a1461f379a61968f7a92c3b914c29c272b8b2504005213cb2d6b",
+        ),
+        (
+            "trade_tick_sell_603334.hex",
+            72,
+            "5384ba9137089ad9b4f2f9b2db49899344b564aa024794cb31958a261bd742e2",
+        ),
+        (
+            "order_queue_buy_603334_75.hex",
+            75,
+            "d4f7cdb63e4e891487e11a740a17421750ecc7d537a43da0ca34d06aad6e0ba1",
+        ),
+        (
+            "order_queue_sell_603334_71.hex",
+            71,
+            "2656bb7459f5d97162866c27faea9344ae3f2f515a1ee8c4f5c1038d36ff5627",
+        ),
+        (
+            "order_cancel_sell_batch_603334_87.hex",
+            87,
+            "b2dac0b5a7578c85c4f30af1dc4d4ae330d79371541b676791e74e54d4219ada",
+        ),
     ],
 )
 def test_captured_depth_push_fixture_integrity(name, expected_len, expected_hash):
@@ -468,6 +873,30 @@ def test_captured_continuous_depth_push_has_exact_ten_levels():
     assert result["bids"][-1] == (68.96, 300)
     assert result["asks"][0] == (69.07, 700)
     assert result["asks"][-1] == (69.48, 200)
+
+
+def test_captured_614b_continuous_depth_push_has_exact_ten_levels():
+    body = _captured_depth_push("continuous_603334_614.hex")
+
+    assert snapshot_protocol.is_stock_depth_envelope(body)
+    assert snapshot_protocol.is_depth_push(body)
+    result = snapshot_protocol.parse_depth_push(body)
+
+    assert result is not None
+    assert result["code"] == "603334"
+    assert result["market"] == "SH"
+    assert result["phase"] == "continuous"
+    assert result["raw_len"] == 614
+    assert result["code_offset"] == 61
+    assert result["prev_close"] == 32.26
+    assert result["open"] == 32.56
+    assert result["high"] == 35.49
+    assert result["low"] == 32.0
+    assert result["price"] == 34.86
+    assert len(result["bids"]) == 10
+    assert len(result["asks"]) == 10
+    assert result["bids"][0] == (34.8, 4_900)
+    assert result["asks"][0] == (34.85, 100)
 
 
 @pytest.mark.parametrize(

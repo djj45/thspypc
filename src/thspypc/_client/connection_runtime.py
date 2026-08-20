@@ -320,6 +320,9 @@ class ConnectionRuntime:
         self.ranking_depth_codes: set[str] = set()
         self.ranking_depth_callbacks: dict[str, Callable[[dict], None]] = {}
         self.depth_events: queue.Queue[dict] = queue.Queue(maxsize=1024)
+        self.market_event_codes: set[str] = set()
+        self.market_event_callbacks: dict[str, Callable[[dict], None]] = {}
+        self.market_events: queue.Queue[dict] = queue.Queue(maxsize=4096)
 
     def start_heartbeat(self) -> None:
         if not self.enable_heartbeat:
@@ -366,6 +369,15 @@ class ConnectionRuntime:
         self._ensure_snapshot_reader()
         logger.info("ranking_depth: 已订阅 %s（market=%d）", code, market)
 
+    def activate_market_events(self, code: str, market: int, callback) -> None:
+        """Activate normalized trade/depth/queue/cancel event delivery."""
+        with self._push_lock:
+            self.market_event_codes.add(code)
+            if callback is not None:
+                self.market_event_callbacks[code] = callback
+        self._ensure_snapshot_reader()
+        logger.info("market_events: 已订阅 %s（market=%d）", code, market)
+
     def deactivate_depth(self, code: str, *, clear_latest: bool = True) -> bool:
         """Stop local depth delivery; close L2 readers when no consumer remains.
 
@@ -384,6 +396,7 @@ class ConnectionRuntime:
                 not self.depth_codes
                 and not self.ranking_depth_codes
                 and not self.snapshot_codes
+                and not self.market_event_codes
             )
         if should_stop:
             self.stop_snapshot()
@@ -406,6 +419,23 @@ class ConnectionRuntime:
                 not self.depth_codes
                 and not self.ranking_depth_codes
                 and not self.snapshot_codes
+                and not self.market_event_codes
+            )
+        if should_stop:
+            self.stop_snapshot()
+        return active
+
+    def deactivate_market_events(self, code: str) -> bool:
+        """Stop normalized event delivery for one code."""
+        with self._push_lock:
+            active = code in self.market_event_codes
+            self.market_event_codes.discard(code)
+            self.market_event_callbacks.pop(code, None)
+            should_stop = (
+                not self.depth_codes
+                and not self.ranking_depth_codes
+                and not self.snapshot_codes
+                and not self.market_event_codes
             )
         if should_stop:
             self.stop_snapshot()
@@ -425,6 +455,28 @@ class ConnectionRuntime:
                     record.get("code") in self.depth_codes
                     or record.get("code") in self.ranking_depth_codes
                 ):
+                    return record
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+
+    def receive_market_event(
+        self,
+        timeout: float | None = None,
+    ) -> dict | None:
+        """Return the next event for an active normalized subscription."""
+        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
+        while True:
+            remaining = (
+                None
+                if deadline is None
+                else max(deadline - time.monotonic(), 0.0)
+            )
+            try:
+                record = self.market_events.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            with self._push_lock:
+                if record.get("code") in self.market_event_codes:
                     return record
             if deadline is not None and time.monotonic() >= deadline:
                 return None
@@ -462,9 +514,16 @@ class ConnectionRuntime:
             self.depth_callbacks.clear()
             self.ranking_depth_codes.clear()
             self.ranking_depth_callbacks.clear()
+            self.market_event_codes.clear()
+            self.market_event_callbacks.clear()
             while True:
                 try:
                     self.depth_events.get_nowait()
+                except queue.Empty:
+                    break
+            while True:
+                try:
+                    self.market_events.get_nowait()
                 except queue.Empty:
                     break
         manager = self._service_connections()
@@ -550,9 +609,17 @@ class ConnectionRuntime:
         """
         from ..protocol import (
             is_depth_push as default_is_depth_push,
+            is_order_cancel_batch_push,
+            is_order_cancel_push,
+            is_order_queue_push,
             is_snapshot_push as default_is_snapshot_push,
+            is_trade_tick_batch_push,
             parse_depth_push_records as default_parse_depth_push_records,
+            parse_order_cancel_batch_push,
+            parse_order_cancel_push,
+            parse_order_queue_push,
             parse_snapshot_push as default_parse_snapshot_push,
+            parse_trade_tick_batch_push,
         )
 
         matches = is_snapshot_push or default_is_snapshot_push
@@ -561,9 +628,22 @@ class ConnectionRuntime:
         depth_parse_records = (
             parse_depth_push_records or default_parse_depth_push_records
         )
-        # 优先匹配 71B 逐笔；否则尝试 0x0f7f 十档盘口推送。
-        if matches(body):
+        # 优先匹配批量/单笔成交（旧71B/0x7f或新0x60-04）；否则尝试
+        # 0x0f7f 十档盘口推送。批量帧必须展开成逐条记录再交给相同回调链。
+        if is_trade_tick_batch_push(body):
+            batch = parse_trade_tick_batch_push(body)
+            records = batch.get("records", []) if batch is not None else []
+        elif matches(body):
             record = parse(body)
+            records = [record] if record is not None else []
+        elif is_order_cancel_batch_push(body):
+            batch = parse_order_cancel_batch_push(body)
+            records = batch.get("records", []) if batch is not None else []
+        elif is_order_cancel_push(body):
+            record = parse_order_cancel_push(body)
+            records = [record] if record is not None else []
+        elif is_order_queue_push(body):
+            record = parse_order_queue_push(body)
             records = [record] if record is not None else []
         elif depth_matches(body):
             if parse_depth_push_records is not None or parse_depth_push is None:
@@ -574,10 +654,23 @@ class ConnectionRuntime:
         else:
             return False
         for record in records:
+            if record.get("event") == "order_cancel":
+                # The browser stream uses a compact event vocabulary while
+                # keeping the wire parser's name available for diagnostics.
+                record = {
+                    **record,
+                    "event": "cancel",
+                    "source_event": "order_cancel",
+                }
             code = record["code"]
-            if "price" in record:
-                self.latest_prices[code] = record["price"]
+            event = record.get("event")
             is_depth_record = "bids" in record or record.get("phase") == "auction"
+            updates_latest_price = (
+                "price" in record
+                and (is_depth_record or event in (None, "trade"))
+            )
+            if updates_latest_price:
+                self.latest_prices[code] = record["price"]
             with self._push_lock:
                 depth_active = is_depth_record and (
                     code in self.depth_codes or code in self.ranking_depth_codes
@@ -593,6 +686,8 @@ class ConnectionRuntime:
                     code in self.snapshot_codes
                     or self.snapshot_callback is not None
                 )
+                market_event_active = code in self.market_event_codes
+                market_event_callback = self.market_event_callbacks.get(code)
             if cache_depth:
                 self.latest_depth[code] = record
             if depth_active:
@@ -618,7 +713,28 @@ class ConnectionRuntime:
                         callback(record)
                     except Exception as exc:
                         logger.warning("depth 回调异常: %s", exc)
-            if snapshot_active and self.snapshot_callback is not None:
+            if market_event_active:
+                try:
+                    self.market_events.put_nowait(record)
+                except queue.Full:
+                    try:
+                        self.market_events.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.market_events.put_nowait(record)
+                    except queue.Full:
+                        pass
+                if market_event_callback is not None:
+                    try:
+                        market_event_callback(record)
+                    except Exception as exc:
+                        logger.warning("market event 回调异常: %s", exc)
+            if (
+                snapshot_active
+                and self.snapshot_callback is not None
+                and (is_depth_record or event in (None, "trade"))
+            ):
                 try:
                     self.snapshot_callback(
                         code,
@@ -683,17 +799,25 @@ class ConnectionRuntime:
                     sock = self._push_sockets.get(key)
                 if sock is None:
                     continue
-                if not _real_socket_alive(sock):
-                    dead_l2.append((key, sock))
+                # probe_socket_alive() temporarily calls setblocking(False) on
+                # Windows.  Probe and heartbeat write must share the same lane
+                # lock as business recv; otherwise recv can fail with 10035.
+                request_lock = self._push_request_locks[key]
+                if not request_lock.acquire(blocking=False):
+                    # An active request/reader owns the lane; skip this beat.
                     continue
                 seq = self.heartbeat_seq_push.get(key, 0) + 1
                 self.heartbeat_seq_push[key] = seq
                 try:
-                    with self._push_request_locks[key]:
-                        sock.sendall(build_main(seq) + b"\n")
+                    if not _real_socket_alive(sock):
+                        dead_l2.append((key, sock))
+                        continue
+                    sock.sendall(build_main(seq) + b"\n")
                 except OSError as exc:
                     logger.debug("L2[%s] 心跳发送失败：%s", key, exc)
                     dead_l2.append((key, sock))
+                finally:
+                    request_lock.release()
             for key, sock in dead_l2:
                 with self._push_lock:
                     if self._push_sockets.get(key) is sock:

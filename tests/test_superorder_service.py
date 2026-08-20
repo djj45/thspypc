@@ -72,6 +72,36 @@ def test_standard_account_rejected_before_opening_socket():
     assert opened == []
 
 
+def test_superorder_delivers_push_seen_before_query_response(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: sock,
+    )
+    responses = iter([b"market-push", b"hd1.0-superorder"])
+    unsolicited = []
+    service = SuperorderService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=2,
+        unsolicited=unsolicited.append,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.parse_superorder_response",
+        lambda body: [{"code": "603334"}] if body.endswith(b"superorder") else [],
+    )
+
+    result = service.superorder(
+        "603334",
+        market=17,
+        start_ts=1,
+        end_ts=2,
+    )
+
+    assert result == [{"code": "603334"}]
+    assert unsolicited == [b"market-push"]
+
+
 def test_level2_empty_queue_uses_market_role_and_returns_empty():
     sock = FakeSocket()
     opened = []

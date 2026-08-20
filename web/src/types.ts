@@ -101,6 +101,101 @@ export interface MarketViewFast {
   depth: Depth
 }
 
+// ── 个股实时事件 / 超级盘口 ──
+export interface MarketEvent {
+  event: 'trade' | 'depth' | 'order_queue' | 'cancel' | 'status' | string
+  code: string
+  time?: string
+  timestamp?: number
+  ts?: number
+  price?: number
+  volume?: number
+  direction?: string
+  side?: 'buy' | 'sell'
+  state?: string
+  error?: string
+  bids?: Array<[number, number]>
+  asks?: Array<[number, number]>
+  entries?: OrderQueueEntry[]
+  [key: string]: unknown
+}
+
+export interface ReplayIndexPoint {
+  ts: number
+  time: string
+  price: number
+  volume?: number
+  buy1_price?: number
+  buy1_volume?: number
+  sell1_price?: number
+  sell1_volume?: number
+}
+
+export interface ReplayIndex {
+  code: string
+  market: number
+  trade_date: string | null
+  count: number
+  index: ReplayIndexPoint[]
+}
+
+export interface ReplayDepthLevel {
+  level: number
+  price?: number
+  volume?: number
+}
+
+export interface ReplaySnapshot {
+  code: string
+  requested_ts: number
+  index: number
+  snapshot: {
+    ts: number
+    time: string
+    price: number
+    bids: ReplayDepthLevel[]
+    asks: ReplayDepthLevel[]
+    [key: string]: unknown
+  }
+}
+
+export interface OrderQueueEntry {
+  shares?: number
+  hands?: number
+  major?: boolean
+  [key: string]: unknown
+}
+
+export interface OrderQueueSide {
+  side: 'buy' | 'sell'
+  price?: number
+  total_order_count?: number
+  total_hands?: number
+  visible_count?: number
+  visible_major_order_count?: number
+  visible_major_hands?: number
+  truncated?: boolean
+  entries: Array<number | OrderQueueEntry>
+}
+
+export interface OrderQueues {
+  buy: OrderQueueSide
+  sell: OrderQueueSide
+}
+
+export interface SuperorderWindow {
+  code: string
+  start: string
+  end: string
+  trades: MarketEvent[]
+  details: {
+    orders?: MarketEvent[]
+    buy_cancels?: MarketEvent[]
+    sell_cancels?: MarketEvent[]
+    events?: MarketEvent[]
+  }
+}
+
 // ── 板块（hot_boards）──
 export interface Board {
   code: string

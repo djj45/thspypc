@@ -17,6 +17,7 @@ from ..models import Capability, Support
 
 
 FrameReader = Callable[[SocketLike], bytes]
+UnsolicitedHandler = Callable[[bytes], None]
 _CODE_LIST_SIZE = re.compile(rb"CodeListSize=(\d+)")
 
 
@@ -29,10 +30,12 @@ class L2SubscriptionCoordinator:
         frame_reader: FrameReader = read_frame,
         max_frames: int = 5,
         evidence: AccountEvidenceRecorder | None = None,
+        unsolicited: UnsolicitedHandler | None = None,
     ) -> None:
         self._read_frame = frame_reader
         self._max_frames = max_frames
         self._evidence = evidence
+        self._unsolicited = unsolicited
         self._registered = weakref.WeakKeyDictionary()
         self._connection_locks = weakref.WeakKeyDictionary()
         self._state_lock = threading.RLock()
@@ -82,6 +85,8 @@ class L2SubscriptionCoordinator:
                                 break
                             match = _CODE_LIST_SIZE.search(response)
                             if match is None:
+                                if self._unsolicited is not None:
+                                    self._unsolicited(response)
                                 continue
                             saw_status = True
                             if int(match.group(1)) >= 1:

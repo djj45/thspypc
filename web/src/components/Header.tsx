@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/endpoints'
-import { useStock } from '../state/StockContext'
+import { normalizeStockCode, useStock } from '../state/StockContext'
+import type { StockPageMode } from '../state/StockContext'
 
 function color(n: number | undefined): string {
   if (n === undefined || Number.isNaN(n)) return 'flat'
@@ -9,7 +10,13 @@ function color(n: number | undefined): string {
   return 'flat'
 }
 
-export function Header() {
+export function Header({
+  view,
+  onView,
+}: {
+  view: StockPageMode
+  onView: (view: StockPageMode) => void
+}) {
   const { code, setCode, marketView } = useStock()
   const [input, setInput] = useState(code)
   const [status, setStatus] = useState<{
@@ -22,6 +29,8 @@ export function Header() {
     api.status().then(setStatus).catch(() => {})
   }, [])
 
+  useEffect(() => setInput(code), [code])
+
   const connect = async () => {
     try {
       await api.connect()
@@ -33,7 +42,8 @@ export function Header() {
   }
 
   const commit = () => {
-    const c = input.trim()
+    const c = normalizeStockCode(input, code)
+    setInput(c)
     if (c && c !== code) setCode(c)
   }
 
@@ -51,6 +61,23 @@ export function Header() {
   return (
     <header className="header">
       <span className="title">同花顺看盘 · thspypc</span>
+      <nav className="page-tabs" aria-label="个股页面">
+        {(
+          [
+            ['kanpan', '看盘'],
+            ['timeline', '分时'],
+            ['superorder', '超级盘口'],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            className={view === key ? 'active' : ''}
+            onClick={() => onView(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
       <input
         value={input}
         onChange={(e) => setInput(e.target.value)}

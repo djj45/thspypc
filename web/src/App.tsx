@@ -1,5 +1,10 @@
-import { useEffect } from 'react'
-import { StockProvider, useStock } from './state/StockContext'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  normalizeStockCode,
+  StockProvider,
+  useStock,
+} from './state/StockContext'
+import type { StockPageMode } from './state/StockContext'
 import { Header } from './components/Header'
 import { TimelineChart } from './components/center/TimelineChart'
 import { KlineChart } from './components/center/KlineChart'
@@ -8,6 +13,9 @@ import { DepthPanel } from './components/right/DepthPanel'
 import { DxjlPanel } from './components/right/DxjlPanel'
 import { LeftGrid } from './components/left/LeftGrid'
 import { usePersistedWidth } from './components/left/shared'
+import { TimelinePage } from './pages/TimelinePage'
+import { SuperorderPage } from './pages/SuperorderPage'
+import { StockStreamProvider } from './state/StockStreamContext'
 
 // 左栏总宽可拖拽（与中栏图表之间的分隔条），持久化。
 const LEFT_MIN = 560
@@ -58,51 +66,114 @@ function StockNav() {
   return null
 }
 
-export default function App() {
+function KanpanPage() {
   const left = usePersistedWidth('ths.layout.leftW', 1040, LEFT_MIN, LEFT_MAX)
   return (
-    <StockProvider>
-      <div className="app">
-        <Header />
-        <StockNav />
-        <div
-          className="body"
-          style={{
-            gridTemplateColumns: `${left.w}px 5px minmax(260px, 1fr) 280px`,
-          }}
-        >
-          <div className="col">
-            <LeftGrid leftW={left.w} />
+    <div
+      className="body"
+      style={{
+        gridTemplateColumns: `${left.w}px 5px minmax(260px, 1fr) 280px`,
+      }}
+    >
+      <div className="col">
+        <LeftGrid leftW={left.w} />
+      </div>
+      <div className="vsplit" onPointerDown={left.onPointerDown} />
+      <div className="col center">
+        <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+          <div className="panel-title">分时</div>
+          <div className="chart-host">
+            <TimelineChart />
           </div>
-          <div className="vsplit" onPointerDown={left.onPointerDown} />
-          <div className="col center">
-            <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-              <div className="panel-title">分时</div>
-              <div className="chart-host">
-                <TimelineChart />
-              </div>
-            </div>
-            <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-              <KlineChart />
-            </div>
+        </div>
+        <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+          <KlineChart />
+        </div>
+      </div>
+      <div className="col">
+        <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+          <div className="panel-title">盘口</div>
+          <div className="panel-body">
+            <StockInfo />
+            <DepthPanel />
           </div>
-          <div className="col">
-            <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-              <div className="panel-title">盘口</div>
-              <div className="panel-body">
-                <StockInfo />
-                <DepthPanel />
-              </div>
-            </div>
-            <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-              <div className="panel-title">短线精灵</div>
-              <div className="panel-body">
-                <DxjlPanel />
-              </div>
-            </div>
+        </div>
+        <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+          <div className="panel-title">短线精灵</div>
+          <div className="panel-body">
+            <DxjlPanel />
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+function readView(): StockPageMode {
+  const value = new URLSearchParams(window.location.search).get('view')
+  return value === 'timeline' || value === 'superorder' ? value : 'kanpan'
+}
+
+function RoutedShell({
+  view,
+  onView,
+}: {
+  view: StockPageMode
+  onView: (view: StockPageMode) => void
+}) {
+  const { code, setCode } = useStock()
+  const restored = useRef(false)
+
+  useEffect(() => {
+    if (restored.current) return
+    restored.current = true
+    const initial = normalizeStockCode(
+      new URLSearchParams(window.location.search).get('code'),
+      code,
+    )
+    if (initial && initial !== code) setCode(initial)
+  }, [code, setCode])
+
+  useEffect(() => {
+    const query = new URLSearchParams(window.location.search)
+    query.set('view', view)
+    query.set('code', code)
+    window.history.replaceState(null, '', `/?${query.toString()}`)
+  }, [code, view])
+
+  return (
+    <div className="app">
+      <Header view={view} onView={onView} />
+      <StockNav />
+      {view === 'kanpan' ? (
+        <KanpanPage />
+      ) : (
+        <StockStreamProvider code={code} enabled>
+          {view === 'timeline' ? <TimelinePage /> : <SuperorderPage />}
+        </StockStreamProvider>
+      )}
+    </div>
+  )
+}
+
+export default function App() {
+  const [view, setView] = useState<StockPageMode>(readView)
+  useEffect(() => {
+    const onPopState = () => setView(readView())
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+  const changeView = useCallback((next: StockPageMode) => {
+    if (next === view) return
+    const query = new URLSearchParams(window.location.search)
+    query.set('view', next)
+    window.history.pushState(null, '', `/?${query.toString()}`)
+    setView(next)
+  }, [view])
+
+  return (
+    <StockProvider mode={view}>
+      <RoutedShell view={view} onView={changeView} />
     </StockProvider>
   )
 }

@@ -45,6 +45,7 @@ from .subscription import L2SubscriptionCoordinator
 
 logger = logging.getLogger(__name__)
 FrameReader = Callable[[SocketLike], bytes]
+UnsolicitedHandler = Callable[[bytes], None]
 
 
 def _repair_order_detail_tail(sock, body: bytes, *, period: int) -> bytes:
@@ -115,12 +116,18 @@ class SuperorderService:
         max_frames: int = 32,
         subscriptions: L2SubscriptionCoordinator | None = None,
         evidence: AccountEvidenceRecorder | None = None,
+        unsolicited: UnsolicitedHandler | None = None,
     ) -> None:
         self._connections = connections
         self._read_frame = frame_reader
         self._max_frames = max_frames
         self._subscriptions = subscriptions
         self._evidence = evidence
+        self._unsolicited = unsolicited
+
+    def _deliver_unsolicited(self, body: bytes) -> None:
+        if self._unsolicited is not None:
+            self._unsolicited(body)
 
     def superorder(
         self,
@@ -211,6 +218,7 @@ class SuperorderService:
                         saw_frame = True
                 if records:
                     break
+                self._deliver_unsolicited(response)
 
         if records:
             if self._evidence is not None:
@@ -324,6 +332,7 @@ class SuperorderService:
                         saw_frame = True
                 if records:
                     break
+                self._deliver_unsolicited(response)
 
         if records:
             if self._evidence is not None:
@@ -478,6 +487,7 @@ class SuperorderService:
                     return parsed
                 if b"CodeListSize=" in response:
                     return []
+                self._deliver_unsolicited(response)
         return []
 
     def order_queue(
@@ -653,6 +663,7 @@ class SuperorderService:
                         "visible_major_shares": 0,
                         "visible_major_hands": 0.0,
                     }
+                self._deliver_unsolicited(response)
         return {
             "code": code,
             "side": side,

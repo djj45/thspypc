@@ -4,8 +4,8 @@
 > `THSClient`。`ThsRuntime` 只串行化首次登录；业务请求由库内
 > MAIN/SH_L2/SZ_L2 等连接各自的 single-flight 锁保护，不同连接可并行。
 >
-> 实时推送（短线精灵 / 快照订阅）暂未接入——待盘中抓包核对后再加
-> WebSocket 通道。
+> 个股实时推送已接入 `/api/stock-stream/{code}`：逐笔、十档、买卖一队列和
+> 撤单共用后台唯一 `THSClient` 与市场 L2 socket，不产生额外登录。
 
 ## 启动
 
@@ -36,6 +36,13 @@ OpenAPI 文档。
 | GET | `/api/market_view_fast/{code}?levels=5` | 首屏行情与盘口（不包含分时） |
 | GET | `/api/intraday/{code}` | 统一返回早盘竞价、盘中分时、尾盘竞价 |
 | GET | `/api/intraday_auctions/{code}` | 兼容接口；新前端不再使用 |
+| GET | `/api/superorder/{code}?start=&end=` | 7169 精确逐笔成交回放 |
+| GET | `/api/order-details/{code}?start=&end=` | 7175 挂单 + 7170/7171 买卖撤单 |
+| GET | `/api/order-queues/{code}?trade_date=` | 7173/7174 买一和卖一委托队列 |
+| GET | `/api/superorder-replay/{code}?trade_date=` | 4096 回放轻量时间/价格/量索引（完整记录服务端缓存） |
+| GET | `/api/superorder-replay/{code}/snapshot?ts=&trade_date=` | 缓存中离 ts 最近的完整十档快照 |
+| GET | `/api/superorder-window/{code}?start=&end=` | 串行聚合7169与7175/7170/7171，窗口上限300秒 |
+| WS | `/api/stock-stream/{code}?market=` | `trade/depth/order_queue/cancel/status` 统一个股事件流 |
 | GET | `/api/stocks` | 全市场代码表（~7400 条，首次较慢） |
 | GET | `/api/hot?count=29&sort_by=199112&sort_dir=D` | 排序榜单 |
 | GET | `/api/stock_list_ranked?sort_by=199112&count=5400&sort_dir=D&with_values=1` | 全市场排序榜（L2 SortCount 放大一次拉全 ~0.1s；`sort_dir=A` 升序已实测） |
@@ -88,8 +95,12 @@ total;dur=48.2, sh_l2_wait;dur=11.1, sh_l2_io;dur=31.9, app;dur=43.4
   普通或账号类型仍未知时跳过 L2 预热。
 - 若以后要多人/多账号，把 `ThsRuntime` 改成"每账号一个实例"的池即可，
   REST 契约不变。
-- 实时推送接口（`subscribe_realtime` / `snapshot_subscribe`）等盘中抓包
-  核对字段后，以 WebSocket 通道加入。
+- WebSocket 按股票引用计数并扇出；4214注册、后台reader和7169/4096/717x查询
+  共用同一市场连接锁。查询期间先到的主动推送交回统一事件分发器，不双读、不丢帧。
+- 4096 完整记录只保存在最多8项的进程内LRU缓存；浏览器先取轻量索引，点选光标
+  后再取一条完整十档。当前日缓存60秒，历史日缓存1小时。
+- 服务退出时 `ThsRuntime.close()` 会关闭唯一客户端和全部socket，降低热重启后的
+  服务端旧会话残留概率。
 
 ## 相关文件
 

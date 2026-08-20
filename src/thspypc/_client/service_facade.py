@@ -914,8 +914,6 @@ class ServiceFacade:
         Raises:
             RuntimeError: 未登录或 L2 市场连接建立失败。
         """
-        from ..errors import ChannelUnavailableError
-
         if market == 0:
             market = self._market_for_code(code)
         market = _intraday_market(market)
@@ -931,15 +929,10 @@ class ServiceFacade:
             if profile.kind is AccountKind.STANDARD
             else Capability.L2_TIMELINE
         )
-        if (
-            capability is Capability.L2_TIMELINE
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
+        # The push reader and request/response services share the market's
+        # ManagedConnection request lock.  An active WebSocket subscription is
+        # therefore not a competing socket reader: the request temporarily
+        # owns the lane and the push reader resumes afterwards.
         records = self._run_default_service(
             (capability,),
             lambda: self._timeline_service.timeline(
@@ -1002,8 +995,6 @@ class ServiceFacade:
         Raises:
             RuntimeError: 未登录或 L2 市场连接建立失败。
         """
-        from ..errors import ChannelUnavailableError
-
         if market == 0:
             market = self._market_for_code(code)
         market = _intraday_market(market)
@@ -1019,15 +1010,6 @@ class ServiceFacade:
             if profile.kind is AccountKind.STANDARD
             else Capability.L2_AUCTION
         )
-        if (
-            capability is Capability.L2_AUCTION
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
         return self._run_default_service(
             (capability,),
             lambda: self._auction_service.auction(
@@ -1069,38 +1051,19 @@ class ServiceFacade:
 
         Raises:
             CapabilityUnavailableError: 普通账号无 L2 通道。
-            ChannelUnavailableError: 后台快照线程正在占用 4214 连接。
-
         Note:
             ``delegate_a``(dt12)/``delegate_b``(dt74) 的买卖语义沪深不同：深市
             a=卖方/b=买方，沪市 a=主动方/b=被动方挂单。详见
             ``superorder_protocol`` 模块 docstring。
         """
-        from ..errors import ChannelUnavailableError
-
         if market == 0:
             market = self._market_for_code(code)
         start_ts = self._superorder_ts(start)
         end_ts = self._superorder_ts(end)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
-        profile = (
-            self._service_connections.profile
-            if self._service_connections is not None
-            else self.observed_account_profile
-        )
-        if (
-            profile.kind is AccountKind.LEVEL2
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
-
-        # L2 逐笔回放单次请求（与 timeline/depth_ten 一致；连接治理交给
-        # ConnectionManager，它在 acquire 时自动重建失效连接）。
+        # request() 与后台推送读取线程共享每市场 request lock；请求期间若先收到
+        # 主动推送，SuperorderService 会交回统一事件分发器，不会丢帧或双 recv。
         return self._run_default_service(
             (Capability.L2_TIMELINE,),
             lambda: self._superorder_service.superorder(
@@ -1155,10 +1118,7 @@ class ServiceFacade:
 
         Raises:
             CapabilityUnavailableError: 普通账号无 L2 通道。
-            ChannelUnavailableError: 后台快照线程正在占用 4214 连接。
         """
-        from ..errors import ChannelUnavailableError
-
         if market == 0:
             market = self._market_for_code(code)
         historical = start is not None or end is not None
@@ -1175,21 +1135,6 @@ class ServiceFacade:
             pageid = SNAPSHOT_REPLAY_PAGEID
         if self._auth is None and self._service_connections is None:
             self.authenticate()
-        profile = (
-            self._service_connections.profile
-            if self._service_connections is not None
-            else self.observed_account_profile
-        )
-        if (
-            profile.kind is AccountKind.LEVEL2
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
-
         return self._run_default_service(
             (Capability.L2_TIMELINE,),
             lambda: self._superorder_service.snapshot_replay(
@@ -1224,20 +1169,6 @@ class ServiceFacade:
         end_ts = self._superorder_ts(end)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
-        profile = (
-            self._service_connections.profile
-            if self._service_connections is not None
-            else self.observed_account_profile
-        )
-        if (
-            profile.kind is AccountKind.LEVEL2
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
         return self._run_default_service(
             (Capability.L2_TIMELINE,),
             lambda: self._superorder_service.order_details(
@@ -1291,20 +1222,6 @@ class ServiceFacade:
         context_start, context_end = self._order_queue_context(trade_date)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
-        profile = (
-            self._service_connections.profile
-            if self._service_connections is not None
-            else self.observed_account_profile
-        )
-        if (
-            profile.kind is AccountKind.LEVEL2
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
         return self._run_default_service(
             (Capability.L2_TIMELINE,),
             lambda: self._superorder_service.order_queue(
@@ -1331,20 +1248,6 @@ class ServiceFacade:
         context_start, context_end = self._order_queue_context(trade_date)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
-        profile = (
-            self._service_connections.profile
-            if self._service_connections is not None
-            else self.observed_account_profile
-        )
-        if (
-            profile.kind is AccountKind.LEVEL2
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
         return self._run_default_service(
             (Capability.L2_TIMELINE,),
             lambda: self._superorder_service.order_queues(
@@ -1385,15 +1288,6 @@ class ServiceFacade:
             if profile.kind is AccountKind.STANDARD
             else Capability.L2_AUCTION
         )
-        if (
-            capability is Capability.L2_AUCTION
-            and self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 4214 连接",
-            )
         return self._run_default_service(
             (capability,),
             lambda: self._auction_service.closing_auction(
@@ -1444,14 +1338,6 @@ class ServiceFacade:
             profile.kind is AccountKind.LEVEL2
             and market not in (16, 32, 144, 151)
         ):
-            if (
-                self._snapshot_thread is not None
-                and self._snapshot_thread.is_alive()
-            ):
-                raise ChannelUnavailableError(
-                    "l2_snapshot",
-                    "后台快照线程正在读取 Level2 连接",
-                )
             last_err: Exception | None = None
             for attempt in range(2):
                 try:
@@ -1668,25 +1554,6 @@ class ServiceFacade:
         if market == 0:
             market = self._market_for_code(code)
         market = _intraday_market(market)
-        from ..errors import ChannelUnavailableError
-
-        if (
-            self._snapshot_thread is not None
-            and self._snapshot_thread.is_alive()
-            and (
-                (
-                    self._service_connections.profile
-                    if self._service_connections is not None
-                    else self.observed_account_profile
-                ).kind
-                is AccountKind.LEVEL2
-            )
-        ):
-            raise ChannelUnavailableError(
-                "l2_snapshot",
-                "后台快照线程正在读取 L2 连接",
-            )
-
         last_err = ""
         for attempt in range(retries + 1):
             if (
@@ -2151,8 +2018,8 @@ class ServiceFacade:
         market: int | None,
     ) -> int:
         """Register one code on its market L2 channel and return market code."""
-        if market is None:
-            market = 17 if code.startswith("6") else 33
+        if market in (None, 0):
+            market = self._market_for_code(code)
         key = pick_l2_market(market)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
@@ -2198,6 +2065,29 @@ class ServiceFacade:
             logger.warning("depth_subscribe: %s 注册失败: %s", code, exc)
             return False
         self._connection_runtime.activate_depth(code, market, callback)
+        return True
+
+    def market_events_subscribe(
+        self,
+        code: str,
+        market: int | None = None,
+        callback=None,
+    ) -> bool:
+        """Subscribe to normalized trade/depth/queue/cancel events.
+
+        This reuses the same 4214 registration, market L2 socket and reader as
+        :meth:`depth_subscribe`; it never creates another THSClient or login.
+        """
+        try:
+            market = self._register_l2_snapshot_code(code, market=market)
+        except ProtocolError as exc:
+            logger.warning("market_events_subscribe: %s 注册失败: %s", code, exc)
+            return False
+        self._connection_runtime.activate_market_events(
+            code,
+            market,
+            callback,
+        )
         return True
 
     def ranking_depth_subscribe(
@@ -2372,9 +2262,17 @@ class ServiceFacade:
             clear_latest=clear_latest,
         )
 
+    def market_events_unsubscribe(self, code: str) -> bool:
+        """Stop normalized market-event delivery for one code."""
+        return self._connection_runtime.deactivate_market_events(code)
+
     def receive_depth(self, timeout: float | None = None) -> dict | None:
         """读取下一条已订阅十档事件；超时返回 ``None``。"""
         return self._connection_runtime.receive_depth(timeout)
+
+    def receive_market_event(self, timeout: float | None = None) -> dict | None:
+        """Read the next normalized event for active market subscriptions."""
+        return self._connection_runtime.receive_market_event(timeout)
 
     def latest_price(self, code: str) -> float | None:
         """取某代码的最新现价（snapshot_subscribe 后由推送线程更新）。"""
