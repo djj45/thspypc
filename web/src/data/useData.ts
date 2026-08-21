@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 
-// 数据模式：snapshot=请求一次；poll=定时轮询（预留）；push=WebSocket 推送（预留）。
-// 首版只实现 snapshot，poll/push 接口预留，后续接同花顺订阅推送。
+// 数据模式：snapshot=请求一次；poll=完成一次请求后定时刷新；push 由专用
+// WebSocket hook 实现，这里仅保留类型入口。
 export type DataMode = 'snapshot' | 'poll' | 'push'
 
 export interface DataState<T> {
@@ -22,6 +22,7 @@ export function useData<T>(
   deps: unknown[] = [],
   mode: DataMode = 'snapshot',
   delayMs = 0,
+  pollMs = 5_000,
 ): DataState<T> {
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
@@ -34,7 +35,7 @@ export function useData<T>(
   const refresh = useCallback(() => setTick((t) => t + 1), [])
 
   useEffect(() => {
-    if (mode !== 'snapshot') return // poll/push 预留，首版不实现
+    if (mode === 'push') return
     let alive = true
     let timer: ReturnType<typeof setTimeout> | undefined
     setLoading(true)
@@ -51,7 +52,10 @@ export function useData<T>(
           if (alive) setError(e instanceof Error ? e.message : String(e))
         })
         .finally(() => {
-          if (alive) setLoading(false)
+          if (!alive) return
+          setLoading(false)
+          // 以上一次完成为起点调度，慢请求不会叠加成并发轮询。
+          if (mode === 'poll') timer = setTimeout(run, Math.max(1_000, pollMs))
         })
     }
     // 延迟只在首次挂载生效：首屏让 quote/depth 先上屏；之后 deps 变化
@@ -68,7 +72,7 @@ export function useData<T>(
       if (timer !== undefined) clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, tick, delayMs])
+  }, [...deps, tick, mode, delayMs, pollMs])
 
   return { data, loading, error, refresh }
 }

@@ -41,8 +41,9 @@ export function RankPanel() {
         sort.desc ? 'D' : 'A',
       ),
     [sortBy, sort.desc],
-    'snapshot',
+    'poll',
     1000,
+    5000,
   )
   const nameMap = useStockNames()
   const { globalCodesRef } = useStock()

@@ -1,4 +1,5 @@
 import { useStock } from '../../state/StockContext'
+import type { MarketEvent } from '../../types'
 
 function cls(v: number | undefined) {
   if (v === undefined) return 'flat'
@@ -21,9 +22,11 @@ function fmtVol(n: number | undefined) {
 export function StockInfo({
   tradeDate,
   selectedPrice,
+  liveEvent,
 }: {
   tradeDate?: string
   selectedPrice?: number
+  liveEvent?: MarketEvent
 } = {}) {
   const { code, quote, marketView } = useStock()
   const dailyRows = marketView.data?.kline ?? []
@@ -33,11 +36,21 @@ export function StockInfo({
   const dayBar = dayIndex >= 0 ? dailyRows[dayIndex] : undefined
   const previousBar = dayIndex > 0 ? dailyRows[dayIndex - 1] : undefined
   const historical = dayBar != null
-  const price = historical ? selectedPrice ?? dayBar.close : quote?.price
-  const pc = historical ? previousBar?.close : quote?.prevClose
-  const open = historical ? dayBar.open : quote?.open
-  const high = historical ? dayBar.high : quote?.high
-  const low = historical ? dayBar.low : quote?.low
+  const liveNumber = (key: string): number | undefined => {
+    const value = liveEvent?.[key]
+    if (value == null) return undefined
+    const number = Number(value)
+    return Number.isFinite(number) ? number : undefined
+  }
+  const price = historical
+    ? selectedPrice ?? dayBar.close
+    : liveNumber('price') ?? quote?.price
+  const pc = historical
+    ? previousBar?.close
+    : liveNumber('prev_close') ?? quote?.prevClose
+  const open = historical ? dayBar.open : liveNumber('open') ?? quote?.open
+  const high = historical ? dayBar.high : liveNumber('high') ?? quote?.high
+  const low = historical ? dayBar.low : liveNumber('low') ?? quote?.low
   const volume = historical ? dayBar.volume : quote?.vol
   const amount = historical ? dayBar.amount : quote?.amount
   const chg = price != null && pc != null ? price - pc : quote?.chg

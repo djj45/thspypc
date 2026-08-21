@@ -85,6 +85,21 @@ def _client():
     )
 
 
+def test_seal_table_failure_is_negative_cached(monkeypatch):
+    client = _client()
+    calls = []
+
+    def fail_rank(**kwargs):
+        calls.append(kwargs)
+        raise ProtocolError("drifted response")
+
+    monkeypatch.setattr(client, "stock_list_hot", fail_rank)
+
+    assert client._seal_table() == {}
+    assert client._seal_table() == {}
+    assert len(calls) == 1
+
+
 def test_context_borrows_main_and_push_sockets_with_init_state():
     client = _client()
     main = FakeSocket()
@@ -1898,6 +1913,8 @@ def test_snapshot_loop_dispatches_every_record_in_batched_depth_frame(monkeypatc
     )
 
     assert set(runtime.latest_depth) == {"600000", "600012"}
+    assert records[0]["event"] == "depth"
+    assert records[1]["event"] == "depth"
     assert callbacks == [records[1]]
     assert client.receive_depth(timeout=0) == records[0]
     assert client.receive_depth(timeout=0) == records[1]

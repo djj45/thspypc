@@ -598,7 +598,12 @@ class ServiceFacade:
             )
         except (ProtocolError, OSError, RuntimeError) as exc:
             logger.warning("stock_quote_fields: 封单额表拉取失败: %s", exc)
-            return cache[1] if cache else {}
+            # 失败也写入短期负缓存。否则每个可视窗口 quotes_ext 都会立刻
+            # 重跑一次 5400 股排序；服务端字段漂移期间会放大成连续 L2 请求，
+            # 甚至触发连接层重新鉴权。已有旧真值时继续沿用旧表。
+            table = cache[1] if cache else {}
+            self.__dict__["_seal_cache"] = (now, table)
+            return table
         table = {
             str(r.get("code")): r["dt44"]
             for r in ranked

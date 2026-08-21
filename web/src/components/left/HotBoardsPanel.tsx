@@ -5,7 +5,7 @@ import type { Board, SystemBlock } from '../../types'
 import { BoardTable, Cell, StateBox, type BoardRowData } from './shared'
 
 export function HotBoardsPanel() {
-  const boards = useData<Board[]>(() => api.hotBoards(), [], 'snapshot', 800)
+  const boards = useData<Board[]>(() => api.hotBoards(), [], 'poll', 800, 8000)
   const blocks = useData<SystemBlock[]>(() => api.boards(), [])
 
   const nameMap = useMemo(
@@ -19,7 +19,8 @@ export function HotBoardsPanel() {
         code: b.code,
         name: b.name ?? nameMap.get(b.code) ?? b.code,
         chgPct: b.chg_pct,
-        speed4m: b.speed_4m ?? b.speed_1m,
+        speed1m: b.speed_1m,
+        speed4m: b.speed_4m,
         mainInflow: b.main_inflow,
         upCount: b.up_count,
         downCount: b.down_count,

@@ -665,6 +665,12 @@ class ConnectionRuntime:
             code = record["code"]
             event = record.get("event")
             is_depth_record = "bids" in record or record.get("phase") == "auction"
+            if is_depth_record and event is None:
+                # 深度解析器历史上只用 bids/asks/phase 表示类型；统一市场事件
+                # WebSocket 依赖 event 字段分流，不补标签会导致十档推送已经到达
+                # 后端却被浏览器静默过滤。
+                record["event"] = "depth"
+                event = "depth"
             updates_latest_price = (
                 "price" in record
                 and (is_depth_record or event in (None, "trade"))

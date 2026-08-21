@@ -193,21 +193,19 @@ class StockListService:
                     and not drift_retried
                     and _rows_missing_value_field(page_stocks, response_field)
                 ):
-                    # 响应漂移（如 592890 回 dt44 表）：重连该 L2 角色取新鲜
-                    # 连接重试一次；仍漂移则按缺值行处理（排末尾），绝不能
-                    # 静默退化成整表代码序。仅 L2 路径（角色由连接管理器
-                    # 自管重连；MAIN 的自愈在 facade list_quotes）。
+                    # 响应漂移（如 592890 回 dt44 表）只在当前已登录 socket
+                    # 上重发一次。字段漂移是服务端返回内容问题，不足以判定传输
+                    # 连接已坏；主动 close/acquire 会额外执行 HTTP 鉴权和 L2
+                    # 登录，在页面轮询时可能形成 Passport 拒绝/重试风暴。
+                    # 第二次仍漂移则保留缺值行并排到末尾，绝不能静默退化成
+                    # 整表代码序。
                     drift_retried = True
                     logger.warning(
-                        "排序响应漂移: sort_by=%s 期望 %s 实有 %s，重连 %s 重试",
+                        "排序响应漂移: sort_by=%s 期望 %s 实有 %s，在 %s 原连接重试",
                         sort_by,
                         response_field,
                         sorted(k for k in page_stocks[0] if k.startswith("dt")),
                         role.value,
-                    )
-                    self._connections.close(role)
-                    connection = self._connections.acquire(
-                        role, capability=Capability.L2_MARKET_ACCESS
                     )
                     continue
                 data_count = metadata["sort_data_count"]

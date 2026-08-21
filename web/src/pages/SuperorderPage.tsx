@@ -284,7 +284,7 @@ export function SuperorderPage() {
         </div>
       </section>
       <aside className="superorder-side">
-        <section className="panel stock-summary"><div className="panel-title">个股概览</div><div className="panel-body"><StockInfo tradeDate={historicalDate} selectedPrice={historicalDate ? snapshot?.snapshot.price : undefined} /></div></section>
+        <section className="panel stock-summary"><div className="panel-title">个股概览</div><div className="panel-body"><StockInfo tradeDate={historicalDate} selectedPrice={historicalDate ? snapshot?.snapshot.price : undefined} liveEvent={stream.latestDepth} /></div></section>
         <section className="panel snapshot-panel"><div className="panel-title">光标时刻{historicalDate ? '五档（历史4417）' : '十档'}</div><div className="panel-body"><SnapshotBook data={snapshot} bestBid={atLatestSnapshot ? Number(buyQueue?.price ?? 0) || undefined : undefined} bestAsk={atLatestSnapshot ? Number(sellQueue?.price ?? 0) || undefined : undefined} levelCount={historicalDate ? 5 : 10} /></div></section>
         <section className="panel queues-panel">
           <div className="panel-title">买一 / 卖一委托队列</div>

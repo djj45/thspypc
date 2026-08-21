@@ -1477,6 +1477,19 @@ def _row_field_raw(
     return None
 
 
+def _normalize_board_speed(value: float | None) -> float | None:
+    """Normalize the two observed percentage encodings used by board speed.
+
+    Most 0x22 responses decode directly to a percentage (for example
+    ``-0.0407``).  The 2026-08-21 live response intermittently used the
+    multiplied representation (``-4_070_000`` for the same value), matching
+    the encoding drift already observed on L2 stock ranking tables.
+    """
+    if value is None:
+        return None
+    return value / 100_000_000 if abs(value) > 1_000 else value
+
+
 def parse_board_full_quote_response(body: bytes) -> list[dict]:
     """解析板块指数全量行情响应（2026-08-02 抓包确认的三表合并）。
 
@@ -1563,12 +1576,12 @@ def parse_board_full_quote_response(body: bytes) -> list[dict]:
             "speed_4m": (
                 None
                 if rec.get("dt48_raw") in _BOARD_SENTINEL_U32
-                else rec.get("dt48")
+                else _normalize_board_speed(rec.get("dt48"))
             ),
             "speed_1m": (
                 None
                 if rec.get("dt167_raw") in _BOARD_SENTINEL_U32
-                else rec.get("dt167")
+                else _normalize_board_speed(rec.get("dt167"))
             ),
             "main_inflow": (
                 None

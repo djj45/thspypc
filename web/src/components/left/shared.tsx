@@ -52,9 +52,9 @@ export interface StockRowData {
 
 // 批量统一字段：滚动的可视窗口代码传进来，返回 code→QuoteExt 映射。
 // 防抖吸收快速滚动的窗口抖动；新结果合并进旧 map（回滚时已看过的行
-// 立即显示缓存值，不闪 "-"）。窗口静止不重复请求（盘中实时更新待接入
-// 同花顺推送后实现）。空列表不发。后端单批偶发缺行（冷启动争抢）时
-// 自动补拉缺失代码（最多 3 轮），保证初始可见区一定有数据。
+// 立即显示缓存值，不闪 "-"）。窗口静止后每 4 秒受控刷新一次；以上一轮完成
+// 为起点调度，不会叠加并发请求。空列表不发。后端单批偶发缺行（冷启动
+// 争抢）时自动补拉缺失代码（最多 3 轮），保证初始可见区一定有数据。
 export function useQuoteExt(
   codes: string[],
   debounceMs = 200,
@@ -64,7 +64,8 @@ export function useQuoteExt(
   useEffect(() => {
     if (!key) return
     let alive = true
-    const timer = setTimeout(async () => {
+    let timer = 0
+    const run = async (): Promise<void> => {
       let pending = key.split(',')
       for (let attempt = 0; attempt < 3 && alive && pending.length; attempt++) {
         try {
@@ -77,16 +78,20 @@ export function useQuoteExt(
             return merged
           })
           pending = pending.filter((c) => !got.has(c))
-          if (!pending.length) return
+          if (!pending.length) break
         } catch {
           /* 整批失败：下一轮重试 */
         }
-        await new Promise((resolve) => setTimeout(resolve, 500))
+        if (pending.length) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
       }
-    }, debounceMs)
+      if (alive) timer = window.setTimeout(run, 4_000)
+    }
+    timer = window.setTimeout(run, debounceMs)
     return () => {
       alive = false
-      clearTimeout(timer)
+      window.clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, debounceMs])
@@ -501,6 +506,7 @@ export interface BoardRowData {
   code: string
   name: string
   chgPct?: number
+  speed1m?: number
   speed4m?: number
   mainInflow?: number
   upCount?: number
@@ -511,14 +517,15 @@ export interface BoardRowData {
 const BOARD_COLS: { label: string; sortKey?: string }[] = [
   { label: '板块' },
   { label: '涨幅', sortKey: 'chgPct' },
-  { label: '涨速', sortKey: 'speed4m' },
+  { label: '1分', sortKey: 'speed1m' },
+  { label: '4分', sortKey: 'speed4m' },
   { label: '主力', sortKey: 'mainInflow' },
   { label: '涨家', sortKey: 'upCount' },
   { label: '跌家', sortKey: 'downCount' },
   { label: '涨停', sortKey: 'limitUp' },
 ]
 
-const BOARD_COL_WIDTHS = [90, 46, 40, 50, 34, 34, 34]
+const BOARD_COL_WIDTHS = [90, 46, 40, 40, 50, 34, 34, 34]
 
 export function BoardTable({
   rows,
@@ -555,12 +562,14 @@ export function BoardTable({
       case 1:
         return <span key={i} className={clsOf(b.chgPct)}>{fmtPct(b.chgPct)}</span>
       case 2:
-        return <span key={i} className={clsOf(b.speed4m)}>{fmtPct(b.speed4m)}</span>
+        return <span key={i} className={clsOf(b.speed1m)}>{fmtPct(b.speed1m)}</span>
       case 3:
-        return <span key={i} className={clsOf(b.mainInflow)}>{fmtAmt(b.mainInflow)}</span>
+        return <span key={i} className={clsOf(b.speed4m)}>{fmtPct(b.speed4m)}</span>
       case 4:
-        return <span key={i} className="up">{b.upCount != null ? String(Math.round(b.upCount)) : '-'}</span>
+        return <span key={i} className={clsOf(b.mainInflow)}>{fmtAmt(b.mainInflow)}</span>
       case 5:
+        return <span key={i} className="up">{b.upCount != null ? String(Math.round(b.upCount)) : '-'}</span>
+      case 6:
         return <span key={i} className="down">{b.downCount != null ? String(Math.round(b.downCount)) : '-'}</span>
       default:
         return <span key={i} className="up">{b.limitUp != null ? String(Math.round(b.limitUp)) : '-'}</span>

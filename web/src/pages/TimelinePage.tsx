@@ -36,6 +36,22 @@ function directionClass(event: MarketEvent): string {
   return /sell|卖|5/i.test(direction) ? 'down' : /buy|买|1/i.test(direction) ? 'up' : 'flat'
 }
 
+function depthEventToBook(event: MarketEvent | undefined): Depth | null {
+  if (!event?.bids?.length && !event?.asks?.length) return null
+  const levels = (rows: Array<[number, number]> | undefined) =>
+    (rows ?? []).map(([price, qty], index) => ({
+      level: String(index + 1),
+      price: Number(price),
+      qty: Number(qty),
+      amount: Number(price) * Number(qty),
+    }))
+  return {
+    code: event.code,
+    buy: levels(event.bids),
+    sell: levels(event.asks),
+  }
+}
+
 function TickTape({ rows }: { rows: MarketEvent[] }) {
   return (
     <div className="panel-body tick-tape">
@@ -88,6 +104,10 @@ export function TimelinePage() {
   const [history, setHistory] = useState<MarketEvent[]>([])
   const [depth, setDepth] = useState<Depth | null>(null)
   const [error, setError] = useState('')
+  const liveDepth = useMemo(
+    () => depthEventToBook(stream.latestDepth),
+    [stream.latestDepth],
+  )
 
   useEffect(() => {
     let current = true
@@ -115,6 +135,10 @@ export function TimelinePage() {
     return () => { current = false }
   }, [code])
 
+  useEffect(() => {
+    if (liveDepth) setError('')
+  }, [liveDepth])
+
   const rows = useMemo(
     () => [...history, ...stream.trades].slice(-300).reverse(),
     [history, stream.trades],
@@ -134,8 +158,8 @@ export function TimelinePage() {
         <section className="panel quote-book">
           <div className="panel-title">十档盘口</div>
           <div className="panel-body">
-            <StockInfo />
-            <TenLevelBook depth={depth} />
+            <StockInfo liveEvent={stream.latestDepth} />
+            <TenLevelBook depth={liveDepth ?? depth} />
           </div>
         </section>
         <section className="panel tape-panel">

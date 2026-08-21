@@ -72,19 +72,25 @@ def _to_dict(value):
 
 
 def _jsonable(value):
-    """递归剥掉 hd 解析遗留的 ``_raw`` bytes 字段（如 ``dt39_raw``）。
+    """把服务层结果递归转换成 FastAPI/WebSocket 可编码的 JSON 值。
 
     部分 service（如 ``hot_boards``）的解析路径会把原始未解码字节塞进 dict
     的 ``<field>_raw`` 键，这些是调试产物、前端无需，且含 non-UTF-8 字节会
-    让 pydantic 序列化失败（500）。这里递归移除所有 bytes/bytearray 值。
+    让 pydantic 序列化失败（500）。实时推送事件还会携带 ``datetime``，而
+    Starlette 的 ``WebSocket.send_json`` 不会像普通 HTTP 响应一样先经过
+    FastAPI 的 encoder，因此这里也统一转成 ISO-8601 字符串。
     """
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))
+    if isinstance(value, (datetime, date_type, datetime_time)):
+        return value.isoformat()
     if isinstance(value, dict):
         return {
             k: _jsonable(v)
             for k, v in value.items()
             if not isinstance(v, (bytes, bytearray))
         }
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
 
@@ -209,11 +215,15 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             return client.snapshot_replay(code, **kwargs)
 
         records = _call(operation)
-        with _cache_lock:
-            _replay_cache[key] = (time.monotonic(), records)
-            _replay_cache.move_to_end(key)
-            while len(_replay_cache) > _replay_cache_max_entries:
-                _replay_cache.popitem(last=False)
+        # 盘中 4096 偶发先返回空表（连接刚注册、响应被别的推送帧穿插）。空表
+        # 不是稳定真值，不能缓存 60 秒，否则一次瞬时空响应会让整个当前交易日
+        # 的超级盘口持续显示无数据。历史日期空表是确定结果，仍可长缓存。
+        if records or trade_date is not None:
+            with _cache_lock:
+                _replay_cache[key] = (time.monotonic(), records)
+                _replay_cache.move_to_end(key)
+                while len(_replay_cache) > _replay_cache_max_entries:
+                    _replay_cache.popitem(last=False)
         return records
 
     @staticmethod

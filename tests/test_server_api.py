@@ -587,6 +587,31 @@ def test_superorder_replay_index_and_snapshot_share_cache(client_and_app):
     assert sum(call[0] == "snapshot_replay" for call in fake.calls) == 1
 
 
+def test_current_superorder_replay_does_not_cache_transient_empty(client_and_app):
+    fake, client = client_and_app
+    responses = iter(
+        [
+            [],
+            [{"time": "13:01:00", "ts": 1_787_293_260, "price": 34.86}],
+        ]
+    )
+
+    def replay(*args, **kwargs):
+        fake.calls.append(("snapshot_replay", *args))
+        return next(responses)
+
+    fake.snapshot_replay = replay
+
+    first = client.get("/api/superorder-replay/603334", params={"market": 17})
+    second = client.get("/api/superorder-replay/603334", params={"market": 17})
+
+    assert first.status_code == 200
+    assert first.json()["count"] == 0
+    assert second.status_code == 200
+    assert second.json()["count"] == 1
+    assert sum(call[0] == "snapshot_replay" for call in fake.calls) == 2
+
+
 def test_superorder_window_serially_aggregates_truth(client_and_app):
     fake, client = client_and_app
     start = datetime(2026, 8, 20, 13, 19, 0)
@@ -623,9 +648,12 @@ def test_stock_stream_fans_out_shared_client_events(client_and_app):
                 "code": "603334",
                 "price": 34.86,
                 "volume": 100,
+                "time": datetime(2026, 8, 21, 13, 8, 59),
             }
         )
-        assert websocket.receive_json()["event"] == "trade"
+        event = websocket.receive_json()
+        assert event["event"] == "trade"
+        assert event["time"] == "2026-08-21T13:08:59"
 
     assert ("market_events_subscribe", "603334", 17) in fake.calls
     deadline = time.monotonic() + 1.0

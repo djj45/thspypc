@@ -702,8 +702,8 @@ def test_rows_missing_value_field_detector():
     assert not _rows_missing_value_field([], "dt250")
 
 
-def test_ranked_l2_response_drift_reconnects_and_retries(monkeypatch):
-    """592890 回 dt44 表（响应漂移）时：重连该 L2 角色重试一次，最终按 dt250 全局有序。
+def test_ranked_l2_response_drift_retries_same_connection(monkeypatch):
+    """592890 回 dt44 表时在原 L2 socket 重发，避免额外鉴权登录。
 
     若无守卫，两榜全缺 dt250 会退化为代码序（用户侧表现为主力净额乱序）。
     """
@@ -713,11 +713,9 @@ def test_ranked_l2_response_drift_reconnects_and_retries(monkeypatch):
     def make_sh_sock():
         sock = FakeSocket()
         sh_socks.append(sock)
-        # 第 1 条连接回漂移表（只有 dt44），重连后的连接回干净的 dt250 表
-        if len(sh_socks) == 1:
-            sock.reader = lambda: b"SortTotal=2 drifted"
-        else:
-            sock.reader = lambda: b"SortTotal=2 clean"
+        # 同一连接第一次回漂移表（只有 dt44），重发后回干净的 dt250 表。
+        responses = iter([b"SortTotal=2 drifted", b"SortTotal=2 clean"])
+        sock.reader = lambda: next(responses)
         return sock
 
     def make_sock(spec):
@@ -772,12 +770,11 @@ def test_ranked_l2_response_drift_reconnects_and_retries(monkeypatch):
     )
     # 全局按 dt250 降序（9亿 > 7亿 > 5亿），而非代码序
     assert [r["code"] for r in result] == ["600000", "000001", "600001"]
-    # SH_L2 打开两次（漂移→重连），旧连接被关闭
-    assert opened == [
-        ConnectionRole.SH_L2, ConnectionRole.SH_L2, ConnectionRole.SZ_L2,
-    ]
-    assert sh_socks[0].closed
-    assert not sh_socks[1].closed
+    # SH_L2 只登录一次；两次请求都复用同一 socket，不消费第二张 Passport。
+    assert opened == [ConnectionRole.SH_L2, ConnectionRole.SZ_L2]
+    assert len(sh_socks) == 1
+    assert len(sh_socks[0].sent) == 2
+    assert not sh_socks[0].closed
 
 
 

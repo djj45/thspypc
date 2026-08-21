@@ -142,7 +142,10 @@ export function CustomGroupPanel({
   }
 
   const [visibleCodes, setVisibleCodes] = useState<string[]>([])
-  const quotes = useQuoteExt(visibleCodes)
+  // 小型自定义板块（如260818的26只）必须整组刷新，才能保证涨幅排序能把
+  // 视口外的新强弱股票移动进来；大分组仍只拉可视窗口，避免超长URL和重负载。
+  const quoteCodes = finalCodes.length <= 100 ? finalCodes : visibleCodes
+  const quotes = useQuoteExt(quoteCodes)
 
   const rows: StockRowData[] = useMemo(
     () =>

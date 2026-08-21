@@ -136,6 +136,14 @@ def test_parse_full_quote_speed_1m():
     assert by_code["886112"]["speed_1m"] == pytest.approx(-0.0622, abs=0.001)
 
 
+def test_board_speed_normalizes_live_multiplied_encoding():
+    from thspypc.features.system_blocks_protocol import _normalize_board_speed
+
+    assert _normalize_board_speed(-3_740_000.0) == pytest.approx(-0.0374)
+    assert _normalize_board_speed(0.125) == 0.125
+    assert _normalize_board_speed(None) is None
+
+
 def test_merge_across_frames():
     merged = {}
     for name in ("full_resp_0x20.bin", "full_resp_22.bin"):
