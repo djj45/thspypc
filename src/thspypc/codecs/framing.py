@@ -3,9 +3,54 @@ from __future__ import annotations
 
 import re
 import socket
+import threading
+import weakref
+from collections.abc import Callable
+from typing import Any
 
 
 FRAME_MAGIC = b"\xfd\xfd\xfd\xfd"
+
+FrameObserver = Callable[[Any, bytes], None]
+_observer_lock = threading.RLock()
+_frame_observers: weakref.WeakKeyDictionary[Any, FrameObserver] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def register_frame_observer(sock: Any, observer: FrameObserver) -> None:
+    """Register one non-owning observer for bodies read from *sock*."""
+    try:
+        with _observer_lock:
+            _frame_observers[sock] = observer
+    except TypeError:
+        # Only real sockets are registered by production code.  A rare test
+        # double which cannot be weak-referenced simply remains unobserved.
+        return
+
+
+def unregister_frame_observer(sock: Any) -> None:
+    try:
+        with _observer_lock:
+            _frame_observers.pop(sock, None)
+    except TypeError:
+        return
+
+
+def _notify_frame_observers(sock: Any, body: bytes) -> None:
+    try:
+        with _observer_lock:
+            observer = _frame_observers.get(sock)
+    except TypeError:
+        return
+    if observer is None:
+        return
+    try:
+        observer(sock, body)
+    except Exception:
+        # Observability must never turn a successfully decoded protocol frame
+        # into a failed business request.
+        return
 
 
 def encode_frame(body: bytes) -> bytes:
@@ -58,5 +103,7 @@ def read_frame(sock: socket.socket) -> bytes:
         if bytes(magic) == FRAME_MAGIC:
             break
     body_len = _read_frame_body_length(sock)
-    return read_exact(sock, body_len)
+    body = read_exact(sock, body_len)
+    _notify_frame_observers(sock, body)
+    return body
 

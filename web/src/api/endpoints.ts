@@ -33,6 +33,8 @@ const intradayInFlight = new Map<
   Promise<(AuctionPoint & TimelinePoint)[]>
 >()
 const klineInFlight = new Map<string, Promise<Kline[]>>()
+const stockReadyInFlight = new Map<string, Promise<void>>()
+const stockReadyUntil = new Map<string, number>()
 
 // 已返回结果的短 TTL 缓存：快速来回切票/刷新时不再重复请求。
 // 分时/盘口缓存秒级；日 K 稍长（下一根 K 更新前基本不变）。
@@ -41,6 +43,7 @@ const INTRADAY_TTL_MS = 2_000
 const KLINE_DAY_TTL_MS = 15_000
 const KLINE_MINUTE_TTL_MS = 3_000
 const CACHE_LIMIT = 64
+const STOCK_READY_TTL_MS = 2_000
 
 interface CacheEntry<T> {
   at: number
@@ -139,6 +142,24 @@ function waitForPreheat(): Promise<void> {
   return polling
 }
 
+function waitForStockReady(code: string): Promise<void> {
+  const now = Date.now()
+  if ((stockReadyUntil.get(code) ?? 0) > now) return Promise.resolve()
+  const current = stockReadyInFlight.get(code)
+  if (current) return current
+  const request = waitForPreheat()
+    .then(() => getJson<{ code: string; market: number; ready: boolean }>(
+      `/api/stock-ready/${code}`,
+      20_000,
+    ))
+    .then(() => {
+      stockReadyUntil.set(code, Date.now() + STOCK_READY_TTL_MS)
+    })
+    .finally(() => stockReadyInFlight.delete(code))
+  stockReadyInFlight.set(code, request)
+  return request
+}
+
 function getMarketView(
   code: string,
   period: string,
@@ -160,6 +181,7 @@ export const api = {
   // 连接
   status: () => getJson<Status>('/api/status'),
   preheatReady: () => waitForPreheat(),
+  stockReady: (code: string) => waitForStockReady(code),
   connect: () =>
     postJson<{ success: boolean; server: string; error: string }>('/api/connect'),
 

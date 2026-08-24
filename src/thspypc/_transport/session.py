@@ -171,6 +171,34 @@ class MarketSession:
         finally:
             self._request_lock.release()
 
+    def try_dispatch(
+        self,
+        request,
+        *,
+        frame_reader,
+        timeout: float,
+        max_frames: int = 32,
+    ):
+        """Submit one background request only when the socket lane is idle.
+
+        The dispatcher remains the sole reader until the request completes.
+        This is used by heartbeat probes so the heartbeat thread never calls
+        ``recv`` or steals a frame from a synchronous business request.
+        """
+        if not self._request_lock.acquire(blocking=False):
+            return None
+        try:
+            if self._dispatcher.busy:
+                return None
+            return self._dispatcher.submit(
+                [request],
+                frame_reader=frame_reader,
+                timeout=timeout,
+                max_frames=max_frames,
+            )[0]
+        finally:
+            self._request_lock.release()
+
     def dispatch(
         self,
         requests,

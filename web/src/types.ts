@@ -5,6 +5,24 @@ export interface PreheatMarket {
   skipped?: boolean
   error?: string
 }
+export interface HeartbeatLaneStatus {
+  generation: number
+  state: 'idle' | 'pending' | 'healthy' | 'suspect' | 'unresponsive'
+  keepalive_sent: number
+  probes_sent: number
+  responses: number
+  explicit_acks: number
+  inbound_frames: number
+  skipped_busy: number
+  consecutive_misses: number
+  pending: boolean
+  bound_age_ms: number | null
+  last_keepalive_age_ms: number | null
+  last_probe_age_ms: number | null
+  last_response_age_ms: number | null
+  last_ack_age_ms: number | null
+  last_rx_age_ms: number | null
+}
 export interface Status {
   connected: boolean
   server: string
@@ -15,6 +33,14 @@ export interface Status {
     elapsed_ms?: number
     markets?: Record<string, PreheatMarket>
     error?: string
+  }
+  heartbeat?: {
+    enabled: boolean
+    mode: 'observe_only' | 'unavailable'
+    probe_interval_seconds?: number
+    response_timeout_seconds?: number
+    miss_threshold?: number
+    lanes: Record<string, HeartbeatLaneStatus>
   }
 }
 

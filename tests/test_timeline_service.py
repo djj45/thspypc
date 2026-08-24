@@ -215,6 +215,45 @@ def test_level2_workflow_uses_selected_role_and_matches_response(monkeypatch):
     assert b"pageid=1334" in sock.sent[1]
 
 
+def test_level2_workflow_waits_past_legacy_frame_budget(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    pushes = [f"market-push-{index}".encode() for index in range(80)]
+    responses = iter([b"CodeListSize=1", *pushes, b"hd3.1\x00timeline"])
+    service = TimelineService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=1,
+    )
+    expected = [{"code": "601318", "bar_index": 1}]
+    monkeypatch.setattr(
+        "thspypc.services.timeline.parse_timeline_l2_response",
+        lambda _body: expected,
+    )
+
+    assert service.timeline("601318", market=17, timeout=1.0) == expected
+
+
+def test_level2_workflow_skips_timeline_for_other_code(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(LEVEL2_PROFILE, lambda _spec: sock)
+    other = b"hd3.1\x00other"
+    target = b"hd3.1\x00target"
+    responses = iter([b"CodeListSize=1", other, target])
+    service = TimelineService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+    )
+    monkeypatch.setattr(
+        "thspypc.services.timeline.parse_timeline_l2_response",
+        lambda body: [{"code": "600519" if body == other else "601318"}],
+    )
+
+    assert service.timeline("601318", market=17, timeout=1.0) == [
+        {"code": "601318"}
+    ]
+
+
 def test_level2_index_workflow_skips_stock_snapshot_registration(monkeypatch):
     opened = []
     manager = ConnectionManager(

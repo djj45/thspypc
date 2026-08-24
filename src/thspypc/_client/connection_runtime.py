@@ -15,7 +15,23 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ..transport import ConnectionRole, OpenedConnection, probe_socket_alive
+from ..codecs.framing import (
+    read_frame,
+    register_frame_observer,
+    unregister_frame_observer,
+)
+from ..features.heartbeat_protocol import (
+    build_heartbeat_probe,
+    is_heartbeat_ack,
+)
+from ..transport import (
+    ConnectionRole,
+    DispatchDecision,
+    DispatchRequest,
+    OpenedConnection,
+    probe_socket_alive,
+)
+from .heartbeat_monitor import HeartbeatMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +284,13 @@ class ConnectionFactory:
 class ConnectionRuntime:
     """Own heartbeat, push-reader, and shutdown lifecycle."""
 
+    # The official desktop client emits this response-bearing short probe on
+    # a 60-second cadence.  Sending it every 30 seconds makes the server reply
+    # to alternating probes and creates a deterministic false ``suspect``.
+    HEARTBEAT_PROBE_INTERVAL_TICKS = 20
+    HEARTBEAT_RESPONSE_TIMEOUT = 12.0
+    HEARTBEAT_MISS_THRESHOLD = 2
+
     def __init__(
         self,
         *,
@@ -309,6 +332,10 @@ class ConnectionRuntime:
         self.heartbeat_seq_realorder = 0
         self.heartbeat_seq_board_stats = 0
         self.heartbeat_seq_push: dict[str, int] = {}
+        self._heartbeat_monitor = HeartbeatMonitor(
+            response_timeout=self.HEARTBEAT_RESPONSE_TIMEOUT,
+            miss_threshold=self.HEARTBEAT_MISS_THRESHOLD,
+        )
         self.snapshot_thread: threading.Thread | None = None
         self.snapshot_stop = threading.Event()
         self.snapshot_codes: set[str] = set()
@@ -343,6 +370,142 @@ class ConnectionRuntime:
         if self.heartbeat_thread and self.heartbeat_thread.is_alive():
             self.heartbeat_thread.join(timeout=5)
         self.heartbeat_thread = None
+
+    def heartbeat_status(self) -> dict[str, object]:
+        """Return a lock-only heartbeat snapshot suitable for ``/api/status``."""
+        return {
+            "enabled": bool(self.enable_heartbeat),
+            # First deployment is deliberately diagnostic-only.  It proves
+            # ACK timing and false-positive rate before connection retirement
+            # is allowed to trigger a fresh Passport/login lifecycle.
+            "mode": "observe_only",
+            "probe_interval_seconds": (
+                self.HEARTBEAT_PROBE_INTERVAL_TICKS * 3
+            ),
+            "response_timeout_seconds": self.HEARTBEAT_RESPONSE_TIMEOUT,
+            "miss_threshold": self.HEARTBEAT_MISS_THRESHOLD,
+            "lanes": self._heartbeat_monitor.snapshot(),
+        }
+
+    def _bind_heartbeat_lane(self, lane: str, sock: Any) -> None:
+        self._heartbeat_monitor.bind(lane, sock)
+        register_frame_observer(
+            sock,
+            lambda observed_sock, body, lane_name=lane: (
+                self._heartbeat_monitor.observe(
+                    lane_name,
+                    observed_sock,
+                    body,
+                )
+            ),
+        )
+
+    def _probe_consumer(
+        self,
+        lane: str,
+        sock: Any,
+        probe_id: int,
+        unsolicited: Callable[[bytes], Any] | None,
+    ):
+        def consume(body: bytes, observed_sock: Any) -> DispatchDecision:
+            # Production readers notify centrally before returning the body.
+            # The fallback keeps injected test readers and custom readers
+            # observable without double-counting production frames.
+            if self._heartbeat_monitor.has_pending(
+                lane,
+                observed_sock,
+                probe_id,
+            ):
+                self._heartbeat_monitor.observe(lane, observed_sock, body)
+            ack = is_heartbeat_ack(body)
+            if unsolicited is not None and not ack:
+                try:
+                    unsolicited(body)
+                except Exception as exc:
+                    logger.debug(
+                        "%s 心跳探针转交下行帧失败: %s",
+                        lane,
+                        exc,
+                    )
+            return DispatchDecision(matched=True, done=True, value=ack)
+
+        return consume
+
+    def _finish_probe_future(
+        self,
+        lane: str,
+        sock: Any,
+        probe_id: int,
+        future: Any,
+    ) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            state = self._heartbeat_monitor.fail_probe(
+                lane,
+                sock,
+                probe_id,
+            )
+            if state is not None:
+                log = logger.warning if state == "unresponsive" else logger.debug
+                log("%s 心跳探针无下行响应（%s）: %s", lane, state, exc)
+
+    def _schedule_dispatch_probe(
+        self,
+        lane: str,
+        sock: Any,
+        owner: Any,
+        frame: bytes,
+        frame_reader: Callable[[Any], bytes],
+        *,
+        unsolicited: Callable[[bytes], Any] | None = None,
+    ) -> bool:
+        self._bind_heartbeat_lane(lane, sock)
+        probe_id = self._heartbeat_monitor.begin_probe(lane, sock)
+        if probe_id is None:
+            return False
+        request = DispatchRequest(
+            frame=frame,
+            consume=self._probe_consumer(
+                lane,
+                sock,
+                probe_id,
+                unsolicited,
+            ),
+            name=f"heartbeat:{lane}",
+            trailing_newline=False,
+        )
+        try:
+            future = owner.try_dispatch(
+                request,
+                frame_reader=frame_reader,
+                timeout=self.HEARTBEAT_RESPONSE_TIMEOUT,
+                max_frames=256,
+            )
+        except Exception as exc:
+            state = self._heartbeat_monitor.fail_probe(lane, sock, probe_id)
+            logger.debug("%s 心跳探针发送失败（%s）: %s", lane, state, exc)
+            return False
+        if future is None:
+            self._heartbeat_monitor.cancel_probe(lane, sock, probe_id)
+            self._heartbeat_monitor.note_skipped(lane, sock)
+            return False
+        future.add_done_callback(
+            lambda completed, lane_name=lane, lane_sock=sock, pid=probe_id: (
+                self._finish_probe_future(
+                    lane_name,
+                    lane_sock,
+                    pid,
+                    completed,
+                )
+            )
+        )
+        return True
+
+    def _expire_raw_probes(self) -> None:
+        for lane, _sock, _probe_id, state in self._heartbeat_monitor.expire():
+            log = logger.warning if state == "unresponsive" else logger.debug
+            log("%s 心跳探针无下行响应（%s）", lane, state)
 
     def activate_snapshot(self, code: str, market: int, callback) -> None:
         self.snapshot_codes.add(code)
@@ -756,7 +919,10 @@ class ConnectionRuntime:
         self,
         build_main_heartbeat: Callable[[int], bytes] | None = None,
         build_realorder_heartbeat: Callable[[int], bytes] | None = None,
+        build_probe_heartbeat: Callable[[int], bytes] | None = None,
     ) -> None:
+        from ..features.board_stats_protocol import read_frame_board_stats
+        from ..features.realorder_protocol import read_frame_realorder
         from ..protocol import (
             build_heartbeat_8901,
             build_heartbeat_9601,
@@ -766,32 +932,90 @@ class ConnectionRuntime:
         build_realorder = (
             build_realorder_heartbeat or build_heartbeat_9601
         )
+        build_probe = build_probe_heartbeat or build_heartbeat_probe
         tick = 0
         while not self.heartbeat_stop.is_set():
             if self.heartbeat_stop.wait(3.0):
                 break
             tick += 1
-            if self._main_socket():
+            self._expire_raw_probes()
+            manager = self._service_connections()
+            main_sock = self._main_socket()
+            if main_sock:
+                self._bind_heartbeat_lane("main", main_sock)
+                main_connection = (
+                    manager.peek(ConnectionRole.MAIN)
+                    if manager is not None
+                    else None
+                )
+                main_owner = (
+                    main_connection
+                    if main_connection is not None
+                    and main_connection.socket is main_sock
+                    else self._market_session
+                )
                 try:
                     self.heartbeat_seq_main += 1
-                    sent = self._market_session.try_send(
+                    sent = main_owner.try_send(
                         build_main(self.heartbeat_seq_main)
                     )
-                    if not sent:
+                    if sent:
+                        self._heartbeat_monitor.note_keepalive(
+                            "main",
+                            main_sock,
+                        )
+                    else:
+                        self._heartbeat_monitor.note_skipped("main", main_sock)
                         logger.debug("8901 连接正在处理业务请求，跳过本轮心跳")
                 except OSError as exc:
                     logger.debug("8901 心跳发送失败（不影响查询）: %s", exc)
-            manager = self._service_connections()
+                if tick % self.HEARTBEAT_PROBE_INTERVAL_TICKS == 0:
+                    self.heartbeat_seq_main += 1
+                    probe_token = int(time.monotonic() * 1000)
+                    self._schedule_dispatch_probe(
+                        "main",
+                        main_sock,
+                        main_owner,
+                        build_probe(probe_token),
+                        read_frame,
+                        unsolicited=self.deliver_market_push,
+                    )
             if manager is not None:
                 kline = manager.peek(ConnectionRole.KLINE_FAST)
                 if kline is not None:
+                    kline_sock = kline.socket
+                else:
+                    kline_sock = None
+                if kline is not None and kline_sock is not None:
+                    self._bind_heartbeat_lane("kline_fast", kline_sock)
                     try:
                         self.heartbeat_seq_main += 1
-                        kline.try_send(build_main(self.heartbeat_seq_main))
+                        sent = kline.try_send(build_main(self.heartbeat_seq_main))
+                        if sent:
+                            self._heartbeat_monitor.note_keepalive(
+                                "kline_fast",
+                                kline_sock,
+                            )
+                        else:
+                            self._heartbeat_monitor.note_skipped(
+                                "kline_fast",
+                                kline_sock,
+                            )
                     except OSError as exc:
                         logger.debug(
                             "KLINE_FAST heartbeat failed: %s",
                             exc,
+                        )
+                    if tick % self.HEARTBEAT_PROBE_INTERVAL_TICKS == 0:
+                        self.heartbeat_seq_main += 1
+                        probe_token = int(time.monotonic() * 1000)
+                        self._schedule_dispatch_probe(
+                            "kline_fast",
+                            kline_sock,
+                            kline,
+                            build_probe(probe_token),
+                            read_frame,
+                            unsolicited=self.deliver_market_push,
                         )
             # 预热出来的 SH_L2/SZ_L2 也是裸 socket，之前没有心跳，服务器会
             # 在空闲几十秒后主动 FIN；业务再使用时 4214 注册自然拿不到
@@ -805,12 +1029,15 @@ class ConnectionRuntime:
                     sock = self._push_sockets.get(key)
                 if sock is None:
                     continue
+                lane = f"{key}_l2"
+                self._bind_heartbeat_lane(lane, sock)
                 # probe_socket_alive() temporarily calls setblocking(False) on
                 # Windows.  Probe and heartbeat write must share the same lane
                 # lock as business recv; otherwise recv can fail with 10035.
                 request_lock = self._push_request_locks[key]
                 if not request_lock.acquire(blocking=False):
                     # An active request/reader owns the lane; skip this beat.
+                    self._heartbeat_monitor.note_skipped(lane, sock)
                     continue
                 seq = self.heartbeat_seq_push.get(key, 0) + 1
                 self.heartbeat_seq_push[key] = seq
@@ -819,6 +1046,33 @@ class ConnectionRuntime:
                         dead_l2.append((key, sock))
                         continue
                     sock.sendall(build_main(seq) + b"\n")
+                    self._heartbeat_monitor.note_keepalive(lane, sock)
+                    reader_active = bool(
+                        self.snapshot_thread
+                        and self.snapshot_thread.is_alive()
+                    )
+                    if (
+                        reader_active
+                        and tick % self.HEARTBEAT_PROBE_INTERVAL_TICKS == 0
+                    ):
+                        seq += 1
+                        self.heartbeat_seq_push[key] = seq
+                        probe_token = int(time.monotonic() * 1000)
+                        probe_id = self._heartbeat_monitor.begin_probe(
+                            lane,
+                            sock,
+                        )
+                        if probe_id is not None:
+                            try:
+                                # The captured short probe has no trailing LF.
+                                sock.sendall(build_probe(probe_token))
+                            except OSError:
+                                self._heartbeat_monitor.fail_probe(
+                                    lane,
+                                    sock,
+                                    probe_id,
+                                )
+                                raise
                 except OSError as exc:
                     logger.debug("L2[%s] 心跳发送失败：%s", key, exc)
                     dead_l2.append((key, sock))
@@ -839,17 +1093,37 @@ class ConnectionRuntime:
                         if key == "sh"
                         else ConnectionRole.SZ_L2
                     )
-            if tick % 10 == 0 and self._realorder_socket():
+            if (
+                tick % self.HEARTBEAT_PROBE_INTERVAL_TICKS == 0
+                and self._realorder_socket()
+            ):
                 try:
                     self.heartbeat_seq_realorder += 1
+                    realorder_sock = self._realorder_socket()
+                    self._bind_heartbeat_lane("realorder", realorder_sock)
                     service = self._realorder_service()
-                    if service is not None:
-                        sent = service.send_heartbeat(
-                            self.heartbeat_seq_realorder
+                    connection = (
+                        manager.peek(ConnectionRole.REALORDER)
+                        if manager is not None
+                        else None
+                    )
+                    if connection is not None:
+                        unsolicited = getattr(
+                            service,
+                            "observe_unsolicited",
+                            None,
                         )
-                        if not sent:
-                            logger.debug("9601 连接正在处理业务请求，跳过本轮心跳")
+                        self._schedule_dispatch_probe(
+                            "realorder",
+                            realorder_sock,
+                            connection,
+                            build_probe(int(time.monotonic() * 1000)),
+                            read_frame_realorder,
+                            unsolicited=unsolicited,
+                        )
                     else:
+                        # Compatibility fallback before the service registry is
+                        # configured: preserve keepalive without taking recv.
                         with self._realorder_lock:
                             sock = self._realorder_socket()
                             if sock:
@@ -859,26 +1133,47 @@ class ConnectionRuntime:
                                     )
                                     + b"\n"
                                 )
+                                self._heartbeat_monitor.note_keepalive(
+                                    "realorder",
+                                    sock,
+                                )
                 except OSError as exc:
                     logger.debug("9601 心跳发送失败（不影响查询）: %s", exc)
             # statscalc 独立统计节点（9601）心跳：与 realorder 同为 5 字节 9601 心跳，
             # 但走独立 socket/lock。仅在连接已建立时发送。
             if (
-                tick % 10 == 0
+                tick % self.HEARTBEAT_PROBE_INTERVAL_TICKS == 0
                 and self._board_stats_socket is not None
                 and self._board_stats_socket() is not None
                 and self._board_stats_lock is not None
             ):
                 try:
                     self.heartbeat_seq_board_stats += 1
-                    with self._board_stats_lock:
-                        sock = self._board_stats_socket()
-                        if sock:
+                    sock = self._board_stats_socket()
+                    if sock:
+                        self._bind_heartbeat_lane("board_stats", sock)
+                    connection = (
+                        manager.peek(ConnectionRole.BOARD_STATS)
+                        if manager is not None
+                        else None
+                    )
+                    if sock and connection is not None:
+                        self._schedule_dispatch_probe(
+                            "board_stats",
+                            sock,
+                            connection,
+                            build_probe(int(time.monotonic() * 1000)),
+                            read_frame_board_stats,
+                        )
+                    elif sock:
+                        with self._board_stats_lock:
                             sock.sendall(
-                                build_realorder(
-                                    self.heartbeat_seq_board_stats
-                                )
+                                build_realorder(self.heartbeat_seq_board_stats)
                                 + b"\n"
+                            )
+                            self._heartbeat_monitor.note_keepalive(
+                                "board_stats",
+                                sock,
                             )
                 except OSError as exc:
                     logger.debug(
@@ -888,6 +1183,9 @@ class ConnectionRuntime:
     def disconnect(self) -> None:
         self.stop_heartbeat()
         self.stop_snapshot()
+        for sock in self._heartbeat_monitor.bound_sockets():
+            unregister_frame_observer(sock)
+        self._heartbeat_monitor.clear()
         manager = self._service_connections()
         if manager is not None:
             manager.close_all()

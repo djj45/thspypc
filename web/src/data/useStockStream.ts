@@ -46,9 +46,9 @@ export function useStockStream(code: string, enabled = true) {
 
     const open = async () => {
       if (stopped || generation.current !== current) return
-      // 与分时/K线相同，等后端完成 SH/SZ L2 预热后再建 4214 订阅，
-      // 避免冷启动时 WebSocket 与预热线程同时创建同一市场 socket。
-      await api.preheatReady()
+      // 先完成该股票的 4214 注册，再建实时流。分时/盘口/超级盘口共用
+      // 同一个浏览器侧 single-flight，不会在切股时并发争抢注册响应。
+      await api.stockReady(code)
       if (stopped || generation.current !== current) return
       await new Promise((resolve) =>
         setTimeout(resolve, STREAM_SWITCH_COALESCE_MS),

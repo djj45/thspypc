@@ -3,6 +3,8 @@
 import concurrent.futures
 from pathlib import Path
 import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -310,6 +312,55 @@ def test_preheat_service_connections_reuses_l2_roles_for_kline(monkeypatch):
     }
 
     client.disconnect()
+
+
+def test_l2_stale_passport_refreshes_only_once(monkeypatch):
+    client = _client()
+    initial = SimpleNamespace(
+        passport64="passport-initial",
+        passport_bytes=b"passport-initial-bytes",
+    )
+    fresh = SimpleNamespace(
+        passport64="passport-fresh",
+        passport_bytes=b"passport-fresh-bytes",
+    )
+    auth_calls = []
+    login_calls = []
+
+    monkeypatch.setattr(
+        "thspypc.protocol.resolve_l2_hosts_grouped",
+        lambda _passport: {"sh": [], "sz": ["192.0.2.1"]},
+    )
+    monkeypatch.setattr(
+        client,
+        "_probe_fastest_hosts",
+        lambda hosts, timeout, role: list(hosts),
+    )
+    monkeypatch.setattr(
+        client,
+        "_rotated_l2_batch",
+        lambda hosts, _key: list(hosts),
+    )
+    monkeypatch.setattr(client, "_advance_l2_offset", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        client,
+        "_try_open_manual_sock",
+        lambda host, passport, *_args, **_kwargs: (
+            login_calls.append((host, passport)) or "stale_passport"
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "authenticate",
+        lambda *, force=False: auth_calls.append(force) or fresh,
+    )
+
+    assert client._open_manual_push_connection(33, material=initial) is None
+    assert auth_calls == [True]
+    assert login_calls == [
+        ("192.0.2.1", "passport-initial"),
+        ("192.0.2.1", "passport-fresh"),
+    ]
 
 
 def test_concurrent_default_calls_keep_each_others_capability_lease():
@@ -1797,6 +1848,34 @@ def test_l2_heartbeat_skips_probe_while_request_lane_is_busy(monkeypatch):
 
     assert lock.acquire_calls == 1
     assert sock.sent == []
+
+
+def test_main_heartbeat_probe_uses_dispatcher_and_records_ack():
+    client = _client()
+    sock = FakeSocket()
+    client._sock = sock
+    runtime = client._connection_runtime
+    probe = b"framed-probe"
+
+    assert runtime._schedule_dispatch_probe(
+        "main",
+        sock,
+        client._market_session,
+        probe,
+        lambda _sock: b"\x09\x00\x00\x00",
+    )
+
+    deadline = time.monotonic() + 1.0
+    while runtime.heartbeat_status()["lanes"]["main"]["pending"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    status = runtime.heartbeat_status()["lanes"]["main"]
+    assert runtime.heartbeat_status()["probe_interval_seconds"] == 60
+    assert sock.sent == [probe]
+    assert status["state"] == "healthy"
+    assert status["probes_sent"] == 1
+    assert status["responses"] == 1
+    assert status["explicit_acks"] == 1
 
 
 def test_depth_subscribe_multi_market_and_local_unsubscribe_lifecycle(monkeypatch):

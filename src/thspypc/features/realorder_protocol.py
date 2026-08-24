@@ -8,6 +8,7 @@ import struct
 from ..codecs.framing import (
     FRAME_MAGIC,
     _read_frame_body_length,
+    _notify_frame_observers,
     encode_frame,
     read_exact,
 )
@@ -222,7 +223,9 @@ def read_frame_realorder(sock: socket.socket) -> bytes:
         if bytes(magic) == FRAME_MAGIC:
             break
     body_len = _read_frame_body_length(sock) + 1
-    return read_exact(sock, body_len)
+    body = read_exact(sock, body_len)
+    _notify_frame_observers(sock, body)
+    return body
 
 
 def build_qurealorder_query(

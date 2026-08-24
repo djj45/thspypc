@@ -247,6 +247,22 @@ class ManagedConnection:
             trailing_newline=trailing_newline,
         )
 
+    def try_dispatch(
+        self,
+        request,
+        *,
+        frame_reader,
+        timeout: float,
+        max_frames: int = 32,
+    ):
+        """Submit one non-blocking background request on an idle lane."""
+        return self._session.try_dispatch(
+            request,
+            frame_reader=frame_reader,
+            timeout=timeout,
+            max_frames=max_frames,
+        )
+
     def receive(
         self,
         *,

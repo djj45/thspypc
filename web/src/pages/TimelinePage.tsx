@@ -114,24 +114,37 @@ export function TimelinePage() {
     setHistory([])
     setDepth(null)
     setError('')
-    // 十档和逐笔独立结算：一个接口失败不能把另一个已经成功的面板清空。
-    void api.depth(code, 10).then((result) => {
-      if (current) setDepth(result)
-    }).catch((reason) => {
-      if (current) setError(reason instanceof Error ? reason.message : String(reason))
-    })
-
-    // 盘后没有实时逐笔流；14:57-15:00 又是尾盘竞价，查询7175/7170/7171
-    // 连续交易窗口只会空等。官方客户端盘后只加载历史分时/盘口，因此这里也
-    // 不请求超级盘口窗口。盘中只取7169成交，不再附带挂单撤单三路查询。
-    if (isRealtimeMarketSession()) {
-      const [start, end] = recentSessionWindow()
-      void api.superorderTrades(code, start, end).then((result) => {
-        if (current) setHistory(result)
-      }).catch((reason) => {
+    const load = async () => {
+      try {
+        await api.stockReady(code)
+      } catch (reason) {
         if (current) setError(reason instanceof Error ? reason.message : String(reason))
-      })
+        return
+      }
+      if (!current) return
+
+      // 十档和逐笔在注册后顺序执行；各自独立结算，一个失败不清空另一个。
+      try {
+        const result = await api.depth(code, 10)
+        if (current) setDepth(result)
+      } catch (reason) {
+        if (current) setError(reason instanceof Error ? reason.message : String(reason))
+      }
+      if (!current) return
+
+      // 盘后没有实时逐笔流；14:57-15:00 又是尾盘竞价，查询7175/7170/7171
+      // 连续交易窗口只会空等。盘中只取7169成交，不再附带挂单撤单三路查询。
+      if (isRealtimeMarketSession()) {
+        const [start, end] = recentSessionWindow()
+        try {
+          const result = await api.superorderTrades(code, start, end)
+          if (current) setHistory(result)
+        } catch (reason) {
+          if (current) setError(reason instanceof Error ? reason.message : String(reason))
+        }
+      }
     }
+    void load()
     return () => { current = false }
   }, [code])
 

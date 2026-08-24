@@ -655,3 +655,45 @@ def test_parse_snapshot_replay_response_index_multi_table():
         1786065300, 1786065303, 1786065306,
         1785978900, 1785978903, 1785978906,
     ]
+
+
+def test_snapshot_replay_classifier_distinguishes_index_from_7169():
+    def table(field_ids: list[int], code: str = "399001") -> bytes:
+        field_table = b"".join(
+            bytes((datatype, 0x30, 0, 4)) for datatype in field_ids
+        )
+        shell = b"\x16\x00\x01\x00\x20" + code.encode("ascii") + b"\x00" * 17
+        return (
+            b"hd1.0\x00"
+            + struct.pack("<IHHH", 0, 0x0046, 32, 8)
+            + field_table
+            + shell
+        )
+
+    replay = table([1, 10, 13, 19, 49, 18, 123, 125])
+    trades = table([1, 56, 10, 13, 12, 74, 75, 18])
+
+    assert superorder_protocol.is_snapshot_replay_response(
+        replay,
+        code="399001",
+    )
+    assert not superorder_protocol.is_snapshot_replay_response(
+        replay,
+        code="000001",
+    )
+    assert not superorder_protocol.is_snapshot_replay_response(
+        trades,
+        code="399001",
+    )
+    assert superorder_protocol.is_superorder_response(
+        trades,
+        code="399001",
+    )
+    assert not superorder_protocol.is_superorder_response(
+        trades,
+        code="000001",
+    )
+    assert not superorder_protocol.is_superorder_response(
+        replay,
+        code="399001",
+    )

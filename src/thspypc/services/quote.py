@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import socket
 import struct
+import time
 from collections.abc import Callable
 
 from .._transport import (
@@ -423,24 +425,39 @@ class QuoteService:
             timeout=min(timeout, 5.0),
         )
         frame = build_depth_ten_query(code, market=market)
-        saw_depth_frame = False
+        deadline = time.monotonic() + timeout
+        unsolicited_count = 0
         with connection.request(frame, timeout=timeout) as sock:
-            for _ in range(self._max_frames):
-                response = self._read_frame(sock)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "depth response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    )
+                sock.settimeout(remaining)
+                try:
+                    response = self._read_frame(sock)
+                except socket.timeout:
+                    raise TimeoutError(
+                        "depth response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    ) from None
                 response = _repair_short_record(sock, response)
                 result = parse_depth_quote_response(response)
                 if result:
+                    if result.get("code") not in (None, "", code):
+                        unsolicited_count += 1
+                        self._subscriptions.deliver_unsolicited(response)
+                        continue
                     if self._evidence is not None:
                         self._evidence.record_feature(
                             Capability.L2_SNAPSHOT_PUSH,
                             Support.YES,
                         )
                     return result
-                if b"hd1.0" in response:
-                    saw_depth_frame = True
-        if saw_depth_frame:
-            raise ProtocolError("收到十档盘口帧但无法解析")
-        return {}
+                unsolicited_count += 1
+                self._subscriptions.deliver_unsolicited(response)
 
 
 def _depth_l2_role(market: int) -> ConnectionRole:

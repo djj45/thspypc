@@ -308,8 +308,9 @@ export function StockProvider({
     const loadIntraday = async () => {
       const target = codeRef.current
       try {
-        // 等待后端预热就绪再走 L2，避免冷启动时请求排队等锁/超时。
-        await api.preheatReady()
+        // 先完成该股票的 4214 注册，再读取分时；与盘口、逐笔及实时流
+        // 共享前端 single-flight，切股时不会同时争抢注册响应。
+        await api.stockReady(target)
         if (target !== codeRef.current) return
         const rows = await retryCurrentRequest(
           () => api.intraday(target),

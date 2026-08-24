@@ -140,6 +140,20 @@ def test_subscription_and_heartbeat_share_request_lock():
     assert service.send_heartbeat(2)
 
 
+def test_probe_owned_push_is_retained_for_next_receiver(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(_profile(), lambda _spec: sock)
+    service = RealOrderService(manager, _instances())
+    monkeypatch.setattr(
+        "thspypc.services.realorder.parse_pushrealorder_response",
+        lambda body: [{"代码": "600000"}] if body == b"push" else [],
+    )
+
+    assert service.observe_unsolicited(b"push")
+    service._subscribed_markets.add(16)
+    assert service.receive_pushes(timeout=0) == ([{"代码": "600000"}], 0)
+
+
 def test_push_reader_holds_exclusive_socket_ownership():
     sock = FakeSocket()
     request_lock = threading.Lock()

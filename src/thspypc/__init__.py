@@ -119,6 +119,7 @@ from .protocol import (
     ANOMALY_GROUP_PREFIX, build_category_id, build_datatype,
     # 心跳（keep-alive）
     build_heartbeat_8901, build_heartbeat_9601,
+    build_heartbeat_probe, is_heartbeat_ack,
 )
 from .blocks import BlockManager, BlockAuth, StockItem, StockGroup, BlockError
 from .qr_login import (
@@ -206,6 +207,7 @@ __all__ = [
     "SUBREAL_CHANNELS", "SUBREALORDER_MARKETS",
     "ANOMALY_GROUP_PREFIX", "build_category_id", "build_datatype",
     "build_heartbeat_8901", "build_heartbeat_9601",
+    "build_heartbeat_probe", "is_heartbeat_ack",
     "BlockManager", "BlockAuth", "StockItem", "StockGroup", "BlockError",
     "QrLoginResult", "qr_login_flow",
     "save_credentials", "load_credentials", "is_credentials_expired", "default_cache_path",

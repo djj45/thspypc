@@ -220,7 +220,7 @@ def test_successful_l2_services_promote_only_observed_features(
     )
     monkeypatch.setattr(
         "thspypc.services.timeline.parse_timeline_l2_response",
-        lambda _body: [{"dt10": 12.3}],
+        lambda _body: [{"code": "000938", "dt10": 12.3}],
     )
     monkeypatch.setattr(
         "thspypc.services.auction.parse_auction_response",

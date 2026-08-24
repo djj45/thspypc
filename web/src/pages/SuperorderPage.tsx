@@ -158,6 +158,8 @@ export function SuperorderPage() {
     setSelectedTs(null)
     const load = async () => {
       try {
+        await api.stockReady(code)
+        if (!current) return
         const nextReplay = await api.superorderReplay(code, historicalDate)
         if (!current) return
         // 4260 当前日响应盘后偶尔尾随静态记录；页面只展示A股有效盘口时段。

@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from collections.abc import Callable
+import socket
+import time
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
@@ -275,16 +277,31 @@ class TimelineService:
                 market=market,
                 timeout=min(timeout, 5.0),
             )
-        saw_timeline_frame = False
+        deadline = time.monotonic() + timeout
+        unsolicited_count = 0
         with connection.request(frame, timeout=timeout) as sock:
-            for _ in range(self._max_frames):
-                response = self._read_frame(sock)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "timeline response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    )
+                sock.settimeout(remaining)
+                try:
+                    response = self._read_frame(sock)
+                except socket.timeout:
+                    raise TimeoutError(
+                        "timeline response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    ) from None
                 if (
                     not response.startswith(b"\x0a")
                     and b"hd3.1\x00" not in response
                 ):
+                    unsolicited_count += 1
+                    self._subscriptions.deliver_unsolicited(response)
                     continue
-                saw_timeline_frame = True
                 parser = (
                     parse_timeline_l2_response
                     if plan.level2
@@ -292,6 +309,13 @@ class TimelineService:
                 )
                 records = parser(response)
                 if records:
+                    if not any(row.get("code") == code for row in records):
+                        unsolicited_count += 1
+                        self._subscriptions.deliver_unsolicited(response)
+                        continue
+                    records = [
+                        row for row in records if row.get("code") == code
+                    ]
                     # 指数分时的买卖力量（红绿柱）：用 dt14/dt15（累计主动买/卖）。
                     # 普通账号 9355 和 Level2 1334 的 DataType 都含 14/15。
                     if any(
@@ -306,11 +330,8 @@ class TimelineService:
                             Support.YES,
                         )
                     return records
-
-        if saw_timeline_frame:
-            label = "Level2" if plan.level2 else "普通账号"
-            raise ProtocolError(f"收到{label}分时帧但无法解析")
-        return []
+                label = "Level2" if plan.level2 else "普通账号"
+                raise ProtocolError(f"收到{label}分时帧但无法解析")
 
     def history_timeline(
         self,

@@ -217,6 +217,28 @@ class MarketSessionTest(unittest.TestCase):
         self.assertTrue(self.session.try_send(b"heartbeat"))
         self.assertEqual(self.sock.sent, [b"query\n", b"heartbeat\n"])
 
+    def test_try_dispatch_owns_probe_response_without_trailing_newline(self):
+        request = DispatchRequest(
+            b"probe",
+            lambda body, _sock: DispatchDecision(
+                matched=body == b"ack",
+                done=body == b"ack",
+                value="healthy",
+            ),
+            name="heartbeat",
+            trailing_newline=False,
+        )
+
+        future = self.session.try_dispatch(
+            request,
+            frame_reader=lambda _sock: b"ack",
+            timeout=1.0,
+        )
+
+        self.assertIsNotNone(future)
+        self.assertEqual(future.result(timeout=1.0), "healthy")
+        self.assertEqual(self.sock.sent, [b"probe"])
+
     def test_request_rejects_closed_connection(self) -> None:
         session = MarketSession(lambda: None, threading.RLock())
         with self.assertRaisesRegex(ConnectionError, "连接已关闭"):
@@ -323,6 +345,29 @@ class MarketSessionTest(unittest.TestCase):
                 frame_reader=read_frame,
                 timeout=0.02,
             )
+
+    def test_dispatch_waits_past_legacy_frame_budget(self):
+        noise = [f"push-{index}".encode() for index in range(80)]
+        reads = iter([*noise, b"quote-response"])
+
+        result = self.session.dispatch(
+            [
+                DispatchRequest(
+                    b"quote",
+                    lambda body, sock: DispatchDecision(
+                        body == b"quote-response",
+                        body == b"quote-response",
+                        "quote-value",
+                    ),
+                    name="quote",
+                )
+            ],
+            frame_reader=lambda _sock: next(reads),
+            timeout=1.0,
+            max_frames=1,
+        )
+
+        self.assertEqual(result, ["quote-value"])
 
     def test_separate_dispatch_callers_can_share_one_reader(self):
         second_sent = threading.Event()

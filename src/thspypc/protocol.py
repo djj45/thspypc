@@ -1198,6 +1198,12 @@ from .features.index_push_protocol import (  # noqa: E402,F811
     parse_index_push,
 )
 
+from .features.heartbeat_protocol import (  # noqa: E402,F811
+    HEARTBEAT_ACK_BODIES,
+    build_heartbeat_probe,
+    is_heartbeat_ack,
+)
+
 # Preserve the historical protocol surface while authentication callers move to
 # AuthService; the duplicate authentication source block has been removed.
 from .features.auth_protocol import (  # noqa: E402,F811

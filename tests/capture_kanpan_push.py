@@ -82,6 +82,7 @@ from thspypc.features.index_push_protocol import (  # noqa: E402
 
 # ── Wireshark 路径探测 ──
 WS_CANDIDATES = [
+    r"D:\软件\Wireshark-4.4.7-x64-with-Npcap-1.50-Portable\Wireshark\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\WiresharkPortable64\App\Wireshark",
     r"D:\software\Wireshark_4.6.7_Portable\Wireshark\App\Wireshark",

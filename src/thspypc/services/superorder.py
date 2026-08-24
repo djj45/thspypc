@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import socket
 import struct
+import time
 from collections.abc import Callable
 
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
@@ -35,6 +36,8 @@ from ..features.superorder_protocol import (
     build_order_queue_query,
     build_snapshot_replay_query,
     build_superorder_query,
+    is_superorder_response,
+    is_snapshot_replay_response,
     parse_order_detail_response,
     parse_order_queue_response,
     parse_snapshot_replay_response,
@@ -184,17 +187,24 @@ class SuperorderService:
             end_ts=end_ts,
             pageid=pageid,
         )
-        records: list[dict] = []
-        saw_frame = False
-
+        deadline = time.monotonic() + timeout
+        unsolicited_count = 0
         with connection.request(request, timeout=timeout) as sock:
-            for _ in range(self._max_frames):
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "7169 response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    )
+                sock.settimeout(remaining)
                 try:
                     response = self._read_frame(sock)
                 except socket.timeout:
-                    if records:
-                        break
-                    raise
+                    raise TimeoutError(
+                        "7169 response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    ) from None
                 except ValueError:
                     recv = getattr(sock, "recv", None)
                     if recv is not None:
@@ -202,34 +212,21 @@ class SuperorderService:
                             recv(8192)
                         except OSError as exc:
                             raise ConnectionError("连接已关闭") from exc
-                    if records:
-                        break
                     continue
 
-                # 7169 帧：normalize 前以 0x0a 开头，normalize 后含 hd1.0
-                if response.startswith(b"\x0a") or b"hd1.0" in response:
+                if is_superorder_response(response, code=code):
                     parsed = parse_superorder_response(response)
-                    if parsed:
-                        records.extend(parsed)
-                        sock.settimeout(2.0)
-                        saw_frame = True
-                        continue
-                    if b"hd1.0" in response:
-                        saw_frame = True
-                if records:
-                    break
+                    parsed = [
+                        row for row in parsed if row.get("code") == code
+                    ]
+                    if self._evidence is not None:
+                        self._evidence.record_feature(
+                            Capability.L2_TIMELINE,
+                            Support.YES,
+                        )
+                    return parsed
+                unsolicited_count += 1
                 self._deliver_unsolicited(response)
-
-        if records:
-            if self._evidence is not None:
-                self._evidence.record_feature(
-                    Capability.L2_TIMELINE,
-                    Support.YES,
-                )
-            return records
-        if saw_frame:
-            raise ProtocolError("收到 7169 逐笔帧但无法解析")
-        return []
 
     def snapshot_replay(
         self,
@@ -291,17 +288,24 @@ class SuperorderService:
             start_ts=start_ts,
             end_ts=end_ts,
         )
-        records: list[dict] = []
-        saw_frame = False
-
+        deadline = time.monotonic() + timeout
+        unsolicited_count = 0
         with connection.request(request, timeout=timeout) as sock:
-            for _ in range(self._max_frames):
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "4096 response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    )
+                sock.settimeout(remaining)
                 try:
                     response = self._read_frame(sock)
                 except socket.timeout:
-                    if records:
-                        break
-                    raise
+                    raise TimeoutError(
+                        "4096 response timed out after "
+                        f"{unsolicited_count} unsolicited frames"
+                    ) from None
                 except ValueError:
                     recv = getattr(sock, "recv", None)
                     if recv is not None:
@@ -309,11 +313,9 @@ class SuperorderService:
                             recv(8192)
                         except OSError as exc:
                             raise ConnectionError("连接已关闭") from exc
-                    if records:
-                        break
                     continue
 
-                if response.startswith(b"\x0a") or b"hd1.0" in response:
+                if is_snapshot_replay_response(response, code=code):
                     parsed = parse_snapshot_replay_response(response)
                     if parsed and start_ts > 0 and end_ts > 0:
                         # 指数响应一个帧常含多张表（今日 + 请求历史日），
@@ -323,27 +325,16 @@ class SuperorderService:
                             for r in parsed
                             if start_ts <= r.get("ts", 0) <= end_ts
                         ]
-                    if parsed:
-                        records.extend(parsed)
-                        sock.settimeout(2.0)
-                        saw_frame = True
-                        continue
-                    if b"hd1.0" in response:
-                        saw_frame = True
-                if records:
-                    break
+                    if self._evidence is not None:
+                        self._evidence.record_feature(
+                            Capability.L2_TIMELINE,
+                            Support.YES,
+                        )
+                    # A recognized zero-row table is a confirmed empty response,
+                    # unlike exhausting a fixed number of unrelated push frames.
+                    return parsed
+                unsolicited_count += 1
                 self._deliver_unsolicited(response)
-
-        if records:
-            if self._evidence is not None:
-                self._evidence.record_feature(
-                    Capability.L2_TIMELINE,
-                    Support.YES,
-                )
-            return records
-        if saw_frame:
-            raise ProtocolError("收到 4096 盘口快照帧但无法解析")
-        return []
 
     def order_details(
         self,

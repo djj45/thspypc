@@ -87,6 +87,10 @@ def test_superorder_delivers_push_seen_before_query_response(monkeypatch):
         unsolicited=unsolicited.append,
     )
     monkeypatch.setattr(
+        "thspypc.services.superorder.is_superorder_response",
+        lambda body, **_kwargs: body.endswith(b"superorder"),
+    )
+    monkeypatch.setattr(
         "thspypc.services.superorder.parse_superorder_response",
         lambda body: [{"code": "603334"}] if body.endswith(b"superorder") else [],
     )
@@ -100,6 +104,118 @@ def test_superorder_delivers_push_seen_before_query_response(monkeypatch):
 
     assert result == [{"code": "603334"}]
     assert unsolicited == [b"market-push"]
+
+
+def test_superorder_skips_same_protocol_response_for_other_code(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(_profile(AccountKind.LEVEL2), lambda _spec: sock)
+    other = b"hd1.0-other-stock"
+    target = b"hd1.0-target-stock"
+    responses = iter([other, target])
+    unsolicited = []
+    service = SuperorderService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        unsolicited=unsolicited.append,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.is_superorder_response",
+        lambda body, **_kwargs: body == target,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.parse_superorder_response",
+        lambda body: [
+            {"code": "600519" if body == other else "601318", "seq": 1}
+        ],
+    )
+
+    result = service.superorder(
+        "601318",
+        market=17,
+        start_ts=1,
+        end_ts=2,
+    )
+
+    assert result == [{"code": "601318", "seq": 1}]
+    assert unsolicited == [other]
+
+
+def test_superorder_accepts_recognized_empty_table(monkeypatch):
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: FakeSocket(),
+    )
+    target = b"hd1.0-empty-superorder"
+    service = SuperorderService(manager, frame_reader=lambda _sock: target)
+    monkeypatch.setattr(
+        "thspypc.services.superorder.is_superorder_response",
+        lambda body, **_kwargs: body == target,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.parse_superorder_response",
+        lambda _body: [],
+    )
+
+    assert service.superorder(
+        "601318",
+        market=17,
+        start_ts=1,
+        end_ts=2,
+    ) == []
+
+
+def test_snapshot_replay_waits_past_legacy_frame_budget(monkeypatch):
+    sock = FakeSocket()
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: sock,
+    )
+    pushes = [f"market-push-{index}".encode() for index in range(100)]
+    target = b"hd1.0-snapshot-replay"
+    responses = iter([*pushes, target])
+    unsolicited = []
+    service = SuperorderService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=1,
+        unsolicited=unsolicited.append,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.is_snapshot_replay_response",
+        lambda body, **_kwargs: body == target,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.parse_snapshot_replay_response",
+        lambda _body: [{"code": "000001", "ts": 1}],
+    )
+
+    result = service.snapshot_replay("000001", market=33, timeout=1.0)
+
+    assert result == [{"code": "000001", "ts": 1}]
+    assert unsolicited == pushes
+
+
+def test_snapshot_replay_accepts_recognized_empty_table(monkeypatch):
+    manager = ConnectionManager(
+        _profile(AccountKind.LEVEL2),
+        lambda _spec: FakeSocket(),
+    )
+    target = b"hd1.0-empty-snapshot-replay"
+    service = SuperorderService(
+        manager,
+        frame_reader=lambda _sock: target,
+        max_frames=1,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.is_snapshot_replay_response",
+        lambda body, **_kwargs: body == target,
+    )
+    monkeypatch.setattr(
+        "thspypc.services.superorder.parse_snapshot_replay_response",
+        lambda _body: [],
+    )
+
+    assert service.snapshot_replay("000001", market=33) == []
 
 
 def test_level2_empty_queue_uses_market_role_and_returns_empty():

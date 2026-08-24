@@ -82,6 +82,24 @@ def test_registration_delivers_push_seen_before_ack():
     assert unsolicited == [b"market-push"]
 
 
+def test_registration_waits_past_legacy_frame_budget_for_ack():
+    sock = FakeSocket()
+    manager = ConnectionManager(PROFILE, lambda _spec: sock)
+    connection = manager.acquire(ConnectionRole.SH_L2)
+    pushes = [f"market-push-{index}".encode() for index in range(80)]
+    responses = iter([*pushes, b"CodeListSize=1"])
+    unsolicited = []
+    coordinator = L2SubscriptionCoordinator(
+        frame_reader=lambda _sock: next(responses),
+        max_frames=1,
+        unsolicited=unsolicited.append,
+    )
+
+    assert coordinator.ensure_registered(connection, "601318", market=17)
+    assert unsolicited == pushes
+    assert len(sock.sent) == 1
+
+
 def test_zero_status_is_not_remembered():
     sock = FakeSocket()
     manager = ConnectionManager(PROFILE, lambda _spec: sock)
@@ -204,7 +222,7 @@ def test_timeline_and_auction_share_registration(monkeypatch):
     )
     monkeypatch.setattr(
         "thspypc.services.timeline.parse_timeline_l2_response",
-        lambda _body: [{"dt10": 12.3}],
+        lambda _body: [{"code": "000938", "dt10": 12.3}],
     )
     monkeypatch.setattr(
         "thspypc.services.auction.parse_auction_response",

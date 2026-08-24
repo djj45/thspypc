@@ -157,6 +157,99 @@ def test_depth_quote_returns_empty_when_only_notifications_arrive():
     assert service.depth_quote("000001", market=33) == {}
 
 
+def test_depth_ten_waits_past_legacy_frame_budget(monkeypatch):
+    sock = FakeSocket()
+    profile = AccountProfile(
+        kind=AccountKind.LEVEL2,
+        capabilities={
+            Capability.L2_MARKET_ACCESS: Support.YES,
+            Capability.L2_SNAPSHOT_PUSH: Support.YES,
+        },
+    )
+    manager = ConnectionManager(profile, lambda _spec: sock)
+    pushes = [f"market-push-{index}".encode() for index in range(80)]
+    target = b"hd1.0\x00depth"
+    responses = iter([b"CodeListSize=1", *pushes, target])
+    service = QuoteService(
+        manager,
+        frame_reader=lambda _sock: next(responses),
+        max_frames=1,
+    )
+    expected = {"code": "601318", "buy": [], "sell": []}
+    monkeypatch.setattr(
+        "thspypc.services.quote.parse_depth_quote_response",
+        lambda body: expected if body == target else {},
+    )
+
+    assert service.depth_quote(
+        "601318",
+        market=17,
+        timeout=1.0,
+        ten_levels=True,
+    ) == expected
+
+
+def test_depth_ten_skips_depth_for_other_code(monkeypatch):
+    sock = FakeSocket()
+    profile = AccountProfile(
+        kind=AccountKind.LEVEL2,
+        capabilities={
+            Capability.L2_MARKET_ACCESS: Support.YES,
+            Capability.L2_SNAPSHOT_PUSH: Support.YES,
+        },
+    )
+    manager = ConnectionManager(profile, lambda _spec: sock)
+    other = b"hd1.0\x00other-depth"
+    target = b"hd1.0\x00target-depth"
+    responses = iter([b"CodeListSize=1", other, target])
+    service = QuoteService(manager, frame_reader=lambda _sock: next(responses))
+    monkeypatch.setattr(
+        "thspypc.services.quote.parse_depth_quote_response",
+        lambda body: {
+            "code": "600519" if body == other else "601318",
+            "buy": [],
+            "sell": [],
+        },
+    )
+
+    result = service.depth_quote(
+        "601318",
+        market=17,
+        timeout=1.0,
+        ten_levels=True,
+    )
+
+    assert result["code"] == "601318"
+
+
+def test_depth_ten_forwards_unparsed_hd1_push(monkeypatch):
+    sock = FakeSocket()
+    profile = AccountProfile(
+        kind=AccountKind.LEVEL2,
+        capabilities={
+            Capability.L2_MARKET_ACCESS: Support.YES,
+            Capability.L2_SNAPSHOT_PUSH: Support.YES,
+        },
+    )
+    manager = ConnectionManager(profile, lambda _spec: sock)
+    other = b"hd1.0\x00unrelated-push"
+    target = b"hd1.0\x00target-depth"
+    responses = iter([b"CodeListSize=1", other, target])
+    service = QuoteService(manager, frame_reader=lambda _sock: next(responses))
+    expected = {"code": "601318", "buy": [], "sell": []}
+    monkeypatch.setattr(
+        "thspypc.services.quote.parse_depth_quote_response",
+        lambda body: expected if body == target else {},
+    )
+
+    assert service.depth_quote(
+        "601318",
+        market=17,
+        timeout=1.0,
+        ten_levels=True,
+    ) == expected
+
+
 def test_quote_service_checks_capability_before_opening():
     opened = []
     manager = ConnectionManager(

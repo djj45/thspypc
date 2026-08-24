@@ -70,23 +70,29 @@ class L2SubscriptionCoordinator:
                 if key in registered:
                     return False
             last_error: ProtocolError | None = None
-            # 新建连接/切换股票时，注册响应前可能还有 init 遗留帧；实测偶尔
-            # 连续 5 帧都不是 CodeListSize。放宽读取上限并重试一次，避免
-            # 首次 intraday/timeline 偶发 502。
+            # 新建连接/切换股票时，注册响应前可能夹着任意数量的 init 遗留帧
+            # 和实时行情推送。不能用固定帧数判断 ACK 缺失：活跃股票在 24 帧
+            # 之后才返回 CodeListSize 很常见。每次尝试改为以截止时间为准，
+            # 中间帧全部交给统一推送分发器。
             frame = build_snapshot_subscribe(code, market=market, seq=0)
             for attempt in range(2):
                 saw_status = False
+                zero_statuses = 0
+                deadline = time.monotonic() + timeout
                 try:
                     with connection.request(frame, timeout=timeout) as sock:
-                        for _ in range(max(self._max_frames, 24)):
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            sock.settimeout(remaining)
                             try:
                                 response = self._read_frame(sock)
                             except socket.timeout:
                                 break
                             match = _CODE_LIST_SIZE.search(response)
                             if match is None:
-                                if self._unsolicited is not None:
-                                    self._unsolicited(response)
+                                self.deliver_unsolicited(response)
                                 continue
                             saw_status = True
                             if int(match.group(1)) >= 1:
@@ -98,6 +104,12 @@ class L2SubscriptionCoordinator:
                                         Support.YES,
                                     )
                                 return True
+                            # 某些服务器在有效 ACK 前先发一次 size=0；继续等后续
+                            # 状态。但连续两次明确为 0 可视作本次注册被拒绝，
+                            # 无需把整个 timeout 消耗在重复状态上。
+                            zero_statuses += 1
+                            if zero_statuses >= 2:
+                                break
                 except (socket.timeout, OSError) as exc:
                     last_error = ProtocolError(
                         f"4214 注册请求网络异常: {exc}"
@@ -114,6 +126,11 @@ class L2SubscriptionCoordinator:
                     time.sleep(0.05)
 
         raise last_error or ProtocolError("4214 订阅未返回 CodeListSize")
+
+    def deliver_unsolicited(self, body: bytes) -> None:
+        """Forward a frame which does not belong to the synchronous request."""
+        if self._unsolicited is not None:
+            self._unsolicited(body)
 
     def is_registered(
         self,

@@ -215,6 +215,12 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             return client.snapshot_replay(code, **kwargs)
 
         records = _call(operation)
+        if not records and trade_date is None:
+            # 当前日 4260@4096 偶发先返回一张合法零行表。它不是稳定真值，
+            # 在同一客户端、同一 L2 socket 上短暂等待后只重试一次；这里绝不
+            # 新建客户端、刷新 Passport 或切换服务器。
+            time.sleep(0.15)
+            records = _call(operation)
         # 盘中 4096 偶发先返回空表（连接刚注册、响应被别的推送帧穿插）。空表
         # 不是稳定真值，不能缓存 60 秒，否则一次瞬时空响应会让整个当前交易日
         # 的超级盘口持续显示无数据。历史日期空表是确定结果，仍可长缓存。
@@ -614,11 +620,17 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             if disconnect_task is not None:
                 disconnect_task.cancel()
             if subscriber is not None:
-                await asyncio.to_thread(
-                    runtime.unsubscribe_stock_stream,
-                    code,
-                    subscriber,
-                )
+                # This method only updates an in-process refcount and schedules
+                # the delayed release timer.  Calling it directly guarantees
+                # cleanup even when Starlette cancels the WebSocket coroutine;
+                # an awaited ``to_thread`` here could be cancelled before its
+                # worker ever starts, leaking the shared client subscription.
+                runtime.unsubscribe_stock_stream(code, subscriber)
+
+    @app.get("/api/stock-ready/{code}")
+    def stock_ready(code: str, market: int = 0) -> dict:
+        """Register one stock once before HTTP panels and WebSocket fan out."""
+        return _jsonable(runtime.prepare_stock_stream(code, market=market))
 
     @app.get("/api/intraday_auctions/{code}")
     def intraday_auctions(

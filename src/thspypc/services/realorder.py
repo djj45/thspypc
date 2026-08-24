@@ -157,6 +157,14 @@ class RealOrderService:
             return False
         return connection.try_send(build_heartbeat_9601(seq))
 
+    def observe_unsolicited(self, body: bytes) -> bool:
+        """Retain a push consumed while a dispatcher-owned probe is pending."""
+        pushes = parse_pushrealorder_response(body)
+        if not pushes:
+            return False
+        self._pending_pushes.extend(pushes)
+        return True
+
     def receive_pushes(
         self,
         *,

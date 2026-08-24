@@ -874,6 +874,53 @@ def parse_superorder_response(body: bytes) -> list[dict]:
     return records
 
 
+def is_superorder_response(body: bytes, *, code: str | None = None) -> bool:
+    """Return whether *body* contains the requested 7169 trade table.
+
+    7169 shares its ``0x46/32/8`` header layout with index 4096 tables and a
+    busy L2 lane carries many unrelated ``hd1.0`` pushes. Match the field
+    signature and optional stock code before a synchronous caller consumes the
+    frame; a structurally valid zero-row table is still a confirmed response.
+    """
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError:
+            return False
+
+    pos = 0
+    while True:
+        marker = body.find(b"hd1.0", pos)
+        if marker < 0:
+            return False
+        base = marker + 6
+        if base + 10 <= len(body):
+            _count, flag, record_size, field_count = struct.unpack_from(
+                "<IHHH", body, base
+            )
+            field_offset = base + 10
+            field_end = field_offset + field_count * 4
+            if (
+                (flag, record_size, field_count)
+                == (
+                    SUPERORDER_FLAG,
+                    SUPERORDER_RECORD_SIZE,
+                    SUPERORDER_FIELD_COUNT,
+                )
+                and field_end <= len(body)
+                and tuple(
+                    body[field_offset + index * 4] for index in range(3)
+                )
+                == (1, 56, 10)
+            ):
+                if code is None:
+                    return True
+                shell_end = min(field_end + 160, len(body))
+                if code.encode("ascii") in body[field_end:shell_end]:
+                    return True
+        pos = marker + 6
+
+
 def build_snapshot_replay_query(
     code: str,
     market: int = 33,
@@ -1003,6 +1050,68 @@ def build_snapshot_replay_query(
         return bytes(h) + text
 
     return encode_frame(b"\x09" + _sub(seq, main_text) + _sub(companion_seq, comp_text))
+
+
+def is_snapshot_replay_response(body: bytes, *, code: str | None = None) -> bool:
+    """Return whether *body* contains a recognized 4096 replay table.
+
+    An empty table is still a matching response.  Callers need this distinction
+    because a busy L2 socket can deliver many unrelated push frames before the
+    requested 4096 response; exhausting a frame budget must not be interpreted
+    as a valid empty replay.
+    """
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError:
+            return False
+
+    layouts = {
+        (SNAPSHOT_REPLAY_FLAG, 216, 54),
+        (
+            SNAPSHOT_REPLAY_HIST_FLAG,
+            SNAPSHOT_REPLAY_HIST_RECORD_SIZE,
+            SNAPSHOT_REPLAY_HIST_FIELD_COUNT,
+        ),
+        (
+            SNAPSHOT_REPLAY_INDEX_FLAG,
+            SNAPSHOT_REPLAY_INDEX_RECORD_SIZE,
+            SNAPSHOT_REPLAY_INDEX_FIELD_COUNT,
+        ),
+    }
+    pos = 0
+    while True:
+        marker = body.find(b"hd1.0", pos)
+        if marker < 0:
+            return False
+        base = marker + 6
+        if base + 10 <= len(body):
+            flag, record_size, field_count = struct.unpack_from(
+                "<HHH", body, base + 4
+            )
+            layout = (flag, record_size, field_count)
+            field_offset = base + 10
+            field_end = field_offset + field_count * 4
+            if layout in layouts and field_end <= len(body):
+                # 4096 index tables share 0x46/32/8 with 7169 trades. Their
+                # second field is dt10 (price), while 7169 starts dt1/dt56.
+                if layout == (
+                    SNAPSHOT_REPLAY_INDEX_FLAG,
+                    SNAPSHOT_REPLAY_INDEX_RECORD_SIZE,
+                    SNAPSHOT_REPLAY_INDEX_FIELD_COUNT,
+                ) and (
+                    body[field_offset] != 1
+                    or body[field_offset + 4] != 10
+                ):
+                    pos = marker + 6
+                    continue
+                if code is not None:
+                    shell_end = min(field_end + 160, len(body))
+                    if code.encode("ascii") not in body[field_end:shell_end]:
+                        pos = marker + 6
+                        continue
+                return True
+        pos = marker + 6
 
 
 def parse_snapshot_replay_response(body: bytes) -> list[dict]:
@@ -1189,6 +1298,7 @@ __all__ = [
     "SNAPSHOT_REPLAY_INDEX_FLAG",
     "SNAPSHOT_REPLAY_INDEX_RECORD_SIZE",
     "SNAPSHOT_REPLAY_INDEX_FIELD_COUNT",
+    "is_snapshot_replay_response",
     "SNAPSHOT_REPLAY_INDEX_PAGEID",
     "ORDER_QUEUE_BUY_PERIOD",
     "ORDER_QUEUE_SELL_PERIOD",
@@ -1210,6 +1320,7 @@ __all__ = [
     "CANCEL_DETAIL_RECORD_SIZE",
     "CANCEL_DETAIL_FIELD_COUNT",
     "build_superorder_query",
+    "is_superorder_response",
     "parse_superorder_response",
     "build_snapshot_replay_query",
     "parse_snapshot_replay_response",

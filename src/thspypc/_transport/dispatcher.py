@@ -52,6 +52,10 @@ class ResponseDispatcher:
     briefly owns the connection send lock.  Waiting does not hold that lock,
     allowing another caller to register another in-flight request.  Legacy
     synchronous requests call :meth:`wait_idle` before taking over ``recv``.
+    A request expires by its monotonic deadline, not by the number of frames
+    observed.  Market sockets multiplex unsolicited pushes with responses, so
+    an active symbol can legitimately put dozens of unrelated frames ahead of
+    a requested table.
     """
 
     def __init__(self, socket_getter: Callable[[], SocketLike | None]) -> None:
@@ -181,8 +185,6 @@ class ResponseDispatcher:
                     for pending in list(self._pending):
                         if pending.request.future.done():
                             self._pending.remove(pending)
-                        elif pending.frames_seen >= pending.max_frames:
-                            self._finish_exhausted_locked(pending)
                     self._condition.notify_all()
         except BaseException as exc:
             with self._condition:

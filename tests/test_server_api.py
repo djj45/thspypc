@@ -193,6 +193,10 @@ class FakeClient:
         self.stream_callback = callback
         return True
 
+    def market_events_prepare(self, code, market=0):
+        self.calls.append(("market_events_prepare", code, market))
+        return market or self._market_for_code(code)
+
     def market_events_unsubscribe(self, code):
         self.calls.append(("market_events_unsubscribe", code))
         self.stream_callback = None
@@ -262,6 +266,11 @@ def test_status_and_connect(client_and_app):
 
     status = client.get("/api/status").json()
     assert status["connected"] is False
+    assert status["heartbeat"] == {
+        "enabled": False,
+        "mode": "unavailable",
+        "lanes": {},
+    }
 
     resp = client.post("/api/connect").json()
     assert resp["success"] is True
@@ -587,7 +596,7 @@ def test_superorder_replay_index_and_snapshot_share_cache(client_and_app):
     assert sum(call[0] == "snapshot_replay" for call in fake.calls) == 1
 
 
-def test_current_superorder_replay_does_not_cache_transient_empty(client_and_app):
+def test_current_superorder_replay_rechecks_transient_empty(client_and_app):
     fake, client = client_and_app
     responses = iter(
         [
@@ -606,10 +615,36 @@ def test_current_superorder_replay_does_not_cache_transient_empty(client_and_app
     second = client.get("/api/superorder-replay/603334", params={"market": 17})
 
     assert first.status_code == 200
-    assert first.json()["count"] == 0
+    assert first.json()["count"] == 1
     assert second.status_code == 200
     assert second.json()["count"] == 1
     assert sum(call[0] == "snapshot_replay" for call in fake.calls) == 2
+
+
+def test_current_superorder_replay_only_returns_empty_after_recheck(client_and_app):
+    fake, client = client_and_app
+    responses = iter(
+        [
+            [],
+            [],
+            [{"time": "13:01:00", "ts": 1_787_293_260, "price": 34.86}],
+        ]
+    )
+
+    def replay(*args, **kwargs):
+        fake.calls.append(("snapshot_replay", *args))
+        return next(responses)
+
+    fake.snapshot_replay = replay
+
+    first = client.get("/api/superorder-replay/603334", params={"market": 17})
+    second = client.get("/api/superorder-replay/603334", params={"market": 17})
+
+    assert first.status_code == 200
+    assert first.json()["count"] == 0
+    assert second.status_code == 200
+    assert second.json()["count"] == 1
+    assert sum(call[0] == "snapshot_replay" for call in fake.calls) == 3
 
 
 def test_superorder_window_serially_aggregates_truth(client_and_app):
@@ -663,6 +698,20 @@ def test_stock_stream_fans_out_shared_client_events(client_and_app):
     ):
         time.sleep(0.01)
     assert ("market_events_unsubscribe", "603334") in fake.calls
+
+
+def test_stock_ready_registers_code_before_page_fanout(client_and_app):
+    fake, client = client_and_app
+
+    response = client.get("/api/stock-ready/000938")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": "000938",
+        "market": 33,
+        "ready": True,
+    }
+    assert ("market_events_prepare", "000938", 0) in fake.calls
 
 
 def test_stock_stream_reconnect_grace_reuses_client_subscription(env_file):

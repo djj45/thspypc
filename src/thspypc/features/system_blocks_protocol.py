@@ -1477,16 +1477,25 @@ def _row_field_raw(
     return None
 
 
-def _normalize_board_speed(value: float | None) -> float | None:
-    """Normalize the two observed percentage encodings used by board speed.
+def _normalize_board_speed(
+    value: float | None,
+    raw: int | None = None,
+) -> float | None:
+    """Normalize the observed percentage encodings used by board speed.
 
     Most 0x22 responses decode directly to a percentage (for example
     ``-0.0407``).  The 2026-08-21 live response intermittently used the
     multiplied representation (``-4_070_000`` for the same value), matching
-    the encoding drift already observed on L2 stock ranking tables.
+    the encoding drift already observed on L2 stock ranking tables.  The
+    2026-08-24 live response also alternated to a compact fixed-point form:
+    raw ``355`` means ``+0.0355`` and raw ``0x080000EB`` means ``-0.0235``.
+    That form is identifiable by the zero high nibble of the original word;
+    checking the decoded magnitude alone would confuse it with a real value.
     """
     if value is None:
         return None
+    if raw is not None and raw >> 28 == 0:
+        return value / 10_000
     return value / 100_000_000 if abs(value) > 1_000 else value
 
 
@@ -1576,12 +1585,16 @@ def parse_board_full_quote_response(body: bytes) -> list[dict]:
             "speed_4m": (
                 None
                 if rec.get("dt48_raw") in _BOARD_SENTINEL_U32
-                else _normalize_board_speed(rec.get("dt48"))
+                else _normalize_board_speed(
+                    rec.get("dt48"), rec.get("dt48_raw")
+                )
             ),
             "speed_1m": (
                 None
                 if rec.get("dt167_raw") in _BOARD_SENTINEL_U32
-                else _normalize_board_speed(rec.get("dt167"))
+                else _normalize_board_speed(
+                    rec.get("dt167"), rec.get("dt167_raw")
+                )
             ),
             "main_inflow": (
                 None

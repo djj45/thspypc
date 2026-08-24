@@ -306,6 +306,10 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
     def _hb_seq_9601(self, value):
         self._connection_runtime.heartbeat_seq_realorder = value
 
+    def heartbeat_status(self) -> dict[str, object]:
+        """Return per-lane heartbeat response metrics without socket probing."""
+        return self._connection_runtime.heartbeat_status()
+
     @property
     def _snapshot_thread(self):
         return self._connection_runtime.snapshot_thread

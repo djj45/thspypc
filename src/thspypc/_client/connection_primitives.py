@@ -911,7 +911,7 @@ class ConnectionPrimitives:
             # 被多次使用后服务器会拒（PromptText="通行证有被修改的痕迹"）。主连接
             # 已建立不受影响，但新的 L2 登录会被拒。检测到 stale 或全失败时，
             # 重新 full_http_auth 拿新鲜票据再试一轮。
-            if stale or allow_refresh:
+            if allow_refresh:
                 if stale:
                     logger.warning("L2[%s] 登录票据/节点会话被服务端拒绝，"
                                    "重新 HTTP 鉴权拿新鲜 Passport64...",
@@ -929,6 +929,11 @@ class ConnectionPrimitives:
                     )
                 except Exception as e:
                     logger.error("L2[%s] 重新鉴权失败: %s", key, e)
+            elif stale:
+                logger.error(
+                    "L2[%s] 重新鉴权后的新 Passport64 仍被服务端拒绝，立即停止",
+                    key,
+                )
             logger.error("L2[%s] 全部候选 IP 都失败", key)
             return None
 

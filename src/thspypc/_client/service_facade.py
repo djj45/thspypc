@@ -2095,6 +2095,20 @@ class ServiceFacade:
         )
         return True
 
+    def market_events_prepare(
+        self,
+        code: str,
+        market: int | None = None,
+    ) -> int:
+        """Register *code* on its existing L2 lane without starting a reader.
+
+        The web stock-switch gate calls this once before depth, timeline,
+        superorder and WebSocket consumers fan out.  The connection-scoped
+        coordinator makes repeated calls idempotent; no new client, socket or
+        Passport is created.
+        """
+        return self._register_l2_snapshot_code(code, market=market)
+
     def ranking_depth_subscribe(
         self,
         codes,

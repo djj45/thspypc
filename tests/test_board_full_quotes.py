@@ -144,6 +144,13 @@ def test_board_speed_normalizes_live_multiplied_encoding():
     assert _normalize_board_speed(None) is None
 
 
+def test_board_speed_normalizes_live_compact_fixed_point_encoding():
+    from thspypc.features.system_blocks_protocol import _normalize_board_speed
+
+    assert _normalize_board_speed(355.0, 355) == pytest.approx(0.0355)
+    assert _normalize_board_speed(-235.0, 0x080000EB) == pytest.approx(-0.0235)
+
+
 def test_merge_across_frames():
     merged = {}
     for name in ("full_resp_0x20.bin", "full_resp_22.bin"):

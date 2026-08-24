@@ -92,6 +92,7 @@ class ThsRuntime:
                 **self._preheat_state,
                 "markets": dict(self._preheat_state.get("markets", {})),
             }
+            heartbeat_status = getattr(client, "heartbeat_status", None)
             return {
                 # status 必须永远是轻量查询。client.is_connected 会取得 MAIN
                 # 请求锁；MAIN 协议请求超时时它会连带卡住 /api/status，令前端
@@ -107,6 +108,15 @@ class ThsRuntime:
                 "account_kind": kind,
                 "credentials": bool(self._env.get("THS_USERNAME")),
                 "preheat": preheat,
+                "heartbeat": (
+                    heartbeat_status()
+                    if callable(heartbeat_status)
+                    else {
+                        "enabled": False,
+                        "mode": "unavailable",
+                        "lanes": {},
+                    }
+                ),
             }
 
     def connect(self) -> dict:
@@ -238,6 +248,25 @@ class ThsRuntime:
                     raise RuntimeError(f"{code} 市场事件订阅失败")
                 self._stream_active_codes.add(code)
         return subscriber
+
+    def prepare_stock_stream(
+        self,
+        code: str,
+        *,
+        market: int = 0,
+    ) -> dict:
+        """Complete the one-time 4214 registration before page requests fan out."""
+        resolved_market = self.call(
+            lambda client: client.market_events_prepare(
+                code,
+                market=market,
+            )
+        )
+        return {
+            "code": code,
+            "market": resolved_market,
+            "ready": True,
+        }
 
     def unsubscribe_stock_stream(self, code: str, subscriber: queue.Queue) -> None:
         """Remove a browser queue and release the client subscription at refcount 0."""
