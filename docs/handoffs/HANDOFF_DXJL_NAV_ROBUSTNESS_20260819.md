@@ -85,7 +85,9 @@
 规则：FDF 长度字段写 `00000004`，线上实际跟 5B body；因此普通 8901 reader 得到
 `09 00 00 00`，9601 的 `+1` reader 得到 `09 00 00 00 00`，两种都必须认作 ACK。
 样本 ACK 延迟：8901 约 8.53s/9.64s，9601 约 7.72s，故实现取 12s 超时、60s
-探针周期、连续两次无下行才标记 `unresponsive`。60s 周期来自官方90s抓包：每条
+探针周期。2026-08-25盘中确认健康MAIN也会忽略大多数短探针，因此首次miss标记
+`suspect`、连续两次标记`ack_silent`，不再单凭短ACK静默标记`unresponsive`；只有
+明确socket读写/关闭错误才能判`unresponsive`。60s周期来自官方90s抓包：每条
 8901连接只在约第60秒出现一次短探针；14:10活网误设30s后服务端严格隔次响应，已
 据此校正，避免确定性的假 `suspect`。
 
@@ -94,9 +96,9 @@
 - 3s 长心跳保留；60s 短探针不带尾部换行，MAIN/KLINE/两路9601通过现有
   `ResponseDispatcher` 取得读所有权，心跳线程不直接 `recv`；活动 L2 由原推送
   reader 消费响应。
-- framing 层按 socket 旁路通知 `HeartbeatMonitor`；显式零 ACK 和探针后的任意合法
-  下行都可证明活性。业务 lane 忙而未发送探针只计 `skipped_busy`，不计 miss；旧
-  socket 的迟到 ACK 不能清除新 generation 的状态。
+- framing 层按 socket 旁路通知 `HeartbeatMonitor`；显式零 ACK 和任意合法业务下行
+  都可证明活性。业务 lane 忙而未发送探针只计 `skipped_busy`，不计 miss；旧socket
+  的迟到ACK不能清除新generation状态。`transport_failures`与最后失败年龄单独暴露。
 - `/api/status.heartbeat` 暴露各 lane 的 sent/response/ACK/miss/last_rx 年龄。
 - **目前是 `mode=observe_only`**：两次 miss 只记录/告警，不关闭 socket、不重新登录，
   先积累盘中误报率。自动淘汰、换连接和恢复订阅尚未开启，避免未经观测就在盘中

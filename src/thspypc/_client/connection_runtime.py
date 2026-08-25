@@ -446,6 +446,9 @@ class ConnectionRuntime:
                 sock,
                 probe_id,
             )
+            if isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
+                if self._heartbeat_monitor.note_transport_failure(lane, sock):
+                    state = "unresponsive"
             if state is not None:
                 log = logger.warning if state == "unresponsive" else logger.debug
                 log("%s 心跳探针无下行响应（%s）: %s", lane, state, exc)
@@ -484,6 +487,9 @@ class ConnectionRuntime:
             )
         except Exception as exc:
             state = self._heartbeat_monitor.fail_probe(lane, sock, probe_id)
+            if isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
+                if self._heartbeat_monitor.note_transport_failure(lane, sock):
+                    state = "unresponsive"
             logger.debug("%s 心跳探针发送失败（%s）: %s", lane, state, exc)
             return False
         if future is None:
@@ -504,8 +510,7 @@ class ConnectionRuntime:
 
     def _expire_raw_probes(self) -> None:
         for lane, _sock, _probe_id, state in self._heartbeat_monitor.expire():
-            log = logger.warning if state == "unresponsive" else logger.debug
-            log("%s 心跳探针无下行响应（%s）", lane, state)
+            logger.debug("%s 心跳探针无下行响应（%s）", lane, state)
 
     def activate_snapshot(self, code: str, market: int, callback) -> None:
         self.snapshot_codes.add(code)
@@ -968,6 +973,10 @@ class ConnectionRuntime:
                         self._heartbeat_monitor.note_skipped("main", main_sock)
                         logger.debug("8901 连接正在处理业务请求，跳过本轮心跳")
                 except OSError as exc:
+                    self._heartbeat_monitor.note_transport_failure(
+                        "main",
+                        main_sock,
+                    )
                     logger.debug("8901 心跳发送失败（不影响查询）: %s", exc)
                 if tick % self.HEARTBEAT_PROBE_INTERVAL_TICKS == 0:
                     self.heartbeat_seq_main += 1
@@ -1002,6 +1011,10 @@ class ConnectionRuntime:
                                 kline_sock,
                             )
                     except OSError as exc:
+                        self._heartbeat_monitor.note_transport_failure(
+                            "kline_fast",
+                            kline_sock,
+                        )
                         logger.debug(
                             "KLINE_FAST heartbeat failed: %s",
                             exc,
@@ -1043,6 +1056,7 @@ class ConnectionRuntime:
                 self.heartbeat_seq_push[key] = seq
                 try:
                     if not _real_socket_alive(sock):
+                        self._heartbeat_monitor.note_transport_failure(lane, sock)
                         dead_l2.append((key, sock))
                         continue
                     sock.sendall(build_main(seq) + b"\n")
@@ -1072,8 +1086,13 @@ class ConnectionRuntime:
                                     sock,
                                     probe_id,
                                 )
+                                self._heartbeat_monitor.note_transport_failure(
+                                    lane,
+                                    sock,
+                                )
                                 raise
                 except OSError as exc:
+                    self._heartbeat_monitor.note_transport_failure(lane, sock)
                     logger.debug("L2[%s] 心跳发送失败：%s", key, exc)
                     dead_l2.append((key, sock))
                 finally:
@@ -1138,6 +1157,12 @@ class ConnectionRuntime:
                                     sock,
                                 )
                 except OSError as exc:
+                    realorder_sock = self._realorder_socket()
+                    if realorder_sock is not None:
+                        self._heartbeat_monitor.note_transport_failure(
+                            "realorder",
+                            realorder_sock,
+                        )
                     logger.debug("9601 心跳发送失败（不影响查询）: %s", exc)
             # statscalc 独立统计节点（9601）心跳：与 realorder 同为 5 字节 9601 心跳，
             # 但走独立 socket/lock。仅在连接已建立时发送。
@@ -1176,6 +1201,12 @@ class ConnectionRuntime:
                                 sock,
                             )
                 except OSError as exc:
+                    sock = self._board_stats_socket()
+                    if sock is not None:
+                        self._heartbeat_monitor.note_transport_failure(
+                            "board_stats",
+                            sock,
+                        )
                     logger.debug(
                         "statscalc 9601 心跳发送失败（不影响查询）: %s", exc
                     )

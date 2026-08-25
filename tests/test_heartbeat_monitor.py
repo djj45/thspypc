@@ -70,7 +70,7 @@ def test_monitor_accepts_any_inbound_and_counts_explicit_ack():
     assert status["consecutive_misses"] == 0
 
 
-def test_monitor_needs_two_consecutive_timeouts_and_ignores_old_socket():
+def test_monitor_separates_ack_silence_from_transport_failure_and_old_socket():
     clock = FakeClock()
     monitor = HeartbeatMonitor(
         response_timeout=12,
@@ -87,8 +87,16 @@ def test_monitor_needs_two_consecutive_timeouts_and_ignores_old_socket():
 
     second = monitor.begin_probe("main", old)
     clock.advance(12)
-    assert monitor.expire()[0][3] == "unresponsive"
-    assert monitor.snapshot()["main"]["consecutive_misses"] == 2
+    assert monitor.expire()[0][3] == "ack_silent"
+    status = monitor.snapshot()["main"]
+    assert status["consecutive_misses"] == 2
+    assert status["transport_failures"] == 0
+
+    assert monitor.note_transport_failure("main", old)
+    status = monitor.snapshot()["main"]
+    assert status["state"] == "unresponsive"
+    assert status["transport_failures"] == 1
+    assert status["last_transport_failure_age_ms"] == 0
 
     assert monitor.bind("main", new) == 2
     assert monitor.observe("main", old, b"\x09\x00\x00\x00") is True
@@ -96,7 +104,24 @@ def test_monitor_needs_two_consecutive_timeouts_and_ignores_old_socket():
     assert status["generation"] == 2
     assert status["state"] == "idle"
     assert status["explicit_acks"] == 0
+    assert status["transport_failures"] == 0
+    assert not monitor.note_transport_failure("main", old)
     assert first != second
+
+
+def test_valid_inbound_recovers_a_transport_failure():
+    monitor = HeartbeatMonitor()
+    sock = FakeSocket()
+    monitor.bind("main", sock)
+
+    assert monitor.note_transport_failure("main", sock)
+    assert monitor.snapshot()["main"]["state"] == "unresponsive"
+
+    monitor.observe("main", sock, b"quote-response")
+    status = monitor.snapshot()["main"]
+    assert status["state"] == "healthy"
+    assert status["transport_failures"] == 1
+    assert status["consecutive_misses"] == 0
 
 
 def test_cancelled_busy_probe_is_not_counted_as_sent():

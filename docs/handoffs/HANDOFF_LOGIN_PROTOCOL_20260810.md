@@ -104,6 +104,13 @@ MANUAL fixed=209 的历史值 `D2 09`（2304 字符票）和 `DE 09`（2316 字�
   同日官方客户端看盘页+94页新抓包进一步确认：当前板块排行全走 8901，9601
   WDCS 连接只有心跳、没有 statscalc 请求；故该角色只能说明旧辅助通道登录，
   不能代表当前板块排行功能。
+- 2026-08-25 盘中对BOARD_STATS做独立聚焦复测：MAIN成功后先显式取得一张fresh
+  Passport，再登录`8.132.233.77:9601`，首次即`VerifyCode=0`、无`-1`。旧
+  `statscalc`请求仍在15.14秒后空返回，但同一socket的第二轮60秒短探针收到显式ACK；
+  最终`probes=2 / acks=1 / misses=0 / transport_failures=0 / healthy`。这把“登录与
+  心跳可用”和“业务不可用”进一步拆开。另发现公开懒建连实现已有`_auth`时会复用
+  current Passport；正式启用前必须改为角色独立fresh材料，并在fresh后仍`-1`时立即
+  停止。当前Web排行不依赖该旧入口。
 - STANDARD 是否长期由官方发往 shlv2 仍是独立的路由问题；长度算法闭环不要求
   修改当前 MAIN 路由。
 

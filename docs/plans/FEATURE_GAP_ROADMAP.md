@@ -46,9 +46,9 @@
 | 十档盘口实时推送（549B） | `depth_subscribe` / `receive_depth` / `latest_depth` | ⚠️ API 已收口，待盘中验收 | 专用按代码回调、事件队列、合并帧全记录分发、本地退订/最后订阅关闭通道、普通账号边界及沪深多代码离线测试已完成；尚缺下个交易日沪深盘中端到端验收。服务端单码 wire unsubscribe 尚无已确认协议，当前采用本地过滤。 |
 | 逐笔成交回放（7169） | `superorder` | ✅ 完整 | 沪深通用，normalize 后定长 32B/行，4214/4260 两通道同构，活网验证通过 |
 | 超级盘口分时回放（4096） | `snapshot_replay` | ✅ 完整 | 个股：盘中 4260（0xFE/216/54）、盘后/历史 4417（0x9E/120/30）；指数：pageid=77 双查询对（0x46/32/8，2026-08-07 对齐）；`start/end` 自动选通道，四大指数昨日活网验证通过（北证50 无历史超级盘口） |
-| 板块辅助计算（9601） | `board_stats_interval` / `board_stats_updownlimit` / `board_calcext` | ⚠️ `calcext` 可用；`statscalc` 为旧路径 | 2026-08-17 当前客户端看盘页+94页抓包无任何 statscalc；排行实际走 8901。旧 `.77` 与当前 aly `.78` 对旧请求均超时，不能标“完整” |
+| 板块辅助计算（9601） | `board_stats_interval` / `board_stats_updownlimit` / `board_calcext` | ⚠️ `calcext` 可用；`statscalc` 为旧路径 | 2026-08-25 `.77:9601` fresh Passport登录和60秒心跳ACK活网通过（2 probes/1 ACK/0传输错误），但旧statcalc请求仍15秒超时；当前客户端排行实际走8901。连接可用不等于业务可用，且正式启用前须补角色独立fresh鉴权 |
 | 北交所（BSE）分时 | `timeline` | ✅ 完整 | 个股 10443 / 北证50 指数 11695，flag 0x0046/0x006e |
-| 心跳保活 | 自动（`_start_heartbeat`） | ✅ 完整 | 8901 每 3s / 9601 每 30s |
+| 心跳保活 | 自动（`_start_heartbeat`） | ✅ observe-only | 8901每3秒长保活并按60秒发短探针；管理型9601通道按60秒发响应探针。短ACK静默只记`suspect/ack_silent`，明确传输错误才记`unresponsive` |
 
 > 普通账号冷启动抓包已验证 MAIN 登录及上述基础行情；Level2 专属字段仍按独立
 > capability 路由，不因 MAIN 可用而开放。

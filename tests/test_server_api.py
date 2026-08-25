@@ -446,6 +446,67 @@ def test_market_view_fast_prefers_bounded_pipeline(env_file):
     assert not any(call[0] == "depth_quote" for call in fake.calls)
 
 
+def test_market_view_fast_recovers_once_from_stale_main_transport(env_file):
+    class StaleThenReadyClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.pipeline_calls = 0
+
+        def market_view_pipeline(self, code, market=0, timeout=12.0):
+            self.pipeline_calls += 1
+            if self.pipeline_calls == 1:
+                self.is_connected = False
+                raise ConnectionError("stale MAIN socket")
+            return (
+                {"code": code, "market": market},
+                {"code": code, "buy": [], "sell": []},
+            )
+
+    fake = StaleThenReadyClient()
+    fake.is_connected = True
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+    runtime._client = fake
+    runtime._connected_once = True
+    client = TestClient(create_app(runtime))
+
+    response = client.get("/api/market_view_fast/000938")
+
+    assert response.status_code == 200
+    assert response.json()["quote"]["code"] == "000938"
+    assert fake.pipeline_calls == 2
+    assert fake.calls == [("connect",)]
+
+
+def test_market_view_fast_stops_when_single_reconnect_fails(env_file):
+    class ReconnectRejectedClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.pipeline_calls = 0
+            self.connect_calls = 0
+
+        def market_view_pipeline(self, code, market=0, timeout=12.0):
+            self.pipeline_calls += 1
+            self.is_connected = False
+            raise ConnectionError("stale MAIN socket")
+
+        def connect(self):
+            self.connect_calls += 1
+            return _Result(success=False, error="all_hosts_failed")
+
+    fake = ReconnectRejectedClient()
+    fake.is_connected = True
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+    runtime._client = fake
+    runtime._connected_once = True
+    client = TestClient(create_app(runtime))
+
+    response = client.get("/api/market_view_fast/000938")
+
+    assert response.status_code == 502
+    assert fake.pipeline_calls == 1
+    assert fake.connect_calls == 1
+
+
 def test_market_view_fast_never_queries_timeline(client_and_app):
     fake, client = client_and_app
 

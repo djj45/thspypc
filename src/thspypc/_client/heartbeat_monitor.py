@@ -21,15 +21,18 @@ class _LaneState:
     explicit_acks: int = 0
     inbound_frames: int = 0
     skipped_busy: int = 0
+    transport_failures: int = 0
     consecutive_misses: int = 0
     last_keepalive_at: float | None = None
     last_probe_at: float | None = None
     last_response_at: float | None = None
     last_ack_at: float | None = None
     last_rx_at: float | None = None
+    last_transport_failure_at: float | None = None
     pending_id: int | None = None
     pending_since: float | None = None
     pending_previous_probe_at: float | None = None
+    pending_previous_state: str | None = None
 
 
 class HeartbeatMonitor:
@@ -88,6 +91,7 @@ class HeartbeatMonitor:
             self._next_probe_id += 1
             probe_id = self._next_probe_id
             state.pending_previous_probe_at = state.last_probe_at
+            state.pending_previous_state = state.state
             state.probes_sent += 1
             state.last_probe_at = now
             state.pending_id = probe_id
@@ -105,7 +109,10 @@ class HeartbeatMonitor:
             state.pending_id = None
             state.pending_since = None
             state.pending_previous_probe_at = None
-            state.state = "healthy" if state.last_rx_at is not None else "idle"
+            state.state = state.pending_previous_state or (
+                "healthy" if state.last_rx_at is not None else "idle"
+            )
+            state.pending_previous_state = None
 
     def has_pending(self, lane: str, sock: Any, probe_id: int) -> bool:
         with self._lock:
@@ -130,9 +137,32 @@ class HeartbeatMonitor:
                 state.pending_id = None
                 state.pending_since = None
                 state.pending_previous_probe_at = None
+                state.pending_previous_state = None
             state.consecutive_misses = 0
             state.state = "healthy"
         return ack
+
+    def note_transport_failure(self, lane: str, sock: Any) -> bool:
+        """Record definitive socket I/O failure for the current generation.
+
+        A missing short-probe ACK is only weak evidence: healthy production
+        nodes were observed answering ordinary quote requests while ignoring
+        most probes.  ``unresponsive`` is therefore reserved for an actual
+        read/write/closed-socket failure reported by the transport owner.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._current_locked(lane, sock)
+            if state is None:
+                return False
+            state.transport_failures += 1
+            state.last_transport_failure_at = now
+            state.pending_id = None
+            state.pending_since = None
+            state.pending_previous_probe_at = None
+            state.pending_previous_state = None
+            state.state = "unresponsive"
+            return True
 
     def fail_probe(
         self,
@@ -145,12 +175,16 @@ class HeartbeatMonitor:
             state = self._matching_probe_locked(lane, sock, probe_id)
             if state is None:
                 return None
+            previous_state = state.pending_previous_state
             state.pending_id = None
             state.pending_since = None
             state.pending_previous_probe_at = None
+            state.pending_previous_state = None
             state.consecutive_misses += 1
             state.state = (
                 "unresponsive"
+                if previous_state == "unresponsive"
+                else "ack_silent"
                 if state.consecutive_misses >= self.miss_threshold
                 else "suspect"
             )
@@ -195,6 +229,7 @@ class HeartbeatMonitor:
                     "explicit_acks": state.explicit_acks,
                     "inbound_frames": state.inbound_frames,
                     "skipped_busy": state.skipped_busy,
+                    "transport_failures": state.transport_failures,
                     "consecutive_misses": state.consecutive_misses,
                     "pending": state.pending_id is not None,
                     "bound_age_ms": age(state.bound_at),
@@ -203,6 +238,9 @@ class HeartbeatMonitor:
                     "last_response_age_ms": age(state.last_response_at),
                     "last_ack_age_ms": age(state.last_ack_at),
                     "last_rx_age_ms": age(state.last_rx_at),
+                    "last_transport_failure_age_ms": age(
+                        state.last_transport_failure_at
+                    ),
                 }
                 for lane, state in self._lanes.items()
             }

@@ -1878,6 +1878,39 @@ def test_main_heartbeat_probe_uses_dispatcher_and_records_ack():
     assert status["explicit_acks"] == 1
 
 
+def test_heartbeat_dispatch_timeout_is_only_probe_silence():
+    client = _client()
+    sock = FakeSocket()
+    runtime = client._connection_runtime
+    runtime._bind_heartbeat_lane("main", sock)
+    probe_id = runtime._heartbeat_monitor.begin_probe("main", sock)
+    future = concurrent.futures.Future()
+    future.set_exception(TimeoutError("probe response deadline"))
+
+    runtime._finish_probe_future("main", sock, probe_id, future)
+
+    status = runtime.heartbeat_status()["lanes"]["main"]
+    assert status["state"] == "suspect"
+    assert status["consecutive_misses"] == 1
+    assert status["transport_failures"] == 0
+
+
+def test_heartbeat_dispatch_connection_error_marks_unresponsive():
+    client = _client()
+    sock = FakeSocket()
+    runtime = client._connection_runtime
+    runtime._bind_heartbeat_lane("main", sock)
+    probe_id = runtime._heartbeat_monitor.begin_probe("main", sock)
+    future = concurrent.futures.Future()
+    future.set_exception(ConnectionError("socket closed"))
+
+    runtime._finish_probe_future("main", sock, probe_id, future)
+
+    status = runtime.heartbeat_status()["lanes"]["main"]
+    assert status["state"] == "unresponsive"
+    assert status["transport_failures"] == 1
+
+
 def test_depth_subscribe_multi_market_and_local_unsubscribe_lifecycle(monkeypatch):
     client = _client()
     sh = FakeSocket()

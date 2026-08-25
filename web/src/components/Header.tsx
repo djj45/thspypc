@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api/endpoints'
 import { normalizeStockCode, useStock } from '../state/StockContext'
 import type { StockPageMode } from '../state/StockContext'
+import type { Status } from '../types'
 
 function color(n: number | undefined): string {
   if (n === undefined || Number.isNaN(n)) return 'flat'
@@ -19,14 +20,32 @@ export function Header({
 }) {
   const { code, setCode, marketView } = useStock()
   const [input, setInput] = useState(code)
-  const [status, setStatus] = useState<{
-    connected: boolean
-    server: string
-    account_kind: string
-  } | null>(null)
+  const [status, setStatus] = useState<Status | null>(null)
 
   useEffect(() => {
-    api.status().then(setStatus).catch(() => {})
+    let cancelled = false
+    const refreshStatus = () => {
+      api
+        .status()
+        .then((next) => {
+          if (!cancelled) setStatus(next)
+        })
+        .catch(() => {})
+    }
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') refreshStatus()
+    }
+
+    refreshStatus()
+    const timer = window.setInterval(refreshStatus, 15_000)
+    window.addEventListener('focus', refreshStatus)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refreshStatus)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+    }
   }, [])
 
   useEffect(() => setInput(code), [code])
@@ -35,7 +54,7 @@ export function Header({
     try {
       await api.connect()
       const s = await api.status()
-      setStatus(s as never)
+      setStatus(s)
     } catch {
       /* ignore */
     }

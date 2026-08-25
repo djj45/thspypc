@@ -7,13 +7,14 @@ export interface PreheatMarket {
 }
 export interface HeartbeatLaneStatus {
   generation: number
-  state: 'idle' | 'pending' | 'healthy' | 'suspect' | 'unresponsive'
+  state: 'idle' | 'pending' | 'healthy' | 'suspect' | 'ack_silent' | 'unresponsive'
   keepalive_sent: number
   probes_sent: number
   responses: number
   explicit_acks: number
   inbound_frames: number
   skipped_busy: number
+  transport_failures: number
   consecutive_misses: number
   pending: boolean
   bound_age_ms: number | null
@@ -22,6 +23,7 @@ export interface HeartbeatLaneStatus {
   last_response_age_ms: number | null
   last_ack_age_ms: number | null
   last_rx_age_ms: number | null
+  last_transport_failure_age_ms: number | null
 }
 export interface Status {
   connected: boolean

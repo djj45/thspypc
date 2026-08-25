@@ -135,15 +135,33 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         finally:
             reset_request_timing(token)
 
-    def _call(operation: Callable[[object], object]) -> object:
-        try:
-            return runtime.call(operation)
-        except CapabilityUnavailableError as exc:
-            raise HTTPException(403, str(exc))
-        except (UnsupportedAccountFeatureError, ValueError) as exc:
-            raise HTTPException(400, str(exc))
-        except (ChannelUnavailableError, ProtocolError, RuntimeError, OSError) as exc:
-            raise HTTPException(502, str(exc))
+    def _call(
+        operation: Callable[[object], object],
+        *,
+        retry_transport_once: bool = False,
+    ) -> object:
+        attempts = 2 if retry_transport_once else 1
+        for attempt in range(attempts):
+            try:
+                return runtime.call(operation)
+            except CapabilityUnavailableError as exc:
+                raise HTTPException(403, str(exc))
+            except (UnsupportedAccountFeatureError, ValueError) as exc:
+                raise HTTPException(400, str(exc))
+            except OSError as exc:
+                # A stale MAIN socket is discovered only by the first request
+                # after a long idle period.  Idempotent callers may ask for one
+                # in-request recovery attempt: runtime.call has already marked
+                # the dead MAIN connection disconnected, so this next call goes
+                # through the normal single-client, fresh-auth connect path.
+                # A failed reconnect is not retried again.
+                if attempt + 1 < attempts:
+                    continue
+                raise HTTPException(502, str(exc))
+            except (ChannelUnavailableError, ProtocolError, RuntimeError) as exc:
+                raise HTTPException(502, str(exc))
+
+        raise AssertionError("unreachable")
 
     # 短 TTL 响应缓存：同一只票快速来回切换/刷新时，不再重复打 8901 socket。
     # 仅缓存成功结果；失败不缓存。缓存为进程内、单用户（runtime 唯一）。
@@ -159,13 +177,17 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         operation: Callable[[object], object],
         *,
         cache_if: Callable[[object], bool] | None = None,
+        retry_transport_once: bool = False,
     ) -> object:
         now = time.monotonic()
         with _cache_lock:
             entry = _response_cache.get(key)
             if entry is not None and now - entry[0] < ttl:
                 return entry[1]
-        result = _call(operation)
+        result = _call(
+            operation,
+            retry_transport_once=retry_transport_once,
+        )
         if cache_if is not None and not cache_if(result):
             return result
         with _cache_lock:
@@ -690,6 +712,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 ("market_view_fast", code, levels, market),
                 1.0,
                 operation,
+                retry_transport_once=True,
             )
         )
 
