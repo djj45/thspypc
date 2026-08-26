@@ -35,6 +35,9 @@ const intradayInFlight = new Map<
 const klineInFlight = new Map<string, Promise<Kline[]>>()
 const stockReadyInFlight = new Map<string, Promise<void>>()
 const stockReadyUntil = new Map<string, number>()
+const groupsInFlight = new Map<string, Promise<StockGroup[]>>()
+const dynamicPlatesInFlight = new Map<string, Promise<DynamicPlate[]>>()
+const selfStocksInFlight = new Map<string, Promise<StockGroup>>()
 
 // 已返回结果的短 TTL 缓存：快速来回切票/刷新时不再重复请求。
 // 分时/盘口缓存秒级；日 K 稍长（下一根 K 更新前基本不变）。
@@ -323,10 +326,19 @@ export const api = {
     getJson<RankItem[]>(`/api/dde_rank?sort_by=${sortBy}&count=${count}`),
 
   // 自选 / 自定义板块 / 动态板块
-  groups: () => getJson<StockGroup[]>('/api/groups'),
+  groups: () =>
+    dedupe(groupsInFlight, 'groups', () =>
+      getJson<StockGroup[]>('/api/groups'),
+    ),
   group: (name: string) => getJson<StockGroup>(`/api/groups/${name}`),
-  selfStocks: () => getJson<StockGroup>('/api/self_stocks'),
-  dynamicPlates: () => getJson<DynamicPlate[]>('/api/dynamic_plates'),
+  selfStocks: () =>
+    dedupe(selfStocksInFlight, 'self', () =>
+      getJson<StockGroup>('/api/self_stocks'),
+    ),
+  dynamicPlates: () =>
+    dedupe(dynamicPlatesInFlight, 'plates', () =>
+      getJson<DynamicPlate[]>('/api/dynamic_plates'),
+    ),
   dynamicPlateRefresh: (name: string) =>
     getJson<DynamicPlate>(
       `/api/dynamic_plate_refresh?name=${encodeURIComponent(name)}`,

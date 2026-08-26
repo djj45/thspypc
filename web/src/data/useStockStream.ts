@@ -5,6 +5,43 @@ import type { MarketEvent } from '../types'
 const MAX_EVENTS = 600
 const STREAM_SWITCH_COALESCE_MS = 120
 
+/**
+ * Stable identity shared by the live stream and the recent 7169 replay.
+ *
+ * A trade sequence is normally unique, but live batch pushes can overlap and
+ * the same trade can also be present in the initial replay window.  Include
+ * the order/trade fields as well so an upstream sequence collision does not
+ * collapse two genuinely different executions.
+ */
+export function marketEventIdentity(event: MarketEvent): string {
+  const eventKind =
+    event.event ||
+    (event.seq != null && (event.price != null || event.dt10 != null)
+      ? 'trade'
+      : '')
+  return [
+    event.code,
+    eventKind,
+    event.timestamp ?? event.ts ?? event.dt1 ?? event.time ?? '',
+    event.seq ?? '',
+    event.trade_no ?? event.previous_trade_no ?? '',
+    event.delegate_a ?? '',
+    event.delegate_b ?? '',
+    event.cancel_id ?? event.order_id ?? '',
+    event.price ?? event.dt10 ?? '',
+    event.volume ?? event.dt13 ?? '',
+    event.direction ?? event.side ?? event.dt20 ?? '',
+  ].join('\u0001')
+}
+
+function shouldDedupeEvent(event: MarketEvent): boolean {
+  return (
+    event.event === 'trade' ||
+    event.event === 'cancel' ||
+    event.event === 'order_queue'
+  )
+}
+
 export function isRealtimeMarketSession(now = new Date()): boolean {
   const day = now.getDay()
   if (day === 0 || day === 6) return false
@@ -69,7 +106,22 @@ export function useStockStream(code: string, enabled = true) {
             if (event.error) setError(event.error)
             return
           }
+          // A market lane can still receive a delayed frame for a code whose
+          // local unsubscribe grace period has not elapsed.  The server also
+          // filters by code, but keep the browser boundary fail-closed so a
+          // stale or malformed event can never enter the newly selected tape.
+          if (event.code !== code) return
           setEvents((rows) => {
+            if (
+              shouldDedupeEvent(event) &&
+              rows.some(
+                (currentEvent) =>
+                  marketEventIdentity(currentEvent) ===
+                  marketEventIdentity(event),
+              )
+            ) {
+              return rows
+            }
             const next = [...rows, event]
             return next.length > MAX_EVENTS
               ? next.slice(next.length - MAX_EVENTS)

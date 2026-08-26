@@ -932,6 +932,39 @@ def test_runtime_background_preheat_runs_once_and_reports_markets(env_file):
     assert fake.preheat_count == 1
 
 
+def test_runtime_status_does_not_wait_for_cold_connect(env_file):
+    """Preheat polling must stay responsive while MAIN login owns the lifecycle lock."""
+
+    class BlockingConnectClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.connect_entered = threading.Event()
+            self.allow_connect = threading.Event()
+
+        def connect(self):
+            self.connect_entered.set()
+            assert self.allow_connect.wait(timeout=2.0)
+            self.is_connected = True
+            return _Result()
+
+    fake = BlockingConnectClient()
+    runtime = ThsRuntime(env_path=env_file, client_factory=lambda u, p, i: fake)
+
+    assert runtime.start_preheat()
+    assert fake.connect_entered.wait(timeout=1.0)
+    started = time.perf_counter()
+    try:
+        status = runtime.status()
+    finally:
+        fake.allow_connect.set()
+
+    assert time.perf_counter() - started < 0.1
+    assert status["connected"] is False
+    assert status["preheat"]["state"] == "running"
+    assert runtime._preheat_thread is not None
+    runtime._preheat_thread.join(timeout=2.0)
+
+
 def test_preheat_retry_stops_when_foreground_login_succeeds(
     env_file,
     monkeypatch,

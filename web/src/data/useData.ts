@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import {
+  isRecoverableRequestError,
+  recoverableRetryDelay,
+} from '../api/client'
 
 // 数据模式：snapshot=请求一次；poll=完成一次请求后定时刷新；push 由专用
 // WebSocket hook 实现，这里仅保留类型入口。
@@ -38,24 +42,36 @@ export function useData<T>(
     if (mode === 'push') return
     let alive = true
     let timer: ReturnType<typeof setTimeout> | undefined
+    let failureCount = 0
     setLoading(true)
     const run = () => {
+      let recoverableDelay: number | undefined
       fetcherRef
         .current()
         .then((d) => {
           if (alive) {
+            failureCount = 0
             setData(d)
             setError('')
           }
         })
         .catch((e) => {
-          if (alive) setError(e instanceof Error ? e.message : String(e))
+          if (!alive) return
+          setError(e instanceof Error ? e.message : String(e))
+          if (isRecoverableRequestError(e)) {
+            failureCount += 1
+            recoverableDelay = recoverableRetryDelay(failureCount)
+          }
         })
         .finally(() => {
           if (!alive) return
           setLoading(false)
-          // 以上一次完成为起点调度，慢请求不会叠加成并发轮询。
-          if (mode === 'poll') timer = setTimeout(run, Math.max(1_000, pollMs))
+          // 以上一次完成为起点调度，慢请求不会叠加成并发轮询。snapshot
+          // 首次遇到冷启动超时也会在后台自恢复；4xx 等确定错误不会重打。
+          if (mode === 'poll' || recoverableDelay !== undefined) {
+            const delay = recoverableDelay ?? Math.max(1_000, pollMs)
+            timer = setTimeout(run, delay)
+          }
         })
     }
     // 延迟只在首次挂载生效：首屏让 quote/depth 先上屏；之后 deps 变化

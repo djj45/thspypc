@@ -148,7 +148,7 @@ function RoutedShell({
       {view === 'kanpan' ? (
         <KanpanPage />
       ) : (
-        <StockStreamProvider code={code} enabled>
+        <StockStreamProvider key={code} code={code} enabled>
           {view === 'timeline' ? <TimelinePage /> : <SuperorderPage />}
         </StockStreamProvider>
       )}

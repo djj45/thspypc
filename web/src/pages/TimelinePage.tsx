@@ -4,7 +4,10 @@ import { TimelineChart } from '../components/center/TimelineChart'
 import { StockInfo } from '../components/right/StockInfo'
 import { useStock } from '../state/StockContext'
 import { useSharedStockStream } from '../state/StockStreamContext'
-import { isRealtimeMarketSession } from '../data/useStockStream'
+import {
+  isRealtimeMarketSession,
+  marketEventIdentity,
+} from '../data/useStockStream'
 import type { Depth, MarketEvent } from '../types'
 
 function localIso(value: Date): string {
@@ -61,7 +64,7 @@ function TickTape({ rows }: { rows: MarketEvent[] }) {
         </thead>
         <tbody>
           {rows.length ? rows.map((row, index) => (
-            <tr key={`${eventTime(row)}-${String(row.seq ?? index)}`}>
+            <tr key={`${marketEventIdentity(row)}-${index}`}>
               <td className="left dim">{eventTime(row)}</td>
               <td className={directionClass(row)}>{Number(row.price ?? row.dt10 ?? 0).toFixed(2)}</td>
               <td>{Number(row.volume ?? row.dt13 ?? 0).toLocaleString()}</td>
@@ -138,7 +141,11 @@ export function TimelinePage() {
         const [start, end] = recentSessionWindow()
         try {
           const result = await api.superorderTrades(code, start, end)
-          if (current) setHistory(result)
+          if (current) {
+            setHistory(
+              result.filter((event) => !event.code || event.code === code),
+            )
+          }
         } catch (reason) {
           if (current) setError(reason instanceof Error ? reason.message : String(reason))
         }
@@ -152,10 +159,19 @@ export function TimelinePage() {
     if (liveDepth) setError('')
   }, [liveDepth])
 
-  const rows = useMemo(
-    () => [...history, ...stream.trades].slice(-300).reverse(),
-    [history, stream.trades],
-  )
+  const rows = useMemo(() => {
+    const seen = new Set<string>()
+    return [...history, ...stream.trades]
+      .filter((event) => !event.code || event.code === code)
+      .filter((event) => {
+        const identity = marketEventIdentity(event)
+        if (seen.has(identity)) return false
+        seen.add(identity)
+        return true
+      })
+      .slice(-300)
+      .reverse()
+  }, [code, history, stream.trades])
 
   return (
     <main className="subpage timeline-page">

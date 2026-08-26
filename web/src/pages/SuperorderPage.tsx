@@ -3,6 +3,7 @@ import { api } from '../api/endpoints'
 import { StockInfo } from '../components/right/StockInfo'
 import { useStock } from '../state/StockContext'
 import { useSharedStockStream } from '../state/StockStreamContext'
+import { marketEventIdentity } from '../data/useStockStream'
 import type {
   MarketEvent,
   OrderQueueSide,
@@ -118,7 +119,7 @@ function DetailsTable({ rows }: { rows: MarketEvent[] }) {
         <thead><tr><th className="left">时间</th><th>类型</th><th>方向</th><th>价格</th><th>数量</th><th>委托号</th></tr></thead>
         <tbody>
           {rows.length ? rows.map((row, index) => (
-            <tr key={String(row.seq ?? row.order_id ?? index)}>
+            <tr key={`${marketEventIdentity(row)}-${index}`}>
               <td className="left dim">{String(row.time ?? row.cancelled_time ?? row.placed_time ?? '—').slice(-8)}</td>
               <td>{String(row.event ?? 'trade')}</td>
               <td className={String(row.side ?? row.direction).match(/sell|卖|5/i) ? 'down' : 'up'}>{String(row.side ?? row.direction ?? '—')}</td>
@@ -261,10 +262,22 @@ export function SuperorderPage() {
   const buyQueue = stream.latestQueues.buy ?? queues?.buy
   const sellQueue = stream.latestQueues.sell ?? queues?.sell
   const rows = useMemo(() => {
-    if (tab === 'trades') return [...(windowData?.trades ?? []), ...stream.trades.slice(-100)]
-    const details = windowData?.details
-    if (tab === 'orders') return (details?.orders ?? []) as MarketEvent[]
-    return [...(details?.buy_cancels ?? []), ...(details?.sell_cancels ?? [])] as MarketEvent[]
+    let source: MarketEvent[]
+    if (tab === 'trades') {
+      source = [...(windowData?.trades ?? []), ...stream.trades.slice(-100)]
+    } else {
+      const details = windowData?.details
+      source = tab === 'orders'
+        ? (details?.orders ?? []) as MarketEvent[]
+        : [...(details?.buy_cancels ?? []), ...(details?.sell_cancels ?? [])] as MarketEvent[]
+    }
+    const seen = new Set<string>()
+    return source.filter((row) => {
+      const identity = marketEventIdentity(row)
+      if (seen.has(identity)) return false
+      seen.add(identity)
+      return true
+    })
   }, [stream.trades, tab, windowData])
   const latestReplayTs = replay?.index[replay.index.length - 1]?.ts
   const atLatestSnapshot = selectedTs != null && selectedTs === latestReplayTs

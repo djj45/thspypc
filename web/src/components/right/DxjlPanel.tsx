@@ -1,5 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../../api/endpoints'
+import {
+  isRecoverableRequestError,
+  recoverableRetryDelay,
+} from '../../api/client'
 import { useStock } from '../../state/StockContext'
 import type { Dxjl } from '../../types'
 
@@ -110,24 +114,39 @@ export function DxjlPanel() {
 
   useEffect(() => {
     let alive = true
-    api
-      .dxjlLatest()
-      .then((data) => {
-        if (!alive) return
-        const sorted = [...data].sort((a, b) => a.时间 - b.时间)
-        rowsRef.current = sorted
-        setRows(sorted)
-        if (sorted.length) cursorRef.current = sorted[0].时间
-        setError('')
-      })
-      .catch((e) => {
-        if (alive) setError(e instanceof Error ? e.message : String(e))
-      })
-      .finally(() => {
-        if (alive) setLoading(false)
-      })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let failureCount = 0
+    const loadLatest = () => {
+      api
+        .dxjlLatest()
+        .then((data) => {
+          if (!alive) return
+          failureCount = 0
+          const sorted = [...data].sort((a, b) => a.时间 - b.时间)
+          rowsRef.current = sorted
+          setRows(sorted)
+          if (sorted.length) cursorRef.current = sorted[0].时间
+          setError('')
+        })
+        .catch((e) => {
+          if (!alive) return
+          setError(e instanceof Error ? e.message : String(e))
+          if (isRecoverableRequestError(e)) {
+            failureCount += 1
+            timer = setTimeout(
+              loadLatest,
+              recoverableRetryDelay(failureCount),
+            )
+          }
+        })
+        .finally(() => {
+          if (alive) setLoading(false)
+        })
+    }
+    loadLatest()
     return () => {
       alive = false
+      if (timer !== undefined) clearTimeout(timer)
     }
   }, [])
 

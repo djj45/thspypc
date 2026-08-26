@@ -9,6 +9,10 @@ import {
   type ReactNode,
 } from 'react'
 import { api } from '../api/endpoints'
+import {
+  isRecoverableRequestError,
+  recoverableRetryDelay,
+} from '../api/client'
 import type { DataState } from '../data/useData'
 import type {
   AuctionPoint,
@@ -114,35 +118,30 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function isRecoverableRequestError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (error.name === 'TimeoutError' ||
-      /signal timed out|failed to fetch|HTTP 502/i.test(error.message))
-  )
-}
-
 // 只恢复最终停留的股票。后端 Web 路由会把单次协议工作限制在浏览器超时以内，
-// 这里再用退避处理短暂的 502/网络超时；已经切走的旧任务绝不重试。
+// 这里持续退避处理短暂的 502/网络超时；错误会立即上屏，但当前任务在后台
+// 自恢复。已经切走或刷新替换的旧任务会在 250ms 内退出，不占住通道闸门。
 async function retryCurrentRequest<T>(
   request: () => Promise<T>,
   isCurrent: () => boolean,
+  onRecoverableError?: (error: unknown) => void,
 ): Promise<T> {
-  const retryDelays = [1_500, 4_000]
-  for (let attempt = 0; ; attempt += 1) {
+  let failureCount = 0
+  for (;;) {
     try {
       return await request()
     } catch (error) {
-      if (
-        attempt >= retryDelays.length ||
-        !isRecoverableRequestError(error) ||
-        !isCurrent()
-      ) {
+      if (!isRecoverableRequestError(error) || !isCurrent()) {
         throw error
       }
-      await new Promise((resolve) =>
-        setTimeout(resolve, retryDelays[attempt]),
-      )
+      failureCount += 1
+      onRecoverableError?.(error)
+      const deadline = Date.now() + recoverableRetryDelay(failureCount)
+      while (isCurrent() && Date.now() < deadline) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(250, deadline - Date.now())),
+        )
+      }
       if (!isCurrent()) throw error
     }
   }
@@ -152,6 +151,11 @@ async function retryCurrentRequest<T>(
 // 共用市场 L2 socket，只保留一个人无感的短合并窗口。
 const INTRADAY_SWITCH_COALESCE_MS = 100
 const KLINE_SWITCH_COALESCE_MS = 180
+const AUCTION_POLL_INTERVAL_MS = 3_000
+const AUCTION_WINDOWS = [
+  { start: [9, 15], end: [9, 26] },
+  { start: [14, 57], end: [15, 1] },
+] as const
 
 // 同花顺会优先用本地图表数据绘制再后台刷新。Web 保留最近看过的
 // 股票/周期/复权组合，避免切回时先清空图表。
@@ -279,6 +283,7 @@ export function StockProvider({
   // only a short coalescing window.  The lane gate bounds each lane to the
   // current request plus the latest queued stock.
   useEffect(() => {
+    let active = true
     setFast(null)
     setIntraday(null)
     setFastLoading(true)
@@ -288,49 +293,138 @@ export function StockProvider({
     setIntradayError('')
 
     const loadFast = async () => {
-      const target = codeRef.current
+      const target = code
+      const isCurrent = () => active && target === codeRef.current
+      if (!isCurrent()) return
       try {
         const firstPaint = await retryCurrentRequest(
           () => api.marketViewFast(target),
-          () => target === codeRef.current,
+          isCurrent,
+          (error) => {
+            if (!isCurrent()) return
+            setFastError(errorText(error))
+            setFastLoading(false)
+          },
         )
-        if (target === codeRef.current) {
+        if (isCurrent()) {
           setFast(firstPaint)
           setFastError('')
         }
       } catch (error) {
-        if (target === codeRef.current) setFastError(errorText(error))
+        if (isCurrent()) setFastError(errorText(error))
       } finally {
-        if (target === codeRef.current) setFastLoading(false)
+        if (isCurrent()) setFastLoading(false)
       }
     }
 
     const loadIntraday = async () => {
-      const target = codeRef.current
+      const target = code
+      const isCurrent = () => active && target === codeRef.current
+      if (!isCurrent()) return
+      const showRecoverableError = (error: unknown) => {
+        if (!isCurrent()) return
+        setIntradayError(errorText(error))
+        setIntradayLoading(false)
+      }
       try {
         // 先完成该股票的 4214 注册，再读取分时；与盘口、逐笔及实时流
         // 共享前端 single-flight，切股时不会同时争抢注册响应。
-        await api.stockReady(target)
-        if (target !== codeRef.current) return
+        await retryCurrentRequest(
+          () => api.stockReady(target),
+          isCurrent,
+          showRecoverableError,
+        )
+        if (!isCurrent()) return
         const rows = await retryCurrentRequest(
           () => api.intraday(target),
-          () => target === codeRef.current,
+          isCurrent,
+          showRecoverableError,
         )
-        if (target === codeRef.current) setIntraday({ code: target, rows })
+        if (isCurrent()) {
+          setIntraday({ code: target, rows })
+          setIntradayError('')
+        }
       } catch (error) {
-        if (target === codeRef.current) setIntradayError(errorText(error))
+        if (isCurrent()) setIntradayError(errorText(error))
       } finally {
-        if (target === codeRef.current) setIntradayLoading(false)
+        if (isCurrent()) setIntradayLoading(false)
       }
     }
 
     fastLane(loadFast)
-    if (!needsIntraday) return
-    const timer = setTimeout(() => {
-      intradayLane(loadIntraday)
-    }, INTRADAY_SWITCH_COALESCE_MS)
-    return () => clearTimeout(timer)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    if (needsIntraday) {
+      timer = setTimeout(() => {
+        intradayLane(loadIntraday)
+      }, INTRADAY_SWITCH_COALESCE_MS)
+    }
+    return () => {
+      active = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }, [code, mode, refreshTick, fastLane, intradayLane])
+
+  // 集合竞价阶段没有连续交易逐笔推送，分时接口却会持续补充竞价撮合点。
+  // 页面若在14:57前打开，单次快照不会自行出现尾盘橙线；只在两个竞价窗口
+  // 每3秒刷新当前股票，窗口外不增加任何请求。
+  useEffect(() => {
+    if (mode === 'superorder') return
+    let active = true
+    const startTimers: number[] = []
+    const stopTimers: number[] = []
+    const intervals: number[] = []
+
+    const poll = () => {
+      const target = code
+      intradayLane(async () => {
+        if (!active || target !== codeRef.current) return
+        try {
+          await api.stockReady(target)
+          if (!active || target !== codeRef.current) return
+          const rows = await api.intraday(target)
+          if (active && target === codeRef.current) {
+            setIntraday({ code: target, rows })
+            setIntradayError('')
+          }
+        } catch (error) {
+          if (active && target === codeRef.current) {
+            setIntradayError(errorText(error))
+          }
+        }
+      })
+    }
+
+    const now = new Date()
+    for (const auctionWindow of AUCTION_WINDOWS) {
+      const start = new Date(now)
+      start.setHours(auctionWindow.start[0], auctionWindow.start[1], 0, 0)
+      const end = new Date(now)
+      end.setHours(auctionWindow.end[0], auctionWindow.end[1], 0, 0)
+      if (now >= end) continue
+
+      const begin = () => {
+        if (!active) return
+        poll()
+        const interval = window.setInterval(poll, AUCTION_POLL_INTERVAL_MS)
+        intervals.push(interval)
+        stopTimers.push(
+          window.setTimeout(
+            () => window.clearInterval(interval),
+            Math.max(0, end.getTime() - Date.now()),
+          ),
+        )
+      }
+      if (now >= start) begin()
+      else startTimers.push(window.setTimeout(begin, start.getTime() - now.getTime()))
+    }
+
+    return () => {
+      active = false
+      for (const timer of startTimers) window.clearTimeout(timer)
+      for (const timer of stopTimers) window.clearTimeout(timer)
+      for (const interval of intervals) window.clearInterval(interval)
+    }
+  }, [code, mode, intradayLane])
 
   // K-line starts immediately on the selected market's L2 connection.
   // Period/fuquan changes only rerun this lane.  Cached rows remain visible
@@ -352,21 +446,29 @@ export function StockProvider({
     }
     setKlineLoading(true)
     setKlineError('')
+    let active = true
     const load = async () => {
-      const target = codeRef.current
+      const target = code
+      const isCurrent = () => active && target === codeRef.current
+      if (!isCurrent()) return
       try {
         // KLINE_FAST 也在预热范围内；等它就绪再发，避免与预热争建连。
         await api.preheatReady()
-        if (target !== codeRef.current) return
+        if (!isCurrent()) return
         // Web 看盘固定复用 Level2 市场连接：沪/北走 SH_L2、深走 SZ_L2，
         // pageid=1334。不要使用 ifindhq_fast；它是独立 BASIC/MAIN 连接。
         const channel = 'level2'
         const rows = await retryCurrentRequest(
           () => api.kline(target, period, 320, fuquan, channel),
-          () => target === codeRef.current,
+          isCurrent,
+          (error) => {
+            if (!isCurrent()) return
+            setKlineError(errorText(error))
+            setKlineLoading(false)
+          },
         )
         // 展示侧 validKline 还会按 code/period/fuquan 过滤，旧响应不会上屏
-        if (target === codeRef.current) {
+        if (isCurrent()) {
           const tagged = { code: target, period, fuquan, rows }
           const targetKey = klineCacheKey(target, period, fuquan)
           klineCacheRef.current.delete(targetKey)
@@ -377,11 +479,12 @@ export function StockProvider({
             klineCacheRef.current.delete(oldest)
           }
           setKline(tagged)
+          setKlineError('')
         }
       } catch (error) {
-        if (target === codeRef.current) setKlineError(errorText(error))
+        if (isCurrent()) setKlineError(errorText(error))
       } finally {
-        if (target === codeRef.current) setKlineLoading(false)
+        if (isCurrent()) setKlineLoading(false)
       }
     }
     // 切股时先让轻量盘口和上方分时抢到首屏；快速连续滚动只为最终停留
@@ -389,7 +492,10 @@ export function StockProvider({
     const timer = setTimeout(() => {
       klineLane(load)
     }, KLINE_SWITCH_COALESCE_MS)
-    return () => clearTimeout(timer)
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
   }, [code, mode, period, fuquan, refreshTick, klineLane])
 
   const validFast = fast?.code === code ? fast : null

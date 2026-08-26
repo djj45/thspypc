@@ -84,40 +84,52 @@ class ThsRuntime:
         return self._client
 
     def status(self) -> dict:
-        with self._lifecycle_lock:
-            client = self._get_client()
-            profile = getattr(client, "observed_account_profile", None)
-            kind = profile.kind.value if profile is not None else None
-            preheat = {
-                **self._preheat_state,
-                "markets": dict(self._preheat_state.get("markets", {})),
-            }
-            heartbeat_status = getattr(client, "heartbeat_status", None)
-            return {
-                # status 必须永远是轻量查询。client.is_connected 会取得 MAIN
-                # 请求锁；MAIN 协议请求超时时它会连带卡住 /api/status，令前端
-                # 误判整个后端已死。真实传输异常仍由 call() 路径更新此标志。
-                "connected": bool(
-                    self._connected_once
-                    and (
-                        not hasattr(client, "_sock")
-                        or getattr(client, "_sock", None) is not None
-                    )
-                ),
-                "server": getattr(client, "_connected_ip", None),
-                "account_kind": kind,
-                "credentials": bool(self._env.get("THS_USERNAME")),
-                "preheat": preheat,
-                "heartbeat": (
-                    heartbeat_status()
-                    if callable(heartbeat_status)
-                    else {
-                        "enabled": False,
-                        "mode": "unavailable",
-                        "lanes": {},
-                    }
-                ),
-            }
+        # status 是冷启动协调面，不能等待正在 client.connect() 中持有的
+        # lifecycle lock；否则浏览器的预热轮询会先超时，继而提前放出整页
+        # 业务请求，造成一串 signal timed out。这里仅读取原子替换的快照；
+        # client 尚未创建时也不为了查状态而触发创建或登录。
+        client = self._client
+        profile = (
+            getattr(client, "observed_account_profile", None)
+            if client is not None
+            else None
+        )
+        kind = profile.kind.value if profile is not None else None
+        preheat_state = self._preheat_state
+        preheat = {
+            **preheat_state,
+            "markets": dict(preheat_state.get("markets", {})),
+        }
+        heartbeat_status = (
+            getattr(client, "heartbeat_status", None)
+            if client is not None
+            else None
+        )
+        return {
+            # client.is_connected 会取得 MAIN 请求锁；MAIN 协议请求超时时它会
+            # 连带卡住 /api/status。真实传输异常仍由 call() 更新此标志。
+            "connected": bool(
+                client is not None
+                and self._connected_once
+                and (
+                    not hasattr(client, "_sock")
+                    or getattr(client, "_sock", None) is not None
+                )
+            ),
+            "server": getattr(client, "_connected_ip", None),
+            "account_kind": kind,
+            "credentials": bool(self._env.get("THS_USERNAME")),
+            "preheat": preheat,
+            "heartbeat": (
+                heartbeat_status()
+                if callable(heartbeat_status)
+                else {
+                    "enabled": False,
+                    "mode": "unavailable",
+                    "lanes": {},
+                }
+            ),
+        }
 
     def connect(self) -> dict:
         with self._lifecycle_lock:
