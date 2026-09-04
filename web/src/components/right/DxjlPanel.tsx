@@ -34,6 +34,16 @@ const keyOf = (d: Dxjl) => `${d.时间}|${d.代码}|${d.异动编码}|${d.金额
 const DXJL_POLL_MS = 5_000
 // WS 实时 + 历史前插共用的行数上限（聊天窗口语义，超出裁最旧）
 const DXJL_MAX_ROWS = 1_000
+// 只展示这几类异动，其余推送/历史行一律不显示
+const DXJL_VISIBLE_TYPES = new Set([
+  '大笔买入',
+  '大笔卖出',
+  '打开涨停板',
+  '打开跌停板',
+])
+const isVisibleDxjl = (d: Dxjl) => DXJL_VISIBLE_TYPES.has(d.异动类型)
+// 历史页整页都被过滤掉时连续向前翻的页数上限（防止死循环）
+const DXJL_PAGE_SCAN_LIMIT = 10
 
 /** 异动方向：买入/上涨压力=up(红)，卖出/下跌压力=down(绿)。
  *  特判两对与字面相反的：打开跌停板是上涨事件(红)、打开涨停板是下跌事件(绿)；
@@ -119,10 +129,12 @@ export function DxjlPanel() {
   )
   const [wsLive, setWsLive] = useState(false)
 
-  // 合并新行（去重、升序、限量）；贴底跟随语义与轮询路径一致
+  // 合并新行（过滤、去重、升序、限量）；贴底跟随语义与轮询路径一致
   const mergeRows = useCallback((incoming: Dxjl[]) => {
     const seen = new Set(rowsRef.current.map(keyOf))
-    const fresh = incoming.filter((d) => !seen.has(keyOf(d)))
+    const fresh = incoming.filter(
+      (d) => isVisibleDxjl(d) && !seen.has(keyOf(d)),
+    )
     if (!fresh.length) return
     const el = scrollRef.current
     followRef.current =
@@ -195,7 +207,9 @@ export function DxjlPanel() {
         .then((data) => {
           if (!alive) return
           failureCount = 0
-          const sorted = [...data].sort((a, b) => a.时间 - b.时间)
+          const sorted = [...data].filter(isVisibleDxjl).sort(
+            (a, b) => a.时间 - b.时间,
+          )
           // 贴底跟随：视口在底部附近才随新行滚到底；用户翻历史时不打断
           const el = scrollRef.current
           followRef.current =
@@ -252,32 +266,49 @@ export function DxjlPanel() {
   }, [loading, rows])
 
   const loadMore = useCallback(() => {
-    const cursor = cursorRef.current
-    if (loadingMoreRef.current || !hasMoreRef.current || cursor == null) return
+    const initialCursor = cursorRef.current
+    if (
+      loadingMoreRef.current ||
+      !hasMoreRef.current ||
+      initialCursor == null
+    )
+      return
     loadingMoreRef.current = true
     setLoadingMore(true)
     const el = scrollRef.current
     const prevHeight = el?.scrollHeight ?? 0
     const prevTop = el?.scrollTop ?? 0
-    api
-      .dxjlHistory(1, cursor)
-      .then((older) => {
-        const olderAsc = older
+    const run = async () => {
+      let cursor = initialCursor
+      // 一页历史可能整页都是被过滤掉的异动类型：连续向前翻，直到拿到
+      // 至少一条可见新行、页面为空（到头）或翻页上限。
+      for (let page = 0; page < DXJL_PAGE_SCAN_LIMIT; page++) {
+        const older = await api.dxjlHistory(1, cursor)
+        const pageRows = older
           .filter((d) => d.时间 <= cursor)
           .sort((a, b) => a.时间 - b.时间)
-        const seen = new Set(rowsRef.current.map(keyOf))
-        const fresh = olderAsc.filter((d) => !seen.has(keyOf(d)))
-        if (!fresh.length) {
+        if (!pageRows.length) {
           hasMoreRef.current = false
           setHasMore(false)
           return
         }
+        cursor = pageRows[0].时间
+        const seen = new Set(rowsRef.current.map(keyOf))
+        const fresh = pageRows.filter(
+          (d) => isVisibleDxjl(d) && !seen.has(keyOf(d)),
+        )
+        if (!fresh.length) continue
         cursorRef.current = fresh[0].时间
         pendingAdjustRef.current = { prevHeight, prevTop }
         const next = [...fresh, ...rowsRef.current]
         rowsRef.current = next
         setRows(next)
-      })
+        return
+      }
+      // 限额内没等到可见行：前移游标，下次滚动到顶继续翻
+      cursorRef.current = cursor
+    }
+    run()
       .catch(() => {
         // 单页失败不打断列表，下次滚到顶部自动重试
       })
