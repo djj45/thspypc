@@ -56,7 +56,7 @@ if errorlevel 1 (
   echo [dev.bat] ERROR: py.exe was not found.
   exit /b 1
 )
-py -3.14 -c "import fastapi, uvicorn, thspypc" >nul 2>&1
+py -3.14 -c "import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, websockets, thspypc" >nul 2>&1
 if errorlevel 1 (
   echo [dev.bat] ERROR: Python 3.14 or backend dependencies are unavailable.
   echo [dev.bat] Run: py -3.14 -m pip install -e .[server]
