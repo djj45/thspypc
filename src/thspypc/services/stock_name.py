@@ -47,6 +47,25 @@ _NAME_GROUPS = {
     "standard": ("32;208;", 392),
 }
 
+# A 股名称组是股票名的权威来源。其余组（ifindhq 中证指数、hkus 港股、
+# fu*/usotc 基金等）的代码会与 A 股股票冲突——000977 既是深市浪潮信息的
+# 代码、也是中证「内地低碳」指数的代码；同码合并时必须让股票名胜出，
+# 指数/港/基金名只用于补缺（2026-09-04 实测 63 个 A 股名被 ifindhq 覆盖，
+# 成交额榜首 000977 显示成「内地低碳」）。
+_A_SHARE_NAME_GROUPS = frozenset({"level2_16", "level2_32", "standard_32"})
+
+
+def _merge_group_names(parts: list[tuple[str, dict[str, str]]]) -> dict[str, str]:
+    """按组合并名称：非 A 股组先写、A 股组最后写（同码股票名覆盖指数名）。"""
+    merged: dict[str, str] = {}
+    ordered = sorted(
+        parts,
+        key=lambda part: part[0] in _A_SHARE_NAME_GROUPS,
+    )
+    for _group, names in ordered:
+        merged.update(names)
+    return merged
+
 # The 120/104 market ignores StockNameVer=;;. The 2026-08-09 00:07:56
 # capture shows hexin triggers it with MarketCode=104; plus the real 104_*
 # ConfigVer list; the server then returns both [name_120_120] and
@@ -404,14 +423,14 @@ def download_full_stock_names(
 
 def _merge_cached_group_names(groups: list[str]) -> dict[str, str] | None:
     """所有组的当日缓存都存在且新鲜时合并返回；否则返回 None。"""
-    merged: dict[str, str] = {}
+    parts: list[tuple[str, dict[str, str]]] = []
     for group_key in groups:
         path = group_cache_path(group_key)
         cached = load_name_cache(path)
         if cached is None or not name_cache_is_fresh(path):
             return None
-        merged.update(cached[1])
-    return merged
+        parts.append((group_key, cached[1]))
+    return _merge_group_names(parts)
 
 
 def download_all_stock_names(
@@ -478,13 +497,16 @@ def download_all_stock_names(
             )
 
         with ThreadPoolExecutor(max_workers=max(1, len(alive_groups))) as pool:
-            # pool.map 保序：合并顺序与原串行循环一致（后组覆盖前组）。
+            # pool.map 保序：parts 与 alive_groups 一一对应，供按组优先级合并。
             parts = list(pool.map(collect, alive_groups))
         for part in parts:
-            result["names"].update(part["names"])
             result["by_segment"].update(part["by_segment"])
             result["skipped"].extend(part["skipped"])
             result["segments"].extend(part["segments"])
+        # 同码时 A 股组（沪深）胜出：ifindhq 等指数组的代码会与股票冲突。
+        result["names"] = _merge_group_names(
+            [(group, part["names"]) for group, part in zip(alive_groups, parts)]
+        )
         return result
     finally:
         for stop, _sock in heartbeats:

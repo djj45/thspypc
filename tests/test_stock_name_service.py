@@ -162,3 +162,27 @@ def test_merge_cached_group_names(monkeypatch, tmp_path):
         "000001": "平安银行",
     }
     assert sn._merge_cached_group_names(["g1", "missing"]) is None
+
+
+def test_merge_group_names_prefers_a_share_over_index_groups():
+    """同码冲突时 A 股组名必须胜出。
+
+    2026-09-04 实测：ifindhq（中证指数）组的 000977=内地低碳 覆盖了深市组
+    的 000977=浪潮信息，导致成交额榜首显示错误名称。
+    """
+    from thspypc.services import stock_name as sn
+
+    # 与 STOCK_NAME_GROUPS["level2"] 的真实顺序一致：ifindhq 排在沪深组之后
+    merged = sn._merge_group_names([
+        ("level2_16", {"600519": "贵州茅台", "920289": "N华汇"}),
+        ("level2_32", {"000977": "浪潮信息"}),
+        ("hkus_176", {"00700": "腾讯控股"}),
+        ("ifindhq_120", {"000977": "内地低碳", "899050": "北证50"}),
+    ])
+
+    assert merged["000977"] == "浪潮信息"
+    assert merged["600519"] == "贵州茅台"
+    assert merged["920289"] == "N华汇"
+    # 指数/港股独有的代码不受影响，仍用于补缺
+    assert merged["899050"] == "北证50"
+    assert merged["00700"] == "腾讯控股"

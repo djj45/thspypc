@@ -114,6 +114,9 @@ class ServiceFacade:
             named = sum(1 for stock in stocks if stock.get("name"))
             return named < len(stocks) * 0.8
 
+        def has_unnamed(stocks: list[dict]) -> bool:
+            return any(not stock.get("name") for stock in stocks)
+
         if not refresh:
             loaded = load_stock_codes(path)
             if loaded is not None:
@@ -129,6 +132,11 @@ class ServiceFacade:
                             "名称源仍未就绪",
                             saved_date, len(stocks),
                         )
+                elif has_unnamed(stocks) and fill_names(stocks):
+                    # 自愈补缺：当日缓存写盘时名称源未就绪（首日并发同步竞态
+                    # 落掉部分组）或写盘后才上市的新股（如 920289），名称组
+                    # 缓存当日就绪后补全并回写；补不上则保持原样，不空转重写。
+                    save_stock_codes(stocks, path)
                 else:
                     logger.info("stock_list_cached: 命中缓存 (%s, %d 条)",
                                 saved_date, len(stocks))
@@ -151,6 +159,10 @@ class ServiceFacade:
                     "stock_list_cached: 名称覆盖率不足，不写缓存（可重试）"
                 )
         else:
+            # 覆盖率达标但仍有零星空洞（新股/名称组部分失败）也先补全再写盘，
+            # 不把当天的空名称固化（补不上照写，避免整表反复重拉）。
+            if has_unnamed(stocks):
+                fill_names(stocks)
             save_stock_codes(stocks, path)
         return stocks
 
@@ -1804,6 +1816,18 @@ class ServiceFacade:
         68758: ("dt150", "auction_amount"),
     }
 
+    # 可全表锚定的键 → 直查真值的轻量 DataType（400 码/批）。
+    # 68758 竞价金额：L2 大 SortCount 响应在整张表混入 ×1e4/×1e6/×1e8 的
+    # dt150，只校正头 120 行会让下一批虚值在重排后再次冒到榜首，必须全表
+    # 锚定（dt17×dt7 从 [5,7,17] 小表直查）。19 成交额同理（2026-09-04
+    # 全榜乱序实测）：标准列表表 [5,19] 直接回真值 dt19；此前走 0xc4 大表
+    # 没有 dt19，dt13×dt10 只是 vwap≈现价的近似，±0.1% 的倍率窗永远匹配
+    # 不上，校正静默失效（0xc4 大表还易与页面轮询抢 MAIN 超时）。
+    _LIGHT_ANCHOR_DATATYPES: dict[int, list[int]] = {
+        68758: [5, 7, 17],
+        19: [5, 19],
+    }
+
     def _anchor_correct_money_sort(
         self,
         stocks: list[dict],
@@ -1818,12 +1842,10 @@ class ServiceFacade:
         if not anchor or not with_values or not stocks:
             return stocks
         ranked_field, derive_key = anchor
-        # 68758 的大 SortCount 响应会在整张表里混入 ×1e4/×1e6/×1e8
-        # 的 dt150。只校正头 120 行会让下一批虚值在重排后再次冒到榜首，
-        # 因此竞价金额必须全表锚定。它只需 dt7+dt17，400 码/批即可；其他
-        # 0xc4 金额键响应更大，仍只检查最可能污染榜首的 120 行。
-        full_auction_amount = sort_by == 68758
-        candidates = stocks if full_auction_amount else stocks[:120]
+        # 68758/19 的轻量表可全表锚定（虚值不止出现在榜首 120 行）；
+        # 其他 0xc4 金额键响应更大，仍只检查最可能污染榜首的 120 行。
+        light_datatype = self._LIGHT_ANCHOR_DATATYPES.get(sort_by)
+        candidates = stocks if light_datatype is not None else stocks[:120]
         codes_to_anchor = [
             str(r.get("code", "")) for r in candidates if r.get("code")
         ]
@@ -1839,8 +1861,8 @@ class ServiceFacade:
         for code in codes_to_anchor:
             groups.setdefault(self._market_for_code(code), []).append(code)
         anchors: dict[str, float] = {}
-        datatype = [5, 7, 17] if full_auction_amount else MONEY_QUOTE_DATATYPE
-        batch_size = 400 if full_auction_amount else 40
+        datatype = light_datatype or MONEY_QUOTE_DATATYPE
+        batch_size = 400 if light_datatype is not None else 40
         for market, codes in groups.items():
             for i in range(0, len(codes), batch_size):
                 chunk = codes[i : i + batch_size]
@@ -1873,7 +1895,7 @@ class ServiceFacade:
             anchors=anchors,
             sort_dir=sort_dir,
         )
-        if full_auction_amount:
+        if sort_by == 68758:
             # 给 Web 一个明确的“已校准”字段。旧后端只返回原始 dt150，前端
             # 绝不能把它当真值显示，否则热更新期间会出现几万亿。
             for stock in stocks:

@@ -834,6 +834,86 @@ def test_auction_amount_anchor_calibrates_rows_beyond_old_top_120(monkeypatch):
     assert calls[0][2] == [5, 7, 17]
 
 
+def test_amount_sort_anchor_uses_light_dt19_table_for_full_list(monkeypatch):
+    """成交额(19)虚值必须用 [5,19] 真值表全表锚定，不能退回 0xc4 近似。
+
+    历史缺陷（2026-09-04）：19 走 0xc4 大表无 dt19，锚点是 dt13×dt10 的
+    近似值，±0.1% 倍率窗匹配不上虚值 → 校正静默失效、全榜乱序。
+    """
+    client = _client()
+    anchors: dict[str, float] = {}
+    rows = []
+    for index in range(130):
+        code = f"{600000 + index:06d}"
+        amount = float(200_000_000 - index * 1_000_000)
+        anchors[code] = amount
+        rows.append({"code": code, "market": 17, "dt19": amount})
+    target = rows[129]["code"]
+    rows[129]["dt19"] = anchors[target] * 1e4
+    calls = []
+
+    def fake_list_quotes(codes, *, market, datatype, pageid, timeout):
+        calls.append((list(codes), market, list(datatype), pageid, timeout))
+        return [{"code": code, "dt19": anchors[code]} for code in codes]
+
+    monkeypatch.setattr(client, "list_quotes", fake_list_quotes)
+
+    result = client._anchor_correct_money_sort(
+        rows,
+        sort_by=19,
+        sort_dir="D",
+        with_values=True,
+        timeout=2.0,
+    )
+
+    corrected = next(row for row in result if row["code"] == target)
+    assert corrected["dt19"] == anchors[target]
+    assert calls[0][2] == [5, 19]
+    # 全表锚定（不止头 120 行），且虚拟行按真值回到榜尾位置
+    assert len(calls[0][0]) == 130
+    assert result.index(corrected) == 129
+
+
+def test_stock_list_cached_backfills_unnamed_rows_on_cache_hit(monkeypatch, tmp_path):
+    """当日 stocks2 缓存命中时补全空名称行（新股/首日同步竞态）并回写。"""
+    import json
+
+    from thspypc._client.stock_cache import save_stock_codes
+
+    client = _client()
+    cache_path = str(tmp_path / "stocks.json")
+    save_stock_codes(
+        [
+            {"code": "600000", "name": "浦发银行", "market": 17},
+            {"code": "920289", "name": "", "market": None},
+        ],
+        cache_path,
+    )
+
+    def fake_names(self, timeout=45.0):
+        return {"names": {"920289": "N华汇"}}
+
+    monkeypatch.setattr(type(client), "fetch_stock_names_full", fake_names)
+
+    result = client.stock_list_cached(cache_path=cache_path)
+
+    assert next(r for r in result if r["code"] == "920289")["name"] == "N华汇"
+    with open(cache_path, encoding="utf-8") as f:
+        assert next(
+            r for r in json.load(f)["stocks"] if r["code"] == "920289"
+        )["name"] == "N华汇"
+
+    # 名称源补不上时不空转重写（saved_at 不变）
+    with open(cache_path, encoding="utf-8") as f:
+        saved_at = json.load(f)["saved_at"]
+    monkeypatch.setattr(
+        type(client), "fetch_stock_names_full", lambda self, timeout=45.0: {"names": {}}
+    )
+    client.stock_list_cached(cache_path=cache_path)
+    with open(cache_path, encoding="utf-8") as f:
+        assert json.load(f)["saved_at"] == saved_at
+
+
 def test_stock_list_opt_in_delegates_full_replay(monkeypatch):
     client = _client()
     client._sock = FakeSocket()
