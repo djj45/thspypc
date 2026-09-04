@@ -1828,6 +1828,17 @@ class ServiceFacade:
         19: [5, 19],
     }
 
+    # 全表锚定的批次流量缓存 TTL（秒）。排行榜每 5s 轮询一次，全表锚定
+    # 每次要在 MAIN 上打 ~14 批 list_quotes，开盘高峰与 quotes_ext 抢
+    # 连接导致 dispatcher 超时→重连风暴，盘口/短线精灵被拖死
+    # （2026-09-04 13:00 开盘实测）。锚点只用于识别 ×10^2k 的倍率量级，
+    # 数值小幅滞后不影响校正正确性：68758 竞价金额开盘后全天不变给 300s；
+    # 19 成交额日内缓慢增长给 30s。0xc4 榜首 120 行锚定流量小，不缓存。
+    _MONEY_ANCHOR_TTL: dict[int, float] = {
+        68758: 300.0,
+        19: 30.0,
+    }
+
     def _anchor_correct_money_sort(
         self,
         stocks: list[dict],
@@ -1857,36 +1868,59 @@ class ServiceFacade:
         )
         from ..services.stock_list import _anchor_correct_ranked_values
 
-        groups: dict[int, list[str]] = {}
-        for code in codes_to_anchor:
-            groups.setdefault(self._market_for_code(code), []).append(code)
-        anchors: dict[str, float] = {}
-        datatype = light_datatype or MONEY_QUOTE_DATATYPE
-        batch_size = 400 if light_datatype is not None else 40
-        for market, codes in groups.items():
-            for i in range(0, len(codes), batch_size):
-                chunk = codes[i : i + batch_size]
-                try:
-                    records = self.list_quotes(
-                        chunk,
-                        market=market,
-                        datatype=datatype,
-                        pageid=1334,
-                        timeout=timeout,
-                    )
-                except (ProtocolError, OSError) as exc:
-                    logger.warning("money sort 锚定批失败 market=%s: %s", market, exc)
-                    continue
-                for record in records:
-                    code = str(record.get("code", ""))
-                    if not code:
+        ttl = self._MONEY_ANCHOR_TTL.get(sort_by)
+        anchor_cache = getattr(self, "_money_anchor_cache", None)
+        if anchor_cache is None:
+            anchor_cache = self._money_anchor_cache = {}
+        anchors: dict[str, float] | None = None
+        cached = anchor_cache.get(sort_by) if ttl else None
+        if cached is not None and time.monotonic() - cached[0] < ttl:
+            anchors = cached[1]
+        if anchors is None:
+            groups: dict[int, list[str]] = {}
+            for code in codes_to_anchor:
+                groups.setdefault(self._market_for_code(code), []).append(code)
+            anchors = {}
+            datatype = light_datatype or MONEY_QUOTE_DATATYPE
+            batch_size = 400 if light_datatype is not None else 40
+            for market, codes in groups.items():
+                for i in range(0, len(codes), batch_size):
+                    chunk = codes[i : i + batch_size]
+                    try:
+                        records = self.list_quotes(
+                            chunk,
+                            market=market,
+                            datatype=datatype,
+                            pageid=1334,
+                            timeout=timeout,
+                        )
+                    except (ProtocolError, OSError) as exc:
+                        logger.warning(
+                            "money sort 锚定批失败 market=%s: %s", market, exc
+                        )
                         continue
-                    if derive_key in ("main_inflow", "amount", "auction_amount"):
-                        value = derive_list_quote_fields(record).get(derive_key)
-                    else:
-                        value = record.get(derive_key)
-                    if isinstance(value, (int, float)):
-                        anchors[code] = value
+                    for record in records:
+                        code = str(record.get("code", ""))
+                        if not code:
+                            continue
+                        if derive_key in (
+                            "main_inflow", "amount", "auction_amount",
+                        ):
+                            value = derive_list_quote_fields(record).get(
+                                derive_key
+                            )
+                        else:
+                            value = record.get(derive_key)
+                        if isinstance(value, (int, float)):
+                            anchors[code] = value
+            # 覆盖率达标才缓存：部分市场组失败时保留旧行为（下轮重试），
+            # 不把残缺锚点钉死一个 TTL 周期。
+            if (
+                ttl
+                and anchors
+                and len(anchors) >= len(codes_to_anchor) * 0.9
+            ):
+                anchor_cache[sort_by] = (time.monotonic(), anchors)
         if not anchors:
             return stocks
         stocks, corrected = _anchor_correct_ranked_values(

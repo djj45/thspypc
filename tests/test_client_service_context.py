@@ -874,6 +874,57 @@ def test_amount_sort_anchor_uses_light_dt19_table_for_full_list(monkeypatch):
     assert result.index(corrected) == 129
 
 
+def test_money_sort_anchor_cache_suppresses_repeat_batches(monkeypatch):
+    """全表锚定按 TTL 缓存：5s 轮询不能每轮都在 MAIN 上重打全部批次。"""
+    client = _client()
+    anchors = {f"{600000 + i:06d}": float(1_000_000 + i) for i in range(20)}
+    rows = [
+        {"code": code, "market": 17, "dt19": value}
+        for code, value in anchors.items()
+    ]
+    rows[0]["dt19"] = anchors[rows[0]["code"]] * 1e4
+    calls = []
+
+    def fake_list_quotes(codes, *, market, datatype, pageid, timeout):
+        calls.append(list(codes))
+        return [{"code": code, "dt19": anchors[code]} for code in codes]
+
+    monkeypatch.setattr(client, "list_quotes", fake_list_quotes)
+
+    for _ in range(3):
+        result = client._anchor_correct_money_sort(
+            [dict(r) for r in rows],
+            sort_by=19,
+            sort_dir="D",
+            with_values=True,
+            timeout=2.0,
+        )
+        assert result[0]["dt19"] == anchors[result[0]["code"]]
+
+    # 三轮轮询只允许首批网络请求一次（TTL 内复用缓存锚点）
+    assert len(calls) == 1
+
+    # 覆盖率不足（锚点大部分失败）不得写缓存：下轮仍会重试
+    calls.clear()
+
+    def flaky_list_quotes(codes, *, market, datatype, pageid, timeout):
+        calls.append(list(codes))
+        return []  # 全部失败
+
+    monkeypatch.setattr(client, "list_quotes", flaky_list_quotes)
+    fresh = _client()
+    monkeypatch.setattr(fresh, "list_quotes", flaky_list_quotes)
+    fresh._anchor_correct_money_sort(
+        [dict(r) for r in rows], sort_by=19, sort_dir="D",
+        with_values=True, timeout=2.0,
+    )
+    fresh._anchor_correct_money_sort(
+        [dict(r) for r in rows], sort_by=19, sort_dir="D",
+        with_values=True, timeout=2.0,
+    )
+    assert len(calls) == 2
+
+
 def test_stock_list_cached_backfills_unnamed_rows_on_cache_hit(monkeypatch, tmp_path):
     """当日 stocks2 缓存命中时补全空名称行（新股/首日同步竞态）并回写。"""
     import json
