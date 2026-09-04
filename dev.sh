@@ -50,7 +50,7 @@ check_python() {
   fi
 
   if ! "${PYTHON_CMD[@]}" -c \
-      'import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, thspypc' \
+      'import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, websockets, thspypc' \
       >/dev/null 2>&1; then
     echo "[dev.sh] ERROR: Python 3.14 or backend dependencies are unavailable."
     if [[ "${PYTHON_CMD[0]}" == "py" ]]; then
