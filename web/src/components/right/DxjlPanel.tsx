@@ -30,8 +30,10 @@ function fmtAmt(n: number) {
 }
 const keyOf = (d: Dxjl) => `${d.时间}|${d.代码}|${d.异动编码}|${d.金额}`
 
-// 实时轮询节奏：与 useData poll 默认一致；dxjl 是高频异动流，5s 足够顺滑
+// 实时轮询节奏：WS 实时流断开时的回退通道（与 useData poll 默认一致）
 const DXJL_POLL_MS = 5_000
+// WS 实时 + 历史前插共用的行数上限（聊天窗口语义，超出裁最旧）
+const DXJL_MAX_ROWS = 1_000
 
 /** 异动方向：买入/上涨压力=up(红)，卖出/下跌压力=down(绿)。
  *  特判两对与字面相反的：打开跌停板是上涨事件(红)、打开涨停板是下跌事件(绿)；
@@ -109,14 +111,78 @@ export function DxjlPanel() {
   const loadingMoreRef = useRef(false)
   const cursorRef = useRef<number | null>(null) // 已加载最早一条的时间
   const pinnedRef = useRef(false) // 初次数据就绪后贴底一次
-  const followRef = useRef(false) // 轮询新行时是否贴底跟随
+  const followRef = useRef(false) // 新行到达时是否贴底跟随
   const scrollRef = useRef<HTMLDivElement>(null)
   // 前插历史页后补偿滚动量，保持视口停留原位
   const pendingAdjustRef = useRef<{ prevHeight: number; prevTop: number } | null>(
     null,
   )
+  const [wsLive, setWsLive] = useState(false)
 
+  // 合并新行（去重、升序、限量）；贴底跟随语义与轮询路径一致
+  const mergeRows = useCallback((incoming: Dxjl[]) => {
+    const seen = new Set(rowsRef.current.map(keyOf))
+    const fresh = incoming.filter((d) => !seen.has(keyOf(d)))
+    if (!fresh.length) return
+    const el = scrollRef.current
+    followRef.current =
+      el == null || el.scrollHeight - el.scrollTop - el.clientHeight <= 48
+    const next = [...rowsRef.current, ...fresh]
+      .sort((a, b) => a.时间 - b.时间)
+      .slice(-DXJL_MAX_ROWS)
+    rowsRef.current = next
+    setRows(next)
+    if (next.length) cursorRef.current = next[0].时间
+  }, [])
+
+  // 实时推送通道：9601 subrealorder 服务端推送（同花顺客户端同款语义，
+  // 盘中约 1500 条异动/分钟，轮询 160 条窗口在活跃时段必漏）。断线自动
+  // 重连，断开期间由下方轮询 effect 兜底。
   useEffect(() => {
+    let alive = true
+    let socket: WebSocket | null = null
+    let retryTimer = 0
+    let attempt = 0
+    const open = () => {
+      if (!alive) return
+      socket = new WebSocket(api.dxjlStreamUrl())
+      socket.onopen = () => {
+        attempt = 0
+        setWsLive(true)
+      }
+      socket.onmessage = (message) => {
+        if (!alive) return
+        try {
+          const data = JSON.parse(String(message.data))
+          if (data.event === 'snapshot' && Array.isArray(data.rows)) {
+            mergeRows(data.rows as Dxjl[])
+          } else if (data.event === 'dxjl') {
+            const { event: _event, ...row } = data
+            mergeRows([row as Dxjl])
+          }
+        } catch {
+          /* 坏帧忽略，后续帧继续 */
+        }
+      }
+      socket.onclose = () => {
+        if (!alive) return
+        setWsLive(false)
+        const delay = Math.min(1000 * 2 ** attempt, 10_000)
+        attempt += 1
+        retryTimer = window.setTimeout(open, delay)
+      }
+    }
+    open()
+    return () => {
+      alive = false
+      window.clearTimeout(retryTimer)
+      socket?.close()
+    }
+  }, [mergeRows])
+
+  // 轮询兜底：实时通道在线时休眠，断开期间按 5s 拉最新页补齐
+  useEffect(() => {
+    if (wsLive) return
     let alive = true
     let timer: ReturnType<typeof setTimeout> | undefined
     let failureCount = 0
@@ -149,7 +215,7 @@ export function DxjlPanel() {
             failureCount += 1
             schedule(recoverableRetryDelay(failureCount))
           } else {
-            // 实时页不能因一次失败永久冻结，按正常节奏重试
+            // 兜底轮询不能因一次失败永久冻结，按正常节奏重试
             schedule(DXJL_POLL_MS)
           }
         })
@@ -162,7 +228,7 @@ export function DxjlPanel() {
       alive = false
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [])
+  }, [wsLive])
 
   // 初次就绪贴底；轮询新行仅在贴底跟随时滚底；前插历史页做滚动量补偿
   useEffect(() => {

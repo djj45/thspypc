@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -63,6 +64,18 @@ class ThsRuntime:
             tuple[threading.Timer, object],
         ] = {}
         self._stream_release_delay = 2.0
+        # 短线精灵 9601 实时推送采集：同花顺客户端是推送语义（盘中约 1500
+        # 条异动/分钟），HTTP 轮询 160 条窗口在活跃时段必然漏数据。后台线程
+        # subscribe_realtime 后持续 receive_pushes，记录归一化入环形缓冲并
+        # 扇出给浏览器 WS 订阅者（与个股事件流的订阅模型同构）。
+        self._dxjl_lock = threading.RLock()
+        self._dxjl_thread: threading.Thread | None = None
+        self._dxjl_stop = threading.Event()
+        self._dxjl_buffer: deque[dict] = deque(maxlen=4096)
+        self._dxjl_subscribers: set[queue.Queue] = set()
+        self._dxjl_last_ts = 0
+        self._dxjl_name_map: dict[str, str] | None = None
+        self._dxjl_name_map_at = 0.0
 
     @property
     def env(self) -> dict[str, str]:
@@ -325,6 +338,116 @@ class ThsRuntime:
             except Exception as exc:
                 logger.warning("%s 市场事件退订失败: %s", code, exc)
 
+    # ── 短线精灵实时推送采集 ──
+
+    DXJL_SNAPSHOT_ROWS = 200
+    DXJL_NAME_TTL = 300.0
+
+    def ensure_dxjl_collector(self) -> None:
+        """启动（或复用）9601 推送采集线程；幂等。"""
+        with self._dxjl_lock:
+            if self._dxjl_thread is not None and self._dxjl_thread.is_alive():
+                return
+            self._dxjl_stop.clear()
+            self._dxjl_thread = threading.Thread(
+                target=self._dxjl_collect_loop,
+                name="ths-dxjl-collector",
+                daemon=True,
+            )
+            self._dxjl_thread.start()
+            logger.info("dxjl 采集线程已启动")
+
+    def subscribe_dxjl_stream(self) -> queue.Queue:
+        """注册一个短线精灵 WS 订阅者并确保采集线程在跑。"""
+        subscriber: queue.Queue = queue.Queue(maxsize=2048)
+        # 先注册再启动线程：采集线程的最早一批推送就能进订阅者队列，
+        # 连接方无需依赖快照补齐。
+        with self._dxjl_lock:
+            self._dxjl_subscribers.add(subscriber)
+        self.ensure_dxjl_collector()
+        return subscriber
+
+    def unsubscribe_dxjl_stream(self, subscriber: queue.Queue) -> None:
+        with self._dxjl_lock:
+            self._dxjl_subscribers.discard(subscriber)
+
+    def dxjl_buffer_tail(self, count: int = DXJL_SNAPSHOT_ROWS) -> list[dict]:
+        """环形缓冲末尾的最近记录（旧→新），供 WS 连接时补快照。"""
+        with self._dxjl_lock:
+            tail = list(self._dxjl_buffer)[-count:]
+        tail.sort(key=lambda row: row["时间"])
+        return tail
+
+    def _dxjl_collect_loop(self) -> None:
+        subscribed = False
+        while not self._dxjl_stop.is_set():
+            try:
+                if not subscribed:
+                    self.call(lambda client: client.subscribe_realtime())
+                    subscribed = True
+                    logger.info("dxjl 9601 subrealorder 订阅成功")
+                self.call(
+                    lambda client: client.receive_pushes(
+                        timeout=5.0,
+                        callback=self._on_dxjl_record,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("dxjl 采集循环异常，5s 后重订阅重试: %s", exc)
+                subscribed = False
+                if self._dxjl_stop.wait(5.0):
+                    break
+
+    def _on_dxjl_record(self, record: dict) -> None:
+        row = self._normalize_dxjl_record(record)
+        with self._dxjl_lock:
+            self._dxjl_buffer.append(row)
+            subscribers = list(self._dxjl_subscribers)
+        for subscriber in subscribers:
+            try:
+                subscriber.put_nowait(row)
+            except queue.Full:
+                # 慢消费者丢弃即可，重连时由缓冲快照补齐
+                pass
+
+    def _normalize_dxjl_record(self, record: dict) -> dict:
+        # 推送帧无时间戳：用到达时刻（微秒）并强制单调递增，保证排序键稳定。
+        now_us = int(time.time() * 1_000_000)
+        with self._dxjl_lock:
+            if now_us <= self._dxjl_last_ts:
+                now_us = self._dxjl_last_ts + 1
+            self._dxjl_last_ts = now_us
+        row = {
+            "时间": now_us,
+            "市场": str(record.get("市场", "")),
+            "代码": str(record.get("代码", "")),
+            "异动类型": record.get("异动类型", ""),
+            "异动编码": record.get("异动编码", 0),
+            "金额": record.get("金额", 0.0),
+            # 推送解析字段名是「涨幅」，与页面查询的「涨跌幅」对齐
+            "涨跌幅": record.get("涨跌幅", record.get("涨幅", 0.0)),
+        }
+        name = self._dxjl_names().get(row["代码"])
+        if name:
+            row["名称"] = name
+        return row
+
+    def _dxjl_names(self) -> dict[str, str]:
+        now = time.monotonic()
+        if (
+            self._dxjl_name_map is None
+            or now - self._dxjl_name_map_at > self.DXJL_NAME_TTL
+        ):
+            try:
+                self._dxjl_name_map = self.call(
+                    lambda client: client.fetch_stock_names_full()["names"]
+                )
+            except Exception:
+                logger.debug("dxjl 名称表不可用，本批跳过名称", exc_info=True)
+                self._dxjl_name_map = self._dxjl_name_map or {}
+            self._dxjl_name_map_at = now
+        return self._dxjl_name_map
+
     def close(self) -> None:
         """Release the single client and all sockets during server shutdown."""
         with self._stream_lock:
@@ -334,6 +457,9 @@ class ThsRuntime:
             self._stream_subscribers.clear()
             self._stream_active_codes.clear()
             self._stream_markets.clear()
+        self._dxjl_stop.set()
+        with self._dxjl_lock:
+            self._dxjl_subscribers.clear()
         with self._lifecycle_lock:
             client = self._client
             self._connected_once = False

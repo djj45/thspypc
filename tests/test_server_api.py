@@ -32,6 +32,7 @@ class FakeClient:
         self.is_connected = False
         self.calls = []
         self.stream_callback = None
+        self._dxjl_delivered = False
 
     def connect(self):
         self.calls.append(("connect",))
@@ -201,6 +202,38 @@ class FakeClient:
         self.calls.append(("market_events_unsubscribe", code))
         self.stream_callback = None
         return True
+
+    def subscribe_realtime(self, markets=None):
+        self.calls.append(("subscribe_realtime",))
+        return None
+
+    def receive_pushes(
+        self,
+        timeout=10.0,
+        callback=None,
+        full_frame_callback=None,
+        continue_on_timeout=False,
+    ):
+        self.calls.append(("receive_pushes",))
+        time.sleep(0.02)
+        if callback is not None and not self._dxjl_delivered:
+            self._dxjl_delivered = True
+            callback(
+                {
+                    "代码": "000977",
+                    "市场": "16",
+                    "异动类型": "封涨停板",
+                    "异动编码": 211,
+                    "金额": 12_345_678.0,
+                    "涨幅": 3.21,
+                    "raw_bytes": "ab",
+                }
+            )
+        return [], 0
+
+    def fetch_stock_names_full(self, timeout=45.0):
+        self.calls.append(("fetch_stock_names_full",))
+        return {"names": {"000977": "浪潮信息"}}
 
     def stock_list(self, with_names=False):
         self.calls.append(("stock_list", with_names))
@@ -759,6 +792,43 @@ def test_stock_stream_fans_out_shared_client_events(client_and_app):
     ):
         time.sleep(0.01)
     assert ("market_events_unsubscribe", "603334") in fake.calls
+
+
+def test_dxjl_stream_fans_out_realtime_pushes(client_and_app):
+    """短线精灵 WS：9601 推送记录归一化（时间/涨跌幅/名称）后实时扇出。"""
+    fake, client = client_and_app
+
+    with client.websocket_connect("/api/dxjl/stream") as websocket:
+        assert websocket.receive_json() == {
+            "event": "status",
+            "state": "subscribed",
+        }
+        row = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            message = websocket.receive_json()
+            if message.get("event") == "dxjl":
+                row = message
+                break
+            if message.get("event") == "snapshot" and any(
+                item.get("代码") == "000977"
+                for item in message.get("rows", [])
+            ):
+                rows = message["rows"]
+                row = next(
+                    item for item in rows if item["代码"] == "000977"
+                )
+                break
+
+        assert row is not None
+        assert row["代码"] == "000977"
+        assert row["涨跌幅"] == 3.21
+        assert row["名称"] == "浪潮信息"
+        assert isinstance(row["时间"], int)
+        assert "raw_bytes" not in row
+
+    assert any(call[0] == "subscribe_realtime" for call in fake.calls)
+    assert any(call[0] == "receive_pushes" for call in fake.calls)
 
 
 def test_stock_ready_registers_code_before_page_fanout(client_and_app):

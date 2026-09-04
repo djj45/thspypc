@@ -649,6 +649,67 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 # worker ever starts, leaking the shared client subscription.
                 runtime.unsubscribe_stock_stream(code, subscriber)
 
+    @app.websocket("/api/dxjl/stream")
+    async def dxjl_stream(websocket: WebSocket) -> None:
+        """实时扇出短线精灵 9601 推送（订阅后零遗漏，不再依赖轮询窗口）。"""
+        await websocket.accept()
+        subscriber = None
+        disconnect_task = None
+        try:
+            subscriber = await asyncio.to_thread(runtime.subscribe_dxjl_stream)
+            await websocket.send_json(
+                {"event": "status", "state": "subscribed"}
+            )
+            tail = await asyncio.to_thread(runtime.dxjl_buffer_tail)
+            if tail:
+                await websocket.send_json({"event": "snapshot", "rows": tail})
+            disconnect_task = asyncio.create_task(websocket.receive())
+            while True:
+                event_task = asyncio.create_task(
+                    asyncio.to_thread(subscriber.get, True, 1.0)
+                )
+                done, _pending = await asyncio.wait(
+                    {disconnect_task, event_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if disconnect_task in done:
+                    message = disconnect_task.result()
+                    if not event_task.done():
+                        event_task.cancel()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    disconnect_task = asyncio.create_task(websocket.receive())
+                    continue
+                try:
+                    record = event_task.result()
+                except queue.Empty:
+                    await websocket.send_json(
+                        {"event": "status", "state": "idle"}
+                    )
+                    continue
+                await websocket.send_json(
+                    _jsonable({"event": "dxjl", **record})
+                )
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            try:
+                await websocket.send_json(
+                    {
+                        "event": "status",
+                        "state": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+        finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+            if subscriber is not None:
+                runtime.unsubscribe_dxjl_stream(subscriber)
+
     @app.get("/api/stock-ready/{code}")
     def stock_ready(code: str, market: int = 0) -> dict:
         """Register one stock once before HTTP panels and WebSocket fan out."""

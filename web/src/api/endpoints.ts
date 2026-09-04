@@ -280,6 +280,11 @@ export const api = {
     return `${scheme}://${window.location.host}/api/stock-stream/${code}?market=${market}`
   },
 
+  dxjlStreamUrl: () => {
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    return `${scheme}://${window.location.host}/api/dxjl/stream`
+  },
+
   // 全市场代码表（磁盘缓存，自然日有效；供左栏名称回填）
   stocks2: () => getJson<StockListItem[]>('/api/stocks2'),
 
