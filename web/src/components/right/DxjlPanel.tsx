@@ -30,6 +30,9 @@ function fmtAmt(n: number) {
 }
 const keyOf = (d: Dxjl) => `${d.时间}|${d.代码}|${d.异动编码}|${d.金额}`
 
+// 实时轮询节奏：与 useData poll 默认一致；dxjl 是高频异动流，5s 足够顺滑
+const DXJL_POLL_MS = 5_000
+
 /** 异动方向：买入/上涨压力=up(红)，卖出/下跌压力=down(绿)。
  *  特判两对与字面相反的：打开跌停板是上涨事件(红)、打开涨停板是下跌事件(绿)；
  *  撤单与封单大减按压力减弱方向（撤买/涨停封单大减=绿，撤卖/跌停封单大减=红）。 */
@@ -106,6 +109,7 @@ export function DxjlPanel() {
   const loadingMoreRef = useRef(false)
   const cursorRef = useRef<number | null>(null) // 已加载最早一条的时间
   const pinnedRef = useRef(false) // 初次数据就绪后贴底一次
+  const followRef = useRef(false) // 轮询新行时是否贴底跟随
   const scrollRef = useRef<HTMLDivElement>(null)
   // 前插历史页后补偿滚动量，保持视口停留原位
   const pendingAdjustRef = useRef<{ prevHeight: number; prevTop: number } | null>(
@@ -116,6 +120,9 @@ export function DxjlPanel() {
     let alive = true
     let timer: ReturnType<typeof setTimeout> | undefined
     let failureCount = 0
+    const schedule = (delay: number) => {
+      timer = setTimeout(loadLatest, delay)
+    }
     const loadLatest = () => {
       api
         .dxjlLatest()
@@ -123,20 +130,27 @@ export function DxjlPanel() {
           if (!alive) return
           failureCount = 0
           const sorted = [...data].sort((a, b) => a.时间 - b.时间)
+          // 贴底跟随：视口在底部附近才随新行滚到底；用户翻历史时不打断
+          const el = scrollRef.current
+          followRef.current =
+            el == null ||
+            el.scrollHeight - el.scrollTop - el.clientHeight <= 48
           rowsRef.current = sorted
           setRows(sorted)
           if (sorted.length) cursorRef.current = sorted[0].时间
           setError('')
+          // 以上一次完成为起点轮询，慢请求不叠加并发（与 useData poll 一致）
+          schedule(DXJL_POLL_MS)
         })
         .catch((e) => {
           if (!alive) return
           setError(e instanceof Error ? e.message : String(e))
           if (isRecoverableRequestError(e)) {
             failureCount += 1
-            timer = setTimeout(
-              loadLatest,
-              recoverableRetryDelay(failureCount),
-            )
+            schedule(recoverableRetryDelay(failureCount))
+          } else {
+            // 实时页不能因一次失败永久冻结，按正常节奏重试
+            schedule(DXJL_POLL_MS)
           }
         })
         .finally(() => {
@@ -150,18 +164,24 @@ export function DxjlPanel() {
     }
   }, [])
 
-  // 初次就绪贴底；之后每次 rows 变化做前插补偿
+  // 初次就绪贴底；轮询新行仅在贴底跟随时滚底；前插历史页做滚动量补偿
   useEffect(() => {
     const el = scrollRef.current
     if (!el || loading || !rows.length) return
     if (!pinnedRef.current) {
       pinnedRef.current = true
       el.scrollTop = el.scrollHeight
+      return
     }
     if (pendingAdjustRef.current) {
       const { prevHeight, prevTop } = pendingAdjustRef.current
       pendingAdjustRef.current = null
       el.scrollTop = el.scrollHeight - prevHeight + prevTop
+      return
+    }
+    if (followRef.current) {
+      followRef.current = false
+      el.scrollTop = el.scrollHeight
     }
   }, [loading, rows])
 
