@@ -31,7 +31,7 @@ import logging
 import struct
 from datetime import datetime
 
-from ..codecs.compression import normalize_8901_response
+from ..codecs.compression import Incomplete8901Response, normalize_8901_response
 from ..codecs.framing import encode_frame
 from ..codecs.hd import _parse_hd_field_table
 from ..codecs.numeric import decode_ths_float
@@ -144,6 +144,16 @@ _CANCEL_DETAIL_FIELDS = (
     (20, 0x70, 4),
     (13, 0x70, 4),
     (37, 0x30, 4),
+)
+_SUPERORDER_FIELDS = (
+    (1, 0x30, 4),
+    (56, 0x30, 4),
+    (10, 0x70, 4),
+    (13, 0x70, 4),
+    (12, 0x30, 4),
+    (74, 0x30, 4),
+    (75, 0x30, 4),
+    (18, 0x70, 4),
 )
 
 # 外层请求路由标记（2026-08-05 抓包确认，0x02FC = 小端 fc 02；区别于 auction 的 0x01FC）
@@ -444,7 +454,9 @@ def _order_detail_table(
     """Return ``(body, data_offset, row_count, shell_code)`` for one table."""
     if body.startswith(b"\x0a"):
         try:
-            body = normalize_8901_response(body)
+            body = normalize_8901_response(body, strict=True)
+        except Incomplete8901Response as exc:
+            body = exc.normalized_prefix
         except ValueError as exc:
             logger.debug("order detail normalization failed: %s", exc)
             return None
@@ -488,7 +500,9 @@ def _order_detail_table(
         if fields != fields_expected:
             continue
         shell_start = base + 10 + field_count * 4
-        shell_end = min(shell_start + 120, len(body) - 22)
+        next_table = body.find(b"hd1.0\x00", shell_start)
+        table_end = next_table if next_table >= 0 else len(body)
+        shell_end = min(shell_start + 120, table_end - 18)
         for code_pos in range(shell_start, shell_end + 1):
             if body[code_pos] not in (0x11, 0x21):
                 continue
@@ -498,15 +512,11 @@ def _order_detail_table(
             # These three tables use a 22-byte shell whose market marker is
             # four bytes into the shell, so records start marker+18.
             data_offset = code_pos + 18
-            available_bytes = len(body) - data_offset
+            available_bytes = table_end - data_offset
             expected_bytes = row_count * row_size
             if available_bytes < expected_bytes:
-                # 8901 明文表的 declared body length 偶尔少 1 字节。服务层会
-                # 从 socket 补读真实尾字节；纯解析调用无法补读时，至少保留
-                # 前面的完整行，避免整张表被误判为空。
-                if available_bytes != expected_bytes - 1:
-                    return None
-                row_count -= 1
+                # Only complete rows from actual source bytes can be trusted.
+                row_count = max(0, available_bytes // row_size)
             return body, data_offset, row_count, raw_code.decode("ascii")
 
 
@@ -702,11 +712,10 @@ def _ts_valid(ts: int) -> bool:
 def _locate_data_offset(body: bytes, shell_search_from: int) -> tuple[int, str]:
     """定位记录区起点 + 提取股票代码。
 
-    7169 帧的个股壳格式：``\\x11``(沪)/``\\x21``(深) + 6 位 ASCII 代码。壳之后到
-    第一条记录之间是**固定的 22 字节头部**（含 dt5 市场标记等，沪深实测一致）。
-    因此 data_off = shell + 7（标记+代码）+ 15（头部填充）= shell + 22。
+    The stock shell is 22 bytes, with its market marker four bytes in.
+    Rows therefore start at marker+18 with trade_no, followed by timestamp.
 
-    为兜住偶发的填充长度漂移，在 shell+22 附近 ±2 字节小窗口内取**首个使连续记录
+    为兜住偶发的填充长度漂移，在 marker+18 附近 ±2 字节小窗口内取**首个使连续记录
     ts 合法**的偏移。窗口很窄（不扫描整个填充区），避免误定位到 body 其它位置的
     合法 ts 序列（多段拼接帧的假阳性）。
 
@@ -728,13 +737,12 @@ def _locate_data_offset(body: bytes, shell_search_from: int) -> tuple[int, str]:
             continue
         if not code.isdigit():
             continue
-        # 壳后 22 字节是记录起点（沪深实测一致）；±2 兜填充漂移
-        for delta in (22, 21, 23, 20, 24):
+        for delta in (18, 17, 19, 16, 20):
             doff = off + delta
-            if doff + 4 > len(body):
+            if doff + 8 > len(body):
                 continue
-            ts0 = struct.unpack_from("<I", body, doff)[0]
-            if _ts_valid(ts0) and _validate_run_start(body, doff):
+            ts0 = struct.unpack_from("<I", body, doff + 4)[0]
+            if _ts_valid(ts0) and _validate_run_start(body, doff + 4):
                 return doff, code
         # 壳找到了但数据起点定位不到，不再找别的壳
         break
@@ -773,7 +781,7 @@ def parse_superorder_response(body: bytes) -> list[dict]:
             "code": "000938",
             "time": datetime,          # dt1, 撮合时刻
             "price": 37.75,            # dt56, 成交价（元）
-            "volume": 100,             # dt10, 成交量（手）
+            "volume": 100,             # dt10, raw quantity; unit not normalized
             "direction": 5,            # dt13, 1=主动买(外盘) / 5=主动卖(内盘)
             "delegate_a": 37048499,    # dt12, 委托号 A（深=卖方 / 沪=主动方）
             "delegate_b": 37045605,    # dt74, 委托号 B（深=买方 / 沪=被动方挂单）
@@ -793,7 +801,9 @@ def parse_superorder_response(body: bytes) -> list[dict]:
     # 1. 入口 normalize（cmd=0x0a 外层压缩，沪深均需）
     if body.startswith(b"\x0a"):
         try:
-            body = normalize_8901_response(body)
+            body = normalize_8901_response(body, strict=True)
+        except Incomplete8901Response as exc:
+            body = exc.normalized_prefix
         except ValueError as exc:
             logger.debug("7169 外层正规化失败: %s", exc)
             return []
@@ -817,16 +827,14 @@ def parse_superorder_response(body: bytes) -> list[dict]:
         if record_count == 0 or record_count > 2_000_000:
             continue
         # 3. 字段表（base+10 起 fc*4 字节）
-        fields = _parse_hd_field_table(body, base + 10, fc)
-        if len(fields) < fc:
-            continue
-        # 校验前 3 字段是 dt1/dt56/dt10（7169 固定字段表）
-        leading = tuple(dt for dt, _, _ in fields[:3])
-        if leading != (1, 56, 10):
+        fields = tuple(_parse_hd_field_table(body, base + 10, fc))
+        if fields != _SUPERORDER_FIELDS:
             continue
         # 4. 定位记录起点 + 股票代码
         shell_search_from = base + 10 + fc * 4
-        data_off, code = _locate_data_offset(body, shell_search_from)
+        next_table = body.find(b"hd1.0\x00", shell_search_from)
+        table_end = next_table if next_table >= 0 else len(body)
+        data_off, code = _locate_data_offset(body[:table_end], shell_search_from)
         if data_off < 0:
             continue
 
@@ -835,9 +843,11 @@ def parse_superorder_response(body: bytes) -> list[dict]:
         prev_ts: int | None = None
         for i in range(record_count):
             row_off = data_off + i * hs
-            if row_off + hs > len(body):
+            if row_off + hs > table_end:
                 break
-            ts = struct.unpack_from("<I", body, row_off)[0]
+            trade_no, ts, price_raw, vol, direction, delegate_a, delegate_b, seq = (
+                struct.unpack_from("<8I", body, row_off)
+            )
             if not _ts_valid(ts):
                 # 一旦遇到非法 ts，后续都是越界数据（下帧头部/填充），停止本帧
                 break
@@ -845,13 +855,8 @@ def parse_superorder_response(body: bytes) -> list[dict]:
                 # 相邻 ts 差过大（跨段拼接/帧边界），停止本帧
                 break
             prev_ts = ts
-            # seq (dt75) 在 row_off+24，超上限说明读到帧边界垃圾，停止本帧
-            seq = struct.unpack_from("<I", body, row_off + 24)[0]
             if seq > _SEQ_MAX:
                 break
-            price_raw, vol, direction, delegate_a, delegate_b, seq, trade_no = (
-                struct.unpack_from("<7I", body, row_off + 4)
-            )
             try:
                 t = datetime.fromtimestamp(ts)
             except (OSError, ValueError, OverflowError):
@@ -872,6 +877,116 @@ def parse_superorder_response(body: bytes) -> list[dict]:
             })
         # 7169 单帧通常已含全部数据；继续找下一个 hd1.0（多帧分页兜底）
     return records
+
+
+def _market_response_evidence(
+    body: bytes, *, period: int, code: str | None = None,
+) -> dict:
+    """Validate all tables of one feed; filtering rows never hides frame errors."""
+    if period not in (
+        SUPERORDER_PERIOD, ORDER_DETAIL_PERIOD, BUY_CANCEL_PERIOD, SELL_CANCEL_PERIOD,
+    ):
+        raise ValueError(f"unsupported market detail period: {period}")
+    result = {
+        "recognized": False, "complete": False, "errors": [],
+        "declared_count": 0, "parsed_count": 0, "rows": [],
+        "table_codes": [], "truncated": False,
+    }
+    errors = result["errors"]
+    try:
+        body = normalize_8901_response(body, strict=True)
+    except Incomplete8901Response as exc:
+        body = exc.normalized_prefix
+        errors.append("compressed_source_exhausted")
+        result["truncated"] = True
+    except ValueError:
+        errors.append("invalid_compressed_response")
+        return result
+
+    position = 0
+    while True:
+        marker = body.find(b"hd1.0\x00", position)
+        if marker < 0:
+            break
+        position = marker + 6
+        if marker + 16 > len(body):
+            errors.append("incomplete_table_header")
+            break
+        count, flag, size, field_count = struct.unpack_from("<IHHH", body, marker + 6)
+        field_start = marker + 16
+        field_end = field_start + field_count * 4
+        if field_end > len(body):
+            errors.append("incomplete_field_table")
+            break
+        fields = tuple(_parse_hd_field_table(body, field_start, field_count))
+        layout = (flag, size, field_count)
+        if period == SUPERORDER_PERIOD:
+            matches = layout == (SUPERORDER_FLAG, 32, 8)
+            matches = matches and tuple(field[0] for field in fields[:3]) == (1, 56, 10)
+        elif period == ORDER_DETAIL_PERIOD:
+            matches = layout == (ORDER_DETAIL_FLAG, 20, 5)
+            matches = matches and fields == _ORDER_DETAIL_FIELDS
+        else:
+            matches = layout == (CANCEL_DETAIL_FLAG, 31, 7)
+            matches = matches and fields == _CANCEL_DETAIL_FIELDS
+        if not matches:
+            continue
+        next_table = body.find(b"hd1.0\x00", field_end)
+        table_end = next_table if next_table >= 0 else len(body)
+        table_code = None
+        for offset in range(field_end, min(field_end + 120, table_end - 6)):
+            candidate = body[offset + 1:offset + 7]
+            if body[offset] in (0x11, 0x21) and candidate.isalnum():
+                table_code = candidate.decode("ascii")
+                break
+        if table_code is None:
+            errors.append("missing_table_code")
+            continue
+        result["table_codes"].append(table_code)
+        result["declared_count"] += count
+        selected = code is None or table_code == code
+        result["recognized"] = result["recognized"] or selected
+        shell_complete = offset + 18 <= table_end
+        if not shell_complete:
+            errors.append(f"incomplete_stock_shell:{table_code}")
+        signature_valid = period != SUPERORDER_PERIOD or fields == _SUPERORDER_FIELDS
+        if not signature_valid:
+            errors.append(f"field_signature_mismatch:{table_code}")
+        valid_widths = sum(field[2] for field in fields) == size
+        if period == SUPERORDER_PERIOD:
+            valid_widths = valid_widths and all(field[2] == 4 for field in fields)
+        if not valid_widths:
+            errors.append(f"field_width_mismatch:{table_code}")
+            parsed = []
+        elif not shell_complete or not signature_valid:
+            parsed = []
+        elif count > 2_000_000:
+            errors.append(f"invalid_row_count:{table_code}:{count}")
+            parsed = []
+        else:
+            table_body = body[marker:table_end]
+            parsed = (
+                parse_superorder_response(table_body)
+                if period == SUPERORDER_PERIOD
+                else parse_order_detail_response(table_body, period=period)
+            )
+        if any(row.get("code") != table_code for row in parsed):
+            errors.append(f"row_code_mismatch:{table_code}")
+        if period == ORDER_DETAIL_PERIOD and any(
+            row.get("side") not in ("buy", "sell") for row in parsed
+        ):
+            errors.append(f"unknown_order_side:{table_code}")
+        if len(parsed) != count:
+            errors.append(f"row_count_mismatch:{table_code}:{count}:{len(parsed)}")
+        result["parsed_count"] += len(parsed)
+        if selected:
+            result["rows"].extend(parsed)
+    result["table_codes"] = sorted(set(result["table_codes"]))
+    result["complete"] = result["recognized"] and not errors
+    result["truncated"] = (
+        result["truncated"] or result["parsed_count"] < result["declared_count"]
+    )
+    return result
 
 
 def is_superorder_response(body: bytes, *, code: str | None = None) -> bool:
