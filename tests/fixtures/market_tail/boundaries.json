@@ -1,0 +1,168 @@
+{
+  "capture_sha256": {
+    "sh": "6814e46e1e95281c01bb0a32ddf2d3117c52d6a7b56572abf41546ce59a0f928",
+    "sz": "c705b6c041ebaffade70cb8a7bb598a724825b2cc442bf2f92e398d59501b040"
+  },
+  "frames": [
+    {
+      "file": "sh-boundary-00.market-wire",
+      "period": 7175,
+      "declared_body_bytes": 16091,
+      "declared_count": 1879,
+      "original_complete": true,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303031656530",
+      "sha256": "2a2291e3252f8e669483149c906995ebdbd90a2aa9a81950dd652059a02930ff"
+    },
+    {
+      "file": "sh-boundary-01.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 7904,
+      "declared_count": 477,
+      "original_complete": false,
+      "actual_tail_hex": "80",
+      "next_header_hex": "fdfdfdfd3030303031313234",
+      "sha256": "549c5df8221888e4ade00b7a923db9775345043b3e34be5741025f7c24fe63d2"
+    },
+    {
+      "file": "sh-boundary-02.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 4388,
+      "declared_count": 256,
+      "original_complete": false,
+      "actual_tail_hex": "c0",
+      "next_header_hex": "fdfdfdfd3030303031373231",
+      "sha256": "934d827b0e1fa6b341a32b62dd9afd53efd013d47469e28c2785a3454f1fd4fb"
+    },
+    {
+      "file": "sh-boundary-03.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 5921,
+      "declared_count": 351,
+      "original_complete": false,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303031333833",
+      "sha256": "4ef80d8315f4cfbca0655301f743d8fec70a673f3a57b38692149348fa4983a4"
+    },
+    {
+      "file": "sh-boundary-04.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 4995,
+      "declared_count": 290,
+      "original_complete": false,
+      "actual_tail_hex": "60",
+      "next_header_hex": "fdfdfdfd3030303030653132",
+      "sha256": "73ea05e6867ce14dadee90c94f3c39d4bbdac348c45d3ed68f2acb6249c76e0f"
+    },
+    {
+      "file": "sh-boundary-05.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 3602,
+      "declared_count": 199,
+      "original_complete": false,
+      "actual_tail_hex": "c0",
+      "next_header_hex": "fdfdfdfd3030303030633630",
+      "sha256": "a07372209c9791fe5a736a411469c3acada874d8d56b1ff9ceb73b818b794ffd"
+    },
+    {
+      "file": "sh-boundary-06.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 3168,
+      "declared_count": 170,
+      "original_complete": true,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303030623336",
+      "sha256": "92f1a301178881347ab6d7356b2977faca78c4ad34addcc68e66427bbd636857"
+    },
+    {
+      "file": "sh-boundary-07.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 2870,
+      "declared_count": 156,
+      "original_complete": true,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303031373366",
+      "sha256": "3c1ff8b31622c9ad3cb63a17e1bcddc3f21c0c511b77cdc347b6d1c6a16c1f2d"
+    },
+    {
+      "file": "sh-boundary-08.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 5951,
+      "declared_count": 365,
+      "original_complete": false,
+      "actual_tail_hex": "80",
+      "next_header_hex": "fdfdfdfd3030303032303366",
+      "sha256": "26e09b948d696cc877c883a1b809420c7362ced5895c7d7ee140ba99063b0f22"
+    },
+    {
+      "file": "sh-boundary-09.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 8255,
+      "declared_count": 524,
+      "original_complete": false,
+      "actual_tail_hex": "80",
+      "next_header_hex": "fdfdfdfd3030303031653465",
+      "sha256": "3560d4343d712598448f0d877d7008e3a3df57451fbc21845df19a9c813590b2"
+    },
+    {
+      "file": "sh-boundary-10.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 7758,
+      "declared_count": 498,
+      "original_complete": false,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303031396132",
+      "sha256": "0a20b7fd1ae3425b7e87951fca927c3336ab34df05d37f5ae8259a3d5a07b783"
+    },
+    {
+      "file": "sh-boundary-11.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 6562,
+      "declared_count": 398,
+      "original_complete": false,
+      "actual_tail_hex": "1e",
+      "next_header_hex": "fdfdfdfd3030303030663333",
+      "sha256": "84e7de91cd892c85ddb060ea20fd5565e66f90e5698a90a5f5dd94fc076ea9c4"
+    },
+    {
+      "file": "sh-boundary-12.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 3891,
+      "declared_count": 223,
+      "original_complete": false,
+      "actual_tail_hex": "60",
+      "next_header_hex": "fdfdfdfd3030303030643338",
+      "sha256": "bc10823abf6c50ac193cfd0711eaa195d5aef8a59a6f14d41dbc6ac99cc8976e"
+    },
+    {
+      "file": "sh-boundary-13.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 3384,
+      "declared_count": 190,
+      "original_complete": true,
+      "actual_tail_hex": "",
+      "next_header_hex": "fdfdfdfdfd30303030303030",
+      "sha256": "afb032444e879fedf2f22ec4f057abb61f30ed7231eade806250705a6402b703"
+    },
+    {
+      "file": "sh-boundary-14.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 3842,
+      "declared_count": 231,
+      "original_complete": true,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303030303665",
+      "sha256": "42044608b8aab997bdac2a102e8477a4b1aae3b1247d2dfb8666a2184039efac"
+    },
+    {
+      "file": "sz-boundary-02.market-wire",
+      "period": 7169,
+      "declared_body_bytes": 61509,
+      "declared_count": 3845,
+      "original_complete": false,
+      "actual_tail_hex": "00",
+      "next_header_hex": "fdfdfdfd3030303030303034",
+      "sha256": "0f007cbf1ddfcb0d9b480a0cbaffc9c81650bcba7a8a59f187ccb2d99607b264"
+    }
+  ]
+}
