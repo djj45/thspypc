@@ -1,5 +1,6 @@
 """Offline routing and entitlement contracts for Level2 order queues."""
 
+import socket
 import struct
 
 import pytest
@@ -26,6 +27,9 @@ class FakeSocket:
     def settimeout(self, value):
         self.timeout = value
 
+    def gettimeout(self):
+        return self.timeout
+
     def sendall(self, data):
         self.sent.append(data)
 
@@ -41,9 +45,21 @@ class TailSocket(FakeSocket):
         super().__init__()
         self.tail = tail
 
-    def recv(self, _size):
-        tail, self.tail = self.tail, b""
+    def recv(self, size, flags=0):
+        tail = self.tail[:size]
+        if not flags & socket.MSG_PEEK:
+            self.tail = self.tail[size:]
         return tail
+
+
+def _trade_response(code, count=1):
+    fields = bytes.fromhex(
+        "01300004383000040a7000040d7000040c3000044a3000044b30000412700004"
+    )
+    shell = b"\x16\x00\x01\x00\x11" + code.encode("ascii") + bytes(11)
+    row = struct.pack("<8I", 101, 1788485400, 0xC00FA3E8, 100, 1, 10, 20, 1)
+    return (b"hd1.0\x00" + struct.pack("<IHHH", count, 0x46, 32, 8)
+            + fields + shell + row * count)
 
 
 def _profile(kind):
@@ -72,13 +88,13 @@ def test_standard_account_rejected_before_opening_socket():
     assert opened == []
 
 
-def test_superorder_delivers_push_seen_before_query_response(monkeypatch):
+def test_superorder_delivers_push_seen_before_query_response():
     sock = FakeSocket()
     manager = ConnectionManager(
         _profile(AccountKind.LEVEL2),
         lambda _spec: sock,
     )
-    responses = iter([b"market-push", b"hd1.0-superorder"])
+    responses = iter([b"market-push", _trade_response("603334")])
     unsolicited = []
     service = SuperorderService(
         manager,
@@ -86,15 +102,6 @@ def test_superorder_delivers_push_seen_before_query_response(monkeypatch):
         max_frames=2,
         unsolicited=unsolicited.append,
     )
-    monkeypatch.setattr(
-        "thspypc.services.superorder.is_superorder_response",
-        lambda body, **_kwargs: body.endswith(b"superorder"),
-    )
-    monkeypatch.setattr(
-        "thspypc.services.superorder.parse_superorder_response",
-        lambda body: [{"code": "603334"}] if body.endswith(b"superorder") else [],
-    )
-
     result = service.superorder(
         "603334",
         market=17,
@@ -102,15 +109,15 @@ def test_superorder_delivers_push_seen_before_query_response(monkeypatch):
         end_ts=2,
     )
 
-    assert result == [{"code": "603334"}]
+    assert [row["code"] for row in result] == ["603334"]
     assert unsolicited == [b"market-push"]
 
 
-def test_superorder_skips_same_protocol_response_for_other_code(monkeypatch):
+def test_superorder_skips_same_protocol_response_for_other_code():
     sock = FakeSocket()
     manager = ConnectionManager(_profile(AccountKind.LEVEL2), lambda _spec: sock)
-    other = b"hd1.0-other-stock"
-    target = b"hd1.0-target-stock"
+    other = _trade_response("600519")
+    target = _trade_response("601318")
     responses = iter([other, target])
     unsolicited = []
     service = SuperorderService(
@@ -118,17 +125,6 @@ def test_superorder_skips_same_protocol_response_for_other_code(monkeypatch):
         frame_reader=lambda _sock: next(responses),
         unsolicited=unsolicited.append,
     )
-    monkeypatch.setattr(
-        "thspypc.services.superorder.is_superorder_response",
-        lambda body, **_kwargs: body == target,
-    )
-    monkeypatch.setattr(
-        "thspypc.services.superorder.parse_superorder_response",
-        lambda body: [
-            {"code": "600519" if body == other else "601318", "seq": 1}
-        ],
-    )
-
     result = service.superorder(
         "601318",
         market=17,
@@ -136,25 +132,17 @@ def test_superorder_skips_same_protocol_response_for_other_code(monkeypatch):
         end_ts=2,
     )
 
-    assert result == [{"code": "601318", "seq": 1}]
+    assert [(row["code"], row["seq"]) for row in result] == [("601318", 1)]
     assert unsolicited == [other]
 
 
-def test_superorder_accepts_recognized_empty_table(monkeypatch):
+def test_superorder_accepts_recognized_empty_table():
     manager = ConnectionManager(
         _profile(AccountKind.LEVEL2),
         lambda _spec: FakeSocket(),
     )
-    target = b"hd1.0-empty-superorder"
+    target = _trade_response("601318", count=0)
     service = SuperorderService(manager, frame_reader=lambda _sock: target)
-    monkeypatch.setattr(
-        "thspypc.services.superorder.is_superorder_response",
-        lambda body, **_kwargs: body == target,
-    )
-    monkeypatch.setattr(
-        "thspypc.services.superorder.parse_superorder_response",
-        lambda _body: [],
-    )
 
     assert service.superorder(
         "601318",
