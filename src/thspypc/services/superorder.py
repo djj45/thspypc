@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import socket
-import struct
 import time
 from collections.abc import Callable
 
@@ -17,31 +16,25 @@ from ..errors import (
 from ..features.account_profile import AccountEvidenceRecorder
 from ..features.superorder_protocol import (
     BUY_CANCEL_PERIOD,
-    CANCEL_DETAIL_FIELD_COUNT,
-    CANCEL_DETAIL_FLAG,
-    CANCEL_DETAIL_RECORD_SIZE,
     ORDER_QUEUE_BUY_PERIOD,
     ORDER_QUEUE_HIST_PAGEID,
     ORDER_QUEUE_PAGEID,
     ORDER_QUEUE_SELL_PERIOD,
     ORDER_DETAIL_PERIOD,
-    ORDER_DETAIL_FIELD_COUNT,
-    ORDER_DETAIL_FLAG,
-    ORDER_DETAIL_RECORD_SIZE,
     SELL_CANCEL_PERIOD,
     SNAPSHOT_REPLAY_HIST_PAGEID,
     SNAPSHOT_REPLAY_INDEX_PAGEID,
     SNAPSHOT_REPLAY_PAGEID,
+    SUPERORDER_PERIOD,
+    _market_response_evidence,
     build_order_detail_query,
     build_order_queue_query,
     build_snapshot_replay_query,
     build_superorder_query,
     is_superorder_response,
     is_snapshot_replay_response,
-    parse_order_detail_response,
     parse_order_queue_response,
     parse_snapshot_replay_response,
-    parse_superorder_response,
 )
 from ..models import AccountKind, Capability, Support
 from .subscription import L2SubscriptionCoordinator
@@ -51,44 +44,68 @@ FrameReader = Callable[[SocketLike], bytes]
 UnsolicitedHandler = Callable[[bytes], None]
 
 
-def _repair_order_detail_tail(sock, body: bytes, *, period: int) -> bytes:
-    """补读 7175/7170/7171 明文表落在 declared frame 外的末字节。"""
-    if body.startswith(b"\x0a"):
+def _repair_market_frame_tail(
+    sock: SocketLike,
+    body: bytes,
+    *,
+    period: int,
+    deadline: float | None = None,
+    evidence: dict | None = None,
+) -> bytes:
+    """Consume one observed tail byte only when it proves the whole response."""
+    if evidence is None:
+        evidence = _market_response_evidence(body, period=period)
+    if not evidence["recognized"] or evidence["complete"]:
         return body
-    marker = body.find(b"hd1.0\x00")
-    if marker < 0 or marker + 16 > len(body):
+    if not evidence["errors"] or not all(
+        error == "compressed_source_exhausted"
+        or error.startswith("row_count_mismatch:")
+        for error in evidence["errors"]
+    ):
         return body
-    row_count, flag, row_size, field_count = struct.unpack_from(
-        "<IHHH", body, marker + 6
-    )
-    expected_layout = (
-        (ORDER_DETAIL_FLAG, ORDER_DETAIL_RECORD_SIZE, ORDER_DETAIL_FIELD_COUNT)
-        if period == ORDER_DETAIL_PERIOD
-        else (CANCEL_DETAIL_FLAG, CANCEL_DETAIL_RECORD_SIZE, CANCEL_DETAIL_FIELD_COUNT)
-    )
-    if (flag, row_size, field_count) != expected_layout:
+    gettimeout = getattr(sock, "gettimeout", None)
+    if gettimeout is None:
         return body
-    field_end = marker + 16 + field_count * 4
-    search_end = min(field_end + 120, len(body) - 7)
-    code_pos = None
-    for candidate in range(field_end, search_end + 1):
-        if body[candidate] not in (0x11, 0x21):
-            continue
-        code = body[candidate + 1 : candidate + 7]
-        if len(code) == 6 and code.isalnum():
-            code_pos = candidate
-            break
-    if code_pos is None:
-        return body
-    expected_end = code_pos + 18 + row_count * row_size
-    if expected_end != len(body) + 1:
+    original_timeout = gettimeout()
+    budget = 0.1
+    if deadline is not None:
+        budget = min(budget, deadline - time.monotonic())
+    if original_timeout is not None:
+        budget = min(budget, original_timeout)
+    if budget <= 0:
         return body
     try:
-        sock.settimeout(1.0)
-        tail = sock.recv(1)
-    except OSError:
-        return body
-    return body + tail if tail else body
+        sock.settimeout(budget)
+        try:
+            candidate = sock.recv(1, socket.MSG_PEEK)
+        except (OSError, TypeError):
+            return body
+        # A single FD may be the start of either supported frame envelope.
+        if len(candidate) != 1 or candidate == b"\xfd":
+            return body
+        repaired = body + candidate
+        checked = _market_response_evidence(repaired, period=period)
+        if not (
+            checked["complete"]
+            and checked["table_codes"] == evidence["table_codes"]
+            and checked["declared_count"] == evidence["declared_count"]
+        ):
+            return body
+        # The request lock owns this buffered byte; do not start another wait.
+        sock.settimeout(0.0)
+        try:
+            consumed = sock.recv(1)
+        except OSError:
+            return body
+        if consumed != candidate:
+            raise ProtocolError("market tail changed while holding the request lock")
+        return repaired
+    finally:
+        sock.settimeout(original_timeout)
+
+
+def _repair_order_detail_tail(sock, body: bytes, *, period: int) -> bytes:
+    return _repair_market_frame_tail(sock, body, period=period)
 
 
 def _superorder_l2_role(market: int) -> ConnectionRole:
@@ -215,16 +232,22 @@ class SuperorderService:
                     continue
 
                 if is_superorder_response(response, code=code):
-                    parsed = parse_superorder_response(response)
-                    parsed = [
-                        row for row in parsed if row.get("code") == code
-                    ]
+                    response = _repair_market_frame_tail(
+                        sock, response, period=SUPERORDER_PERIOD, deadline=deadline,
+                    )
+                    evidence = _market_response_evidence(
+                        response, period=SUPERORDER_PERIOD, code=code,
+                    )
+                    if not evidence["complete"]:
+                        raise ProtocolError(
+                            "incomplete 7169 response: " + ", ".join(evidence["errors"])
+                        )
                     if self._evidence is not None:
                         self._evidence.record_feature(
                             Capability.L2_TIMELINE,
                             Support.YES,
                         )
-                    return parsed
+                    return evidence["rows"]
                 unsolicited_count += 1
                 self._deliver_unsolicited(response)
 
@@ -468,14 +491,19 @@ class SuperorderService:
                     response,
                     period=period,
                 )
-                parsed = parse_order_detail_response(response, period=period)
-                if parsed:
+                evidence = _market_response_evidence(response, period=period, code=code)
+                if evidence["recognized"]:
+                    if not evidence["complete"]:
+                        raise ProtocolError(
+                            f"incomplete {period} response: "
+                            + ", ".join(evidence["errors"])
+                        )
                     if self._evidence is not None:
                         self._evidence.record_feature(
                             Capability.L2_TIMELINE,
                             Support.YES,
                         )
-                    return parsed
+                    return evidence["rows"]
                 if b"CodeListSize=" in response:
                     return []
                 self._deliver_unsolicited(response)
