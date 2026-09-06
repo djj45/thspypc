@@ -12,7 +12,16 @@ except ImportError:  # Optional accelerator; source checkouts use Python fallbac
 _MAX_NORMALIZED_8901_SIZE = 16 * 1024 * 1024
 
 
-def normalize_8901_response(body: bytes) -> bytes:
+class Incomplete8901Response(ValueError):
+    """Compressed input ended before producing the advertised market bytes."""
+
+    def __init__(self, normalized_prefix: bytes, expected_size: int):
+        super().__init__("8901 compressed source exhausted")
+        self.normalized_prefix = normalized_prefix
+        self.expected_size = expected_size
+
+
+def normalize_8901_response(body: bytes, *, strict: bool = False) -> bytes:
     """解开 8901 响应 ``cmd=0x0a`` 的外层压缩，返回客户端实际分发的帧体。
 
     算法逐分支移植自 hexin.exe RVA ``0xf74260``。命令字节后的前四字节是
@@ -23,8 +32,12 @@ def normalize_8901_response(body: bytes) -> bytes:
     就用完，剩余位置是 0x00 填充——此时 ``read_source_byte`` 越界返回 0，
     与 ``read_bit`` 的边界处理一致，而非抛错。
 
+    ``strict=True`` rejects output that depends on synthetic padding, while
+    allowing an unused control-byte prefetch after the last genuine output byte.
+
     Raises:
         ValueError: ``cmd=0x0a`` 帧头非法、声明长度越界或回溯引用无效。
+        Incomplete8901Response: strict 解码实际消费了不存在的控制/字面字节。
     """
     if not body.startswith(b"\x0a"):
         return body
@@ -39,21 +52,26 @@ def normalize_8901_response(body: bytes) -> bytes:
     # 原函数为压缩区分配的是整个 payload 长度，却只复制 payload[4:]，
     # 并允许最后一个控制分支预读到分配块的对齐尾部。显式补零可复现其
     # 预期边界语义，同时避免依赖 malloc 返回块里的历史内容。
+    source_size = len(payload) - 4
     source = payload[4:] + b"\0" * 32
     output = bytearray(expected_size + 8)
     output[:4] = source[:4]
     output_pos = 4
     source_pos = 5
     control = source[4]
+    control_pos = 4
     bits_left = 8
     dictionary = [0] * 0x10000
 
     def read_bit() -> bool:
-        nonlocal control, bits_left, source_pos
+        nonlocal control, bits_left, source_pos, control_pos
+        if strict and control_pos >= source_size and output_pos < expected_size:
+            raise Incomplete8901Response(bytes(output[:output_pos]), expected_size)
         bit = bool(control & 0x80)
         control = (control << 1) & 0xFF
         bits_left -= 1
         if bits_left == 0:
+            control_pos = source_pos
             if source_pos >= len(source):
                 # 原函数在消费完当前控制字节后会预取下一字节，即使当前
                 # 匹配分支已经足够填满输出；此时补零只影响不会再使用的预取值。
@@ -66,6 +84,8 @@ def normalize_8901_response(body: bytes) -> bytes:
 
     def read_source_byte() -> int:
         nonlocal source_pos
+        if strict and source_pos >= source_size and output_pos < expected_size:
+            raise Incomplete8901Response(bytes(output[:output_pos]), expected_size)
         if source_pos >= len(source):
             # 末尾零填充区：部分响应（如深市盘后历史帧）的压缩流在 expected_size
             # 之前几字节就用完，剩余位置本就是 0x00 填充。返回 0 让主循环自然填满，
@@ -114,43 +134,42 @@ def normalize_8901_response(body: bytes) -> bytes:
         append_reference(reference + 1)
 
         fourth_bit = read_bit()
-        fifth_bit = read_bit()
+        # Optional controls follow unconditional output: an unused prefetched
+        # control byte must not invalidate bytes already proven by the stream.
         if not fourth_bit:
-            if fifth_bit:
+            if read_bit():
                 append_reference(reference + 2)
             continue
 
         append_reference(reference + 2)
         append_reference(reference + 3)
-        if not fifth_bit:
+        if not read_bit():
             continue
 
         append_reference(reference + 4)
         sixth_bit = read_bit()
         if not sixth_bit:
             seventh_bit = read_bit()
-            eighth_bit = read_bit()
             if seventh_bit:
                 append_reference(reference + 5)
                 append_reference(reference + 6)
-                if eighth_bit:
+                if read_bit():
                     append_reference(reference + 7)
-            elif eighth_bit:
+            elif read_bit():
                 append_reference(reference + 5)
             continue
 
         for offset in range(5, 9):
             append_reference(reference + offset)
         seventh_bit = read_bit()
-        eighth_bit = read_bit()
         if not seventh_bit:
-            if eighth_bit:
+            if read_bit():
                 append_reference(reference + 9)
             continue
 
         append_reference(reference + 9)
         append_reference(reference + 10)
-        if not eighth_bit:
+        if not read_bit():
             continue
         append_reference(reference + 11)
 
