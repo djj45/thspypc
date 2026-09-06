@@ -20,6 +20,7 @@ import itertools
 import json
 import os
 import re
+import socket
 import threading
 import time
 from pathlib import Path
@@ -211,9 +212,9 @@ class TracingSocket:
             self.trace.send(data[:sent])
         return sent
 
-    def recv(self, bufsize: int) -> bytes:
-        data = self._sock.recv(bufsize)
-        if data:
+    def recv(self, bufsize: int, flags: int = 0) -> bytes:
+        data = self._sock.recv(bufsize, flags) if flags else self._sock.recv(bufsize)
+        if data and not flags & socket.MSG_PEEK:
             self.trace.recv(data)
         return data
 
