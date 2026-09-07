@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import * as echarts from 'echarts'
 import type { ECharts } from 'echarts'
 import { useStock } from '../../state/StockContext'
@@ -54,8 +54,10 @@ function pctColor(pct: number): string {
 }
 
 function fmtWan(v: number): string {
-  // 入参单位：万元
-  if (Math.abs(v) >= 1e4) return (v / 1e4).toFixed(2) + '亿'
+  // 入参单位：万元；按 万 / 千万 / 亿 三档显示
+  const abs = Math.abs(v)
+  if (abs >= 1e4) return (v / 1e4).toFixed(2) + '亿'
+  if (abs >= 1e3) return (v / 1e3).toFixed(1) + '千万'
   return v.toFixed(0) + '万'
 }
 
@@ -79,10 +81,8 @@ export function TimelineChart() {
     }
   }, [])
 
-  useEffect(() => {
-    const chart = chartRef.current
-    if (!chart) return
-
+  // 全部序列数据在渲染期计算：图表 effect 与副图数值图例共用一份结果
+  const seriesData = useMemo(() => {
     const points = intraday.data ?? []
     const continuous = points.filter((p) => p.phase === 'continuous')
     const opening = points.filter((p) => p.phase === 'opening_auction')
@@ -132,6 +132,26 @@ export function TimelineChart() {
       const x = timeToX(p.time)
       if (x != null && p.dt10 != null) closeData.push([x, p.dt10])
     })
+    return {
+      points,
+      contData,
+      avgData,
+      openData,
+      closeData,
+      netBars,
+      netLine,
+      // 最新累计净额与最新分钟净额（万元），供副图常显数值
+      lastCum: netLine.length ? netLine[netLine.length - 1][1] : null,
+      lastNet: netBars.length ? netBars[netBars.length - 1][1] : null,
+    }
+  }, [intraday.data])
+
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+
+    const { points, contData, avgData, openData, closeData, netBars, netLine } =
+      seriesData
 
     // 对称坐标（同花顺式）：左%右价格，三色刻度
     const hasPrev = prevClose != null && prevClose > 0
@@ -380,11 +400,37 @@ export function TimelineChart() {
       },
       { notMerge: true },
     )
-  }, [intraday.data, prevClose])
+  }, [seriesData, prevClose])
 
   return (
     <>
       <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
+      {seriesData.lastCum != null && (
+        <div
+          style={{
+            position: 'absolute',
+            // 与副图 grid（top 74%）对齐的常显数值行
+            top: '74%',
+            left: 60,
+            fontSize: 11,
+            lineHeight: '14px',
+            pointerEvents: 'none',
+            display: 'flex',
+            gap: 10,
+          }}
+        >
+          <span className={seriesData.lastCum > 0 ? 'up' : seriesData.lastCum < 0 ? 'down' : 'flat'}>
+            累计大单 {seriesData.lastCum > 0 ? '+' : ''}
+            {fmtWan(seriesData.lastCum)}
+          </span>
+          {seriesData.lastNet != null && (
+            <span className={seriesData.lastNet > 0 ? 'up' : seriesData.lastNet < 0 ? 'down' : 'flat'}>
+              最新分钟 {seriesData.lastNet > 0 ? '+' : ''}
+              {fmtWan(seriesData.lastNet)}
+            </span>
+          )}
+        </div>
+      )}
       {intraday.loading && (
         <div className="dim" style={{ position: 'absolute', padding: 8 }}>
           加载分时…
