@@ -532,7 +532,7 @@ a[href*="tradingview.com"] {
 .superorder-page {
   display: grid;
   grid-template-columns: minmax(600px, 1fr) 450px;
-  grid-template-rows: minmax(360px, 58%) minmax(230px, 42%);
+  grid-template-rows: minmax(300px, 44%) minmax(200px, 28%) minmax(180px, 28%);
 }
 .replay-chart-panel {
   grid-column: 1;
@@ -540,16 +540,24 @@ a[href*="tradingview.com"] {
 }
 .superorder-side {
   grid-column: 2;
-  grid-row: 1 / span 2;
+  grid-row: 1 / span 3;
   display: grid;
   grid-template-rows: auto minmax(320px, 1fr) minmax(190px, .72fr);
   min-height: 0;
   gap: 1px;
   background: var(--border);
 }
-.replay-details {
+/* 分时走势 + 大单金额副图（与看盘/分时页共用 TimelineChart 组件） */
+.superorder-timeline-panel {
   grid-column: 1;
   grid-row: 2;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.replay-details {
+  grid-column: 1;
+  grid-row: 3;
 }
 .replay-toolbar {
   white-space: nowrap;

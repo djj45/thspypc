@@ -205,7 +205,11 @@ export const api = {
   ) => {
     const key = `${code}|${period}|${count}|${fuquan}|${channel}`
     const ttl =
-      period === 'day' || period === 'week' || period === 'month'
+      period === 'day' ||
+      period === 'week' ||
+      period === 'month' ||
+      period === 'quarter' ||
+      period === 'year'
         ? KLINE_DAY_TTL_MS
         : KLINE_MINUTE_TTL_MS
     return ttlCached(klineCache, klineInFlight, key, ttl, () =>

@@ -81,7 +81,8 @@ export interface Depth {
 // ── K线 ──
 export interface Kline {
   code: string
-  time: string
+  time: string | null // 分钟K为 null（时间由 bar_index 推算）
+  bar_index?: number // 全局分钟计数（分钟K时间轴用）
   open: number
   high: number
   low: number
@@ -95,10 +96,12 @@ export interface TimelinePoint {
   code?: string
   bar_index?: number
   dt10?: number // 现价
-  dt13?: number // 量
-  dt19?: number // 额
+  dt13?: number // 量（累计，股）
+  dt19?: number // 额（累计，元）
   dt40?: number | null
   lead_price?: number // 黄均线（指数）
+  dt227?: number // 累计主动买大单额（元，Level2 分时）
+  dt229?: number // 累计主动卖大单额（元，Level2 分时）
   [k: string]: number | string | null | undefined
 }
 

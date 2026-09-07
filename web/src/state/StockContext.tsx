@@ -34,15 +34,19 @@ export interface QuoteInfo {
   chgPct?: number
 }
 
+// 周期字符串与后端 /api/kline 完全一致（client._KLINE_PERIOD_KEYS）：
+// 分钟周期必须写 'Nmin'，裸 '60'/'30' 会被后端 400 拒绝。
 export const KLINE_PERIODS = [
   'day',
   'week',
   'month',
-  '60',
-  '30',
-  '15',
-  '5',
-  '1',
+  'quarter',
+  'year',
+  '60min',
+  '30min',
+  '15min',
+  '5min',
+  '1min',
 ] as const
 export type KlinePeriod = (typeof KLINE_PERIODS)[number]
 type IntradayPoint = AuctionPoint & TimelinePoint
@@ -287,7 +291,8 @@ export function StockProvider({
     setFast(null)
     setIntraday(null)
     setFastLoading(true)
-    const needsIntraday = mode !== 'superorder'
+    // 超级盘口页也内嵌分时图（含大单副图），分时车道全模式开启
+    const needsIntraday = true
     setIntradayLoading(needsIntraday)
     setFastError('')
     setIntradayError('')
@@ -368,7 +373,6 @@ export function StockProvider({
   // 页面若在14:57前打开，单次快照不会自行出现尾盘橙线；只在两个竞价窗口
   // 每3秒刷新当前股票，窗口外不增加任何请求。
   useEffect(() => {
-    if (mode === 'superorder') return
     let active = true
     const startTimers: number[] = []
     const stopTimers: number[] = []

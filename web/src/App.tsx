@@ -6,6 +6,7 @@ import {
 } from './state/StockContext'
 import type { StockPageMode } from './state/StockContext'
 import { Header } from './components/Header'
+import { useStockNames } from './data/useStockNames'
 import { TimelineChart } from './components/center/TimelineChart'
 import { KlineChart } from './components/center/KlineChart'
 import { StockInfo } from './components/right/StockInfo'
@@ -68,6 +69,9 @@ function StockNav() {
 
 function KanpanPage() {
   const left = usePersistedWidth('ths.layout.leftW', 1040, LEFT_MIN, LEFT_MAX)
+  const { code } = useStock()
+  const names = useStockNames()
+  const stockLabel = `${names.get(code) ?? ''} ${code}`.trim()
   return (
     <div
       className="body"
@@ -81,7 +85,7 @@ function KanpanPage() {
       <div className="vsplit" onPointerDown={left.onPointerDown} />
       <div className="col center">
         <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-          <div className="panel-title">分时</div>
+          <div className="panel-title">分时 · {stockLabel}</div>
           <div className="chart-host">
             <TimelineChart />
           </div>

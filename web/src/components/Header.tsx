@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/endpoints'
+import { useStockNames } from '../data/useStockNames'
 import { normalizeStockCode, useStock } from '../state/StockContext'
 import type { StockPageMode } from '../state/StockContext'
 import type { Status } from '../types'
@@ -19,6 +20,7 @@ export function Header({
   onView: (view: StockPageMode) => void
 }) {
   const { code, setCode, marketView } = useStock()
+  const names = useStockNames()
   const [input, setInput] = useState(code)
   const [status, setStatus] = useState<Status | null>(null)
 
@@ -105,7 +107,9 @@ export function Header({
         style={{ width: 86 }}
         placeholder="代码"
       />
-      <span className="stock-name flat">{code}</span>
+      <span className="stock-name flat" title={code}>
+        {names.get(code) ?? code}
+      </span>
       {price != null && (
         <>
           <span className={`price ${color(chgAmt)}`}>{price.toFixed(2)}</span>

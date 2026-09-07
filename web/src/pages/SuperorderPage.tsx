@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/endpoints'
 import { StockInfo } from '../components/right/StockInfo'
+import { TimelineChart } from '../components/center/TimelineChart'
 import { useStock } from '../state/StockContext'
 import { useSharedStockStream } from '../state/StockStreamContext'
 import { useSuperorderMode } from '../state/superorderMode'
@@ -489,6 +490,12 @@ export function SuperorderPage() {
         </div>
         <div className="chart-host">
           <ReplayChart points={replay?.index ?? []} selectedTs={selectedTs} onSelect={handleSelect} />
+        </div>
+      </section>
+      <section className="panel superorder-timeline-panel">
+        <div className="panel-title">分时走势 · 大单金额</div>
+        <div className="chart-host">
+          <TimelineChart />
         </div>
       </section>
       <aside className="superorder-side">

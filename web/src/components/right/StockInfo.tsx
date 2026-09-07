@@ -1,4 +1,5 @@
 import { useStock } from '../../state/StockContext'
+import { useStockNames } from '../../data/useStockNames'
 import type { MarketEvent } from '../../types'
 
 function cls(v: number | undefined) {
@@ -29,10 +30,11 @@ export function StockInfo({
   liveEvent?: MarketEvent
 } = {}) {
   const { code, quote, marketView } = useStock()
+  const names = useStockNames()
   const dailyRows = marketView.data?.kline ?? []
   const dayIndex = tradeDate == null
     ? -1
-    : dailyRows.findIndex((row) => row.time.slice(0, 10) === tradeDate)
+    : dailyRows.findIndex((row) => row.time?.slice(0, 10) === tradeDate)
   const dayBar = dayIndex >= 0 ? dailyRows[dayIndex] : undefined
   const previousBar = dayIndex > 0 ? dailyRows[dayIndex - 1] : undefined
   const historical = dayBar != null
@@ -70,7 +72,8 @@ export function StockInfo({
           marginBottom: 4,
         }}
       >
-        <span style={{ fontSize: 14, fontWeight: 600 }}>{code}</span>
+        <span style={{ fontSize: 14, fontWeight: 600 }}>{names.get(code)}</span>
+        <span className="dim" style={{ fontSize: 12 }}>{code}</span>
         <span className={`price ${cls(chg)}`} style={{ fontSize: 15, fontWeight: 600 }}>
           {fmt(price)}
         </span>
