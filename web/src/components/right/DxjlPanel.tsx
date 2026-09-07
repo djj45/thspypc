@@ -168,9 +168,14 @@ export function DxjlPanel() {
           const data = JSON.parse(String(message.data))
           if (data.event === 'snapshot' && Array.isArray(data.rows)) {
             mergeRows(data.rows as Dxjl[])
+            // 本地后端上 WS 握手可能快于首次轮询完成：轮询 effect 会因
+            // wsLive=true 提前返回，其 finally 的 alive 守卫也随之失效，
+            // loading 只能由 WS 首批数据清除，否则永远停在"加载中"。
+            setLoading(false)
           } else if (data.event === 'dxjl') {
             const { event: _event, ...row } = data
             mergeRows([row as Dxjl])
+            setLoading(false)
           }
         } catch {
           /* 坏帧忽略，后续帧继续 */
