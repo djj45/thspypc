@@ -293,6 +293,25 @@ class ThsRuntime:
             "ready": True,
         }
 
+    def keepalive_stock_stream(self, code: str, *, market: int = 0) -> None:
+        """Re-arm the server-side trade-push session for one code.
+
+        官方客户端通过周期性重发 ``DateTime=7169(-15-0)`` 这类轻量查询维持
+        逐笔推送（2026-09-07 抓包确认）。L2 通道重连后仅重发 4214 注册不能
+        恢复 trade/cancel/order_queue 推送——实测一次成功的 7169 查询即可
+        复活；depth 推送是广播型，通道重连后仍会到达，不能作为健康信号。
+        """
+        self.call(
+            lambda client: client.superorder(
+                code,
+                -15,
+                0,
+                market=market,
+                pageid=4214,
+                timeout=8.0,
+            )
+        )
+
     def unsubscribe_stock_stream(self, code: str, subscriber: queue.Queue) -> None:
         """Remove a browser queue and release the client subscription at refcount 0."""
         last = False

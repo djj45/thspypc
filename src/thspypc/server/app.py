@@ -589,6 +589,25 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         await websocket.accept()
         subscriber = None
         disconnect_task = None
+        prepare_task = None
+
+        def _lane_key() -> str:
+            resolved = market or _market_for_code(code)
+            return "sh_l2" if resolved == 17 else "sz_l2"
+
+        def _lane_healthy() -> bool:
+            # 通道心跳不可得时不阻塞自愈；只有明确非 healthy 才跳过，
+            # 避免在通道已死时反复触发重开登录（喂风控）。
+            try:
+                lanes = (
+                    (runtime.status().get("heartbeat") or {}).get("lanes")
+                    or {}
+                )
+                state = (lanes.get(_lane_key()) or {}).get("state")
+            except Exception:
+                return True
+            return state in (None, "healthy", "pending")
+
         try:
             subscriber = await asyncio.to_thread(
                 runtime.subscribe_stock_stream,
@@ -599,7 +618,32 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 {"event": "status", "code": code, "state": "subscribed"}
             )
             disconnect_task = asyncio.create_task(websocket.receive())
+            idle_seconds = 0.0
+            # 服务端 trade/cancel/order_queue 推送会话由 7169 族查询维持
+            # （官方客户端约 10-20 秒重发一次 DateTime=7169(-15-0)；实测停
+            # 止查询约 1 分钟后推送停发，且积压事件按查询节奏批量冲刷——
+            # 查询间隔即推送批次粒度）。对齐官方节奏取 15 秒，纯看盘视图
+            # 的逐笔/撤单流也能接近平滑；depth 广播型不受影响。
+            last_keepalive = time.monotonic()
             while True:
+                if (
+                    time.monotonic() - last_keepalive >= 15.0
+                    and (prepare_task is None or prepare_task.done())
+                    and _lane_healthy()
+                ):
+                    last_keepalive = time.monotonic()
+                    prepare_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            runtime.keepalive_stock_stream,
+                            code,
+                            market=market,
+                        )
+                    )
+                    prepare_task.add_done_callback(
+                        lambda task: (
+                            task.exception() if not task.cancelled() else None
+                        )
+                    )
                 event_task = asyncio.create_task(
                     asyncio.to_thread(subscriber.get, True, 1.0)
                 )
@@ -618,10 +662,12 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 try:
                     event = event_task.result()
                 except queue.Empty:
+                    idle_seconds += 1.0
                     await websocket.send_json(
                         {"event": "status", "code": code, "state": "idle"}
                     )
                     continue
+                idle_seconds = 0.0
                 await websocket.send_json(_jsonable(event))
         except WebSocketDisconnect:
             pass
@@ -641,6 +687,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         finally:
             if disconnect_task is not None:
                 disconnect_task.cancel()
+            if prepare_task is not None and not prepare_task.done():
+                prepare_task.cancel()
             if subscriber is not None:
                 # This method only updates an in-process refcount and schedules
                 # the delayed release timer.  Calling it directly guarantees

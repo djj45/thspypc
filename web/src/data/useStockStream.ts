@@ -81,17 +81,34 @@ export function useStockStream(code: string, enabled = true) {
 
     if (!active) return () => {}
 
+    const scheduleRetry = (message: string) => {
+      setState('reconnecting')
+      setError(message)
+      const delay = Math.min(1000 * 2 ** attempt, 10_000)
+      attempt += 1
+      retryTimer = window.setTimeout(open, delay)
+    }
+
     const open = async () => {
       if (stopped || generation.current !== current) return
       // 先完成该股票的 4214 注册，再建实时流。分时/盘口/超级盘口共用
       // 同一个浏览器侧 single-flight，不会在切股时并发争抢注册响应。
-      await api.stockReady(code)
-      if (stopped || generation.current !== current) return
-      await new Promise((resolve) =>
-        setTimeout(resolve, STREAM_SWITCH_COALESCE_MS),
-      )
-      if (stopped || generation.current !== current) return
-      socket = new WebSocket(api.stockStreamUrl(code))
+      // 注册或建连抛错时必须排程重试：重试定时器原本只挂在
+      // socket.onclose 上，若 socket 尚未创建就失败，重连循环会永久
+      // 停摆，表现为推送卡死、只有刷新页面才能恢复。
+      try {
+        await api.stockReady(code)
+        if (stopped || generation.current !== current) return
+        await new Promise((resolve) =>
+          setTimeout(resolve, STREAM_SWITCH_COALESCE_MS),
+        )
+        if (stopped || generation.current !== current) return
+        socket = new WebSocket(api.stockStreamUrl(code))
+      } catch (reason) {
+        if (stopped || generation.current !== current) return
+        scheduleRetry(reason instanceof Error ? reason.message : String(reason))
+        return
+      }
       socket.onopen = () => {
         setState('connected')
         setError('')
@@ -134,10 +151,7 @@ export function useStockStream(code: string, enabled = true) {
       socket.onerror = () => setError('实时通道连接异常')
       socket.onclose = () => {
         if (stopped || generation.current !== current) return
-        setState('reconnecting')
-        const delay = Math.min(1000 * 2 ** attempt, 10_000)
-        attempt += 1
-        retryTimer = window.setTimeout(open, delay)
+        scheduleRetry('实时通道已断开，正在重连')
       }
     }
 
