@@ -647,6 +647,14 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 event_task = asyncio.create_task(
                     asyncio.to_thread(subscriber.get, True, 1.0)
                 )
+                # 断开时 cancel 无法中止已在跑的 queue.get 线程；超时到期后
+                # 它会以 Empty 结束，这里主动消费掉，避免“Task exception
+                # was never retrieved”噪音。
+                event_task.add_done_callback(
+                    lambda task: (
+                        task.exception() if not task.cancelled() else None
+                    )
+                )
                 done, _pending = await asyncio.wait(
                     {disconnect_task, event_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -709,12 +717,19 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 {"event": "status", "state": "subscribed"}
             )
             tail = await asyncio.to_thread(runtime.dxjl_buffer_tail)
-            if tail:
-                await websocket.send_json({"event": "snapshot", "rows": tail})
+            # 空缓冲也发快照：前端据此解除加载态（显示“无数据”），
+            # 而不是等不到任何消息永远停在“加载中”。
+            await websocket.send_json({"event": "snapshot", "rows": tail})
             disconnect_task = asyncio.create_task(websocket.receive())
             while True:
                 event_task = asyncio.create_task(
                     asyncio.to_thread(subscriber.get, True, 1.0)
+                )
+                # 同 stock_stream：cancel 后线程仍会以 Empty 结束，主动消费
+                event_task.add_done_callback(
+                    lambda task: (
+                        task.exception() if not task.cancelled() else None
+                    )
                 )
                 done, _pending = await asyncio.wait(
                     {disconnect_task, event_task},

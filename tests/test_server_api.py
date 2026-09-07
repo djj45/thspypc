@@ -33,6 +33,7 @@ class FakeClient:
         self.calls = []
         self.stream_callback = None
         self._dxjl_delivered = False
+        self.dxjl_latest_rows: list[dict] = []
 
     def connect(self):
         self.calls.append(("connect",))
@@ -274,6 +275,10 @@ class FakeClient:
     def dxjl_history(self, pages=5):
         self.calls.append(("dxjl_history", pages))
         return []
+
+    def dxjl_latest(self, markets=(32, 16), timeout=15.0):
+        self.calls.append(("dxjl_latest",))
+        return [dict(row) for row in self.dxjl_latest_rows]
 
 
 @pytest.fixture()
@@ -829,6 +834,59 @@ def test_dxjl_stream_fans_out_realtime_pushes(client_and_app):
 
     assert any(call[0] == "subscribe_realtime" for call in fake.calls)
     assert any(call[0] == "receive_pushes" for call in fake.calls)
+
+
+def test_dxjl_stream_seeds_history_when_buffer_empty(client_and_app):
+    """盘后冷启动：推送缓冲为空时用最新历史页回填，首连即能看到最后几条。"""
+    fake, client = client_and_app
+    fake.dxjl_latest_rows = [
+        {
+            "时间": 1788764218000093,
+            "市场": "32",
+            "代码": "300757",
+            "异动类型": "大笔买入",
+            "异动编码": 214,
+            "金额": 6635600.0,
+            "涨跌幅": 10.1,
+            "名称": "罗博特科",
+        }
+    ]
+
+    with client.websocket_connect("/api/dxjl/stream") as websocket:
+        assert websocket.receive_json() == {
+            "event": "status",
+            "state": "subscribed",
+        }
+        # 回填与快照读取之间有竞态：历史行可能出现在首连快照里，
+        # 也可能稍后作为单条 dxjl 事件扇出，两条路径都算回填成功。
+        row = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            message = websocket.receive_json()
+            if message.get("event") == "snapshot":
+                hit = next(
+                    (
+                        item
+                        for item in message.get("rows", [])
+                        if item.get("代码") == "300757"
+                    ),
+                    None,
+                )
+            elif message.get("event") == "dxjl":
+                hit = message
+            else:
+                continue
+            if hit is not None:
+                row = hit
+                break
+
+        assert row is not None
+        # 名称表（fetch_stock_names_full）没有 300757，保底用历史行自带名称
+        assert row["名称"] == "罗博特科"
+        assert row["涨跌幅"] == 10.1
+        assert row["异动类型"] == "大笔买入"
+
+    assert any(call[0] == "dxjl_latest" for call in fake.calls)
 
 
 def test_stock_ready_registers_code_before_page_fanout(client_and_app):

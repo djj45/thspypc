@@ -399,12 +399,19 @@ class ThsRuntime:
 
     def _dxjl_collect_loop(self) -> None:
         subscribed = False
+        next_seed_at = 0.0
         while not self._dxjl_stop.is_set():
             try:
                 if not subscribed:
                     self.call(lambda client: client.subscribe_realtime())
                     subscribed = True
                     logger.info("dxjl 9601 subrealorder 订阅成功")
+                # 后端晚于盘中启动（或盘后重启）时推送缓冲是空的，首个
+                # WS 连接会拿到空快照；用最新历史页回填一次，冷却 60s
+                # 重试直到成功或盘中推送自然填充缓冲。
+                if not self._dxjl_buffer and time.monotonic() >= next_seed_at:
+                    self._seed_dxjl_from_history()
+                    next_seed_at = time.monotonic() + 60.0
                 self.call(
                     lambda client: client.receive_pushes(
                         timeout=5.0,
@@ -416,6 +423,18 @@ class ThsRuntime:
                 subscribed = False
                 if self._dxjl_stop.wait(5.0):
                     break
+
+    def _seed_dxjl_from_history(self) -> None:
+        """推送缓冲为空时用 9601 历史最新页回填（盘后也能看到最后几条）。"""
+        try:
+            records = self.call(lambda client: client.dxjl_latest())
+        except Exception:
+            logger.warning("dxjl 历史回填失败，冷却后重试", exc_info=True)
+            return
+        for record in records:
+            self._on_dxjl_record(record)
+        if records:
+            logger.info("dxjl 冷启动回填 %d 条历史记录", len(records))
 
     def _on_dxjl_record(self, record: dict) -> None:
         row = self._normalize_dxjl_record(record)
@@ -452,7 +471,10 @@ class ThsRuntime:
             # 推送解析字段名是「涨幅」，与页面查询的「涨跌幅」对齐
             "涨跌幅": record.get("涨跌幅", record.get("涨幅", 0.0)),
         }
-        name = self._dxjl_names().get(row["代码"])
+        # 历史页记录自带名称；名称表不可用时保底，避免回填行只显示代码
+        name = self._dxjl_names().get(row["代码"]) or str(
+            record.get("名称", "") or ""
+        )
         if name:
             row["名称"] = name
         return row
