@@ -159,11 +159,15 @@ export function TimelineChart() {
     // 避免累计量级把分钟柱压扁。有昨收时主图占 0/1，副图 2/3；否则 1/2。
     const subBarYIdx = hasPrev ? 2 : 1
     const subLineYIdx = hasPrev ? 3 : 2
-    // 大单副图 y 轴（柱：分钟净额；线：累计净额，独立刻度不标数字）
+    // 大单副图 y 轴：左轴=分钟净额柱，右轴=累计净额曲线。
+    // 两个量级差一个数量级，各自独立缩放且都要有刻度——累计曲线若挂
+    // 隐藏轴，可视刻度(柱轴)与曲线高度对不上（曲线 51 亿、刻度只到 6 亿）。
     const subAxes = [
       {
         type: 'value' as const,
         gridIndex: 1,
+        name: '分钟净额',
+        nameTextStyle: { color: '#666', fontSize: 9 },
         scale: true,
         axisLabel: {
           color: '#888',
@@ -175,8 +179,15 @@ export function TimelineChart() {
       {
         type: 'value' as const,
         gridIndex: 1,
+        position: 'right' as const,
+        name: '累计',
+        nameTextStyle: { color: '#666', fontSize: 9 },
         scale: true,
-        axisLabel: { show: false },
+        axisLabel: {
+          color: '#888',
+          fontSize: 10,
+          formatter: (v?: string | number) => fmtWan(Number(v)),
+        },
         splitLine: { show: false },
       },
     ]

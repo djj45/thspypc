@@ -14,6 +14,7 @@ import {
   recoverableRetryDelay,
 } from '../api/client'
 import type { DataState } from '../data/useData'
+import { isRealtimeMarketSession } from '../data/useStockStream'
 import type {
   AuctionPoint,
   Kline,
@@ -156,6 +157,8 @@ async function retryCurrentRequest<T>(
 const INTRADAY_SWITCH_COALESCE_MS = 100
 const KLINE_SWITCH_COALESCE_MS = 180
 const AUCTION_POLL_INTERVAL_MS = 3_000
+// 盘中连续竞价的分时刷新间隔（秒级行情曲线 15s 足够跟手，走 2s TTL 缓存）
+const INTRADAY_SESSION_POLL_MS = 15_000
 const AUCTION_WINDOWS = [
   { start: [9, 15], end: [9, 26] },
   { start: [14, 57], end: [15, 1] },
@@ -429,6 +432,39 @@ export function StockProvider({
       for (const interval of intervals) window.clearInterval(interval)
     }
   }, [code, mode, intradayLane])
+
+  // 盘中分时/大单曲线定时刷新：连续竞价阶段（9:15-11:30 / 13:00-15:00）
+  // 每 15s 拉一次分时（api.intraday 2s TTL + 车道 single-flight 去重），
+  // 页面隐藏时跳过；竞价窗口已有 3s 专用轮询，这里兜住其余交易时段。
+  // 无此刷新时曲线只在切股/竞价窗口更新，盘中会冻结。
+  useEffect(() => {
+    let active = true
+    const poll = () => {
+      if (document.visibilityState !== 'visible') return
+      if (!isRealtimeMarketSession()) return
+      const target = code
+      intradayLane(async () => {
+        if (!active || target !== codeRef.current) return
+        if (!isRealtimeMarketSession()) return
+        try {
+          const rows = await api.intraday(target)
+          if (active && target === codeRef.current) {
+            setIntraday({ code: target, rows })
+            setIntradayError('')
+          }
+        } catch (error) {
+          if (active && target === codeRef.current) {
+            setIntradayError(errorText(error))
+          }
+        }
+      })
+    }
+    const interval = window.setInterval(poll, INTRADAY_SESSION_POLL_MS)
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [code, intradayLane])
 
   // K-line starts immediately on the selected market's L2 connection.
   // Period/fuquan changes only rerun this lane.  Cached rows remain visible
