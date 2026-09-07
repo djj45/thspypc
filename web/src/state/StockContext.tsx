@@ -156,6 +156,10 @@ async function retryCurrentRequest<T>(
 // 共用市场 L2 socket，只保留一个人无感的短合并窗口。
 const INTRADAY_SWITCH_COALESCE_MS = 100
 const KLINE_SWITCH_COALESCE_MS = 180
+// 图表可视K线数量；实际多拉 MA_WARMUP 根用于均线预热（MA 最长 120，
+// 不预热时可视区左侧 MA120/60 会缺一段），展示侧裁回可视数量。
+export const KLINE_VIEW_COUNT = 320
+export const KLINE_MA_WARMUP = 120
 const AUCTION_POLL_INTERVAL_MS = 3_000
 // 盘中连续竞价的分时刷新间隔：3s 视觉上即秒级跳动；与 api.intraday 的
 // 2s TTL 错开使协议查询减半（隔次命中缓存），减轻 L2 车道压力。
@@ -502,7 +506,14 @@ export function StockProvider({
         // pageid=1334。不要使用 ifindhq_fast；它是独立 BASIC/MAIN 连接。
         const channel = 'level2'
         const rows = await retryCurrentRequest(
-          () => api.kline(target, period, 320, fuquan, channel),
+          () =>
+            api.kline(
+              target,
+              period,
+              KLINE_VIEW_COUNT + KLINE_MA_WARMUP,
+              fuquan,
+              channel,
+            ),
           isCurrent,
           (error) => {
             if (!isCurrent()) return
