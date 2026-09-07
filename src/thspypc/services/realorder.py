@@ -13,7 +13,8 @@ from ..features.realorder_protocol import (
     build_heartbeat_9601,
     build_qurealorder_query,
     build_subrealorder_query,
-    parse_pushrealorder_response,
+    decode_realorder_frame,
+    parse_pushrealorder_frame,
     parse_qurealorder_response,
     read_frame_realorder,
 )
@@ -73,8 +74,8 @@ class RealOrderService:
             timeout=timeout,
         ) as sock:
             for _ in range(self._max_query_frames):
-                response = self._read_frame(sock)
-                pushes = parse_pushrealorder_response(response)
+                response = decode_realorder_frame(self._read_frame(sock))
+                pushes = parse_pushrealorder_frame(response)
                 if pushes:
                     self._pending_pushes.extend(pushes)
                     continue
@@ -159,7 +160,7 @@ class RealOrderService:
 
     def observe_unsolicited(self, body: bytes) -> bool:
         """Retain a push consumed while a dispatcher-owned probe is pending."""
-        pushes = parse_pushrealorder_response(body)
+        pushes = parse_pushrealorder_frame(body)
         if not pushes:
             return False
         self._pending_pushes.extend(pushes)
@@ -204,7 +205,7 @@ class RealOrderService:
             except OSError:
                 break
 
-            pushes = parse_pushrealorder_response(response)
+            pushes = parse_pushrealorder_frame(response)
             if not pushes:
                 continue
             frame_count += 1

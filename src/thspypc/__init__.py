@@ -114,7 +114,8 @@ from .protocol import (
     build_init_query, parse_init_response,
     # 短线精灵（异动）
     build_qurealorder_query, parse_qurealorder_response, read_frame_realorder,
-    build_subreal_query, build_subrealorder_query, parse_pushrealorder_response,
+    build_subreal_query, build_subrealorder_query, parse_pushrealorder_frame,
+    parse_pushrealorder_response, decode_realorder_frame,
     SUBREAL_CHANNELS, SUBREALORDER_MARKETS,
     ANOMALY_GROUP_PREFIX, build_category_id, build_datatype,
     # 心跳（keep-alive）
@@ -204,6 +205,7 @@ __all__ = [
     "build_init_query", "parse_init_response",
     "build_qurealorder_query", "parse_qurealorder_response", "read_frame_realorder",
     "build_subreal_query", "build_subrealorder_query", "parse_pushrealorder_response",
+    "parse_pushrealorder_frame", "decode_realorder_frame",
     "SUBREAL_CHANNELS", "SUBREALORDER_MARKETS",
     "ANOMALY_GROUP_PREFIX", "build_category_id", "build_datatype",
     "build_heartbeat_8901", "build_heartbeat_9601",

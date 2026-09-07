@@ -62,7 +62,7 @@ def test_history_query_uses_realorder_role_and_matches_response(monkeypatch):
         frame_reader=lambda _sock: next(responses),
     )
     monkeypatch.setattr(
-        "thspypc.services.realorder.parse_pushrealorder_response",
+        "thspypc.services.realorder.parse_pushrealorder_frame",
         lambda body: [{"代码": "000001"}] if b"push" in body else [],
     )
     monkeypatch.setattr(
@@ -145,7 +145,7 @@ def test_probe_owned_push_is_retained_for_next_receiver(monkeypatch):
     manager = ConnectionManager(_profile(), lambda _spec: sock)
     service = RealOrderService(manager, _instances())
     monkeypatch.setattr(
-        "thspypc.services.realorder.parse_pushrealorder_response",
+        "thspypc.services.realorder.parse_pushrealorder_frame",
         lambda body: [{"代码": "600000"}] if body == b"push" else [],
     )
 

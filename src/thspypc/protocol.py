@@ -1172,6 +1172,8 @@ from .features.realorder_protocol import (  # noqa: E402,F811
     build_heartbeat_9601,
     build_qurealorder_query,
     build_subrealorder_query,
+    decode_realorder_frame,
+    parse_pushrealorder_frame,
     parse_pushrealorder_response,
     parse_qurealorder_response,
     read_frame_realorder,

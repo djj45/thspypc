@@ -430,14 +430,20 @@ class ThsRuntime:
                 pass
 
     def _normalize_dxjl_record(self, record: dict) -> dict:
-        # 推送帧无时间戳：用到达时刻（微秒）并强制单调递增，保证排序键稳定。
-        now_us = int(time.time() * 1_000_000)
-        with self._dxjl_lock:
-            if now_us <= self._dxjl_last_ts:
-                now_us = self._dxjl_last_ts + 1
-            self._dxjl_last_ts = now_us
+        # 事件时间戳（hq1.0 表格解析携带；秒级精度）。旧正则解析无时间，
+        # 用到达时刻（微秒）并强制单调递增兜底，保证排序键稳定。
+        event_ts = int(record.get("时间", 0) or 0)
+        if event_ts > 0:
+            row_ts = event_ts
+        else:
+            now_us = int(time.time() * 1_000_000)
+            with self._dxjl_lock:
+                if now_us <= self._dxjl_last_ts:
+                    now_us = self._dxjl_last_ts + 1
+                self._dxjl_last_ts = now_us
+            row_ts = now_us
         row = {
-            "时间": now_us,
+            "时间": row_ts,
             "市场": str(record.get("市场", "")),
             "代码": str(record.get("代码", "")),
             "异动类型": record.get("异动类型", ""),

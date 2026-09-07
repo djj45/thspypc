@@ -13,6 +13,7 @@ from ..codecs.framing import (
     read_exact,
 )
 from ..codecs.numeric import decode_ths_float
+from ..codecs.snappy import snappy_decompress
 
 
 REALORDER_HOST = "106.14.65.90"
@@ -331,6 +332,14 @@ def _parse_dxjl_record(
         )[0]
 
         code_offset, _ = offsets.get(5, (8, 17))
+        # 代码字段首字节是市场标记（0x11=沪 0x21=深）：pushrealorder 帧
+        # 头的 market= 只代表订阅市场，帧内会混排两市记录，逐记录覆写
+        if code_offset < len(record):
+            marker = record[code_offset]
+            if marker == 0x11:
+                market = "16"
+            elif marker == 0x21:
+                market = "32"
         code = record[
             code_offset + 1:code_offset + 7
         ].decode("ascii", errors="replace")
@@ -507,6 +516,86 @@ def parse_pushrealorder_response(body: bytes) -> list[dict]:
     return records
 
 
+_SNAPPY_HEADER = b"ziptype=snappy\n"
+
+
+def decode_realorder_frame(body: bytes) -> bytes:
+    """解包 9601 帧的 snappy 载荷；未压缩或解压失败时原样返回。
+
+    2026-09-07 抓包（dxjl_compare_20260907.pcap）实测：pushrealorder
+    帧已全部 snappy 化（2813/2813），布局为 ASCII 头（以
+    ``ziptype=snappy\\n`` 结尾）+ ``\\x00`` + u32(LE) + varint(原始长度)
+    + snappy 元素流；解压结果以 ``hq1.0`` 表格开头。u32 含义未逆向
+    （不是压缩长度），但 varint 恒从偏移 5 开始。
+
+    幂等：已解压的帧（载荷直接以 hq1.0 开头）不会再触发解压。
+    """
+    marker = body.find(_SNAPPY_HEADER)
+    if marker < 0:
+        return body
+    head_end = marker + len(_SNAPPY_HEADER)
+    rest = body[head_end:]
+    # 压缩帧此处恒为 \x00 + 4 字节；未压缩帧载荷直接以 "hq1.0" 开头
+    if rest[:1] != b"\x00":
+        return body
+    try:
+        decoded = snappy_decompress(rest[5:])
+    except (ValueError, IndexError):
+        return body
+    if b"hq1.0" not in decoded[:64]:
+        return body
+    return body[:head_end] + decoded
+
+
+def parse_pushrealorder_frame(body: bytes) -> list[dict]:
+    """完整解析一帧 pushrealorder：snappy 解包 + hq1.0 表格优先。
+
+    表格路径给出精确的 时间/代码/异动类型/金额/涨跌幅（含真实事件
+    时间戳）；结构不完整（无表格或表格头非法，如 2026-09 前的旧
+    裸记录格式）回退到 :func:`parse_pushrealorder_response` 的正则
+    启发式。
+    """
+    if b"pushrealorder" not in body:
+        return []
+    decoded = decode_realorder_frame(body)
+    if b"hq1.0" in decoded:
+        market_match = re.search(rb"market=(\d+)", decoded[:200])
+        market = (
+            market_match.group(1).decode("ascii", errors="replace")
+            if market_match else ""
+        )
+        records = _parse_hq10_table(decoded, market)
+        if records is not None:
+            return records
+    return parse_pushrealorder_response(decoded)
+
+
+def _parse_hq10_table(body: bytes, market: str) -> list[dict] | None:
+    """按 hq1.0 表格解析；结构非法返回 None（区别于合法的空表 []）。
+
+    与 :func:`parse_qurealorder_response` 的守卫保持一致：表头长度、
+    记录宽度和首条记录必须落在载荷范围内，否则视为非表格字节流。
+    """
+    hq_offset = body.find(b"hq1.0")
+    if hq_offset < 0:
+        return None
+    payload = body[hq_offset:]
+    if len(payload) < 28:
+        return None
+    header_length, record_count, _field_count, record_length = struct.unpack(
+        "<IIII", payload[8:24]
+    )
+    if record_length == 0:
+        return None
+    if record_count == 0:
+        return []
+    if not 24 <= header_length <= len(payload):
+        return None
+    if len(payload) - header_length < record_length:
+        return None
+    return parse_qurealorder_response(body, market)
+
+
 __all__ = [
     "ALL_REALORDER_CATEGORY_IDS",
     "ANOMALY_BYTE_MAP",
@@ -523,6 +612,8 @@ __all__ = [
     "build_heartbeat_9601",
     "build_qurealorder_query",
     "build_subrealorder_query",
+    "decode_realorder_frame",
+    "parse_pushrealorder_frame",
     "parse_pushrealorder_response",
     "parse_qurealorder_response",
     "read_frame_realorder",
