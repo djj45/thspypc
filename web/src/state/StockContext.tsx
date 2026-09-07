@@ -157,8 +157,11 @@ async function retryCurrentRequest<T>(
 const INTRADAY_SWITCH_COALESCE_MS = 100
 const KLINE_SWITCH_COALESCE_MS = 180
 const AUCTION_POLL_INTERVAL_MS = 3_000
-// 盘中连续竞价的分时刷新间隔（秒级行情曲线 15s 足够跟手，走 2s TTL 缓存）
-const INTRADAY_SESSION_POLL_MS = 15_000
+// 盘中连续竞价的分时刷新间隔：3s 视觉上即秒级跳动；与 api.intraday 的
+// 2s TTL 错开使协议查询减半（隔次命中缓存），减轻 L2 车道压力。
+// 注：8901 推送帧不含 dt227/229，分时大单只能靠轮询官方值或本地按
+// 委托单口径重算（口径仍在标定，见 handoff），故取快速轮询路线。
+const INTRADAY_SESSION_POLL_MS = 3_000
 const AUCTION_WINDOWS = [
   { start: [9, 15], end: [9, 26] },
   { start: [14, 57], end: [15, 1] },
