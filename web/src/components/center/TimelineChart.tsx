@@ -99,8 +99,13 @@ export function TimelineChart() {
       : continuous
     let prevBuy: number | null = null
     let prevSell: number | null = null
+    let prevVol: number | null = null
+    let prevPrice: number | null = null
     const netBars: [number, number][] = []
     const netLine: [number, number][] = []
+    // 成交量副图：dt13 为累计量（股），逐分钟差分；红/绿随该分钟价格相对
+    // 上一分钟的涨跌（A 股分时量柱惯例）
+    const volBars: [number, number, number][] = []
     continuousPoints.forEach((p, i) => {
       if (p.dt10 != null) contData.push([i, p.dt10])
       // 均价：指数用 lead_price（黄线），个股按 累计额/累计量 计算
@@ -111,6 +116,12 @@ export function TimelineChart() {
             ? p.dt19 / p.dt13
             : null
       if (avg != null) avgData.push([i, avg])
+      if (p.dt13 != null && p.dt10 != null) {
+        const up = prevPrice != null ? p.dt10 >= prevPrice : true
+        volBars.push([i, (p.dt13 - (prevVol ?? 0)) / 100, up ? 1 : -1])
+        prevVol = p.dt13
+        prevPrice = p.dt10
+      }
       const buy = p.dt227
       const sell = p.dt229
       if (buy != null && sell != null) {
@@ -138,6 +149,7 @@ export function TimelineChart() {
       avgData,
       openData,
       closeData,
+      volBars,
       netBars,
       netLine,
       // 最新累计净额与最新分钟净额（万元），供副图常显数值
@@ -150,22 +162,44 @@ export function TimelineChart() {
     const chart = chartRef.current
     if (!chart) return
 
-    const { points, contData, avgData, openData, closeData, netBars, netLine } =
+    const { points, contData, avgData, openData, closeData, netBars, netLine, volBars } =
       seriesData
 
     // 对称坐标（同花顺式）：左%右价格，三色刻度
     const hasPrev = prevClose != null && prevClose > 0
-    // 副图 y 轴下标：柱（分钟净额）与累计曲线各自独立缩放，
-    // 避免累计量级把分钟柱压扁。有昨收时主图占 0/1，副图 2/3；否则 1/2。
-    const subBarYIdx = hasPrev ? 2 : 1
-    const subLineYIdx = hasPrev ? 3 : 2
+    // y 轴布局（三副图）：有昨收 主图占 0/1，成交量 2，大单柱 3、累计 4；
+    // 无昨收 主图 0，成交量 1，大单柱 2、累计 3
+    const volYIdx = hasPrev ? 2 : 1
+    const subBarYIdx = hasPrev ? 3 : 2
+    const subLineYIdx = hasPrev ? 4 : 3
+    const fmtHand = (v?: string | number) => {
+      // 入参单位：手
+      const h = Number(v)
+      const abs = Math.abs(h)
+      if (abs >= 1e8) return (h / 1e8).toFixed(2) + '亿手'
+      if (abs >= 1e4) return (h / 1e4).toFixed(1) + '万手'
+      return h.toFixed(0) + '手'
+    }
+    // 成交量副图 y 轴（分钟量，手）
+    const volAxis = {
+      type: 'value' as const,
+      gridIndex: 1,
+      name: '成交量',
+      nameTextStyle: { color: '#666', fontSize: 9 },
+      axisLabel: {
+        color: '#888',
+        fontSize: 10,
+        formatter: fmtHand,
+      },
+      splitLine: { lineStyle: { color: '#1c1c1c' } },
+    }
     // 大单副图 y 轴：左轴=分钟净额柱，右轴=累计净额曲线。
     // 两个量级差一个数量级，各自独立缩放且都要有刻度——累计曲线若挂
     // 隐藏轴，可视刻度(柱轴)与曲线高度对不上（曲线 51 亿、刻度只到 6 亿）。
     const subAxes = [
       {
         type: 'value' as const,
-        gridIndex: 1,
+        gridIndex: 2,
         name: '分钟净额',
         nameTextStyle: { color: '#666', fontSize: 9 },
         scale: true,
@@ -178,7 +212,7 @@ export function TimelineChart() {
       },
       {
         type: 'value' as const,
-        gridIndex: 1,
+        gridIndex: 2,
         position: 'right' as const,
         name: '累计',
         nameTextStyle: { color: '#666', fontSize: 9 },
@@ -242,6 +276,7 @@ export function TimelineChart() {
             axisLine: { lineStyle: { color: '#2a2a2a' } },
             splitLine: { show: false },
           },
+          volAxis,
           ...subAxes,
         ],
       }
@@ -255,14 +290,15 @@ export function TimelineChart() {
             axisLine: { lineStyle: { color: '#2a2a2a' } },
             splitLine: { lineStyle: { color: '#1c1c1c' } },
           },
+          volAxis,
           ...subAxes,
         ],
       }
     }
 
-    const xAxisBase = (showLabel: boolean) => ({
+    const xAxisBase = (gridIndex: number, showLabel: boolean) => ({
       type: 'value' as const,
-      gridIndex: showLabel ? 1 : 0,
+      gridIndex,
       // 数据范围即轴范围（-15=9:15 竞价首点，240=15:00），并固定刻度
       // 间隔：显式 min/max 下 ECharts 会按 (max-min)/splitNumber 均分，
       // 把 -17/243 之类的边界也打成标签（曾显示 09:13/15:03）。
@@ -329,12 +365,29 @@ export function TimelineChart() {
         lineStyle: { color: '#e8a13a', width: 1 },
       },
     ]
+    if (volBars.length) {
+      series.push({
+        name: '成交量',
+        type: 'bar',
+        xAxisIndex: 1,
+        yAxisIndex: volYIdx,
+        // [x, 手数, 涨跌方向]，颜色按第三维（分钟价相对上一分钟涨红跌绿）
+        data: volBars.map(([x, vol, dir]) => ({
+          value: [x, vol],
+          itemStyle: {
+            color:
+              dir >= 0 ? 'rgba(255,59,59,0.6)' : 'rgba(0,200,83,0.6)',
+          },
+        })),
+        barWidth: '60%',
+      })
+    }
     if (netBars.length) {
       series.push(
         {
           name: '大单净额',
           type: 'bar',
-          xAxisIndex: 1,
+          xAxisIndex: 2,
           yAxisIndex: subBarYIdx,
           data: netBars,
           barWidth: '60%',
@@ -356,7 +409,7 @@ export function TimelineChart() {
         {
           name: '大单累计',
           type: 'line',
-          xAxisIndex: 1,
+          xAxisIndex: 2,
           yAxisIndex: subLineYIdx,
           data: netLine,
           showSymbol: false,
@@ -365,12 +418,13 @@ export function TimelineChart() {
       )
     }
 
-    // 恒定双 grid（主图 + 大单副图）：副图轴固定引用 gridIndex 1，
-    // grid 数量随数据增减会让 ECharts 的 axisBuilder 崩溃；无大单数据
-    // 时副图保持空轴即可。
+    // 恒定三 grid（价格 / 成交量 / 大单）：各副图轴固定引用 gridIndex，
+    // grid 数量随数据增减会让 ECharts 的 axisBuilder 崩溃；无数据时副图
+    // 保持空轴即可。
     const grids = [
-      { left: 54, right: 54, top: 8, height: '58%' },
-      { left: 54, right: 54, top: '74%', height: '18%' },
+      { left: 54, right: 54, top: 6, height: '40%' },
+      { left: 54, right: 54, top: '53%', height: '16%' },
+      { left: 54, right: 54, top: '74%', height: '16%' },
     ]
 
     chart.setOption(
@@ -397,7 +451,9 @@ export function TimelineChart() {
                 const text =
                   item.seriesName === '大单净额' || item.seriesName === '大单累计'
                     ? fmtWan(v)
-                    : v.toFixed(2)
+                    : item.seriesName === '成交量'
+                      ? fmtHand(v)
+                      : v.toFixed(2)
                 return `${item.seriesName}: ${text}`
               })
               .join('<br/>')
@@ -405,7 +461,7 @@ export function TimelineChart() {
           },
         },
         grid: grids,
-        xAxis: [xAxisBase(false), xAxisBase(true)],
+        xAxis: [xAxisBase(0, false), xAxisBase(1, false), xAxisBase(2, true)],
         ...yExtra,
         series,
       },
