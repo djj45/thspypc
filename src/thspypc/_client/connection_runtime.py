@@ -825,10 +825,22 @@ class ConnectionRuntime:
             if record.get("event") == "order_cancel":
                 # The browser stream uses a compact event vocabulary while
                 # keeping the wire parser's name available for diagnostics.
+                # The 0x60 push parser and the 7170/7171 replay parser
+                # describe the same cancel concepts under different field
+                # names (placed_at/cancelled_at/lifetime_seconds vs
+                # placed_time/cancelled_time/elapsed_seconds).  Alias the
+                # replay vocabulary here so both sources reach the browser
+                # with one shared naming; the original fields stay for
+                # diagnostics.
                 record = {
                     **record,
                     "event": "cancel",
                     "source_event": "order_cancel",
+                    "cancelled_time": record.get("cancelled_at"),
+                    "placed_time": record.get("placed_at"),
+                    "cancelled_ts": record.get("cancelled_timestamp"),
+                    "placed_ts": record.get("placed_timestamp"),
+                    "elapsed_seconds": record.get("lifetime_seconds"),
                 }
             code = record["code"]
             event = record.get("event")
