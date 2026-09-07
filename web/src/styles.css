@@ -645,6 +645,25 @@ a[href*="tradingview.com"] {
   border-color: #7d6530;
   background: #2a2510;
 }
+.mode-toggle {
+  display: inline-flex;
+  gap: 4px;
+}
+.mode-toggle button {
+  padding: 1px 9px;
+  background: transparent;
+  border-color: #3b4655;
+  color: var(--text-dim);
+}
+.mode-toggle button.active {
+  color: #e8c36a;
+  border-color: #7d6530;
+  background: #2a2510;
+}
+.mode-toggle button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 @media (max-width: 1180px) {
   .header .title,
