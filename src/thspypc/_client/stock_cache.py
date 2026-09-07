@@ -79,8 +79,12 @@ def save_stock_codes(stocks: list[dict], path: str | None = None) -> str:
         "stocks": records,
     }
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        # 原子写：先写临时文件再 os.replace。直接覆盖写在进程被杀
+        # （重启/Ctrl+C）时会留下截断的 JSON，下次启动只能整表重拉。
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
         logger.info("股票代码表已缓存: %s (%d 条)", path, len(records))
     except OSError as e:
         logger.warning("股票代码表写盘失败（不影响本次返回）: %s", e)

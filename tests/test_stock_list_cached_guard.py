@@ -61,3 +61,17 @@ def test_sparse_disk_cache_self_heals_when_names_ready(
     assert [stock["name"] for stock in stocks] == ["浦发银行", "平安银行"]
     healed = load_stock_codes(path)[0]
     assert [stock["name"] for stock in healed] == ["浦发银行", "平安银行"]
+
+
+def test_atomic_save_replaces_corrupt_file_and_leaves_no_tmp(tmp_path):
+    """进程被杀留下的截断缓存必须能被覆盖修复，且不残留 .tmp。"""
+    path = str(tmp_path / "codes.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"version": 2, "saved_date": "2026-09-08", "stocks": [')
+    assert load_stock_codes(path) is None
+
+    save_stock_codes([{"code": "600000", "name": "浦发银行"}], path)
+
+    assert not os.path.exists(path + ".tmp"), "原子写不应残留临时文件"
+    stocks, _ = load_stock_codes(path)
+    assert [stock["code"] for stock in stocks] == ["600000"]
