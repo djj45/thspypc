@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from 'react'
 import { api } from '../../api/endpoints'
+import { IDLE_POLL_MS, useMarketPhase } from '../../data/marketSession'
 import type { QuoteExt } from '../../types'
 import { useStock } from '../../state/StockContext'
 import { clsOf, fmtAmt, fmtPct } from './format'
@@ -52,15 +53,17 @@ export interface StockRowData {
 
 // 批量统一字段：滚动的可视窗口代码传进来，返回 code→QuoteExt 映射。
 // 防抖吸收快速滚动的窗口抖动；新结果合并进旧 map（回滚时已看过的行
-// 立即显示缓存值，不闪 "-"）。窗口静止后每 4 秒受控刷新一次；以上一轮完成
-// 为起点调度，不会叠加并发请求。空列表不发。后端单批偶发缺行（冷启动
-// 争抢）时自动补拉缺失代码（最多 3 轮），保证初始可见区一定有数据。
+// 立即显示缓存值，不闪 "-"）。窗口静止后盘中每 4 秒受控刷新一次（休市
+// 降为 10 分钟心跳）；以上一轮完成为起点调度，不会叠加并发请求。空列表
+// 不发。后端单批偶发缺行（冷启动争抢）时自动补拉缺失代码（最多 3 轮），
+// 保证初始可见区一定有数据。
 export function useQuoteExt(
   codes: string[],
   debounceMs = 200,
 ): Map<string, QuoteExt> {
   const [map, setMap] = useState<Map<string, QuoteExt>>(new Map())
   const key = codes.join(',')
+  const phase = useMarketPhase()
   useEffect(() => {
     if (!key) return
     let alive = true
@@ -80,13 +83,23 @@ export function useQuoteExt(
           pending = pending.filter((c) => !got.has(c))
           if (!pending.length) break
         } catch {
-          /* 整批失败：下一轮重试 */
+          /* 整批失败：本轮内重试 */
         }
         if (pending.length) {
           await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
-      if (alive) timer = window.setTimeout(run, 4_000)
+      if (!alive) return
+      // 成功拿齐 → 按时段节奏（盘中 4s / 休市 10 分钟心跳）；
+      // 失败或缺行 → 30 秒恢复重试：后端冷启动/换挡期掉一批不能让
+      // 盘后页面空白到下一次心跳（此前要等 10 分钟或手动刷新）
+      const complete = pending.length === 0
+      const delay = complete
+        ? phase === 'live'
+          ? 4_000
+          : IDLE_POLL_MS
+        : 30_000
+      timer = window.setTimeout(run, delay)
     }
     timer = window.setTimeout(run, debounceMs)
     return () => {
@@ -94,7 +107,7 @@ export function useQuoteExt(
       window.clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, debounceMs])
+  }, [key, debounceMs, phase])
   return map
 }
 

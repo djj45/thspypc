@@ -3,6 +3,7 @@ import {
   isRecoverableRequestError,
   recoverableRetryDelay,
 } from '../api/client'
+import { IDLE_POLL_MS, useMarketPhase } from './marketSession'
 
 // 数据模式：snapshot=请求一次；poll=完成一次请求后定时刷新；push 由专用
 // WebSocket hook 实现，这里仅保留类型入口。
@@ -35,6 +36,9 @@ export function useData<T>(
   const fetcherRef = useRef(fetcher)
   fetcherRef.current = fetcher
   const firstRunRef = useRef(true)
+  // 轮询节奏随交易时段切换；phase 翻转（开盘/收盘）立即重跑一次并按
+  // 新节奏调度，开盘首刷不用等上一轮休市心跳到期
+  const phase = useMarketPhase()
 
   const refresh = useCallback(() => setTick((t) => t + 1), [])
 
@@ -46,17 +50,20 @@ export function useData<T>(
     setLoading(true)
     const run = () => {
       let recoverableDelay: number | undefined
+      let failed = false
       fetcherRef
         .current()
         .then((d) => {
           if (alive) {
             failureCount = 0
+            failed = false
             setData(d)
             setError('')
           }
         })
         .catch((e) => {
           if (!alive) return
+          failed = true
           setError(e instanceof Error ? e.message : String(e))
           if (isRecoverableRequestError(e)) {
             failureCount += 1
@@ -69,7 +76,16 @@ export function useData<T>(
           // 以上一次完成为起点调度，慢请求不会叠加成并发轮询。snapshot
           // 首次遇到冷启动超时也会在后台自恢复；4xx 等确定错误不会重打。
           if (mode === 'poll' || recoverableDelay !== undefined) {
-            const delay = recoverableDelay ?? Math.max(1_000, pollMs)
+            // 成功 → 按时段节奏（盘中 pollMs / 休市 10 分钟心跳）；
+            // 失败 → 30 秒恢复重试：后端冷启动/换挡期掉一次不能让休市
+            // 页面空白到下一次心跳
+            const delay =
+              recoverableDelay ??
+              (failed
+                ? 30_000
+                : phase === 'live'
+                  ? Math.max(1_000, pollMs)
+                  : IDLE_POLL_MS)
             timer = setTimeout(run, delay)
           }
         })
@@ -88,7 +104,7 @@ export function useData<T>(
       if (timer !== undefined) clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, tick, mode, delayMs, pollMs])
+  }, [...deps, tick, mode, delayMs, pollMs, phase])
 
   return { data, loading, error, refresh }
 }

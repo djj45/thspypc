@@ -4,6 +4,7 @@ import {
   isRecoverableRequestError,
   recoverableRetryDelay,
 } from '../../api/client'
+import { IDLE_POLL_MS, useMarketPhase } from '../../data/marketSession'
 import { useStock } from '../../state/StockContext'
 import type { Dxjl } from '../../types'
 
@@ -197,7 +198,9 @@ export function DxjlPanel() {
     }
   }, [mergeRows])
 
-  // 轮询兜底：实时通道在线时休眠，断开期间按 5s 拉最新页补齐
+  // 轮询兜底：实时通道在线时休眠，断开期间盘中按 5s 拉最新页补齐
+  // （休市降为 10 分钟心跳，盘后挂着断流的页面不再整夜轮询）
+  const phase = useMarketPhase()
   useEffect(() => {
     if (wsLive) return
     let alive = true
@@ -225,7 +228,7 @@ export function DxjlPanel() {
           if (sorted.length) cursorRef.current = sorted[0].时间
           setError('')
           // 以上一次完成为起点轮询，慢请求不叠加并发（与 useData poll 一致）
-          schedule(DXJL_POLL_MS)
+          schedule(phase === 'live' ? DXJL_POLL_MS : IDLE_POLL_MS)
         })
         .catch((e) => {
           if (!alive) return
@@ -234,8 +237,8 @@ export function DxjlPanel() {
             failureCount += 1
             schedule(recoverableRetryDelay(failureCount))
           } else {
-            // 兜底轮询不能因一次失败永久冻结，按正常节奏重试
-            schedule(DXJL_POLL_MS)
+            // 兜底轮询不能因一次失败永久冻结，按当前时段节奏重试
+            schedule(phase === 'live' ? DXJL_POLL_MS : IDLE_POLL_MS)
           }
         })
         .finally(() => {
@@ -247,7 +250,7 @@ export function DxjlPanel() {
       alive = false
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [wsLive])
+  }, [wsLive, phase])
 
   // 初次就绪贴底；轮询新行仅在贴底跟随时滚底；前插历史页做滚动量补偿
   useEffect(() => {
