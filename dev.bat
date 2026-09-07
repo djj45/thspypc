@@ -51,9 +51,18 @@ echo [dev.bat] Check passed. No processes were started.
 exit /b 0
 
 :check_python
+rem Candidate chain: project venv first (uv-managed 3.14 does not register
+rem with the py launcher), then fall back to py -3.14. Only an interpreter
+rem that actually passes the version+dependency probe gets selected.
+set "PY_CMD="
+if exist "%ROOT%.venv\Scripts\python.exe" (
+  "%ROOT%.venv\Scripts\python.exe" -c "import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, websockets, thspypc" >nul 2>&1
+  if not errorlevel 1 set "PY_CMD=%ROOT%.venv\Scripts\python.exe"
+)
+if defined PY_CMD exit /b 0
 where py.exe >nul 2>&1
 if errorlevel 1 (
-  echo [dev.bat] ERROR: py.exe was not found.
+  echo [dev.bat] ERROR: neither .venv nor py.exe is usable.
   exit /b 1
 )
 py -3.14 -c "import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, websockets, thspypc" >nul 2>&1
@@ -62,6 +71,7 @@ if errorlevel 1 (
   echo [dev.bat] Run: py -3.14 -m pip install -e .[server]
   exit /b 1
 )
+set "PY_CMD=py -3.14"
 exit /b 0
 
 :check_frontend
@@ -116,7 +126,7 @@ rem Remove stale backend consoles previously created by this script. This is
 rem intentionally scoped by window title and never targets arbitrary cmd.exe.
 taskkill.exe /F /T /FI "WINDOWTITLE eq thspypc-backend 8765*" >nul 2>&1
 echo [dev.bat] Starting backend at %BACKEND_URL%
-start "thspypc-backend 8765" "%ComSpec%" /d /k "cd /d ""%ROOT%"" && set ""PYTHONPATH=%ROOT%src"" && py -3.14 -m thspypc.server --host 127.0.0.1 --port 8765"
+start "thspypc-backend 8765" "%ComSpec%" /d /k "cd /d ""%ROOT%"" && set ""PYTHONPATH=%ROOT%src"" && %PY_CMD% -m thspypc.server --host 127.0.0.1 --port 8765"
 exit /b 0
 
 :usage

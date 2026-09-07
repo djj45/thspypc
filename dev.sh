@@ -33,33 +33,39 @@ error() {
 }
 
 check_python() {
-  local python_path=""
-  if command -v py >/dev/null 2>&1; then
-    PYTHON_CMD=(py -3.14)
-  elif [[ -x "$ROOT/.venv/bin/python3" ]]; then
-    PYTHON_CMD=("$ROOT/.venv/bin/python3")
-  elif [[ -f "$ROOT/.venv/Scripts/python.exe" ]]; then
-    PYTHON_CMD=("$ROOT/.venv/Scripts/python.exe")
-  elif python_path="$(type -P python3 2>/dev/null)" && [[ -n "$python_path" ]]; then
-    PYTHON_CMD=("$python_path")
-  elif python_path="$(type -P python 2>/dev/null)" && [[ -n "$python_path" ]]; then
-    PYTHON_CMD=("$python_path")
-  else
-    echo "[dev.sh] ERROR: Python 3.14 was not found."
-    return 1
+  # 候选链：先项目 venv（uv 管理的 3.14 不注册 py 启动器），再回退
+  # py -3.14 / PATH python。只有真正通过版本+依赖自检的解释器才被选用。
+  local check='import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, websockets, thspypc'
+  local try=()
+  if [[ -x "$ROOT/.venv/bin/python3" ]]; then
+    try+=("$ROOT/.venv/bin/python3")
   fi
-
-  if ! "${PYTHON_CMD[@]}" -c \
-      'import sys; assert sys.version_info >= (3, 14); import fastapi, uvicorn, websockets, thspypc' \
-      >/dev/null 2>&1; then
-    echo "[dev.sh] ERROR: Python 3.14 or backend dependencies are unavailable."
-    if [[ "${PYTHON_CMD[0]}" == "py" ]]; then
-      echo "[dev.sh] Run: py -3.14 -m pip install -e .[server]"
-    else
-      echo "[dev.sh] Run: uv sync --extra server"
+  if [[ -f "$ROOT/.venv/Scripts/python.exe" ]]; then
+    try+=("$ROOT/.venv/Scripts/python.exe")
+  fi
+  local p
+  for p in python3 python; do
+    p="$(type -P "$p" 2>/dev/null)"
+    if [[ -n "$p" ]]; then
+      try+=("$p")
     fi
-    return 1
+  done
+  local c
+  for c in "${try[@]}"; do
+    if "$c" -c "$check" >/dev/null 2>&1; then
+      PYTHON_CMD=("$c")
+      return 0
+    fi
+  done
+  if command -v py >/dev/null 2>&1; then
+    if py -3.14 -c "$check" >/dev/null 2>&1; then
+      PYTHON_CMD=(py -3.14)
+      return 0
+    fi
   fi
+  echo "[dev.sh] ERROR: Python 3.14 or backend dependencies are unavailable."
+  echo "[dev.sh] Run: uv sync --extra server  (or: py -3.14 -m pip install -e .[server])"
+  return 1
 }
 
 check_frontend() {
