@@ -11,6 +11,12 @@ from .timing import add_request_timing
 from .session_types import SocketLike
 from .dispatcher import ResponseDispatcher
 
+# 同步业务请求等待后台 dispatcher（心跳探针）让出车道的上限。健康探针
+# 亚秒级返回；等满该上限基本可断定探针挂在僵死连接上（收盘后长时间
+# 空闲会被服务端静默丢弃），此时快速失败交给上层重连路径——否则会先
+# 等满整个业务超时，造成恢复后的首次交互卡顿十余秒。
+DISPATCHER_IDLE_WAIT_CAP = 3.0
+
 
 class MarketSession:
     """Serialize send and response-reading ownership for one connection."""
@@ -66,7 +72,9 @@ class MarketSession:
         acquired = self._acquire_request_lock(deadline)
         try:
             remaining = self._remaining(deadline, phase="waiting for dispatcher")
-            if not self._dispatcher.wait_idle(timeout=remaining):
+            if not self._dispatcher.wait_idle(
+                timeout=min(remaining, DISPATCHER_IDLE_WAIT_CAP)
+            ):
                 raise TimeoutError("dispatcher idle wait timed out")
             sock = self._socket_getter()
             if sock is None:
@@ -108,7 +116,9 @@ class MarketSession:
         acquired = self._acquire_request_lock(deadline)
         try:
             remaining = self._remaining(deadline, phase="waiting for dispatcher")
-            if not self._dispatcher.wait_idle(timeout=remaining):
+            if not self._dispatcher.wait_idle(
+                timeout=min(remaining, DISPATCHER_IDLE_WAIT_CAP)
+            ):
                 raise TimeoutError("dispatcher idle wait timed out")
             with self._gate_lock:
                 superseded = gate != self._latest_gate
@@ -136,7 +146,9 @@ class MarketSession:
         acquired = self._acquire_request_lock(deadline)
         try:
             remaining = self._remaining(deadline, phase="waiting for dispatcher")
-            if not self._dispatcher.wait_idle(timeout=remaining):
+            if not self._dispatcher.wait_idle(
+                timeout=min(remaining, DISPATCHER_IDLE_WAIT_CAP)
+            ):
                 raise TimeoutError("dispatcher idle wait timed out")
             sock = self._socket_getter()
             if sock is None:

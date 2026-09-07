@@ -8,6 +8,7 @@ object as their runtime composition root.
 from __future__ import annotations
 
 import logging
+import errno
 import queue
 import socket
 import threading
@@ -450,7 +451,16 @@ class ConnectionRuntime:
                 if self._heartbeat_monitor.note_transport_failure(lane, sock):
                     state = "unresponsive"
             if state is not None:
-                log = logger.warning if state == "unresponsive" else logger.debug
+                # 重连路径关闭旧 socket 后，挂死其上的旧探针以
+                # 10038/EBADF 失败是预期结果，不算 unresponsive 告警
+                superseded_fd = isinstance(exc, OSError) and (
+                    getattr(exc, "winerror", None) == 10038
+                    or getattr(exc, "errno", None) == errno.EBADF
+                )
+                if state == "unresponsive" and not superseded_fd:
+                    log = logger.warning
+                else:
+                    log = logger.debug
                 log("%s 心跳探针无下行响应（%s）: %s", lane, state, exc)
 
     def _schedule_dispatch_probe(
