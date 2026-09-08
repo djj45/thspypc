@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  KLINE_PERIODS,
   normalizeStockCode,
   StockProvider,
   useStock,
 } from './state/StockContext'
-import type { StockPageMode } from './state/StockContext'
+import type { KlinePeriod, StockPageMode } from './state/StockContext'
 import { Header } from './components/Header'
 import { useStockNames } from './data/useStockNames'
 import { TimelineChart } from './components/center/TimelineChart'
@@ -118,6 +119,14 @@ function readView(): StockPageMode {
   return value === 'timeline' || value === 'superorder' ? value : 'kanpan'
 }
 
+/** ?period= URL 参数 → 合法 K 线周期（day/week/.../Nmin），非法值忽略。 */
+function readPeriod(): KlinePeriod | null {
+  const value = new URLSearchParams(window.location.search).get('period')
+  return (KLINE_PERIODS as readonly string[]).includes(value ?? '')
+    ? (value as KlinePeriod)
+    : null
+}
+
 function RoutedShell({
   view,
   onView,
@@ -125,7 +134,7 @@ function RoutedShell({
   view: StockPageMode
   onView: (view: StockPageMode) => void
 }) {
-  const { code, setCode } = useStock()
+  const { code, setCode, period, setPeriod } = useStock()
   const restored = useRef(false)
 
   useEffect(() => {
@@ -136,14 +145,17 @@ function RoutedShell({
       code,
     )
     if (initial && initial !== code) setCode(initial)
-  }, [code, setCode])
+    const initialPeriod = readPeriod()
+    if (initialPeriod && initialPeriod !== period) setPeriod(initialPeriod)
+  }, [code, setCode, period, setPeriod])
 
   useEffect(() => {
     const query = new URLSearchParams(window.location.search)
     query.set('view', view)
     query.set('code', code)
+    query.set('period', period)
     window.history.replaceState(null, '', `/?${query.toString()}`)
-  }, [code, view])
+  }, [code, view, period])
 
   return (
     <div className="app">
