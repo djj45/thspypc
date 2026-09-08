@@ -68,6 +68,19 @@
   `name_16_16`，无需安装客户端。
 - **逐 tick 快照与十档推送底层**（`snapshot_subscribe` / `latest_depth`）：4214 实时
   快照已可用；549B 十档推送 parser/缓存已接入，专用流式 API 尚待收口。
+- **北交所（BSE）行情族**（市场码 151，920xxx 等，2026-09 打通）：行情/代码表、
+  当日分时（1 分钟K合成 + 6144 竞价段）、历史分时（pageid=10444 的 8192
+  packed-date bar 窗，241 行/日）、**盘中超级盘口**（`bse_superorder_day`：
+  pageid=1207 注册 + `DateTime=4096(0-0)` 三子帧，响应 0x0096 大表，
+  每行逐笔事件并携带完整五档快照，活网 973 行与页面总量/总额逐值一致）、
+  **竞价逐笔窗**（`bse_tick_window`：7176 当日 / 6144 历史，09:15-09:25，
+  含买/卖未匹配）。北交所无沪深式 L2 通道（十档回放/委托队列/挂撤明细），
+  且必须连 main.123ths.com 组（独立 `BSE_MAIN` 车道，ifindhq 组不回数据）；
+  协议族与账号类型无关（双账号抓包确认）。详见
+  `docs/handoffs/HANDOFF_BSE_HISTORY_SUPERORDER_20260908.md`。
+- **Web 看盘服务与前端**（`thspypc.server` + `web/`）：FastAPI 单用户
+  REST + WebSocket（个股逐笔/十档/队列与短线精灵实时流），配套 React
+  看盘前端（看盘/分时/超级盘口三视图，见下文「看盘前端」）。
 
 ## 代码架构
 
@@ -685,21 +698,50 @@ Level2 历史尾盘（pageid=4417）已端到端打通：fresh login 重放即�
 真实数据帧一直能解出。
 
 ## 安装
-with THSClient("账号", "密码") as client:
-    client.connect()
-    # 心跳后台自动运行，可随时查询
-    time.sleep(60)  # 静置 1 分钟
-    client.list_quotes(["600056"])  # ✓ 仍可用（心跳维持了连接）
-```
 
 ```bash
-cd D:\code\ths_takehome\thspypc
 uv sync
 # 二维码登录额外需要（终端渲染，非必需）：
 uv pip install qrcode
 ```
 
-## 看盘前端一键启动
+可选原生解压加速：`_compression_native`（stable-ABI C 扩展，仅加速
+BitRLE 解码与位平面转置两个纯函数）由 `.github/workflows/wheels.yml`
+跨平台构建；仓内附 Windows 预编译 `.pyd`，未编译平台自动回退纯 Python，
+一致性由 `tests/test_native_compression.py` 契约测试保证。
+
+## 看盘前端
+
+仓库自带一套 React 看盘前端（`web/`，vite + echarts），由 `thspypc.server`
+（默认 `127.0.0.1:8765`）提供数据，三个视图经顶栏或 URL `?view=` 切换：
+
+- **看盘**：三栏布局——左栏（同花顺板块涨幅/涨速/主力榜、自定义板块/自选股、
+  全市场搜索与排序榜）、中栏（分时·大单金额 + 日K/分钟K，含均线开关、
+  前后复权、缩放范围按周期记忆、分钟K真实日期轴与日分隔线）、右栏
+  （个股概览 + 五档盘口、短线精灵实时流）。看盘页常驻保活：切到分时/
+  超级盘口再切回即时恢复，K 线缩放状态不丢。
+- **分时**：当日分时（含竞价三阶段）、光标时刻十档、逐笔成交明细
+  （7169 回放 + WS 实时推送合并去重）。
+- **超级盘口**：沪深（Level2）为 4096 盘口回放曲线 + 光标十档快照 +
+  买一/卖一委托队列 + 逐笔/挂单/撤单明细，实时模式跟随最新；
+  **北交所**为官方形态——当日全日逐笔（每行含五档快照，点选任意逐笔
+  查看当时盘口）+ 历史日竞价段（09:15-09:25）逐笔，十档/队列无通道。
+
+接口概览（全部在 `/api/` 前缀下，单用户无鉴权）：
+
+| 分组 | 端点 |
+|------|------|
+| 行情 | `quote` / `quotes_ext` / `depth/{code}` / `stocks2` |
+| K线·分时 | `kline/{code}` / `timeline` / `history_timeline` / `auction` / `closing_auction` / `intraday` / `market_view(_fast)` |
+| 超级盘口 | `superorder/{code}`（7169/BSE 竞价窗）/ `superorder-bse/{code}`（BSE 全日+五档）/ `superorder-replay*`（4096）/ `superorder-window` / `order-queues` / `order-details` |
+| 榜单·板块 | `stock_list_ranked` / `dde_rank` / `boards*` / `hot_boards` |
+| 自选·异动 | `groups*` / `self_stocks` / `dynamic_plate*` / `dxjl*` |
+| 实时流 (WS) | `stock-stream/{code}`（逐笔/十档/队列）、`dxjl/stream`（短线精灵） |
+
+盘中轮询按交易时段自动降频（竞价/连续/盘后不同周期），页面隐藏或休市时
+跳过；前端对各接口带 TTL 缓存与在途去重，避免快速切股时打爆通道。
+
+### 一键启动
 
 仓库根目录提供两个启动脚本：
 
@@ -730,12 +772,15 @@ dev.bat   # Windows cmd
 ```
 thspypc/
 ├── pyproject.toml
+├── dev.bat / dev.sh          # 看盘前后端一键启动
+├── docs/                     # 手册/架构/路线图/调查/交接文档（见 docs/README.md）
 ├── src/thspypc/
 │   ├── __init__.py             # 包入口
 │   ├── client.py               # THSClient 公开门面与旧调用兼容
 │   ├── _client/                # 连接原语、服务门面、股票代码缓存
 │   ├── _transport/             # 按角色管理的 socket、会话和请求锁
-│   ├── codecs/                 # 帧、压缩、hd1/hd3、数值编码
+│   │                            #  （MAIN / SH_L2 / SZ_L2 / BSE_MAIN / REALORDER）
+│   ├── codecs/                 # 帧、压缩（含可选 C 加速）、hd1/hd3、数值编码
 │   ├── features/               # 各业务纯协议 builder/parser
 │   ├── services/               # 能力校验、连接选择与完整业务工作流
 │   ├── protocol.py             # 历史 API 兼容导出 + HTTP 鉴权/主机解析
@@ -744,14 +789,15 @@ thspypc/
 │   ├── qr_login.py             # 二维码扫码登录 + 凭证缓存
 │   ├── parse_hfd1.py           # hfd1.0 名称锚点解析
 │   ├── testing.py              # 测试/诊断脚本并发登录与客户端复用 helper
-│   └── server/                 # FastAPI 单用户 REST 接口
+│   └── server/                 # FastAPI 单用户 REST + WebSocket 接口
+├── web/                       # React 看盘前端（vite + echarts）
 └── tests/
     ├── test_*.py               # pytest 离线/在线回归
     ├── verify_*.py             # 活网验证脚本
     ├── capture_*.py            # 抓包工具
     ├── probe_*/analyze_*/_*    # 一次性逆向与诊断脚本
     ├── archive/                # 已完成使命的历史诊断脚本
-    ├── fixtures/               # 脱敏协议样本
+    ├── fixtures/               # 脱敏协议样本（金样本回归）
     └── native/                 # 逆向辅助 C/C++ harness
 ```
 
@@ -764,8 +810,13 @@ thspypc/
   当前推送帧的数值解码通过**异动字节锚定 + THS float 扫描**绕过，已知类别名
   按抓包和官方客户端配置匹配（金额/涨幅 100% 精确）。解出 TLV 能实现通用 schema 驱动解析，但
   实际收益有限（需 Ghidra 逆向 hexin.exe）。
-- A 股名称的 `name_16_16` 块状编码已解：走 `0x001c StockNameVer` 网络全量同步（跨平台，不依赖本地缓存）
-  填充名称（需安装同花顺 PC 客户端）。
+- A 股名称的 `name_16_16` 块状编码已解：走 `0x001c StockNameVer` 网络全量同步
+  填充名称（纯网络跨平台，**无需安装同花顺客户端**；按服务器分组并发登录拉取）。
+- **北交所通道边界**（2026-09-08 活网+抓包确认）：无十档回放/委托队列/挂撤单
+  明细等沪深式 L2 通道；当日超级盘口 = 全日逐笔+五档（4096 全日窗），历史日期
+  官方无超级盘口页、仅 6144 竞价段（09:15-09:25）逐笔；7176 只服务竞价窗，
+  连续竞价时段窗口无响应。北交所请求必须走 main.123ths.com 组的 `BSE_MAIN`
+  车道，且 init MarketDate 需含 `32(0)`。
 - 全市场快照 `market_snapshot()`（hfd1.0）只覆盖沪市，深市不支持；
   用 `market_snapshot_with_quotes()`（stock_list + list_quotes 混合方案）覆盖全市场。
 - 终端 ASCII 二维码可能因字体宽高比扫不了，用 `qr_login.png` 图片扫更可靠。
