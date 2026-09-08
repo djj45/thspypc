@@ -44,6 +44,9 @@ def probe_socket_alive(sock: socket.socket) -> bool:
 class ConnectionRole(str, Enum):
     MAIN = "main"
     KLINE_FAST = "kline_fast"
+    # 北交所（market 151）专用：只在 main.123ths.com 组登录。同账号同请求在
+    # ifindhq 节点会被回 CodeListSize=0 且不下发 151 数据（2026-09-08 实测）。
+    BSE_MAIN = "bse_main"
     SH_L2 = "sh_l2"
     SZ_L2 = "sz_l2"
     REALORDER = "realorder"
@@ -81,6 +84,11 @@ CONNECTION_SPECS = {
         identity=LoginIdentity.STANDARD,
         port=8901,
         required_capability=Capability.BASIC_QUOTE,
+    ),
+    ConnectionRole.BSE_MAIN: ConnectionSpec(
+        role=ConnectionRole.BSE_MAIN,
+        identity=LoginIdentity.STANDARD,
+        port=8901,
     ),
     ConnectionRole.SH_L2: ConnectionSpec(
         role=ConnectionRole.SH_L2,

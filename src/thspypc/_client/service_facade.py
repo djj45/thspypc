@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from datetime import date as date_type, datetime
+from datetime import date as date_type, datetime, time as time_type, timedelta, timezone
 
 from ..errors import ChannelUnavailableError, ProtocolError
 from ..models import AccountKind, Capability, DepthQuote
@@ -651,6 +651,10 @@ class ServiceFacade:
         """
         if market == 0:
             market = self._market_for_code(code)
+        # 北交所（151）盘口走 10443 的 76/77/78/79 五档字段，尚未实现；
+        # 沪深式 L2 十档通道不存在，直接返回空盘口（文档约定），不抛错。
+        if market == 151:
+            return {}
         last_err = ""
         for attempt in range(retries + 1):
             if not self.is_connected:
@@ -1079,6 +1083,23 @@ class ServiceFacade:
         end_ts = self._superorder_ts(end)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
+        # 北交所无沪深式 7169 回放通道：官方客户端走 pageid=10443 的
+        # DateTime=7176 平文本窗口（MAIN 连接，2026-09-08 双账号抓包确认），
+        # 返回秒级逐笔（时间不连续，BSE 流动性差）。
+        if market == 151:
+            from ..services.superorder import bse_tick_window
+
+            return self._run_default_service(
+                (),
+                lambda: bse_tick_window(
+                    self._superorder_service,
+                    code,
+                    market=market,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    timeout=timeout,
+                ),
+            )
         # request() 与后台推送读取线程共享每市场 request lock；请求期间若先收到
         # 主动推送，SuperorderService 会交回统一事件分发器，不会丢帧或双 recv。
         return self._run_default_service(
@@ -1262,6 +1283,9 @@ class ServiceFacade:
         """查买一和卖一队列；历史调用只建立一次 4096/4417 上下文。"""
         if market == 0:
             market = self._market_for_code(code)
+        # 北交所无 7173/7174 队列通道：返回空队列（前端显示空），不抛错。
+        if market == 151:
+            return {}
         context_start, context_end = self._order_queue_context(trade_date)
         if self._auth is None and self._service_connections is None:
             self.authenticate()
@@ -1343,8 +1367,9 @@ class ServiceFacade:
         historical = value is not None and value != date_type.today()
 
         historical_index = historical and market in (16, 32, 144)
-        # 北交所（151）竞价协议尚未逆向；当日分时主体走 BSE 专用 pageid=10443
-        # （MAIN 连接），竞价两段直接留空，不能走沪深 L2 竞价路径（会 400）。
+        # 北交所（151）：早盘竞价（09:15-09:25）用 6144 历史竞价窗（当日/
+        # 历史同一协议，2026-09-08 抓包对齐）；分时主体当日走 1 分钟K合成，
+        # 历史日期走 pageid=10444 的 8192 packed-date bar 窗；无尾盘竞价。
         bse_stock = market == 151
         profile = (
             self._service_connections.profile
@@ -1396,8 +1421,15 @@ class ServiceFacade:
             ]
 
         opening = (
-            []
-            if historical_index or bse_stock
+            self._bse_opening_auction(
+                code,
+                market=market,
+                trade_date=value,
+                timeout=min(timeout, 8.0),
+            )
+            if bse_stock
+            else []
+            if historical_index
             else self.auction(
                 code,
                 market=market,
@@ -1406,14 +1438,15 @@ class ServiceFacade:
             )
         )
         if historical:
-            # 北交所历史分时协议尚未单独对齐；BSE 的 timeline(DateTime=0-0)
-            # 在非交易日/盘前也会返回最近一个交易日序列（实测 241 点），
-            # 直接使用它，而不是返回空 continuous。
+            # 北交所历史分时：pageid=10444 的 8192 packed-date 窗
+            # （2026-09-08 日期标定抓包，bar=packed(日期)×2048+606）。
             continuous = (
-                self.timeline(
+                self._bse_history_timeline(
                     code,
                     market=market,
+                    trade_date=value,
                     timeout=timeout,
+                    retries=retries,
                 )
                 if bse_stock
                 else self.history_timeline(
@@ -1425,10 +1458,18 @@ class ServiceFacade:
                 )
             )
         else:
-            continuous = self.timeline(
-                code,
-                market=market,
-                timeout=timeout,
+            continuous = (
+                self._bse_timeline_from_kline(
+                    code,
+                    market=market,
+                    timeout=timeout,
+                )
+                if bse_stock
+                else self.timeline(
+                    code,
+                    market=market,
+                    timeout=timeout,
+                )
             )
         closing = (
             []
@@ -1452,6 +1493,194 @@ class ServiceFacade:
                 for record in records
             )
         return result
+
+    def _bse_timeline_from_kline(
+        self,
+        code: str,
+        *,
+        market: int,
+        trade_date=None,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """北交所分时：用 1 分钟 K 线合成与沪深 timeline 同构的记录。
+
+        2026-09-08 抓包确认官方客户端对 BSE 分时的驱动请求是 route=0x014f
+        的 1 分钟K（pageid=1334，DataType=7,13,19,11,74,9,8,...），而
+        pageid=10443 分时协议请求只回 ACK 不回数据。合成的 dt13/dt19 为
+        累计量/额（与沪深分时字段语义一致）；无 dt14/15 与 dt227/229
+        （北交所无买卖力量/大单字段，与官方客户端一致）。
+
+        仅支持当日（最新一窗按 bar_index 间隔切段，午休 ~90、隔夜远大于
+        此，取最后一段）。历史日期走 :meth:`_bse_history_timeline`
+        （pageid=10444 的 8192 packed-date bar 窗，2026-09-08 已逆向）；
+        本方法历史日期返回空表。
+        """
+        if trade_date is not None and str(trade_date) != str(
+            date_type.today()
+        ):
+            return []
+        bars = self.kline(
+            code,
+            period="1min",
+            count=300,
+            fuquan="N",
+            market=market,
+            timeout=timeout,
+            retries=0,
+        )
+        if not bars:
+            return []
+        # 切段：取最后一个 bar_index 连续段（午休间隔≈90，隔夜≫120）
+        start = 0
+        for i in range(1, len(bars)):
+            prev_idx = bars[i - 1].get("bar_index") or 0
+            cur_idx = bars[i].get("bar_index") or 0
+            if cur_idx - prev_idx > 120:
+                start = i
+        session = bars[start:]
+        rows: list[dict] = []
+        cum_volume = 0.0
+        cum_amount = 0.0
+        for i, bar in enumerate(session):
+            volume = float(bar.get("volume") or 0)
+            amount = float(bar.get("amount") or 0)
+            cum_volume += volume
+            cum_amount += amount
+            close = bar.get("close")
+            rows.append(
+                {
+                    "code": code,
+                    "minute_index": i,
+                    "bar_index": bar.get("bar_index"),
+                    "dt7": bar.get("open"),
+                    "dt8": bar.get("high"),
+                    "dt9": bar.get("low"),
+                    "dt10": close,
+                    "dt11": close,
+                    "dt13": cum_volume,
+                    "dt19": cum_amount,
+                }
+            )
+        return rows
+
+    def _bse_history_timeline(
+        self,
+        code: str,
+        *,
+        market: int,
+        trade_date,
+        timeout: float = 12.0,
+        retries: int = 1,
+    ) -> list[dict]:
+        """北交所历史分时：pageid=10444 嵌套 8192 packed-date bar 窗。
+
+        2026-09-08 日期标定抓包确认 bar 窗 = ``packed(日期)×2048+606`` 起、
+        宽 355（与沪深 packed-date 游标同一公式）；响应个股表为
+        0x0042/rs28/fc7，241 行/日。失败或非交易日返回空表（不造数据）。
+        """
+        from ..services.timeline import bse_history_timeline
+
+        last_err: Exception | None = None
+        for attempt in range(max(retries, 1)):
+            try:
+                rows = self._run_default_service(
+                    (),
+                    lambda: bse_history_timeline(
+                        self._timeline_service,
+                        code,
+                        date=trade_date,
+                        market=market,
+                        timeout=timeout,
+                    ),
+                )
+            except (ConnectionError, OSError, TimeoutError) as exc:
+                last_err = exc
+                logger.warning(
+                    "BSE 历史分时 %s %s 失败（attempt %d）: %s",
+                    code, trade_date, attempt + 1, exc,
+                )
+                if self._service_connections is not None:
+                    self._service_connections.close(ConnectionRole.BSE_MAIN)
+                continue
+            if rows:
+                return [
+                    {
+                        "code": code,
+                        "minute_index": i,
+                        "bar_index": row.get("bar_index"),
+                        "dt10": row.get("dt10"),
+                        "dt13": row.get("dt13"),
+                        "dt19": row.get("dt19"),
+                        "dt22": row.get("dt22"),
+                        "dt23": row.get("dt23"),
+                    }
+                    for i, row in enumerate(rows)
+                ]
+            last_err = None
+            break
+        if last_err is not None:
+            logger.warning(
+                "BSE 历史分时 %s %s 重试后仍失败: %s", code, trade_date, last_err
+            )
+        return []
+
+    def _bse_opening_auction(
+        self,
+        code: str,
+        *,
+        market: int,
+        trade_date,
+        timeout: float = 8.0,
+    ) -> list[dict]:
+        """北交所早盘竞价（09:15-09:25）逐笔：6144 平文本窗（当日/历史同协议）。
+
+        失败时返回空表——竞价点是增强信息，不能阻塞分时主体。响应为
+        0x003a 表（字段 1,10,49,27,33），与 7176 逐笔回放同一解析器。
+        """
+        from ..services.superorder import bse_tick_window
+
+        day = trade_date if isinstance(trade_date, date_type) else date_type.today()
+        cst = timezone(timedelta(hours=8))
+        start_dt = datetime.combine(day, time_type(9, 15), tzinfo=cst)
+        end_dt = datetime.combine(day, time_type(9, 25), tzinfo=cst)
+        try:
+            ticks = self._run_default_service(
+                (),
+                lambda: bse_tick_window(
+                    self._timeline_service,
+                    code,
+                    market=market,
+                    start_ts=int(start_dt.timestamp()),
+                    end_ts=int(end_dt.timestamp()),
+                    timeout=timeout,
+                    tag=6144,
+                    pageid=10444,
+                    route=0x0100,
+                    flag14=0x0000,
+                    byte16=0x00,
+                    byte17=0x18,
+                ),
+            )
+        except Exception as exc:
+            logger.info(
+                "BSE 竞价窗 %s %s 获取失败（忽略，竞价段留空）: %s",
+                code, day, exc,
+            )
+            return []
+        rows = []
+        for tick in ticks:
+            ts = tick.get("ts")
+            price = tick.get("price")
+            if not ts or price is None:
+                continue
+            rows.append(
+                {
+                    "time": datetime.fromtimestamp(ts, cst),
+                    "dt10": price,
+                    "dt13": tick.get("volume") or 0,
+                }
+            )
+        return rows
 
     def intraday_auctions(
         self,
@@ -2081,6 +2310,11 @@ class ServiceFacade:
         """Register one code on its market L2 channel and return market code."""
         if market in (None, 0):
             market = self._market_for_code(code)
+        # 北交所（151）没有 shlv2/szlv2 式 L2 通道，pick_l2_market 不接受 151；
+        # 十档面板对 BSE 本就无数据（走 10443 五档字段，尚未实现），
+        # stock-ready 门禁直接返回市场码，不再抛 500。
+        if market == 151:
+            return market
         key = pick_l2_market(market)
         if self._auth is None and self._service_connections is None:
             self.authenticate()

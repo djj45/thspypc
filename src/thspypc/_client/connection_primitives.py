@@ -419,7 +419,9 @@ class ConnectionPrimitives:
                 "KLINE_FAST init response did not contain server config"
             )
 
-    def _open_independent_main_connection(self, material=None) -> socket.socket:
+    def _open_independent_main_connection(
+        self, material=None, *, main_hosts_only: bool = False
+    ) -> socket.socket:
         """Open a role-owned iFinD socket with a fresh one-use Passport.
 
         Candidate hosts race concurrently.  Once a host returns
@@ -428,10 +430,18 @@ class ConnectionPrimitives:
 
         ``material`` 可传调用方已取得的一代 AuthMaterial（并行预热使用）；
         默认 None 时方法内部重新 HTTP 鉴权。
+
+        ``main_hosts_only=True`` 只使用 ``main.123ths.com`` 组（北交所
+        market 151 专用连接：ifindhq 节点不下发 151 数据，见 BSE_MAIN 角色）。
         """
         if material is None:
             material = self.authenticate(force=True)
-        hosts = self._resolve_market_hosts(material.passport_bytes)
+        if main_hosts_only:
+            hosts = self._resolve_market_hosts(
+                material.passport_bytes, main_only=True
+            )
+        else:
+            hosts = self._resolve_market_hosts(material.passport_bytes)
         if not hosts:
             hosts = list(self._market_host_candidates())
         sorted_ips = self._probe_fastest_hosts(

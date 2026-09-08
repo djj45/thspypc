@@ -66,6 +66,8 @@ from .features.auction_protocol import (
     parse_index_auction_response,
 )
 from .features.history_timeline_protocol import (
+    BSE_HISTORY_TIMELINE_DATATYPE,
+    BSE_HISTORY_TIMELINE_PAGEID,
     HISTORY_TIMELINE_BAR_SPAN,
     HISTORY_TIMELINE_DATATYPE,
     HISTORY_TIMELINE_PAGEID,
@@ -80,11 +82,13 @@ from .features.history_timeline_protocol import (
     _decode_history_timeline_rows,
     _history_timeline_first_row,
     _history_timeline_row_anchors,
+    build_bse_history_timeline_query,
     build_history_timeline_query,
     build_index_history_timeline_query,
     build_normal_history_timeline_query,
     date_to_normal_timeline_bar,
     date_to_timeline_bar,
+    next_bse_history_timeline_seq,
     normal_timeline_bar_to_date,
     parse_history_timeline_response,
     timeline_bar_to_date,
@@ -301,7 +305,11 @@ MARKET_HOSTS = [
 ]
 
 
-def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
+def resolve_market_hosts(
+    passport_bytes: bytes,
+    *,
+    main_only: bool = False,
+) -> list[str]:
     """从 passport 的 M_hqdns 字段解析域名，DNS 查询得到 8901 服务器 IP 列表。
 
     hexin 客户端不硬编码 IP——HTTP 鉴权返回的 passport 里有 M_hqdns 字段，
@@ -311,8 +319,13 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
     仅在它缺失时回退到 ``ifindhq``，不把 fu4/hkus/euhq/lv2 等其他市场组
     混入 MAIN。
 
+    ``main_only=True`` 只返回 ``main.123ths.com`` 组（北交所专用连接使用：
+    2026-09-08 实测同账号同请求在 ifindhq 节点（如 8.134.121.153）被回
+    ``CodeListSize=0`` 且不下发 151 数据，main 组（8.134.108.168）正常）。
+
     Args:
         passport_bytes: HTTP 鉴权返回的原始 passport_bytes（含 M_hqdns 字段）。
+        main_only: 只取 main 域名组（不含 ifindhq 回退组）。
 
     Returns:
         去重后的 IP 列表。解析失败返回空列表（调用方回退到 MARKET_HOSTS）。
@@ -358,9 +371,10 @@ def resolve_market_hosts(passport_bytes: bytes) -> list[str]:
     domains = list(main_domains)
     if not domains:
         domains = ["main.123ths.com"]
-    for domain in fallback_domains:
-        if domain not in domains:
-            domains.append(domain)
+    if not main_only:
+        for domain in fallback_domains:
+            if domain not in domains:
+                domains.append(domain)
 
     # DNS 解析每个域名，收集所有 IP（去重，保序）
     ips: list[str] = []

@@ -78,8 +78,10 @@ def test_stock_list_builder_wire_contract(kwargs, expected_sha):
     ("kwargs", "expected_sha"),
     [
         (
+            # 2026-09-08 MarketDate 加 32(0) 后重算（北交所 151 数据下发开关，
+            # 见 stock_list_protocol.INIT_MARKET_DATE 注释）。
             {},
-            "760450e14e8d0c040c54c51d8890e9e2647f40948e58b03aeed2e553c1ba842b",
+            "8d455e940122584ef8ab3208156a05a05802b4aeca3a6b0ae838015f9b2de1e7",
         ),
         (
             {
@@ -88,7 +90,7 @@ def test_stock_list_builder_wire_contract(kwargs, expected_sha):
                 "c_modules": "MEQT;X",
                 "seq": 7,
             },
-            "93116a17e865f01d1ec712ca2a4ccafbbfaeae7532dc1fa2ee2f1f7ca272ea5e",
+            "f8f1e1e8da3e45935a070ae54aba1bb7cb5f3e7523c2e4757bb8753d1d2ad80a",
         ),
     ],
 )

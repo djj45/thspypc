@@ -97,6 +97,12 @@ INIT_C_MODULES = "MEQT"
 # 151(北交所个股)不加到 init MarketCode——部分 main.123ths.com IP 拒绝含 151 的 init，
 # 且北交所分时在 main.123ths.com 上不需要 init 里声明 151 即可请求 pageid=10443/11695。
 INIT_MARKET_CODE = "16;144;"
+# MarketDate 必须含 32(0)：2026-09-08 A/B 实测（同连接、同请求字节）——
+# MarketDate=16(0);144(0); 时服务端对含 151 的 CodeList 回 CodeListSize=0
+# 且不下发个股表（pageid=10444 历史分时/6144 竞价全被丢弃）；补上 32(0)
+# 后 920118 个股表立即返回。官方客户端 init 为 16(...);32(...);144(...)，
+# 故与官方对齐。MarketCode 与 C-UACS 经同批实验确认不是该开关。
+INIT_MARKET_DATE = "16(0);32(0);144(0);"
 INIT_STOCK_LINKS = [
     "Stock_176_H_QC",
     "Stock_176_H_QP",
@@ -327,7 +333,7 @@ def build_init_query(
         f"C-Modules={c_modules}\r\n"
         "C-UACS=20120716#0#\r\n"
         f"MarketCode={market_code}\r\n"
-        "MarketDate=16(0);144(0);\r\n"
+        f"MarketDate={INIT_MARKET_DATE}\r\n"
     ).encode("gbk") + b"StockLinkVer=" + stock_link_version
 
     header = bytearray(23)

@@ -1444,3 +1444,127 @@ __all__ = [
     "build_order_detail_query",
     "parse_order_detail_response",
 ]
+
+
+# ── 北交所（BSE）秒级逐笔窗口（2026-09-08 双账号抓包确认）──
+# DateTime=7176(unixStart-unixEnd) 平文本时间窗（区别于沪深的嵌套 pair
+# 结构），pageid=10443，route=0x01fc、子帧头 [14:16]=0x0040，走
+# main.123ths.com 系连接。窗口通常 600s（早盘竞价 09:15-09:25 等），
+# 历史日期的竞价窗换 6144 tag、pageid=10444。响应为 0x0a-LZ 外层的
+# flag=0x003a 表（20B 行：dt1=unix 秒、dt10=价、dt49=累计量、
+# dt27/dt33=买/卖未匹配），逐笔事件驱动、时间不连续（BSE 流动性差）。
+BSE_TICK_WINDOW_PAGEID = 10443
+BSE_TICK_WINDOW_TAG = 7176
+BSE_TICK_WINDOW_DATATYPE = [10, 27, 33, 49]
+# 历史竞价窗（分时页历史日期的 09:15-09:25 逐笔，2026-09-08 日期标定抓包）：
+# tag=6144、pageid=10444、route=0x0100（非 0x01FC）、w14=0x0000、b17=0x18，
+# 响应仍是 0x003a/rs20/fc5 表（字段 1,10,49,27,33），由同一解析器处理。
+BSE_AUCTION_WINDOW_TAG = 6144
+BSE_AUCTION_WINDOW_PAGEID = 10444
+
+_BSE_TICK_SEQ = __import__("itertools").count(0x0300, 2)
+
+
+def build_bse_tick_window_query(
+    code: str,
+    *,
+    market: int = 151,
+    start_ts: int,
+    end_ts: int,
+    tag: int = BSE_TICK_WINDOW_TAG,
+    pageid: int = BSE_TICK_WINDOW_PAGEID,
+    seq: int | None = None,
+    route: int = 0x01FC,
+    flag14: int = 0x0040,
+    byte16: int = 0x08,
+    byte17: int = 0x1C,
+) -> bytes:
+    """构建北交所逐笔/竞价回放窗口请求（DateTime=7176/6144 平文本窗）。
+
+    7176（当日逐笔回放，超级盘口页）：route=0x01FC、[14:18]=40 00 08 1C。
+    6144（历史竞价 09:15-09:25，分时页）：route=0x0100、[14:18]=00 00 00 18。
+    """
+    if seq is None:
+        seq = next(_BSE_TICK_SEQ)
+    dt_text = ",".join(str(v) for v in BSE_TICK_WINDOW_DATATYPE) + ","
+    text = (
+        f"CodeList={market}({code},);\r\nDataType={dt_text}\r\n"
+        f"DateTime={tag}({start_ts}-{end_ts})\r\n"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    header = bytearray(22)
+    header[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 4, seq & 0xFFFF)
+    header[6:10] = b"\x12\x00\x09\x00"
+    struct.pack_into("<H", header, 10, route)
+    struct.pack_into("<H", header, 14, flag14)
+    header[16] = byte16
+    header[17] = byte17
+    struct.pack_into("<I", header, 18, len(text))
+    return encode_frame(b"\x09" + bytes(header) + text)
+
+
+def parse_bse_tick_response(body: bytes) -> list[dict]:
+    """解析北交所 0x003a 逐笔表 → ``{code, ts, price, volume, ...}``。
+
+    dt49 为累计量，逐笔量取相邻差分；首行差分基线为自身（窗口起点）。
+    """
+    from ..codecs.compression import (
+        _decode_bitrle_0x13746d0,
+        _transpose_bitplane_0x1763410,
+    )
+
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError:
+            return []
+    pos = body.find(b"hd3.1\x00")
+    if pos < 0 or len(body) < pos + 16:
+        return []
+    raw_count, flag, rsize, fcount = struct.unpack_from("<IHHH", body, pos + 6)
+    if flag != 0x003A or rsize == 0 or not 1 <= fcount <= 50:
+        return []
+    # dc 高 16 位是修饰位（如 0x0600，2026-09-08 历史竞价响应 dc=0x0600001c
+    # 共 28 行）；行数取低 16 位，与 BE32 长度字交叉校验兜底。
+    count = raw_count & 0xFFFF
+    if count == 0:
+        return []
+    fields = _parse_hd_field_table(body, pos + 16, fcount)
+    if sum(w for _, _, w in fields) != rsize:
+        return []
+    shell_off = pos + 16 + fcount * 4
+    if len(body) < shell_off + 30:
+        return []
+    shell = body[shell_off:shell_off + 26]
+    if shell[:4] != b"\x16\x00\x01\x00":
+        return []
+    code = shell[5:11].decode("ascii", errors="replace")
+    if struct.unpack_from(">I", body, shell_off + 26)[0] != count * rsize:
+        return []
+    plane = _decode_bitrle_0x13746d0(body[shell_off + 26:], count * rsize)
+    rows = _transpose_bitplane_0x1763410(plane, rsize, count)
+
+    records: list[dict] = []
+    prev_cum: float | None = None
+    for index in range(count):
+        row = rows[index * rsize:(index + 1) * rsize]
+        record: dict = {"code": code, "index": index}
+        offset = 0
+        for datatype, fmt, width in fields:
+            chunk = row[offset:offset + width]
+            offset += width
+            if width != 4:
+                continue
+            raw = struct.unpack("<I", chunk)[0]
+            if datatype == 1:
+                record["ts"] = raw
+            elif fmt in (0x70, 0x64):
+                record[f"dt{datatype}"] = decode_ths_float(raw)
+        cum = record.get("dt49")
+        record["volume"] = cum if prev_cum is None or cum is None else max(cum - prev_cum, 0)
+        if cum is not None:
+            prev_cum = cum
+        record["price"] = record.get("dt10")
+        records.append(record)
+    return records

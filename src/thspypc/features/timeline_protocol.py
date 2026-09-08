@@ -162,7 +162,10 @@ def parse_index_timeline_response(body: bytes) -> list[dict]:
         if (
             len(fields) != field_count
             or sum(width for _, _, width in fields) != record_size
-            or not any(datatype == 10 for datatype, _, _ in fields)
+            # 价格字段：沪深表用 dt10（现价）；北交所 0x0046 表用 dt11（分钟
+            # 收盘价），二者必有其一（2026-09-08 抓包确认 BSE 字段集
+            # 1,7,13,19,11,74,9,8，无 dt10）。
+            or not any(datatype in (10, 11) for datatype, _, _ in fields)
             # dt40（领先线）只在老 index flag 有；当日分时(0x005e/0x0066)和北交所(0x0046/0x006e)无 dt40
             or (not is_today and not is_beijing and not any(
                 datatype == 40 for datatype, _, _ in fields
@@ -211,6 +214,13 @@ def parse_index_timeline_response(body: bytes) -> list[dict]:
                 raw_value = struct.unpack("<I", chunk)[0]
                 if datatype == 1:
                     record["bar_index"] = raw_value
+                elif is_beijing and datatype in (13, 19) and fmt in (0x70, 0x64):
+                    # 北交所 0x0046 表里量/额是 fmt=0x70 定点浮点（如 dt19
+                    # raw=2957192016→4402 元），与沪深表的裸整数不同。
+                    record[f"dt{datatype}"] = (
+                        None if raw_value == 0xFFFFFFFF
+                        else decode_ths_float(raw_value)
+                    )
                 else:
                     record[f"dt{datatype}"] = _decode_timeline_field(
                         datatype,
@@ -218,6 +228,12 @@ def parse_index_timeline_response(body: bytes) -> list[dict]:
                         raw_value,
                     )
             records.append(record)
+        # 北交所分钟表的价格字段是 dt11（分钟收盘），下游/前端统一读 dt10，
+        # 这里做别名映射保持输出契约一致。
+        if is_beijing:
+            for record in records:
+                if "dt10" not in record and record.get("dt11") is not None:
+                    record["dt10"] = record["dt11"]
         return enrich_index_lead_line(records)
 
 

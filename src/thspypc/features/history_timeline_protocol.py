@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import itertools
 import re
 import struct
 from collections.abc import Sequence
@@ -22,10 +23,15 @@ logger = logging.getLogger(__name__)
 
 HISTORY_TIMELINE_PAGEID = 4417
 NORMAL_HISTORY_TIMELINE_PAGEID = 9355
-# 北交所（BSE）专用 pageid（2026-08-06 抓包确认）
-# 个股（920xxx 等，market=151）当日分时走 pageid=10443，DataType 含 dt14/dt15（买卖力量）
+# 北交所（BSE）专用 pageid（2026-08-06 抓包确认；请求构造 2026-09-08 重对齐）
+# 个股（920xxx 等，market=151）当日分时走 pageid=10443
 BEIJING_TIMELINE_PAGEID = 10443
-BEIJING_TIMELINE_DATATYPE = [14, 13, 19, 54, 10, 23, 15, 22]
+# 北交所个股分时 DataType（2026-09-08 抓包，官方客户端 210B 单子帧请求）。
+# 响应只回 8 字段子集：1,7,13,19,11,74,9,8（无 dt14/15 买卖力量）。
+BEIJING_TIMELINE_DATATYPE = [
+    7, 8, 9, 10, 13, 14, 19, 69, 70, 90, 92, 159, 195, 6, 45, 66,
+    380, 402, 407, 663, 665, 1606, 2081, 262763,
+]
 # 北证50 指数（899050，market=144）当日分时走 pageid=11695，DataType 无 dt14/dt15（无买卖力量）
 BEIJING_INDEX_TIMELINE_PAGEID = 11695
 BEIJING_INDEX_TIMELINE_DATATYPE = [272, 207, 42, 271, 228, 13, 41, 227, 19, 40, 10, 224, 23, 202, 223, 22, 201, 208]
@@ -885,20 +891,29 @@ def parse_history_timeline_response(
 
 
 # ── 北交所（BSE）当日分时请求 ──
-# 2026-08-06 抓包确认：
-# - 个股（920xxx，market=151）走 pageid=10443，双子帧 0x09
-#   SUB1 route=0x014a hist=0x20（分时主体，DataType 含 14/15）
-#   SUB2 route=0x0100 hist=0x00（五档伴随，DataType=13,18,24,...,157）
-# - 北证50 指数（899050，market=144）走 pageid=11695，双子帧 0x09
-#   SUB1 route=0x003e hist=0x00（前缀 CodeList+pageid）
-#   SUB2 route=0x013e hist=0x20（分时主体，DataType 无 14/15）
-# 响应均为 hd3.1 BitRLE 表（flag=0x0046 个股 / 0x006e 指数），走
-# parse_index_timeline_response 解码。
+# 2026-09-08 抓包对齐（旧版 2026-08-06 的双子帧构造已被服务端弃用：
+# 固定 seq + DateTime=8192 + route 0x014a 只会收到 52B ACK 回显，无数据）：
+# - 个股（920xxx，market=151）走 pageid=10443，单子帧 0x09
+#   route=0x0100 无 hist 标志，seq 滚动（+2/请求），DateTime=0(0-0)
+# - 北证50 指数（899050，market=144）走 pageid=11695（构造未变，未重抓）
+# 响应：0x0a LZ 压缩外层 + hd3.1 BitRLE 表（flag=0x0046 个股 / 0x006e
+# 指数），个股字段 1,7,13,19,11,74,9,8（dt11=分钟收盘，无 dt10/14/15），
+# 走 parse_index_timeline_response 解码（其内部解 0x0a 压缩并做 dt10 别名）。
 
 BEIJING_TIMELINE_COMPANION_DATATYPE = [
     13, 18, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
     122, 123, 124, 125, 150, 151, 152, 153, 154, 155, 156, 157,
 ]
+
+# 北交所分时 seq：官方客户端每发一个嵌套子帧请求序号滚动 +2（2026-09-08
+# 抓包 stream 内 0x01c7→0x01c9→0x01cb→0x01cf）。服务端按 seq 关联响应，
+# 固定旧值会被 ACK 后丢弃。itertools.count 的 __next__ 在 CPython 下原子。
+_BEIJING_SEQ = itertools.count(0x0200, 2)
+
+
+def next_beijing_timeline_seq() -> int:
+    """北交所嵌套子帧请求的滚动序号（进程内单调递增）。"""
+    return next(_BEIJING_SEQ)
 
 
 def build_beijing_timeline_query(
@@ -906,33 +921,29 @@ def build_beijing_timeline_query(
     market: int = 151,
     datatype: list[int] | None = None,
     pageid: int = BEIJING_TIMELINE_PAGEID,
-    seq: int = 0x1181,
-    companion_seq: int = 0x0184,
+    seq: int | None = None,
 ) -> bytes:
     """构建北交所个股（market=151）当日分时请求（pageid=10443）。
 
-    双子帧结构（0x09 前缀）：
-      SUB1 route=0x014a hist=0x20 — 分时主体（DataType 含 14/15 买卖力量）
-      SUB2 route=0x0100 hist=0x00 — 五档伴随（DataType=TIMELINE_COMPANION）
+    2026-09-08 抓包对齐（旧版双子帧 + 固定 seq + DateTime=8192 的构造已被
+    服务端弃用——只回 52B ACK 不回数据）。官方现行为单子帧：
+      子帧头 subtype=0x0009 route=0x0100 无 hist 标志，seq 滚动；
+      文本 DateTime=0(0-0)、LackTime 全 0、以 ``pageid=10443\\r\\n`` 结尾。
+    响应 flag=0x0046：字段 1,7,13,19,11,74,9,8（dt11=分钟收盘价，
+    无 dt10/dt14/dt15，无大单字段），0x0a LZ 压缩外层。
     """
     if datatype is None:
         datatype = BEIJING_TIMELINE_DATATYPE
-    target = f"{market}({code},);"
+    if seq is None:
+        seq = next_beijing_timeline_seq()
     dt_text = ",".join(str(v) for v in datatype) + ","
     query_text = (
-        f"CodeList={target}\r\nDataType={dt_text}\r\n"
-        f"DateTime={TIMELINE_PERIOD}(0-0)\r\n"
-        f"LackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r"
-    ).encode("gbk")
-    companion_dt = ",".join(str(v) for v in BEIJING_TIMELINE_COMPANION_DATATYPE) + ","
-    companion_text = (
-        f"CodeList={target}\r\nDataType={companion_dt}\r\n"
+        f"CodeList={market}({code},);\r\nDataType={dt_text}\r\n"
         f"DateTime=0(0-0)\r\n"
-        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r"
+        f"LackTime=0,0,0,0,0,0,0,0\r\npageid={pageid}\r\n"
     ).encode("gbk")
-    sub1 = _subframe_header(0x0009, 0x014A, seq, len(query_text), history_flag=True) + query_text
-    sub2 = _subframe_header(0x0009, 0x0100, companion_seq, len(companion_text), history_flag=False) + companion_text
-    return encode_frame(b"\x09" + sub1 + sub2)
+    sub = _subframe_header(0x0009, 0x0100, seq, len(query_text), history_flag=False)
+    return encode_frame(b"\x09" + sub + query_text)
 
 
 def build_beijing_index_timeline_query(
@@ -964,3 +975,102 @@ def build_beijing_index_timeline_query(
     sub1 = _subframe_header(0x0002, 0x003E, prefix_seq, len(prefix_text), history_flag=False) + prefix_text
     sub2 = _subframe_header(0x0009, 0x013E, seq, len(query_text), history_flag=True) + query_text
     return encode_frame(b"\x09" + sub1 + sub2)
+
+
+# ---------------------------------------------------------------------------
+# 北交所历史分时（pageid=10444，DateTime=8192 packed-date bar 窗）
+# ---------------------------------------------------------------------------
+
+# 2026-09-08 日期标定抓包（bse_920083_20260908_161904）确认：
+# - 日期→bar 游标与沪深 packed-date 公式完全一致（见
+#   :func:`date_to_normal_timeline_bar`）：09-07→132725342、09-04→132719198、
+#   09-01→132713054、08-31→132708958，均为 packed(日期)×2048+606，窗宽 355。
+# - 请求为嵌套三子帧（与 4417 同构）：wrapper(route=0x0012, sub=0x0002)
+#   + 主体(route=0x0112, sub=0x0009, hist=0x20, seq 滚动) + 尾帧(route=0x0212)。
+# - CodeList 带双基准：16(1A0002,);32(399002,);151(code,);。
+# - 响应 0x0a LZ 外层 + 多张 hd1.0 表：个股 0x0042/rs28/fc7（字段
+#   1,10,13,19,22,23,54），基准 0x003e/rs24/fc6；个别日期回 94KB
+#   flag=0x0086 大表 + 相同三表——全部由 :func:`parse_history_timeline_response`
+#   按 0x0042 normal_table 形状直接锚定解析（241 行/日，槽位缺失集与沪深
+#   ``_HISTORY_TIMELINE_BAR_OFFSETS`` 完全一致）。
+BSE_HISTORY_TIMELINE_PAGEID = 10444
+BSE_HISTORY_TIMELINE_ROUTE_BASE = 0x0012
+BSE_HISTORY_TIMELINE_DATATYPE = [
+    207, 13, 19, 54, 204, 10, 203, 210, 23, 202, 209,
+    22, 201, 208, 6, 1110, 407, 1111,
+]
+BSE_HISTORY_TIMELINE_BENCHMARKS = ((16, "1A0002"), (32, "399002"))
+
+_BSE_HISTORY_SEQ = itertools.count(0x1155, 2)
+
+
+def next_bse_history_timeline_seq() -> int:
+    """北交所历史分时主体子帧的滚动序号（进程内单调递增）。"""
+    return next(_BSE_HISTORY_SEQ)
+
+
+def build_bse_history_timeline_query(
+    code: str,
+    *,
+    date=None,
+    bar_start: int | None = None,
+    market: int = 151,
+    datatype: list[int] | None = None,
+    pageid: int = BSE_HISTORY_TIMELINE_PAGEID,
+    route_base: int = BSE_HISTORY_TIMELINE_ROUTE_BASE,
+    seq: int | None = None,
+    inner_seq: int = 0x0000,
+) -> bytes:
+    """构建北交所历史分时请求（嵌套三子帧，DateTime=8192 packed-date 窗）。
+
+    ``date``/``bar_start`` 二选一；bar 窗为
+    ``[date_to_normal_timeline_bar(date), +355)``。基准对固定
+    ``16(1A0002,);32(399002,);``（上证指数/深证成指，与官方客户端一致）。
+    """
+    if date is not None:
+        bar_start = date_to_normal_timeline_bar(date)
+    if bar_start is None:
+        raise ValueError("必须传 date 或 bar_start 之一")
+    if datatype is None:
+        datatype = BSE_HISTORY_TIMELINE_DATATYPE
+    if seq is None:
+        seq = next(_BSE_HISTORY_SEQ)
+
+    target_list = f"{market}({code},);"
+    benchmark_list = "".join(
+        f"{bench_market}({bench_code},);"
+        for bench_market, bench_code in BSE_HISTORY_TIMELINE_BENCHMARKS
+    )
+    dt_text = ",".join(str(value) for value in datatype) + ","
+    full_text = (
+        f"CodeList={benchmark_list}{target_list}\r\nDataType={dt_text}\r\n"
+        f"DateTime={TIMELINE_PERIOD}({bar_start}-{bar_start + HISTORY_TIMELINE_BAR_SPAN})\r\n"
+        f"DTPrevOff=-61\r\nLackTime=0,3,0,0,0,0,0,0\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    target_text = (
+        f"CodeList={target_list}\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+    tail_text = (
+        f"CodeList={benchmark_list}\r\npageid={pageid}\r\n"
+    ).encode("gbk")
+
+    prefix_frame = _subframe_header(
+        0x0002,
+        route_base,
+        inner_seq,
+        len(target_text),
+    ) + target_text
+    full_frame = _subframe_header(
+        0x0009,
+        0x0100 | route_base,
+        seq,
+        len(full_text),
+        history_flag=True,
+    ) + full_text
+    tail_frame = _subframe_header(
+        0x0002,
+        0x0200 | route_base,
+        inner_seq,
+        len(tail_text),
+    ) + tail_text
+    return encode_frame(b"\x09" + prefix_frame + full_frame + tail_frame)

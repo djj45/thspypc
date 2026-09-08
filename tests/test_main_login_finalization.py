@@ -433,3 +433,67 @@ def test_refresh_failure_returns_all_hosts_failed(monkeypatch):
 
     assert not result.success
     assert result.error == "all_hosts_failed"
+
+
+def test_independent_main_main_hosts_only_filters_to_main_group(monkeypatch):
+    """BSE_MAIN 车道只用 main.123ths.com 组（北交所 151 数据开关，2026-09-08）。"""
+    client = _client()
+    sock = FakeSocket()
+    material = SimpleNamespace(
+        passport64="fresh-passport",
+        passport_bytes=b"passport-dns",
+    )
+    calls = []
+    monkeypatch.setattr(
+        client, "authenticate",
+        lambda *, force=False: calls.append(("auth", force)) or material,
+    )
+
+    def resolve(passport, *, main_only=False):
+        calls.append(("resolve", passport, main_only))
+        return ["192.0.2.1"] if main_only else ["192.0.2.1", "192.0.2.9"]
+
+    monkeypatch.setattr(client, "_resolve_market_hosts", resolve)
+    monkeypatch.setattr(
+        client, "_probe_fastest_hosts",
+        lambda hosts, timeout, role: calls.append(("probe", tuple(hosts))) or list(hosts),
+    )
+    monkeypatch.setattr(
+        client._auth_service, "login_body_for_passport",
+        lambda passport: b"login",
+    )
+    monkeypatch.setattr(
+        client, "_concurrent_login",
+        lambda hosts, body: calls.append(("race", tuple(hosts)))
+        or (hosts[0], sock, {"VerifyCode": "0"}),
+    )
+    monkeypatch.setattr(
+        client, "_initialize_independent_main_socket",
+        lambda current: calls.append(("init", current)),
+    )
+
+    assert client._open_independent_main_connection(main_hosts_only=True) is sock
+    assert ("resolve", b"passport-dns", True) in calls
+    assert ("race", ("192.0.2.1",)) in calls  # ifindhq 组 192.0.2.9 被过滤
+
+
+def test_bse_main_role_opens_main_only_connection(monkeypatch):
+    """BSE_MAIN 角色工厂走 main_hosts_only 的独立连接。"""
+    from thspypc._transport import ConnectionRole
+    from thspypc._transport.connection import CONNECTION_SPECS
+
+    client = _client()
+    sock = FakeSocket()
+    opened = []
+    monkeypatch.setattr(
+        client, "_open_independent_main_connection",
+        lambda **kwargs: opened.append(kwargs) or sock,
+    )
+
+    spec = CONNECTION_SPECS[ConnectionRole.BSE_MAIN]
+    connection = client._open_service_connection(spec)
+
+    assert connection.socket is sock
+    assert connection.owns_socket is True
+    assert connection.initialized is True
+    assert opened == [{"main_hosts_only": True}]

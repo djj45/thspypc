@@ -1140,3 +1140,19 @@ def test_runtime_reconnects_after_transport_failure_marks_main_dead(env_file):
 
     assert runtime.call(lambda _client: "ok") == "ok"
     assert fake.calls == [("connect",), ("connect",)]
+
+
+def test_superorder_replay_bse_returns_empty_index(client_and_app):
+    # 北交所（151）无 4096/7169 回放通道：返回空索引，不调 snapshot_replay、
+    # 不抛 400（2026-09-08 实测前端错误横幅）。
+    fake, client = client_and_app
+
+    replay = client.get(
+        "/api/superorder-replay/920118",
+        params={"market": 151},
+    )
+
+    assert replay.status_code == 200
+    assert replay.json()["count"] == 0
+    assert replay.json()["index"] == []
+    assert not any(call[0] == "snapshot_replay" for call in fake.calls)

@@ -117,6 +117,81 @@ def _superorder_l2_role(market: int) -> ConnectionRole:
     raise ValueError(f"7169 逐笔回放暂不支持市场码: {market}")
 
 
+def bse_tick_window(
+    service,
+    code: str,
+    *,
+    market: int,
+    start_ts: int,
+    end_ts: int,
+    timeout: float = 12.0,
+    tag: int | None = None,
+    pageid: int | None = None,
+    route: int | None = None,
+    flag14: int | None = None,
+    byte16: int | None = None,
+    byte17: int | None = None,
+) -> list[dict]:
+    """北交所秒级逐笔/竞价窗口（7176 当日 / 6144 历史竞价，走 MAIN）。
+
+    ``tag`` 等参数不传时用 7176 默认；历史竞价窗传 ``tag=6144,
+    pageid=10444, route=0x0100, flag14=0, byte16=0, byte17=0x18``
+    （响应同为 0x003a 表）。
+    """
+    from ..features.superorder_protocol import (
+        build_bse_tick_window_query,
+        parse_bse_tick_response,
+    )
+
+    connection = service._connections.acquire(ConnectionRole.BSE_MAIN, capability=None)
+    builder_kwargs = {}
+    if tag is not None:
+        builder_kwargs["tag"] = tag
+    if pageid is not None:
+        builder_kwargs["pageid"] = pageid
+    if route is not None:
+        builder_kwargs["route"] = route
+    if flag14 is not None:
+        builder_kwargs["flag14"] = flag14
+    if byte16 is not None:
+        builder_kwargs["byte16"] = byte16
+    if byte17 is not None:
+        builder_kwargs["byte17"] = byte17
+    request = build_bse_tick_window_query(
+        code,
+        market=market,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        **builder_kwargs,
+    )
+    deadline = time.monotonic() + timeout
+    unsolicited = 0
+    with connection.request(request, timeout=timeout) as sock:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"BSE tick window timed out after {unsolicited} unsolicited frames"
+                )
+            sock.settimeout(remaining)
+            try:
+                response = service._read_frame(sock)
+            except socket.timeout:
+                raise TimeoutError(
+                    f"BSE tick window timed out after {unsolicited} unsolicited frames"
+                ) from None
+            if (
+                not response.startswith(b"\x0a")
+                and b"hd3.1\x00" not in response
+            ):
+                unsolicited += 1
+                continue
+            records = parse_bse_tick_response(response)
+            if records and any(r.get("code") == code for r in records):
+                return [r for r in records if r.get("code") == code]
+            unsolicited += 1
+
+
 class SuperorderService:
     """在持有 L2 连接请求锁的前提下执行一次 7169 逐笔成交回放请求。
 

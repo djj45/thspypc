@@ -218,6 +218,10 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         trade_date: str | None,
         market: int,
     ) -> list[dict]:
+        # 北交所（151）没有 4096/7169 盘口回放通道（官方客户端走 7176 秒级
+        # 逐笔）：返回空索引，前端显示 0 个快照而不是 400 错误横幅。
+        if (market or _market_for_code(code)) == 151:
+            return []
         key = (code, trade_date or "today", market)
         # 当日回放由 WebSocket 增量补充；一分钟内重复切页/点光标无需重新
         # 下载约 500KB 的 4096 全表，更不能与 717x 请求反复争用 L2 lane。

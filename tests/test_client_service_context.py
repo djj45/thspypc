@@ -1536,33 +1536,76 @@ def test_historical_index_intraday_has_no_auction_phases(monkeypatch):
     ]
 
 
-def test_beijing_stock_intraday_skips_auction_phases(monkeypatch):
-    from datetime import date as date_type
+def test_beijing_stock_market_events_prepare_skips_l2_registration():
+    # 北交所无 shlv2/szlv2 通道：stock-ready 门禁不得抛 500（2026-09-08 实测）。
+    client = _client()
+    assert client.market_events_prepare("920118", market=151) == 151
+    assert client.market_events_prepare("920118") == 151
+
+
+def test_beijing_stock_depth_quote_returns_empty_book():
+    # 北交所盘口（10443 五档）未实现，返回空盘口而非抛错（前端显示无数据）。
+    client = _client()
+    assert client.depth_quote("920118", market=151) == {}
+    assert client.depth_quote("920118", market=151, ten_levels=True) == {}
+
+
+def test_beijing_stock_order_queues_return_empty():
+    # 北交所无 7173/7174 队列通道：返回空队列而非抛错。
+    client = _client()
+    assert client.order_queues("920118", market=151) == {}
+
+
+def test_beijing_stock_intraday_synthesizes_from_kline(monkeypatch):
+    from datetime import date as date_type, datetime
 
     client = _client()
     monkeypatch.setattr(
         client,
         "auction",
         lambda *_args, **_kwargs: pytest.fail(
-            "BSE intraday must not request opening auction"
+            "BSE intraday must not request SH/SZ opening auction"
         ),
     )
     monkeypatch.setattr(
         client,
         "closing_auction",
         lambda *_args, **_kwargs: pytest.fail(
-            "BSE intraday must not request closing auction"
+            "BSE intraday must not request SH/SZ closing auction"
         ),
     )
-    timeline_calls = []
-    monkeypatch.setattr(
-        client,
-        "timeline",
-        lambda code, **kwargs: (
-            timeline_calls.append((code, kwargs))
-            or [{"dt10": 10.5}]
-        ),
-    )
+    # BSE 早盘竞价走 6144 窗（_bse_opening_auction），不走沪深 auction()。
+    auction_calls = []
+
+    def fake_opening(code, *, market, trade_date, timeout):
+        auction_calls.append((code, trade_date, timeout))
+        return [
+            {"time": datetime(2026, 9, 8, 9, 15, 5), "dt10": 22.19, "dt13": 100},
+            {"time": datetime(2026, 9, 8, 9, 24, 44), "dt10": 22.09, "dt13": 205},
+        ]
+
+    monkeypatch.setattr(client, "_bse_opening_auction", fake_opening)
+
+    # 1 分钟K夹带上一交易日尾巴（bar_index 隔夜大跳变），合成时应切除。
+    minute_bars = [
+        {"bar_index": 900, "open": 1.0, "high": 1.0, "low": 1.0,
+         "close": 1.0, "volume": 10.0, "amount": 10.0},
+        {"bar_index": 1900, "open": 10.0, "high": 11.0, "low": 9.5,
+         "close": 10.5, "volume": 100.0, "amount": 1050.0},
+        {"bar_index": 1901, "open": 10.5, "high": 10.8, "low": 10.2,
+         "close": 10.6, "volume": 200.0, "amount": 2120.0},
+    ]
+    kline_calls = []
+
+    def fake_kline(code, *, period, **kwargs):
+        kline_calls.append((code, period, kwargs.get("fuquan")))
+        if period == "day":
+            return [
+                {"time": "2026-07-23", "bar_index": 5100, "close": 9.9},
+            ]
+        return list(minute_bars)
+
+    monkeypatch.setattr(client, "kline", fake_kline)
 
     result = client.intraday(
         "920083",
@@ -1570,18 +1613,89 @@ def test_beijing_stock_intraday_skips_auction_phases(monkeypatch):
         trade_date=date_type.today().isoformat(),
     )
 
-    assert result == [{"phase": "continuous", "dt10": 10.5}]
-    assert timeline_calls == [
-        ("920083", {"market": 151, "timeout": 12.0})
+    assert [r["phase"] for r in result] == [
+        "opening_auction", "opening_auction", "continuous", "continuous",
+    ]
+    first, second = result[-2:]
+    assert first["dt10"] == 10.5 and first["dt13"] == 100 and first["dt19"] == 1050
+    assert second["dt10"] == 10.6 and second["dt13"] == 300 and second["dt19"] == 3170
+    assert "dt14" not in first and "dt227" not in first
+    assert kline_calls[0] == ("920083", "1min", "N")
+    assert auction_calls[0][0] == "920083"
+
+
+def test_beijing_stock_intraday_historical_uses_8192_window(monkeypatch):
+    from datetime import date as date_type
+
+    import thspypc.services.timeline as timeline_svc
+
+    client = _client()
+    hist_calls = []
+
+    def fake_hist(service, code, *, date, market, timeout):
+        hist_calls.append((code, date, market))
+        return [
+            {"bar_index": 132719198, "dt10": 21.6, "dt13": 3100.0,
+             "dt19": 66960.0, "dt22": 11400.0, "dt23": 7302.0},
+            {"bar_index": 132719199, "dt10": 21.61, "dt13": 3300.0,
+             "dt19": 71286.0, "dt22": 11500.0, "dt23": 7402.0},
+            {"bar_index": 132719552, "dt10": 21.94, "dt13": 929425.0,
+             "dt19": 20466813.0, "dt22": 9560.0, "dt23": 18861.0},
+        ]
+
+    monkeypatch.setattr(timeline_svc, "bse_history_timeline", fake_hist)
+    monkeypatch.setattr(
+        client,
+        "_bse_opening_auction",
+        lambda *a, **k: [
+            {"time": "2026-09-04T09:15:02", "dt10": 21.19, "dt13": 500},
+        ],
+    )
+    # 历史日期不得触发当日分钟K合成。
+    monkeypatch.setattr(
+        client,
+        "kline",
+        lambda *_a, **_k: pytest.fail("BSE 历史分时不得请求分钟K"),
+    )
+
+    result = client.intraday(
+        "920118",
+        market=151,
+        trade_date="2026-09-04",
+    )
+
+    assert [r["phase"] for r in result] == [
+        "opening_auction", "continuous", "continuous", "continuous",
+    ]
+    continuous = result[1:]
+    assert [r["minute_index"] for r in continuous] == [0, 1, 2]
+    assert continuous[0]["bar_index"] == 132719198
+    assert continuous[0]["dt10"] == 21.6
+    assert continuous[-1]["dt10"] == 21.94
+    assert continuous[-1]["dt13"] == 929425
+    # date 透传为 date 对象（intraday 内部已归一化）
+    assert hist_calls == [
+        ("920118", date_type(2026, 9, 4), 151),
     ]
 
-    # 非交易日/盘前同样走 timeline（服务端返回最近交易日序列），不请求竞价。
-    result = client.intraday(
-        "920083",
-        market=151,
-        trade_date="2026-07-23",
+
+def test_beijing_stock_intraday_historical_failure_returns_empty(monkeypatch):
+    import thspypc.services.timeline as timeline_svc
+
+    client = _client()
+    monkeypatch.setattr(
+        timeline_svc,
+        "bse_history_timeline",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("boom")),
     )
-    assert result == [{"phase": "continuous", "dt10": 10.5}]
+    monkeypatch.setattr(client, "_bse_opening_auction", lambda *a, **k: [])
+    # 连接失败时关闭 MAIN 连接由 _service_connections 为 None 时跳过。
+    result = client.intraday(
+        "920118",
+        market=151,
+        trade_date="2026-09-04",
+    )
+    assert result == []
 
 
 def test_controlled_opener_builds_and_caches_borrowed_l2_socket(

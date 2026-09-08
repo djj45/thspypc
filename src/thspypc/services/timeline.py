@@ -442,3 +442,64 @@ class TimelineService:
         if saw_history_frame:
             raise ProtocolError("收到历史分时帧但无法安全恢复")
         return []
+
+
+def bse_history_timeline(
+    service: "TimelineService",
+    code: str,
+    *,
+    date,
+    market: int = 151,
+    timeout: float = 12.0,
+) -> list[dict]:
+    """北交所历史分时（pageid=10444 嵌套 8192 packed-date 窗，走 MAIN）。
+
+    2026-09-08 日期标定抓包确认：bar 窗 = ``packed(日期)×2048+606`` 起、
+    宽 355，请求/响应与官方客户端逐字节一致；响应的个股表（0x0042/rs28/
+    fc7）直接由 :func:`parse_history_timeline_response` 锚定解析出 241 行。
+    """
+    from ..features.history_timeline_protocol import (
+        build_bse_history_timeline_query,
+    )
+
+    connection = service._connections.acquire(
+        ConnectionRole.BSE_MAIN,
+        capability=None,
+    )
+    frame = build_bse_history_timeline_query(code, date=date, market=market)
+    deadline = time.monotonic() + timeout
+    unsolicited = 0
+    saw_history_frame = False
+    with connection.request(frame, timeout=timeout) as sock:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if saw_history_frame:
+                    # 收到历史帧但未能安全锚定（强省略变体）：返回空表，
+                    # 由上层重试（与沪深 history_timeline 语义一致）。
+                    return []
+                raise TimeoutError(
+                    "BSE history timeline timed out after "
+                    f"{unsolicited} unsolicited frames"
+                )
+            sock.settimeout(remaining)
+            try:
+                response = service._read_frame(sock)
+            except socket.timeout:
+                if saw_history_frame:
+                    return []
+                raise TimeoutError(
+                    "BSE history timeline timed out after "
+                    f"{unsolicited} unsolicited frames"
+                ) from None
+            if (
+                not response.startswith(b"\x0a")
+                and b"hd1.0" not in response
+                and b"hd3.1" not in response
+            ):
+                unsolicited += 1
+                continue
+            saw_history_frame = True
+            records = parse_history_timeline_response(response, code=code)
+            if records:
+                return records

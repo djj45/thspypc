@@ -109,9 +109,11 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         return parse_login_response(body)
 
     @staticmethod
-    def _resolve_market_hosts(passport: bytes) -> list[str]:
+    def _resolve_market_hosts(
+        passport: bytes, *, main_only: bool = False
+    ) -> list[str]:
         """Compatibility hook for diagnostics replacing host resolution."""
-        return resolve_market_hosts(passport)
+        return resolve_market_hosts(passport, main_only=main_only)
 
     def __init__(self, username: str, password: str, imei: str | None = None, mac64: str | None = None,
                  enable_heartbeat: bool = True):
@@ -787,6 +789,15 @@ class THSClient(ConnectionPrimitives, ServiceFacade):
         if spec.role is ConnectionRole.KLINE_FAST:
             return OpenedConnection(
                 socket=self._open_independent_main_connection(),
+                owns_socket=True,
+                initialized=True,
+            )
+        if spec.role is ConnectionRole.BSE_MAIN:
+            # 北交所数据只在 main.123ths.com 组下发（ifindhq 回 CodeListSize=0）。
+            return OpenedConnection(
+                socket=self._open_independent_main_connection(
+                    main_hosts_only=True
+                ),
                 owns_socket=True,
                 initialized=True,
             )
