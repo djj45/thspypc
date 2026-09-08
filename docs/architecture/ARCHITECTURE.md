@@ -8,7 +8,7 @@
 ```text
 THSClient                         公开门面与兼容入口
     ├── ServiceFacade             service-backed 公开行情方法
-    ├── ConnectionPrimitives      MAIN/L2/REALORDER 登录与建连原语
+    ├── ConnectionPrimitives      MAIN/BSE_MAIN/L2/REALORDER 登录与建连原语
     ├── ConnectionFactory         角色建连与 MAIN 登录编排
     ├── ConnectionRuntime         心跳、推送 reader 与关闭顺序
     ├── MarketSession             8901 同步请求生命周期
@@ -19,6 +19,8 @@ THSClient                         公开门面与兼容入口
 features/                        各业务纯协议 builder/parser
 services/                        能力校验、连接选择与完整业务工作流
 codecs/                          帧、压缩、hd1/hd3、数值编码
+server/                          FastAPI 单用户 REST + WebSocket（见下节）
+web/                             React 看盘前端（仓库顶层，vite + echarts）
 protocol.py                      历史 API 兼容导出 + HTTP 鉴权/主机解析
 parse_hfd1.py                    全市场快照解码
 qr_login.py                      二维码和凭证缓存
@@ -37,10 +39,13 @@ qr_login.py                      二维码和凭证缓存
 
 1. 每条 8901 socket 同一时间只能有一个同步业务请求；
 2. 请求锁必须覆盖设置 timeout、发送、读取和匹配全部响应；
-3. 业务请求进行中，后台心跳跳过本轮发送；
+3. 业务请求进行中，后台心跳跳过本轮发送；反向同理——业务请求等待心跳短探针
+   让道时设 **3 秒上限**（探针必须可被业务请求打断，不能让业务白等一个完整
+   探针超时周期）；
 4. 不允许功能方法脱离 `MarketSession` 新增“只锁 send、锁外 read”的代码；
 5. 需要真正并行时，应增加独立连接或实现单 reader + 帧分发器，不能让多个线程
-   直接读取同一 socket。
+   直接读取同一 socket。`KLINE_FAST`（K 线快路径独立 MAIN 连接）就是按此
+   规则落地的并行化实例。
 
 当前 `MarketSession` 是同步 single-flight 实现。它是安全基线，不代表未来不能
 升级为 dispatcher。
@@ -88,11 +93,15 @@ tools/reverse/       一次性逆向和诊断脚本
 
 在目录迁移完成前，新代码至少要有无需账号的离线测试，活网脚本不能作为唯一验收。
 
-## 前端 / API 层接入约束
+## 前端 / API 层接入约束（已落地）
 
-当后续需要为同花顺风格前端（自选股 + K线 + 分时 + 盘口 + 异动 + 板块）提供
-HTTP 接口时，应在 `THSClient` 之上增加一层 `api.py`（或独立服务进程）。但该层
-**不是现在就要做的事**，它的正确性取决于下层先收尾的两个前置条件。
+> **状态（2026-09-08）**：本节规划的 `api.py` 已落地为 `src/thspypc/server/`
+> （FastAPI 单用户 REST + WebSocket，接口见 `docs/guides/WEB_API.md`），配套
+> `web/` React 看盘前端。下文保留当初的分层约束，作为该层继续演进时的边界。
+
+为同花顺风格前端（自选股 + K线 + 分时 + 盘口 + 异动 + 板块）提供 HTTP 接口时，
+在 `THSClient` 之上保留一层薄 HTTP 适配（`server/app.py`），其正确性依赖下层的
+两个前置条件（均已完成）。
 
 ### 分层位置
 
@@ -160,9 +169,18 @@ features → codecs
 - `THSClient.connect_main()`：按需连接 `main.123ths.com`（缺失时回退
   `ifindhq.123ths.com`），在 MAIN socket 上执行
   `login -> 标准 init`；`connect()` 是其兼容入口。
+- `KLINE_FAST`：K 线快路径（`channel="ifindhq_fast"`）的独立 MAIN 连接，
+  登录/init 与 MAIN 相同，只是不与 MAIN 业务共用单飞锁。
+- `BSE_MAIN`：北交所（market 151）专用连接——只在 `main.123ths.com` 组登录
+  （`main_only=True`，不回退 ifindhq），登录/init 与 MAIN 相同。北交所历史
+  分时/竞价窗/当日超级盘口共用该连接（路由依据见
+  `docs/architecture/SERVER_MATRIX.md`）。
 - `SH_L2` / `SZ_L2`：首次 Level2 请求时分别连接 `shlv2` / `szlv2`，在各自
   socket 上执行 `thsuser` 标准行情登录壳 -> 市场 init。
+- `BOARD` / `BOARD_CONSTITUENT_SH` / `BOARD_CONSTITUENT_SZ`：板块指数通道
+  （fu4）与成分股独立连接，身份按账号类型分支（详见 SERVER_MATRIX）。
 - `REALORDER`：首次 9601 请求时建立并登录独立连接。
+- `BOARD_STATS`：9601 statscalc 独立统计节点（懒连接，可环境变量覆盖）。
 
 每个角色都独立拥有 TCP 登录态、init 状态、读写锁和重连策略。普通账号支持应通过
 `AccountProfile` / `Capability` 决定允许建立哪些角色连接，而不是改变上述生命周期

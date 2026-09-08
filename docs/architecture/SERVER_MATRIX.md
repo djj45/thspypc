@@ -4,7 +4,7 @@
 `M_hqdns`，具体 IP 由 DNS 动态解析，不能把某次解析结果写死为长期配置。
 9601 REALORDER 是例外：官方配置提供固定 seed，并可缓存服务端选择的物理节点。
 
-更新时间：2026-08-09。
+更新时间：2026-09-08（新增 BSE_MAIN / KLINE_FAST 角色与北交所路由约束）。
 
 ## 结论：`stock_list` 请求哪种服务器
 
@@ -43,7 +43,9 @@ pageid=5716
 | 连接角色 | 地址 | 登录身份 / 初始化 | 权限要求 | 已验证用途 |
 |---|---|---|---|---|
 | HTTP 鉴权 | `auth.10jqka.com.cn:80` | HTTP 三步鉴权 | 有效账号、密码或扫码凭据 | 获取 passport、signature、`M_hqdns` |
-| MAIN | `main.123ths.com:8901`（优先）/ `ifindhq.123ths.com:8901`（兼容回退） | 普通登录；`VerifyCode=0` 后发送标准 MAIN init，不发送 `__manual` L2 init | `BASIC_QUOTE` / `BASIC_TIMELINE` / `BASIC_HISTORY_TIMELINE` / `BASIC_AUCTION` | 日 K、9355 当日分时与历史分时、早盘/尾盘竞价、股票列表、排序榜、DDE 与批量行情 |
+| MAIN | `main.123ths.com:8901`（优先）/ `ifindhq.123ths.com:8901`（兼容回退） | 普通登录；`VerifyCode=0` 后发送标准 MAIN init，不发送 `__manual` L2 init；init 文本 `MarketCode=16;144;` + `MarketDate=16(0);32(0);144(0);`（2026-09-08 A/B：缺 `32(0)` 时 main 组对含 151 的请求不下发个股表） | `BASIC_QUOTE` / `BASIC_TIMELINE` / `BASIC_HISTORY_TIMELINE` / `BASIC_AUCTION` | 日 K、9355 当日分时与历史分时、早盘/尾盘竞价、股票列表、排序榜、DDE 与批量行情 |
+| KLINE_FAST | `main.123ths.com:8901` 组（独立 socket，与 MAIN 并存） | 与 MAIN 同（普通登录 + 标准 init） | `BASIC_QUOTE` | K 线快路径专用连接（`channel="ifindhq_fast"`，web 首屏/预热用），避免 K 线与 MAIN 业务请求在同一把锁上互相排队 |
+| BSE_MAIN | **仅** `main.123ths.com:8901` 组（`main_only=True`，不含 ifindhq 回退） | 与 MAIN 同（普通登录 + 标准 init） | 与 MAIN 同（无独立 capability） | 北交所 market 151 专用：历史分时 10444（8192 packed-date 窗）、历史/当日竞价窗 7176/6144、当日超级盘口 1207 的 `DateTime=4096(0-0)` 全日逐笔（2026-09-08 抓包 + 活网验证） |
 | SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + `LoginIdentity.L2`（无 UserName/Password 的 7 字段壳，2026-08-10 抓包确认）；init `MarketCode=16;144;` | Level2 账号，且 `L2_MARKET_ACCESS` 已有成功证据；具体功能还分别受 `L2_TIMELINE`、`L2_AUCTION`、`L2_SNAPSHOT_PUSH`、`L2_HISTORY_TIMELINE` 控制 | 沪市 L2 分时（1334）、日 K、竞价、快照推送、历史分时、十档、逐笔回放与委托队列 |
 | SZ_L2 | `szlv2.123ths.com:8901` | Level2 passport + `LoginIdentity.L2`（无 UserName/Password 的 7 字段壳）；init `MarketCode=32;` | 同 SH_L2 | 深市 L2 分时（1334）、日 K、竞价、快照推送、历史分时、十档、逐笔回放与委托队列 |
 | BOARD | `fu4.123ths.com:8901`（从 `M_hqdns` 解析） | 板块通道 `LoginIdentity.BOARD`：Level2 账号无 UserName/Password，普通账号 `UserName=__manual`（2026-08-10 抓包纠正）；`MarketCode=96;128;88;216;48;` + subreal 注册 | `BASIC_QUOTE`（板块指数走该角色门控） | 板块指数列表/行情/分时/竞价（`board_quotes` / `board_timeline` / `board_auction`） |
@@ -67,7 +69,7 @@ pageid=5716
 | `fu4.123ths.com` | 8901 | `96;128;88;URS;UCT;UNX;UCX;UME;216;48` | 板块指数路由，已双账号活网验证 | 已实现 `ConnectionRole.BOARD`（板块指数行情/分时/竞价） |
 | `hkus.123ths.com` | 8901 | `176;112` 和 `168;184;200` | 域名指向港股组；具体品种和账号权限未验证 | 未实现 |
 | `ifindhq.123ths.com` | 8901 | `232;120;104;56` | 尽管公告字段不是沪深 16/32，活网已验证它可承担 A 股 MAIN 请求 | 已实现为 `main` 缺失时的兼容回退 |
-| `main.123ths.com` | 8901 | 普通客户端 MAIN 路由 | 普通账号冷启动实际连接；沪深基础请求同构 | 已实现为 MAIN 首选域名 |
+| `main.123ths.com` | 8901 | 普通客户端 MAIN 路由 | 普通账号冷启动实际连接；沪深基础请求同构 | 已实现为 MAIN 首选域名；北交所走 BSE_MAIN（同为 main 组、独立连接） |
 | `fu2.123ths.com` | 8901 | `64;80;UGF;UZC;UDE` | 多市场路由；确切用途和权限未验证 | 未实现 |
 | `euhq.123ths.com` | 8901 | `160` | 域名表明欧洲行情组；业务和权限未验证 | 未实现 |
 | `fu6.123ths.com` | 8601 | `UZX` | 独立 8601 通道；用途和权限未验证 | 未实现 |
@@ -81,6 +83,14 @@ pageid=5716
 
 - MAIN 优先从 `main` 解析 IP，缺失时回退 `ifindhq`。把 `fu4`、`hkus`、`euhq` 等 IP 混入 MAIN，
   可能登录成功，但已观察到沪深基础行情请求超时。
+- **北交所（market 151）只走 main 组**（2026-09-08 实测）：同账号同请求在 `ifindhq` 节点
+  （如 `8.134.121.153`）被回 `CodeListSize=0` 且不下发 151 数据；main 组（如 `8.134.108.168`）
+  正常。因此北交所业务使用 `BSE_MAIN` 角色（`main_only=True`，永不回退 ifindhq）。另外
+  MAIN/BSE_MAIN 标准 init 的 `MarketDate` 必须含 `32(0)`——缺它时即使连对了 main 组，含 151
+  的请求也被丢弃（10444 历史分时/6144 竞价全无响应）。北交所超级盘口（1207 页 4096）与
+  历史分时/竞价共用该连接；北交所**无** 沪深式 L2 通道（4096 十档回放/7173/7174 队列/
+  7175/7170/7171 挂撤），官方形态见
+  `docs/handoffs/HANDOFF_BSE_HISTORY_SUPERORDER_20260908.md`。
 - 沪深 L2 必须分服。`shlv2` 与 `szlv2` 的 DNS IP 集合当前完全不重叠；
   沪票连 `shlv2` 并 init `16;144`，深票连 `szlv2` 并 init `32`。
 - MAIN 必须完成自己的标准 init；L2 市场 init 只发送到 `shlv2` / `szlv2`。

@@ -3,7 +3,10 @@
 > 目标：读这一份文档就能理解 thspypc 如何登录、如何向哪台服务器发送什么请求、如何解析响应，
 > 以及各功能在源码里的位置，无需再逐行翻源码。需要精确到字节时，再按“代码地图”进入对应文件。
 >
-> 适用范围：A 股（沪深北）免费 PC 行情。日期基准：2026-08-09，协议以同花顺 PC 客户端抓包逆向为准。
+> 适用范围：A 股（沪深北）免费 PC 行情。日期基准：2026-09-08，协议以同花顺 PC 客户端抓包逆向为准。
+> 2026-09-08 增补：北交所协议族全链路——历史分时 10444（嵌套 8192 packed-date 窗）、竞价窗
+> 7176/6144、当日超级盘口 1207 页 `DateTime=4096`（0x0096 表逐笔+五档）、`BSE_MAIN` 专用连接
+> 与 init `MarketDate` 必含 `32(0)`。
 > 2026-08-06 增补：买卖力量字段（dt14/dt15）、北交所（BSE）分时协议（pageid 10443/11695）、main.123ths.com 网关发现。
 > 2026-08-01 增补：系统板块（行业/概念板块指数、成分股）通道与协议、历史分时 packed-date 游标修正。
 > 2026-08-09 增补：DDE 排名 API、7173/7174 委托队列、十档盘口实时推送收口计划。
@@ -18,9 +21,11 @@ thspypc 是一条**三层链路**：
 flowchart LR
     A[HTTP 鉴权<br/>auth.10jqka.com.cn:80] -->|passport64 + M_hqdns 域名清单| B[行情 TCP 8901]
     B --> B1[MAIN 普通行情]
+    B --> B1b[BSE_MAIN 北交所专用<br/>仅 main 组]
     B --> B2[shlv2 沪市 L2]
     B --> B3[szlv2 深市 L2]
     B1 --> C[普通: 9355 当日分时·日K·历史分时 / 竞价 / 列表]
+    B1b --> C2[BSE: 10443 分时 / 10444 历史 / 7176·6144 竞价 / 1207 超级盘口]
     B2 --> D[L2: 1334 分时·日K·竞价 / 4214 十档·逐笔 / 4417 历史]
     B3 --> E[同左，深市]
     B --> B4[REALORDER 9601 异动订阅/推送]
@@ -32,9 +37,9 @@ flowchart LR
 1. **HTTP 鉴权**（`src/thspypc/features/auth_protocol.py`、`src/thspypc/protocol.py`）：账号密码/二维码换 `Passport64`，
    并拿到服务器域名清单 `M_hqdns`。鉴权不建立行情连接。
 2. **行情 TCP 8901**（`src/thspypc/_transport/`、`src/thspypc/_client/connection_primitives.py`）：
-   每类服务器各自 `login → init → 请求/响应`，连接按角色（MAIN / SH_L2 / SZ_L2 / REALORDER /
-   BOARD / BOARD_CONSTITUENT_SH / BOARD_CONSTITUENT_SZ）复用，
-   带单飞锁、心跳和失败治理。
+   每类服务器各自 `login → init → 请求/响应`，连接按角色（MAIN / KLINE_FAST / BSE_MAIN /
+   SH_L2 / SZ_L2 / REALORDER / BOARD / BOARD_CONSTITUENT_SH / BOARD_CONSTITUENT_SZ /
+   BOARD_STATS）复用，带单飞锁、心跳和失败治理。
 3. **业务协议**（`src/thspypc/features/*_protocol.py`）：请求是 **GBK 文本行**（`CodeList/DataType/DateTime/pageid`），
    响应是 **hd1.0 / hd3.1 二进制表**，部分响应外层还有 8901 LZ77 压缩。
 
@@ -155,10 +160,16 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 
 | 通道 | init 内容 | 期望响应 |
 |---|---|---|
-| MAIN | 标准 init | 服务器配置帧 ~49KB（S-OS/S-Version/SName），0.1s 返回 |
+| MAIN / BSE_MAIN / KLINE_FAST | 标准 init（文本含 `MarketCode=16;144;` + `MarketDate=16(0);32(0);144(0);`） | 服务器配置帧 ~49KB（S-OS/S-Version/SName），0.1s 返回 |
 | shlv2 | `MarketCode=16;144;` | 配置帧 23KB+；<5000B 视为该 IP 未激活，换 IP |
 | szlv2 | `MarketCode=32;` | 同上；深市必须连 szlv2（MAIN 节点对 L2 只回 210B 小帧） |
 | BOARD（fu4） | `MarketCode=96;128;88;216;48;`（含 MarketDate/StockLinkVer） | 引导是逐帧流水（subreal 注册 → init → qureal-init → 分类表 → StockNameVer），见 11 节 |
+
+> **`MarketDate` 必须含 `32(0)`（2026-09-08 A/B 实测）**：`MarketDate=16(0);144(0);`
+> 时服务端对含 151（北交所）的 CodeList 回 `CodeListSize=0`，10444 历史分时 / 6144
+> 竞价全部无响应；补上 `32(0)` 后立即恢复（与官方客户端 init 对齐）。`MarketCode`
+> 保持 `16;144;` 不加 151——部分 main 组 IP 拒绝含 151 的 init，且北交所分时不需要
+> init 声明 151。
 
 ### 4.4 登录后
 
@@ -192,15 +203,23 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 |---|---|---|---|---|
 | HTTP | `auth.10jqka.com.cn:80` | 三步鉴权 | 有效账号/二维码 | passport、signature、M_hqdns |
 | MAIN | `main.123ths.com:8901`（优先，支持北交所）/ `ifindhq.123ths.com:8901`（回退，不支持北交所） | 普通登录 + 标准 init | `BASIC_*` | 日K、9355 当日分时、9355 历史分时、早盘/尾盘竞价、股票列表、批量行情、北交所分时(10443/11695) |
+| BSE_MAIN | **仅** `main.123ths.com:8901` 组（不回退 ifindhq） | 同 MAIN（普通登录 + 标准 init） | 同 MAIN | 北交所历史分时 10444、竞价窗 7176/6144、当日超级盘口 1207（见 §7.5） |
+| KLINE_FAST | `main.123ths.com:8901` 组（独立 socket） | 同 MAIN | `BASIC_QUOTE` | K 线快路径（`channel="ifindhq_fast"`），与 MAIN 业务锁隔离 |
 | SH_L2 | `shlv2.123ths.com:8901` | Level2 passport + thsuser 壳；init `16;144;` | `L2_MARKET_ACCESS` + `L2_*` | 沪市 L2 分时、竞价、快照推送、历史分时 |
 | SZ_L2 | `szlv2.123ths.com:8901` | 同左；init `32;` | 同左 | 深市 L2 同左 |
 | BOARD | `fu4.123ths.com:8901` | 板块壳（身份回退链 BOARD→STANDARD→MANUAL）；引导 subreal URS/UCT/UNX/UCX/UME → `MarketCode=96;128;88;216;48;` → qureal-init×10 → `[5],[55]` 分类表 → StockNameVer | `ConnectionRole.BOARD` | 板块行情/分时/竞价（仅板块指数，不做成分股） |
 | BOARD_CONSTITUENT_SH/SZ | 沪 `shlv2.123ths.com:8901` / 深 `szlv2.123ths.com:8901`（普通账号走 `main.123ths.com:8901`） | 股票网关身份（沪 `thsuser` / 深 `__manual`）；MKT_INIT 用股票市场集（`16;144;` / `32;` / `16;32;144;`）+ 两轮 subreal/pageid | `L2_MARKET_ACCESS`（L2 侧） | 按板块查成分股（881121 双账号 176 条，约 4-5s） |
 | REALORDER | 固定 seed `106.14.65.90:9601`（官方客户端可缓存动态节点） | 独立 9601 登录 | `REALORDER` | 异动历史/订阅/推送 |
+| BOARD_STATS | 独立统计节点 `8.132.233.77:9601`（`THSPYPC_STATSCALC_HOST` 可覆盖） | 独立 9601 登录 | `BASIC_QUOTE` | statscalc 板块批量统计（见 §17.2） |
 
 路由约束：
 
 - MAIN 只从 `main`/`ifindhq` 解析 IP；`fu4/hkus/euhq` 等域名能登录但不响应沪深基础行情，禁止混入。
+- **北交所（151）只走 main 组**：同账号同请求在 ifindhq 节点回 `CodeListSize=0` 且不下发
+  151 数据，故北交所历史/竞价/超级盘口业务统一用 `BSE_MAIN`（`main_only=True`）；
+  init `MarketDate` 必含 `32(0)`（见 §4.3）。北交所**无**沪深式 L2 通道（无 4096 十档
+  回放、7173/7174 队列、7175/7170/7171 挂撤），官方"超级盘口"是 1207 页全日逐笔
+  +五档形态（§7.5）。
 - shlv2 与 szlv2 是两套不重叠的 IP 池；沪票连 shlv2、深票连 szlv2，`MarketCode` 必须匹配。
 - L2 业务（4214/4417）**禁止回退到 MAIN 9354/9355**；深市 4417 走 MAIN 只回短帧。
 - 板块指数只能走 fu4；**成分股独立连接必须走股票行情网关**（普通 main / L2 沪 shlv2 /
@@ -239,6 +258,9 @@ login 成功后必须紧跟 init（subtype `0x0001`），激活行情查询通�
 | 板块成分股 | 成分连接 | L2 6000 · 普通 4180 | 8192 | 见 11.2 | main/shlv2/szlv2 | hd3.1 0x64 |
 | **北交所个股分时** | 普通/L2 | **10443** | 8192(0-0) | 14,13,19,54,10,23,15,22 | **main** | hd3.1 0x0046 |
 | **北证50指数分时** | 普通/L2 | **11695** | 8192(0-0) | 272,207,42,271,… | **main** | hd3.1 0x006e |
+| **北交所历史分时** | 普通/L2 | **10444** | 8192(packed日期×2048+606 起、宽 355) | 个股表 0x0042 | **BSE_MAIN** | hd3.1 0x0042（个股表 rs28/fc7） |
+| **北交所竞价窗** | 普通/L2 | 10444 | 7176（当日/历史同协议，09:15-09:25 unix 区间，恰 600s） | 10,27,33,49 | **BSE_MAIN** | hd1.0；历史翻页走 6144 |
+| **北交所当日超级盘口** | 普通/L2 | **1207** | **4096(0-0)**（全日窗） | 34 字段（含五档 20-35/150-157） | **BSE_MAIN** | 0x0096 表（rs112/fc28，每行=一笔+五档） |
 | 短线精灵历史翻页 | 任意 | —（纯文本协议） | — | `DXJL_DATATYPE` | REALORDER 9601 | hq1.0 |
 
 > 竞价类请求的 `DateTime` 两个参数是 **unix 时间戳区间**（如 9:15-9:25）；分时/历史分时是
@@ -348,25 +370,58 @@ dt14/dt15 严格单调（0/240），`dt14 + dt15 ≈ dt13`（成交总量）。
 **北证50（899050）dt14/dt15 全为 0**——服务端不提供北交所指数的主动买卖拆分，
 与同花顺客户端一致（客户端也没有北证50 买卖力量）。
 
-### 7.5 北交所分时（BSE，pageid 10443/11695）
+### 7.5 北交所协议族（分时 10443/11695、历史 10444、竞价 7176/6144、超级盘口 1207）
 
-北交所（BSE）用与沪深完全不同的 pageid 和 market 码，走 `main.123ths.com` 的 MAIN 连接
-（不分 BASIC/LEVEL2，均走 MAIN）：
+北交所（BSE）用与沪深完全不同的 pageid 和 market 码，走 `main.123ths.com` 组
+（不分 BASIC/LEVEL2，均走普通身份）：
 
 | 标的 | market | pageid | DataType | dt14/dt15 | 响应 flag |
 |---|---|---|---|---|---|
 | 北交所个股（920xxx/83xxx/43xxx/87xxx） | **151** | **10443** | `14,13,19,54,10,23,15,22` | ✓ 含 | 0x0046 |
 | 北证50 指数（899050） | **144** | **11695** | `272,207,42,271,228,13,…` | ✗ 无 | 0x006e |
 
-**网关发现（关键）**：北交所数据只在 `main.123ths.com` 的 IP 上可用（如 `218.245.102.0`），
-`ifindhq.123ths.com` 不支持。`resolve_market_hosts` 硬编码优先 `main.123ths.com`（passport
-不含此域名），DNS 失败时才 fallback ifindhq。init MarketCode 不需要加 151。
+**网关与连接（2026-09-08 收口）**：北交所数据只在 `main.123ths.com` 组的 IP 上
+可用，`ifindhq.123ths.com` 节点对含 151 的请求回 `CodeListSize=0` 且不下发数据。
+当日分时（10443/11695）复用 MAIN 连接；历史分时/竞价窗/超级盘口统一走
+`ConnectionRole.BSE_MAIN` 专用连接（`main_only=True`，永不回退 ifindhq）。init
+`MarketCode` 不加 151，但 `MarketDate` 必须含 `32(0)`（见 §4.3），否则 main 组
+连接对含 151 的请求不下发个股表。
 
 请求 builder：`build_beijing_timeline_query`（个股，route SUB1=0x014a/SUB2=0x0100）、
 `build_beijing_index_timeline_query`（指数，route SUB1=0x003e/SUB2=0x013e），均为双子帧 0x09。
 parser：`BEIJING_TIMELINE_FLAGS = {0x0046, 0x006e}`，放宽 dt40 要求。
 
 `_market_for_code` 按代码前缀路由：`43/83/87/920` → market 151，`899` → market 144。
+
+#### 7.5.1 历史分时（pageid=10444，嵌套 8192 packed-date 窗）
+
+`client.history_timeline(code, date)` 对北交所代码自动切 `bse_history_timeline`
+（`services/timeline.py`）：pageid=10444 的 bar 窗 = `packed(日期)×2048+606` 起、
+宽 355（与官方客户端逐字节一致）；响应个股表（0x0042/rs28/fc7）直接由
+`parse_history_timeline_response` 锚定解出 241 行，走 BSE_MAIN。
+
+#### 7.5.2 竞价窗（period=7176 / 6144，仅 09:15:00-09:25:00）
+
+北交所**只有竞价段**逐笔有独立通道（连续竞价时段的 7176 窗口全部无响应，官方
+客户端 2026-09-08 抓包也只请求过 09:15-09:25）。窗口必须恰 600s（`<600s` 不回
+数据）；当日与历史同协议。公开入口：`client.superorder(code, start, end)` 对
+北交所代码自动切 `bse_tick_window` 竞价窗路径（Web 端复用
+`/api/superorder`）。旧日期响应尾部有 2038 哨兵行，服务层按请求窗口过滤。
+
+#### 7.5.3 当日超级盘口（pageid=1207，`DateTime=4096(0-0)`，0x0096 表）
+
+官方"超级盘口"页当日形态 = **全日逐笔 + 每笔五档快照**（北交所无十档/委托队列/
+挂撤明细通道，与账号类型无关）。协议为 3 子帧包（注册子帧 + 主查询 + 状态子帧），
+主查询 `pageid=1207`、route 0x016F、`DataType=10,12,…,157` 34 字段、
+`DateTime=4096(0-0)`；响应为 hd3.1 **0x0096 表**（rs=112/fc=28，BitRLE 位平面），
+每行一笔成交并内嵌五档。字段映射：dt1=ts、dt10=价、dt13=累计量、dt19=累计额、
+dt49=本笔量；买五档 (20,25)(26,27)(28,29)(150,151)(154,155)，卖五档
+(21,31)(32,33)(34,35)(152,153)(156,157)。滚动变体为 `PreDay=1` +
+`4096(-10000-<abs ts>)`（增量窗，未实现，当前用全日整表重拉）。
+
+公开 API：`client.bse_superorder_day(code)`；Web 端 `/api/superorder-bse/{code}`。
+完整证据链与金样本见
+`docs/handoffs/HANDOFF_BSE_HISTORY_SUPERORDER_20260908.md`（§7 为 1207/4096 发现）。
 
 ---
 
@@ -785,10 +840,12 @@ pageid=9355                             # 普通账号；Level2 账号=1334
 
 | 方法 | 底层 |
 |---|---|
-| `timeline(code, market, prev_close)` | 个股/指数：普通→9355 / L2→1334；指数额外还原黄线 |
-| `history_timeline(code, date, market, prev_close)` | 个股：普通→9355 / L2→4417；指数→77 并还原黄线 |
-| `auction(code, trade_date)` | 个股→9354/9355/1334/4417；指数当天→6240 T_URL |
+| `timeline(code, market, prev_close)` | 个股/指数：普通→9355 / L2→1334；指数额外还原黄线；北交所→10443/11695 |
+| `history_timeline(code, date, market, prev_close)` | 个股：普通→9355 / L2→4417；指数→77 并还原黄线；北交所→10444（BSE_MAIN） |
+| `auction(code, trade_date)` | 个股→9354/9355/1334/4417；指数当天→6240 T_URL；北交所→10444 竞价窗（BSE_MAIN） |
 | `closing_auction(code, trade_date)` | 个股→9354/9355/1334/4417；三大指数当天→6240 T_URL |
+| `superorder(code, start, end)` | 沪深→7169 逐笔回放；北交所→7176 竞价窗（自动分流） |
+| `bse_superorder_day(code)` | 北交所当日超级盘口：1207 页 4096 全日逐笔+五档（BSE_MAIN） |
 | `intraday(code, trade_date)` | 个股三段合并；历史指数仅盘中，记录均加 `phase` 标签 |
 | `kline(code, period)` | MAIN 9355，1分/5/15/30/60分/日/周/月/季/年 |
 | `board_quotes / board_timeline / board_auction / board_constituents` | 板块指数与成分股（见 11 节） |
@@ -831,9 +888,11 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
     协议套到指数上，也不要用空数组伪装成服务端存在历史竞价数据。
 14. **买卖力量用 dt14/dt15，不是 dt22/dt23**：dt22/dt23 是实时快照（非累计、非单调），
     翻转任何 bit 都不修复；dt14/dt15 严格单调（`dt14+dt15≈dt13`），是真正的主动买卖累计量。
-15. **北交所走独立 pageid + main.123ths.com**：个股 market=151/pageid=10443，指数 market=144/
-    pageid=11695，均走 main.123ths.com 的 MAIN 连接。ifindhq 不支持北交所。北证50 无买卖力量
-    （dt14/dt15 全 0，与客户端一致）。
+15. **北交所走独立 pageid + main.123ths.com 组**：当日分时 10443/11695 走 MAIN；历史分时
+    10444、竞价窗 7176/6144、当日超级盘口 1207/4096 走 `BSE_MAIN`（仅 main 组，不回退
+    ifindhq）。init `MarketDate` 必含 `32(0)`，否则含 151 的请求被丢弃。北交所无沪深式
+    L2 通道（十档回放/委托队列/挂撤明细），超级盘口=全日逐笔+五档。北证50 无买卖力量
+    （dt14/dt15 全 0，与客户端一致）。详见 §7.5。
 
 ---
 
@@ -851,7 +910,7 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
 | `src/thspypc/features/quote_protocol.py` | list_quotes 五档/十档盘口 builder/parser |
 | `src/thspypc/features/stock_list_protocol.py` | 全市场代码表、init、排序榜、DDE builder/parser |
 | `src/thspypc/features/snapshot_protocol.py` | 4214/5716 快照订阅、71B/549B 推送解析 |
-| `src/thspypc/features/superorder_protocol.py` | 7169 逐笔回放、4096 超级盘口回放、7173/7174 委托队列 |
+| `src/thspypc/features/superorder_protocol.py` | 7169 逐笔回放、4096 超级盘口回放、7173/7174 委托队列；北交所 7176/6144 竞价窗与 1207 页 4096 全日逐笔（0x0096 表五档） |
 | `src/thspypc/features/board_stats_protocol.py` | 9601 statscalc / calcext builder/parser |
 | `src/thspypc/features/realorder_protocol.py` | 9601 qurealorder / subrealorder / pushrealorder |
 | `src/thspypc/features/stock_name_protocol.py` + `stock_name_bootstrap.py` | name_16_16 解码、分组模板与引导帧 |
@@ -870,7 +929,8 @@ closing_auction = closing_auction(trade_date)# 14:57-15:00
 | `src/thspypc/_client/connection_primitives.py` | TCP login/init、并发测速与登录、L2 手动连接、fu4 板块通道/成分连接建连（身份回退链） |
 | `src/thspypc/_client/service_facade.py` | `timeline/history_timeline/auction/closing_auction/intraday/kline` 门面 |
 | `src/thspypc/_client/stock_cache.py` / `src/thspypc/testing.py` | 股票代码缓存 / 测试脚本并发登录与客户端复用 |
-| `src/thspypc/server/` | FastAPI 单用户 REST 接口（`ThsRuntime` + `create_app`） |
+| `src/thspypc/server/` | FastAPI 单用户 REST + WebSocket（`ThsRuntime` + `create_app`），接口见 `docs/guides/WEB_API.md` |
+| `web/` | React 18 + vite + echarts 看盘前端（看盘/分时/超级盘口三视图，超级盘口含北交所形态） |
 | `src/thspypc/codecs/` | framing（FDF）、hd 字段表、numeric（THS float）、compression（8901 LZ77 / BitRLE） |
 | `docs/architecture/SERVER_MATRIX.md` | 服务器域名/权限/路由详细矩阵 |
 | `docs/handoffs/*.md` | 各协议逆向证据链（竞价、分时、推送、历史分时、系统板块） |

@@ -27,6 +27,7 @@
 |------|------|
 | [`FEATURE_GAP_ROADMAP.md`](plans/FEATURE_GAP_ROADMAP.md) | 同花顺 PC 功能缺口对照表与实现优先级依据，随进度更新 |
 | [`SH_AUCTION_X86_HARNESS_PLAN.md`](plans/SH_AUCTION_X86_HARNESS_PLAN.md) | 沪市竞价 32 位离线 harness 实施计划 |
+| [`SUPERORDER_TIMELINE_SUBPAGES_PLAN.md`](plans/SUPERORDER_TIMELINE_SUBPAGES_PLAN.md) | 分时/超级盘口子页面实施计划（已实施；北交所形态见 2026-09-08 交接） |
 
 ## 四、专项调查与复盘记录（阶段性）`docs/investigations/`
 

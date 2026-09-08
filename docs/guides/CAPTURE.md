@@ -66,7 +66,7 @@ tcp port 8901 or tcp port 9601
 
 **抓包命令**：
 ```bash
-cd D:/code/ths_takehome/thspypc
+cd D:/code/test/thspypc
 WS="D:/软件/Wireshark-4.4.7-x64-with-Npcap-1.50-Portable/Wireshark/App/Wireshark"
 
 # 先确认网卡
@@ -132,7 +132,15 @@ WS="D:/软件/Wireshark-4.4.7-x64-with-Npcap-1.50-Portable/Wireshark/App/Wiresha
 | `tests/capture_market_open.py` | **开盘二合一**：批量请求 7000 股（启动序列+代码表+快照）+ 盘中实时推送 | dumpcap + tshark |
 | `tests/capture_hexin_start.py` | 抓启动序列（login + subreal + 推送），自动分析 | dumpcap + tshark |
 | `tests/capture_stock_list.py` | 抓股票列表请求（聚焦 stock_list 分页/参数真值） | dumpcap + tshark |
+| `tests/capture_kanpan.py` | 抓看盘主界面全套（1334/4214/4260、7169/7173/7174/4096 对齐） | dumpcap + tshark |
+| `tests/capture_superorder.py` | 抓超级盘口/逐笔面板（带秒表逐操作对齐） | dumpcap + tshark |
+| `tests/capture_bse_920083.py` | **被动抓官方客户端北交所流量**（920083 日K/分时/盘口；`--analyze-only` 只分析已有 pcapng） | dumpcap + tshark |
+| `tests/capture_system_blocks.py` | 抓系统板块（发现/成分股/板块指数分时历史/盘中实时） | dumpcap + tshark |
 | `tests/collect_push_samples.py` | 采集推送+历史对照样本（盘中） | 账号（.env） |
+
+> **抓官方客户端前先停掉本仓库后端/测试脚本**：同一个 Level2 账号不能同时
+> 在两处登录（8901 会话冲突）。`capture_bse_920083.py` 启动时会检查 8765 端口，
+> 仍在监听则报错退出；其他脚本请手动确认。
 
 ### 场景：开盘批量请求 + 实时推送（推荐 `capture_market_open.py`）
 
@@ -149,9 +157,9 @@ uv run python tests/capture_market_open.py
 
 ## pcap 文件位置
 
-抓包产物统一放 `captures_live/`（已 gitignore）：
+抓包产物统一放 `captures_live/`（已 gitignore，**内含登录票据，勿提交/勿公开上传**）：
 ```
-D:\code\ths_takehome\thspypc\captures_live\
+D:\code\test\thspypc\captures_live\
 ```
 
 如果目录不存在，脚本会自动创建。

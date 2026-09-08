@@ -2,6 +2,11 @@
 
 > 归档位置：`docs/handoffs/`。文中未特别说明的路径均相对仓库根目录。
 >
+> **2026-09-08 状态说明**：本文是 2026-07-16/17 的会话流水，此后所有专项进展
+> 见 [`README.md`](README.md) 索引中更新的交接文档（登录协议、Level2 家族、
+> Web 前端、北交所协议族等）；§四「待办」不再维护，以
+> [`docs/plans/FEATURE_GAP_ROADMAP.md`](../plans/FEATURE_GAP_ROADMAP.md) 为准。
+>
 > **2026-07-29 stock_list 纠正**：下文 §1.5 保留的是 2026-07-19
 > 逆向过程，不再代表当前实现。逐帧活网 A/B 已证明完整代码表只需要一个
 > `DataType=[5],[55]` 请求；旧 `stock_list_replay.bin` 的另外 153 帧均非必需。
@@ -328,7 +333,7 @@ unk=0x36/0x42/0x4a 等非 BitRLE 编码的 hd3.1 帧暂不支持（`parse_hd3_re
 ## 六、测试命令速查
 
 ```bash
-cd D:\code\ths_takehome\thspypc
+cd D:\code\test\thspypc
 
 # 离线测试（无需账号）
 py tests/test_list_quotes.py --offline

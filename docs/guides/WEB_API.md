@@ -6,6 +6,7 @@
 >
 > 个股实时推送已接入 `/api/stock-stream/{code}`：逐笔、十档、买卖一队列和
 > 撤单共用后台唯一 `THSClient` 与市场 L2 socket，不产生额外登录。
+> 短线精灵实时流已接入 `/api/dxjl/stream`（订阅后零遗漏，连接即回快照）。
 
 ## 启动
 
@@ -32,17 +33,20 @@ OpenAPI 文档。
 | GET | `/api/auction/{code}?trade_date=` | 早盘集合竞价 |
 | GET | `/api/closing_auction/{code}?trade_date=` | 尾盘集合竞价 |
 | GET | `/api/intraday/{code}?trade_date=` | 完整日内序列 |
+| GET | `/api/stock-ready/{code}?market=` | 个股 4214 订阅注册（面板与 WS 扇出前先调一次） |
 | GET | `/api/market_view/{code}?period=day&count=320&fuquan=Q&levels=5` | 单股页面聚合数据（行情 + 完整日内 + K 线 + 盘口） |
 | GET | `/api/market_view_fast/{code}?levels=5` | 首屏行情与盘口（不包含分时） |
 | GET | `/api/intraday/{code}` | 统一返回早盘竞价、盘中分时、尾盘竞价 |
 | GET | `/api/intraday_auctions/{code}` | 兼容接口；新前端不再使用 |
-| GET | `/api/superorder/{code}?start=&end=` | 7169 精确逐笔成交回放 |
+| GET | `/api/superorder/{code}?start=&end=&pageid=4214\|4260&timeout=` | 7169 精确逐笔成交回放（timeout 3~25s 可缩短读预算；北交所代码自动切 7176 竞价窗路径，安静窗口需快速失败） |
+| GET | `/api/superorder-bse/{code}?market=&timeout=` | 北交所当日超级盘口：1207 页 4096 全日逐笔（每行含五档快照），timeout 3~20s；仅当日，不缓存 |
 | GET | `/api/order-details/{code}?start=&end=` | 7175 挂单 + 7170/7171 买卖撤单 |
 | GET | `/api/order-queues/{code}?trade_date=` | 7173/7174 买一和卖一委托队列 |
 | GET | `/api/superorder-replay/{code}?trade_date=` | 4096 回放轻量时间/价格/量索引（完整记录服务端缓存） |
 | GET | `/api/superorder-replay/{code}/snapshot?ts=&trade_date=` | 缓存中离 ts 最近的完整十档快照 |
 | GET | `/api/superorder-window/{code}?start=&end=` | 串行聚合7169与7175/7170/7171，窗口上限300秒 |
 | WS | `/api/stock-stream/{code}?market=` | `trade/depth/order_queue/cancel/status` 统一个股事件流 |
+| WS | `/api/dxjl/stream` | 短线精灵 9601 实时流：订阅后零遗漏推送；连接建立即回缓冲快照（空缓冲也回，前端据此解除加载态） |
 | GET | `/api/stocks` | 全市场代码表（~7400 条，首次较慢） |
 | GET | `/api/hot?count=29&sort_by=199112&sort_dir=D` | 排序榜单 |
 | GET | `/api/stock_list_ranked?sort_by=199112&count=5400&sort_dir=D&with_values=1` | 全市场排序榜（L2 SortCount 放大一次拉全 ~0.1s；`sort_dir=A` 升序已实测） |
@@ -99,6 +103,9 @@ total;dur=48.2, sh_l2_wait;dur=11.1, sh_l2_io;dur=31.9, app;dur=43.4
   共用同一市场连接锁。查询期间先到的主动推送交回统一事件分发器，不双读、不丢帧。
 - 4096 完整记录只保存在最多8项的进程内LRU缓存；浏览器先取轻量索引，点选光标
   后再取一条完整十档。当前日缓存60秒，历史日缓存1小时。
+- 北交所超级盘口（`/api/superorder-bse`）走 `BSE_MAIN` 连接（仅 main.123ths.com
+  组），当日全日 ~1000 行不缓存；前端失败后回退竞价窗（`/api/superorder`
+  的 7176 窗口）与 `/api/intraday` 的 6144 竞价点。
 - 服务退出时 `ThsRuntime.close()` 会关闭唯一客户端和全部socket，降低热重启后的
   服务端旧会话残留概率。
 
