@@ -143,6 +143,16 @@ input {
   display: grid;
   overflow: hidden;
 }
+/* 看盘页保活槽位：激活时占满剩余行，非激活时隐藏（组件保持挂载） */
+.page-slot {
+  min-height: 0;
+}
+.page-slot.inactive {
+  display: none;
+}
+.page-slot > .body {
+  height: 100%;
+}
 /* 可拖拽垂直分隔条（列表面板边缘调宽） */
 .vsplit {
   cursor: col-resize;

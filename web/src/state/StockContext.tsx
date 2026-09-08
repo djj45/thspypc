@@ -377,7 +377,9 @@ export function StockProvider({
       active = false
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [code, mode, refreshTick, fastLane, intradayLane])
+    // 不依赖 mode：切视图（看盘↔分时/超级盘口）不清空盘口/分时、不重拉
+    // ——看盘页保活依赖此状态直接复显；盘中新鲜度由会话轮询保持。
+  }, [code, refreshTick, fastLane, intradayLane])
 
   // 集合竞价阶段没有连续交易逐笔推送，分时接口却会持续补充竞价撮合点。
   // 页面若在14:57前打开，单次快照不会自行出现尾盘橙线；只在两个竞价窗口

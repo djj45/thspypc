@@ -161,9 +161,13 @@ function RoutedShell({
     <div className="app">
       <Header view={view} onView={onView} />
       <StockNav />
-      {view === 'kanpan' ? (
+      {/* 看盘页常驻保活：切到分时/超级盘口时隐藏而非卸载（左栏列表、
+          分时/K线图实例与缩放状态、短线精灵流全部保留），返回即时恢复；
+          子页按需挂载，保持原卸载语义。 */}
+      <div className={view === 'kanpan' ? 'page-slot' : 'page-slot inactive'}>
         <KanpanPage />
-      ) : (
+      </div>
+      {view !== 'kanpan' && (
         <StockStreamProvider key={code} code={code} enabled>
           {view === 'timeline' ? <TimelinePage /> : <SuperorderPage />}
         </StockStreamProvider>
