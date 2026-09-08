@@ -1464,6 +1464,184 @@ BSE_AUCTION_WINDOW_PAGEID = 10444
 
 _BSE_TICK_SEQ = __import__("itertools").count(0x0300, 2)
 
+# ── 北交所盘中超级盘口（pageid=1207 + DateTime=4096，2026-09-08 复抓）──
+# 官方"超级盘口"页当日形态：注册子帧 + 4096 全日窗主体 + 状态子帧三联发
+# （单个 fd 帧内嵌三子帧）。响应 flag=0x0096 大表（rsize=112 / 28 字段），
+# 每行一个逐笔事件并携带完整五档快照；同请求另回 0x003a 轻量表（dt49
+# 分段累计，单笔量不可靠，权威字段在 0x0096 表）。
+BSE_SUPERORDER_PAGEID = 1207
+BSE_SUPERORDER_ROUTE = 0x016F
+BSE_SUPERORDER_TABLE_FLAG = 0x0096
+# 金样本（2026-09-08 抓包 frame1468）逐字节对齐的 DataType 序列。
+BSE_SUPERORDER_DATATYPE = [
+    10, 12, 13, 14, 18, 19, 20, 21,
+    25, 26, 27, 28, 29, 31, 32, 33, 34, 35,
+    49, 75, 150, 151, 152, 153, 154, 155, 156, 157,
+    6, 407, 619, 1110,
+]
+# 五档价量字段（价, 量）对：买1-5 / 卖1-5（金样本末行五档单调性验证）。
+BSE_SUPERORDER_BID_FIELDS = [(20, 25), (26, 27), (28, 29), (150, 151), (154, 155)]
+BSE_SUPERORDER_ASK_FIELDS = [(21, 31), (32, 33), (34, 35), (152, 153), (156, 157)]
+
+_BSE_SUPERORDER_SEQ = __import__("itertools").count(0x0600, 2)
+
+
+def _bse_subframe(
+    seq: int,
+    sub_type: bytes,
+    route: int,
+    flag14: int,
+    byte16: int,
+    byte17: int,
+    text: bytes,
+) -> bytes:
+    header = bytearray(22)
+    header[0:4] = b"\x00\x16\x00\x00"
+    struct.pack_into("<H", header, 4, seq & 0xFFFF)
+    header[6:10] = sub_type
+    struct.pack_into("<H", header, 10, route)
+    struct.pack_into("<H", header, 14, flag14)
+    header[16] = byte16
+    header[17] = byte17
+    struct.pack_into("<I", header, 18, len(text))
+    return bytes(header) + text
+
+
+def build_bse_superorder_query(
+    code: str,
+    *,
+    market: int = 151,
+    preday: bool = False,
+    end_ts: int | None = None,
+    seqs: tuple[int, int, int] | None = None,
+) -> bytes:
+    """构建北交所盘中超级盘口请求（pageid=1207，嵌套三子帧）。
+
+    默认 ``DateTime=4096(0-0)``（当日全日）；``preday=True`` 时为官方滚动
+    翻页形态 ``PreDay=1 + DateTime=4096(-10000-<end_ts>)``（T-1 全日至
+    end_ts）。``seqs`` 供金样本测试注入官方观测值；默认用滚动计数器
+    （seq 具体值随连接变化，服务端不校验起始）。
+    """
+    if seqs is None:
+        base = next(_BSE_SUPERORDER_SEQ)
+        seqs = (0x0000, base, base + 2)
+    dt_text = ",".join(str(v) for v in BSE_SUPERORDER_DATATYPE) + ","
+    window = (
+        f"4096(-10000-{end_ts})" if preday and end_ts is not None
+        else "4096(0-0)"
+    )
+    main_text = (
+        ("PreDay=1\r\n" if preday else "")
+        + f"CodeList={market}({code},);\r\nDataType={dt_text}\r\n"
+        + f"DateTime={window}\r\nLackTime=0,0,0,0,0,0,0,0\r\n"
+        + f"pageid={BSE_SUPERORDER_PAGEID}\r\n"
+    ).encode("gbk")
+    register_text = (
+        f"CodeList={market}({code},);\r\npageid={BSE_SUPERORDER_PAGEID}\r\n"
+    ).encode("gbk")
+    status_text = (
+        f"CodeList={market}({code},);\r\n"
+        "DataType=7,10,69,70,2419,2420,6,45,402,619,\r\n"
+        "DateTime=0(0-0)\r\nLackTime=0,0,0,0,0,0,0,0\r\n"
+        f"pageid={BSE_SUPERORDER_PAGEID}\r\n"
+    ).encode("gbk")
+    packet = b"\x09" + b"".join((
+        _bse_subframe(seqs[0], b"\x12\x00\x02\x00", 0x006F, 0, 0, 0, register_text),
+        _bse_subframe(seqs[1], b"\x12\x00\x09\x00", BSE_SUPERORDER_ROUTE, 0, 0, 0x10, main_text),
+        _bse_subframe(seqs[2], b"\x12\x00\x09\x00", BSE_SUPERORDER_ROUTE, 0, 0, 0, status_text),
+    ))
+    return encode_frame(packet)
+
+
+def parse_bse_superorder_response(body: bytes, *, code: str | None = None) -> list[dict]:
+    """解析北交所盘中超级盘口 0x0096 表 → 逐笔+五档快照行。
+
+    每行 ``{code, index, ts, price, volume, dt13=累计量, dt19=累计额,
+    bids/asks=[{price, volume}×5], dt14, dt75, ...}``；ts 非法的哨兵行
+    （如 T-1 响应首行）直接丢弃。一个响应帧可能含多张表（当日 + PreDay
+    的 T-1），全部拼接返回。
+    """
+    from ..codecs.compression import (
+        _decode_bitrle_0x13746d0,
+        _transpose_bitplane_0x1763410,
+    )
+
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError:
+            return []
+
+    records: list[dict] = []
+    pos = 0
+    while True:
+        table_pos = body.find(b"hd3.1\x00", pos)
+        if table_pos < 0:
+            break
+        pos = table_pos + 6
+        if len(body) < table_pos + 16:
+            break
+        raw_count, flag, rsize, fcount = struct.unpack_from(
+            "<IHHH", body, table_pos + 6,
+        )
+        if flag != BSE_SUPERORDER_TABLE_FLAG or rsize == 0 or not 1 <= fcount <= 50:
+            continue
+        count = raw_count & 0xFFFF
+        if count == 0:
+            continue
+        fields = _parse_hd_field_table(body, table_pos + 16, fcount)
+        if sum(w for _, _, w in fields) != rsize:
+            continue
+        shell_off = table_pos + 16 + fcount * 4
+        if len(body) < shell_off + 30:
+            continue
+        shell = body[shell_off:shell_off + 26]
+        if shell[:4] != b"\x16\x00\x01\x00":
+            continue
+        shell_code = shell[5:11].decode("ascii", errors="replace")
+        if code is not None and shell_code != code:
+            continue
+        if struct.unpack_from(">I", body, shell_off + 26)[0] != count * rsize:
+            continue
+        plane = _decode_bitrle_0x13746d0(body[shell_off + 26:], count * rsize)
+        rows = _transpose_bitplane_0x1763410(plane, rsize, count)
+
+        offsets: dict[int, int] = {}
+        offset = 0
+        for datatype, _fmt, width in fields:
+            offsets[datatype] = offset
+            offset += width
+
+        for index in range(count):
+            row = rows[index * rsize:(index + 1) * rsize]
+            record: dict = {"code": shell_code, "index": index}
+            ts = 0
+            for datatype, field_offset in offsets.items():
+                chunk = row[field_offset:field_offset + 4]
+                if len(chunk) != 4:
+                    continue
+                raw = struct.unpack("<I", chunk)[0]
+                if datatype == 1:
+                    ts = raw
+                else:
+                    record[f"dt{datatype}"] = decode_ths_float(raw)
+            # 哨兵/基线行（2038 年时间戳或 0）与窗口无关，直接丢弃。
+            if not 1_700_000_000 <= ts <= 1_900_000_000:
+                continue
+            record["ts"] = ts
+            record["price"] = record.get("dt10")
+            record["volume"] = record.get("dt49")
+            record["bids"] = [
+                {"price": record.get(f"dt{p}"), "volume": record.get(f"dt{v}")}
+                for p, v in BSE_SUPERORDER_BID_FIELDS
+            ]
+            record["asks"] = [
+                {"price": record.get(f"dt{p}"), "volume": record.get(f"dt{v}")}
+                for p, v in BSE_SUPERORDER_ASK_FIELDS
+            ]
+            records.append(record)
+    return records
+
 
 def build_bse_tick_window_query(
     code: str,
@@ -1502,6 +1680,37 @@ def build_bse_tick_window_query(
     header[17] = byte17
     struct.pack_into("<I", header, 18, len(text))
     return encode_frame(b"\x09" + bytes(header) + text)
+
+
+def bse_tick_window_identity(body: bytes) -> tuple[str | None, int] | None:
+    """轻量识别 0x003a 逐笔窗响应，返回 ``(code, 行数)``；非本族返回 None。
+
+    与 :func:`parse_bse_tick_response` 共用表头判据但不解码行数据，供
+    ``bse_tick_window`` 区分"服务端确认的空窗口"（0 行表）与无关帧——
+    否则空窗口会被当作未响应一直等到读超时。空表可能没有壳/行区，
+    此时 code 为 None（表头判据已足够定性）。
+    """
+    if body.startswith(b"\x0a"):
+        try:
+            body = normalize_8901_response(body)
+        except ValueError:
+            return None
+    pos = body.find(b"hd3.1\x00")
+    if pos < 0 or len(body) < pos + 16:
+        return None
+    raw_count, flag, rsize, fcount = struct.unpack_from("<IHHH", body, pos + 6)
+    if flag != 0x003A or rsize == 0 or not 1 <= fcount <= 50:
+        return None
+    count = raw_count & 0xFFFF
+    if count == 0:
+        return (None, 0)
+    shell_off = pos + 16 + fcount * 4
+    if len(body) < shell_off + 30:
+        return None
+    shell = body[shell_off:shell_off + 26]
+    if shell[:4] != b"\x16\x00\x01\x00":
+        return None
+    return (shell[5:11].decode("ascii", errors="replace"), count)
 
 
 def parse_bse_tick_response(body: bytes) -> list[dict]:

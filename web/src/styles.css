@@ -525,6 +525,11 @@ a[href*="tradingview.com"] {
   padding-top: 3px;
   padding-bottom: 3px;
 }
+/* 北交所逐笔表：光标选中的逐笔行 */
+.details-table tr.selected td {
+  background: #2a3346;
+  color: var(--text);
+}
 .empty-state {
   padding: 14px 10px;
 }

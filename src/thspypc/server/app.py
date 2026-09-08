@@ -437,6 +437,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         end: datetime,
         market: int = 0,
         pageid: int = 4214,
+        timeout: float = 25.0,
     ) -> list[dict]:
         """Return Level2 tick replay through the runtime's shared client.
 
@@ -444,11 +445,16 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         exact 7169 interval as protocol truth.  Going through ``runtime`` is
         also important because a standalone diagnostic process would create a
         second THSClient and compete with the Web backend's existing sessions.
+
+        ``timeout`` 允许调用方缩短单次读预算（3~25s）：北交所 7176 逐笔按
+        10 分钟桶整日扫描时，安静桶必须快速失败/返回，不能每个都等满 25s。
         """
         if end < start:
             raise HTTPException(400, "end 不能早于 start")
         if pageid not in (4214, 4260):
             raise HTTPException(400, "pageid 只能是 4214 或 4260")
+        if not 3.0 <= timeout <= 25.0:
+            raise HTTPException(400, "timeout 必须在 3~25 秒之间")
         return _jsonable(
             _call(
                 lambda client: client.superorder(
@@ -457,7 +463,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                     end,
                     market=market,
                     pageid=pageid,
-                    timeout=25.0,
+                    timeout=timeout,
                 )
             )
         )
@@ -546,6 +552,23 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 "index": index,
                 "snapshot": _snapshot_with_levels(records[index]),
             }
+        )
+
+    @app.get("/api/superorder-bse/{code}")
+    def superorder_bse(code: str, market: int = 0, timeout: float = 20.0) -> list[dict]:
+        """北交所当日超级盘口（1207 页 4096 全日窗）：逐笔 + 五档快照。
+
+        仅当日（历史日期官方无超级盘口页）；全日 ~1000 行、~40KB 压缩帧，
+        不缓存。timeout 允许缩短（3~20s）：非交易日服务端不回数据，
+        前端快速失败后走竞价窗兜底。"""
+        if not 3.0 <= timeout <= 20.0:
+            raise HTTPException(400, "timeout 必须在 3~20 秒之间")
+        return _jsonable(
+            _call(
+                lambda client: client.bse_superorder_day(
+                    code, market=market, timeout=timeout,
+                )
+            )
         )
 
     @app.get("/api/superorder-window/{code}")

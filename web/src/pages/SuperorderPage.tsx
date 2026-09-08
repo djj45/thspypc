@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api } from '../api/endpoints'
+import { api, isBseCode } from '../api/endpoints'
 import { StockInfo } from '../components/right/StockInfo'
 import { TimelineChart } from '../components/center/TimelineChart'
 import { useStock } from '../state/StockContext'
@@ -7,10 +7,13 @@ import { useSharedStockStream } from '../state/StockStreamContext'
 import { useSuperorderMode } from '../state/superorderMode'
 import { isRealtimeMarketSession, marketEventIdentity } from '../data/useStockStream'
 import type {
+  BseSuperorderRow,
+  BseTick,
   MarketEvent,
   OrderQueueSide,
   OrderQueues,
   ReplayIndex,
+  ReplayIndexPoint,
   ReplaySnapshot,
   SuperorderWindow,
 } from '../types'
@@ -211,7 +214,335 @@ function DetailsTable({ rows }: { rows: MarketEvent[] }) {
   )
 }
 
+// ── 北交所超级盘口（7176 竞价段秒级逐笔，官方形态为逐笔列表）──
+// 北交所没有沪深式 L2 通道（4096 十档回放 / 7173/7174 委托队列 /
+// 7169+7175 逐笔挂撤明细），官方"超级盘口"就是竞价段（09:15-09:25）
+// 的秒级逐笔回放。2026-09-08 活网验证：7176 只服务竞价窗（连续竞价
+// 时段的 10 分钟窗全部无响应；8-15 盘中抓包官方客户端也只请求过
+// 09:15-09:25 窗口）。主路径 7176（字段全，含 dt27/dt33），失败回退
+// /api/intraday 的 6144 竞价点（当日与历史同协议）。
+const BSE_POLL_MS = 20_000
+
+function hhmmss(ts: number): string {
+  const value = new Date(ts * 1000)
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`
+}
+
+// 竞价窗 09:15:00-09:25:00（秒级 unix）。窗口恰 600s：7176 对 <600s
+// 的窗口不回数据；日期非法时返回 null。
+function bseAuctionWindow(day: string): { start: number; end: number } | null {
+  const start = new Date(`${day}T09:15:00`).getTime() / 1000
+  const end = new Date(`${day}T09:25:00`).getTime() / 1000
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null
+  return { start: Math.floor(start), end: Math.floor(end) }
+}
+
+function bseTickIdentity(tick: BseTick): string {
+  // 竞价进行中整窗重拉时按 (ts,价,累计量) 去重；dt49 是窗口内累计量，
+  // 与 ts 组合即可区分同一秒的多笔。
+  return `${tick.ts}|${tick.price ?? ''}|${tick.dt49 ?? tick.volume ?? ''}`
+}
+
+function BseTickTable({
+  rows,
+  selectedTs,
+}: {
+  rows: BseSuperorderRow[]
+  selectedTs: number | null
+}) {
+  // 与 DetailsTable 相同的贴底策略：打开时滚到最新，用户上翻后不打扰。
+  // 光标点选后滚动定位到对应逐笔行（并高亮），跟随最新时定位末行=贴底。
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const stickToBottomRef = useRef(true)
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (el) el.scrollTop = el.scrollHeight
+    stickToBottomRef.current = true
+  }, [])
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight
+  }, [rows])
+
+  useEffect(() => {
+    if (selectedTs == null) return
+    const el = containerRef.current
+    const row = el?.querySelector<HTMLTableRowElement>(
+      `tr[data-ts="${selectedTs}"]`,
+    )
+    if (el && row) {
+      // 行居中定位（相对滚动容器，不依赖定位祖先）；scroll 事件会自然
+      // 更新贴底标记（选中历史行 = 停止贴底，选中末行 = 恢复贴底）。
+      const containerTop = el.getBoundingClientRect().top
+      const rowRect = row.getBoundingClientRect()
+      el.scrollTop += rowRect.top - containerTop - el.clientHeight / 2 + rowRect.height / 2
+    }
+  }, [selectedTs])
+
+  const handleScroll = useCallback(() => {
+    const el = containerRef.current
+    if (!el) return
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+  }, [])
+
+  const fmtAmount = (value: number | undefined | null) => {
+    if (value == null) return '—'
+    if (value >= 1e8) return (value / 1e8).toFixed(2) + '亿'
+    if (value >= 1e4) return (value / 1e4).toFixed(1) + '万'
+    return String(Math.round(value))
+  }
+
+  return (
+    <div ref={containerRef} onScroll={handleScroll} className="panel-body details-table">
+      <table>
+        <thead><tr><th className="left">时间</th><th>价格</th><th>数量(股)</th><th>累计量(股)</th><th>累计额</th></tr></thead>
+        <tbody>
+          {rows.length ? rows.map((row, index) => (
+            <tr
+              key={`${bseTickIdentity(row)}-${index}`}
+              data-ts={row.ts}
+              className={row.ts === selectedTs ? 'selected' : ''}
+            >
+              <td className="left dim">{hhmmss(row.ts)}</td>
+              <td>{Number(row.price ?? 0).toFixed(2)}</td>
+              <td>{Number(row.volume ?? 0).toLocaleString()}</td>
+              <td>{row.dt13 == null ? (row.dt49 == null ? '—' : Number(row.dt49).toLocaleString()) : Number(row.dt13).toLocaleString()}</td>
+              <td>{fmtAmount(row.dt19)}</td>
+            </tr>
+          )) : <tr><td colSpan={5} className="left dim">暂无逐笔记录</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function BseSuperorderPage() {
+  const { code } = useStock()
+  const today = localDate()
+  const [tradeDate, setTradeDate] = useState(today)
+  const historicalDate = tradeDate === today ? undefined : tradeDate
+  const [ticks, setTicks] = useState<BseSuperorderRow[]>([])
+  const [selectedTs, setSelectedTs] = useState<number | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  // 'day'=当日 4096 全日逐笔+五档 '7176'=竞价窗 'fallback'=6144 竞价点
+  const [source, setSource] = useState<'day' | '7176' | 'fallback'>('day')
+  const stream = useSharedStockStream()
+  // 用户点选图表后不再跟随最新（下一次换股/换日恢复跟随）。
+  const followLatestRef = useRef(true)
+
+  useEffect(() => {
+    let current = true
+    let loadPromise: Promise<void> | null = null
+    setLoading(true)
+    setError('')
+    setTicks([])
+    setSelectedTs(null)
+    setSource(historicalDate ? '7176' : 'day')
+    followLatestRef.current = true
+
+    const auctionWindow = bseAuctionWindow(tradeDate)
+
+    const mergeTicks = (rows: BseSuperorderRow[]) => {
+      if (!rows.length) return
+      const latest = rows.reduce((max, row) => Math.max(max, row.ts || 0), 0)
+      setTicks((prev) => {
+        const merged = new Map(prev.map((tick) => [bseTickIdentity(tick), tick]))
+        for (const row of rows) {
+          if (row.ts > 0) merged.set(bseTickIdentity(row), row)
+        }
+        return [...merged.values()].sort((a, b) => a.ts - b.ts)
+      })
+      if (latest && followLatestRef.current) setSelectedTs(latest)
+    }
+
+    const mergeAuctionTicks = (rows: BseTick[]) => {
+      mergeTicks(rows.map((row) => ({ ...row })))
+    }
+
+    // 6144 兜底：/api/intraday 的 opening_auction 点（当日与历史同协议）。
+    const loadIntradayFallback = async () => {
+      const points = await api.intradayDated(code, tradeDate)
+      if (!current) return
+      const rows = points
+        .filter((point) => point.phase === 'opening_auction' && point.time)
+        .map((point) => ({
+          code,
+          ts: Math.floor(Date.parse(String(point.time)) / 1000),
+          price: point.dt10,
+          volume: point.dt13,
+        }))
+        .filter((tick) => Number.isFinite(tick.ts) && tick.ts > 0)
+        .sort((a, b) => a.ts - b.ts)
+      if (rows.length) {
+        mergeAuctionTicks(rows)
+        setSource('fallback')
+      }
+    }
+
+    // 7176 竞价窗（历史日主路径 / 当日 4096 失败后的次级路径）。
+    const loadAuctionWindow = async () => {
+      if (!auctionWindow) {
+        setError('交易日无效')
+        return
+      }
+      const rows = await api.superorderBseWindow(code, auctionWindow.start, auctionWindow.end)
+      if (!current) return
+      if (rows.length) {
+        mergeAuctionTicks(rows)
+        setSource('7176')
+        return
+      }
+      // 7176 成功但空（非交易日/竞价尚未生成）→ 试一次 6144 兜底。
+      await loadIntradayFallback().catch(() => undefined)
+    }
+
+    const load = async () => {
+      // 当日优先 4096 全日逐笔+五档（官方超级盘口页形态）；历史日期
+      // 官方无超级盘口页，走竞价窗。
+      if (!historicalDate) {
+        try {
+          const rows = await api.superorderBseDay(code)
+          if (!current) return
+          if (rows.length) {
+            mergeTicks(rows)
+            return
+          }
+        } catch {
+          // 非交易日/通道异常 → 竞价窗兜底链。
+        }
+      }
+      try {
+        await loadAuctionWindow()
+      } catch (reason) {
+        if (current) setError(reason instanceof Error ? reason.message : String(reason))
+      }
+    }
+
+    const scheduleLoad = (): Promise<void> => {
+      if (loadPromise) return loadPromise
+      loadPromise = load().finally(() => {
+        loadPromise = null
+        if (current) setLoading(false)
+      })
+      return loadPromise
+    }
+
+    void scheduleLoad()
+    // 仅当日轮询：盘中新逐笔持续生成。历史日期一次加载即定；
+    // 上一轮未结束则跳过本轮。
+    const timer = window.setInterval(() => {
+      if (!historicalDate && isRealtimeMarketSession()) void scheduleLoad()
+    }, BSE_POLL_MS)
+    return () => { current = false; window.clearInterval(timer) }
+  }, [code, tradeDate, historicalDate])
+
+  const chartPoints = useMemo(() => {
+    // ReplayChart 以相邻差分画量条，因此传累计量：day 行用官方累计量
+    // dt13，竞价行没有 dt13 时用 dt49 累计求和。
+    let cumulative = 0
+    return ticks.map((tick) => {
+      const perTick = Number(tick.volume ?? 0)
+      cumulative = tick.dt13 != null ? Number(tick.dt13) : cumulative + perTick
+      return {
+        ts: tick.ts,
+        time: hhmmss(tick.ts),
+        price: Number(tick.price ?? 0),
+        volume: cumulative,
+      } satisfies ReplayIndexPoint
+    })
+  }, [ticks])
+
+  const handleSelect = useCallback((ts: number) => {
+    followLatestRef.current = false
+    setSelectedTs(ts)
+  }, [])
+
+  const selectedRow = useMemo(
+    () => ticks.find((tick) => tick.ts === selectedTs),
+    [ticks, selectedTs],
+  )
+  const selectedPrice = selectedRow?.price
+  // 光标时刻五档（当日 4096 行内嵌盘口快照；复用 SnapshotBook 五档形态）。
+  const selectedBook = useMemo(() => {
+    const row = selectedRow
+    if (!row?.bids?.length || !row?.asks?.length) return null
+    return {
+      code,
+      requested_ts: row.ts,
+      index: 0,
+      snapshot: {
+        ts: row.ts,
+        time: hhmmss(row.ts),
+        price: Number(row.price ?? 0),
+        bids: row.bids.map((level, i) => ({
+          level: i + 1, price: level.price, volume: level.volume,
+        })),
+        asks: row.asks.map((level, i) => ({
+          level: i + 1, price: level.price, volume: level.volume,
+        })),
+      },
+    } satisfies ReplaySnapshot
+  }, [code, selectedRow])
+  const noTicks = !loading && ticks.length === 0
+  const sourceNote = source === 'fallback'
+    ? '6144 兜底（仅竞价点）'
+    : source === '7176'
+      ? historicalDate ? '历史日仅竞价段逐笔（6144 同协议）' : '竞价窗模式'
+      : ''
+
+  return (
+    <main className="subpage superorder-page">
+      <section className="panel replay-chart-panel">
+        <div className="panel-title replay-toolbar">
+          <span>逐笔回放 · {ticks.length} 笔</span>
+          <span className="dim">{source === 'day' ? '当日全日逐笔 + 五档快照（1207 页 4096）' : '竞价段（09:15-09:25）秒级逐笔 · 连续竞价无当日以外通道'}</span>
+          <label>交易日 <input type="date" value={tradeDate} onChange={(event) => setTradeDate(event.target.value)} /></label>
+          <span className="stream-state">实时：{stream.state}</span>
+          {loading && <span className="dim">加载中…</span>}
+          {(error || stream.error) && <span className="down">{(error || stream.error).slice(0, 100)}</span>}
+          {!error && sourceNote && <span className="dim">{sourceNote}</span>}
+        </div>
+        <div className="chart-host">
+          {chartPoints.length
+            ? <ReplayChart points={chartPoints} selectedTs={selectedTs} onSelect={handleSelect} />
+            : <div className="dim empty-state">{noTicks ? '该交易日无逐笔数据（非交易日或无成交）' : ''}</div>}
+        </div>
+      </section>
+      <section className="panel superorder-timeline-panel">
+        <div className="panel-title">分时走势 · 大单金额</div>
+        <div className="chart-host">
+          <TimelineChart />
+        </div>
+      </section>
+      <aside className="superorder-side">
+        <section className="panel stock-summary"><div className="panel-title">个股概览</div><div className="panel-body"><StockInfo tradeDate={historicalDate} selectedPrice={historicalDate ? selectedPrice : undefined} liveEvent={!historicalDate ? stream.latestDepth : undefined} /></div></section>
+        <section className="panel snapshot-panel"><div className="panel-title">{source === 'day' ? '光标时刻五档（逐笔快照）' : '五档盘口'}</div><div className="panel-body">{selectedBook ? <SnapshotBook data={selectedBook} levelCount={5} /> : <div className="dim empty-state">{source === 'day' ? '在图表上点选一个逐笔时刻' : '历史日/竞价窗无盘口快照'}</div>}</div></section>
+        <section className="panel queues-panel"><div className="panel-title">买一 / 卖一委托队列</div><div className="panel-body"><div className="dim empty-state">北交所无委托队列通道</div></div></section>
+      </aside>
+      <section className="panel replay-details">
+        <div className="panel-title detail-tabs">
+          <span>{source === 'day' ? '全日逐笔明细' : '竞价逐笔明细（09:15-09:25）'}</span>
+          <span className="dim">{source === 'day' ? '每行含五档快照 · 时间不连续（BSE 流动性差）' : '历史日官方无超级盘口页'}</span>
+        </div>
+        <BseTickTable rows={ticks} selectedTs={selectedTs} />
+      </section>
+    </main>
+  )
+}
+
 export function SuperorderPage() {
+  const { code } = useStock()
+  // 北交所整体切换为 7176 逐笔形态；十档/队列/4096 回放无对应通道，
+  // 保持"无此通道"空态（2026-09-08 抓包确认协议族与账号类型无关）。
+  if (isBseCode(code)) return <BseSuperorderPage />
+  return <SuperorderPageMain />
+}
+
+function SuperorderPageMain() {
   const { code } = useStock()
   const today = localDate()
   const [tradeDate, setTradeDate] = useState(today)

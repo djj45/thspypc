@@ -1114,6 +1114,32 @@ class ServiceFacade:
             ),
         )
 
+    def bse_superorder_day(
+        self,
+        code: str,
+        *,
+        market: int = 0,
+        timeout: float = 20.0,
+    ) -> list[dict]:
+        """北交所当日盘中超级盘口：1207 页 4096 全日窗（逐笔+五档快照）。
+
+        2026-09-08 复抓确认官方"超级盘口"页当日形态；仅当日可用（历史
+        日期官方无超级盘口页）。每行含 ts/价/单笔量/累计量额与五档价量。
+        """
+        if market == 0:
+            market = self._market_for_code(code)
+        from ..services.superorder import bse_superorder_day as bse_superorder_day_svc
+
+        return self._run_default_service(
+            (),
+            lambda: bse_superorder_day_svc(
+                self._superorder_service,
+                code,
+                market=market,
+                timeout=timeout,
+            ),
+        )
+
     @staticmethod
     def _superorder_ts(value) -> int:
         """把 datetime / time / int 统一转成 unix 时间戳（秒）。"""

@@ -22,7 +22,36 @@ import type {
   ReplaySnapshot,
   SuperorderWindow,
   MarketEvent,
+  BseTick,
+  BseSuperorderRow,
 } from '../types'
+
+// 市场码推断（与后端 _market_for_code 对齐）：0 让后端按代码前缀自推断
+// （支持 沪/深/指数/北交所）。北交所个股（43/83/87/920 前缀）= 151。
+export function marketOfCode(code: string): number {
+  if (code.startsWith('1A') || code.startsWith('1B')) return 16
+  if (code.startsWith('39')) return 32
+  if (code.startsWith('899')) return 144
+  if (code.startsWith('43') || code.startsWith('83') || code.startsWith('87') || code.startsWith('920')) return 151
+  if (code.startsWith('6')) return 17
+  return 33
+}
+
+export const isBseCode = (code: string): boolean => marketOfCode(code) === 151
+
+function pad2(part: number): string {
+  return String(part).padStart(2, '0')
+}
+
+// unix 秒 → 本地 ISO 秒串（/api/superorder 的 start/end 参数格式）。
+// 与 SuperorderPage 的 localIso 同一约定：浏览器本地时区 = 交易所时区。
+export function tsToLocalIso(ts: number): string {
+  const value = new Date(ts * 1000)
+  return (
+    `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}` +
+    `T${pad2(value.getHours())}:${pad2(value.getMinutes())}:${pad2(value.getSeconds())}`
+  )
+}
 
 const marketViewInFlight = new Map<string, Promise<MarketView>>()
 const fastViewInFlight = new Map<string, Promise<MarketViewFast>>()
@@ -268,20 +297,30 @@ export const api = {
       `/api/superorder/${code}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&pageid=4214`,
       25_000,
     ),
+  // 北交所 7176 竞价逐笔窗口（09:15-09:25，恰 600s——更短窗口服务端不回
+  // 数据，且连续竞价时段无逐笔通道，2026-09-08 活网验证）。timeout=6s：
+  // 非交易日/无成交窗口要么被服务端以 0 行表确认，要么快速失败。
+  superorderBseWindow: (code: string, startTs: number, endTs: number) =>
+    getJson<BseTick[]>(
+      `/api/superorder/${code}?start=${encodeURIComponent(tsToLocalIso(startTs))}&end=${encodeURIComponent(tsToLocalIso(endTs))}&timeout=6`,
+      9_000,
+    ),
+  // 北交所当日超级盘口（1207 页 4096 全日窗）：逐笔 + 五档快照，仅当日。
+  // timeout=8s：非交易日服务端不回数据，快速失败后走竞价窗兜底。
+  superorderBseDay: (code: string) =>
+    getJson<BseSuperorderRow[]>(
+      `/api/superorder-bse/${code}?timeout=8`,
+      12_000,
+    ),
+  // 指定交易日的完整日内序列（超级盘口页北交所历史日期取竞价逐笔用）。
+  intradayDated: (code: string, tradeDate: string) =>
+    getJson<(AuctionPoint & TimelinePoint)[]>(
+      `/api/intraday/${code}?trade_date=${encodeURIComponent(tradeDate)}`,
+      20_000,
+    ),
   stockStreamUrl: (code: string) => {
     const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    const market = code.startsWith('6')
-      ? 17
-      : code.startsWith('1A') || code.startsWith('1B')
-        ? 16
-        : code.startsWith('39')
-          ? 32
-          : code.startsWith('899')
-            ? 144
-            : code.startsWith('43') || code.startsWith('83') || code.startsWith('87') || code.startsWith('920')
-              ? 151
-              : 33
-    return `${scheme}://${window.location.host}/api/stock-stream/${code}?market=${market}`
+    return `${scheme}://${window.location.host}/api/stock-stream/${code}?market=${marketOfCode(code)}`
   },
 
   dxjlStreamUrl: () => {

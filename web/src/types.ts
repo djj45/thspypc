@@ -227,6 +227,34 @@ export interface SuperorderWindow {
   }
 }
 
+// 北交所 7176/6144 逐笔记录（bse_tick_window 返回；秒级、时间不连续）：
+// dt49=累计量，volume=相邻差分的单笔量；dt27/dt33=买/卖未匹配（语义
+// 2026-09-08 抓包标注，尚未完全确认）。
+export interface BseTick {
+  code: string
+  index?: number
+  ts: number
+  price?: number
+  volume?: number
+  dt27?: number
+  dt33?: number
+  dt49?: number
+}
+
+// 北交所当日超级盘口行（1207 页 4096 全日窗，0x0096 表）：每行逐笔事件
+// 并携带完整五档快照。dt13=累计量(股)、dt19=累计额(元)、volume=dt49 单笔量；
+// 历史竞价路径复用本类型时 bids/asks/dt13/dt19 缺省。
+export interface BseBookLevel {
+  price?: number
+  volume?: number
+}
+export interface BseSuperorderRow extends BseTick {
+  dt13?: number
+  dt19?: number
+  bids?: BseBookLevel[]
+  asks?: BseBookLevel[]
+}
+
 // ── 板块（hot_boards）──
 export interface Board {
   code: string

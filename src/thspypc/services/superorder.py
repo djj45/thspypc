@@ -117,6 +117,54 @@ def _superorder_l2_role(market: int) -> ConnectionRole:
     raise ValueError(f"7169 逐笔回放暂不支持市场码: {market}")
 
 
+def bse_superorder_day(
+    service,
+    code: str,
+    *,
+    market: int = 151,
+    timeout: float = 20.0,
+) -> list[dict]:
+    """北交所盘中超级盘口（pageid=1207 的 4096 全日窗，走 BSE_MAIN）。
+
+    一个请求 → 首张本代码 0x0096 表即当日全日逐笔+五档快照
+    （2026-09-08 复抓验证：920118 全日 977 行，末行 dt13/dt19 与
+    页面总量/总额一致）。PreDay 滚动翻页形态由调用方另行构造。
+    """
+    from ..features.superorder_protocol import (
+        build_bse_superorder_query,
+        parse_bse_superorder_response,
+    )
+
+    connection = service._connections.acquire(ConnectionRole.BSE_MAIN, capability=None)
+    request = build_bse_superorder_query(code, market=market)
+    deadline = time.monotonic() + timeout
+    unsolicited = 0
+    with connection.request(request, timeout=timeout) as sock:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"BSE superorder day timed out after {unsolicited} unsolicited frames"
+                )
+            sock.settimeout(remaining)
+            try:
+                response = service._read_frame(sock)
+            except socket.timeout:
+                raise TimeoutError(
+                    f"BSE superorder day timed out after {unsolicited} unsolicited frames"
+                ) from None
+            if (
+                not response.startswith(b"\x0a")
+                and b"hd3.1\x00" not in response
+            ):
+                unsolicited += 1
+                continue
+            records = parse_bse_superorder_response(response, code=code)
+            if records:
+                return records
+            unsolicited += 1
+
+
 def bse_tick_window(
     service,
     code: str,
@@ -140,6 +188,7 @@ def bse_tick_window(
     """
     from ..features.superorder_protocol import (
         build_bse_tick_window_query,
+        bse_tick_window_identity,
         parse_bse_tick_response,
     )
 
@@ -188,7 +237,24 @@ def bse_tick_window(
                 continue
             records = parse_bse_tick_response(response)
             if records and any(r.get("code") == code for r in records):
-                return [r for r in records if r.get("code") == code]
+                # 老交易日（如 2026-09-01）响应首行是 ts=2038 年的哨兵/基线
+                # 行，非窗口内逐笔；按请求窗口过滤。
+                return [
+                    r
+                    for r in records
+                    if r.get("code") == code
+                    and start_ts <= int(r.get("ts", 0)) <= end_ts
+                ]
+            # 服务端对窗口内无逐笔的场景回 0 行 0x003a 表（官方客户端滚动
+            # 到安静区间仍即时显示空列表）。识别为合法空结果直接返回，
+            # 否则整日 10 分钟桶扫描会被每个空桶的读超时拖死。
+            identity = bse_tick_window_identity(response)
+            if (
+                identity is not None
+                and identity[1] == 0
+                and identity[0] in (None, code)
+            ):
+                return []
             unsolicited += 1
 
 
