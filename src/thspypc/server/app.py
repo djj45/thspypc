@@ -11,6 +11,7 @@ import contextvars
 from dataclasses import asdict, is_dataclass
 from datetime import date as date_type
 from datetime import datetime, time as datetime_time
+import logging
 import queue
 import threading
 import time
@@ -25,6 +26,8 @@ from ..errors import (
     UnsupportedAccountFeatureError,
 )
 from .runtime import ThsRuntime
+
+logger = logging.getLogger(__name__)
 from .._transport.timing import (
     RequestTiming,
     reset_request_timing,
@@ -145,20 +148,41 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             try:
                 return runtime.call(operation)
             except CapabilityUnavailableError as exc:
+                logger.warning(
+                    "API 403（attempt %d/%d）: %s: %s",
+                    attempt + 1, attempts, type(exc).__name__, exc,
+                )
                 raise HTTPException(403, str(exc))
             except (UnsupportedAccountFeatureError, ValueError) as exc:
                 raise HTTPException(400, str(exc))
-            except OSError as exc:
-                # A stale MAIN socket is discovered only by the first request
-                # after a long idle period.  Idempotent callers may ask for one
-                # in-request recovery attempt: runtime.call has already marked
-                # the dead MAIN connection disconnected, so this next call goes
-                # through the normal single-client, fresh-auth connect path.
-                # A failed reconnect is not retried again.
+            except (
+                OSError,
+                ChannelUnavailableError,
+                ProtocolError,
+                RuntimeError,
+            ) as exc:
+                # 陈旧连接只在空闲后的首个请求上被发现（服务端已 FIN/RST，
+                # 本地 socket 对象仍在）。只读且幂等的调用方可要求一次
+                # 请求内恢复：第一次失败时连接管理器已把死通道标记/探测
+                # 出来（acquire 的 is_alive 探针丢弃 FIN 过的 socket 并重建），
+                # 第二次尝试即走新鲜连接。恢复失败不再重试。
+                # OSError=MAIN 裸传输断（runtime.call 已标记重登录）；
+                # ProtocolError=业务 service 包装的 socket OSError/车道等待
+                # 超时；ChannelUnavailableError=角色建连失败（fu4 登录竞争等）；
+                # RuntimeError=service 层重试耗尽的包装（如「kline xxx day
+                # 重试 0 次仍失败: ConnectionError」，2026-09-09 日志实测
+                # L2 预热 socket 被服务端关闭与业务请求竞速时出现，下一
+                # 请求重建即恢复）。四者都只对读查询重试（写操作不在本服务）。
                 if attempt + 1 < attempts:
+                    logger.info(
+                        "通道失败（attempt %d/%d，请求内重试）: %s: %s",
+                        attempt + 1, attempts, type(exc).__name__, exc,
+                    )
                     continue
-                raise HTTPException(502, str(exc))
-            except (ChannelUnavailableError, ProtocolError, RuntimeError) as exc:
+                logger.warning(
+                    "API 502（attempt %d/%d）: %s: %s",
+                    attempt + 1, attempts, type(exc).__name__, exc,
+                )
                 raise HTTPException(502, str(exc))
 
         raise AssertionError("unreachable")
@@ -323,7 +347,10 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     def quotes_ext(codes: str = Query(..., description="逗号分隔的股票代码")) -> list[dict]:
         """统一列表字段（涨幅/竞价涨幅/竞价金额/成交额/4分钟涨速，批量）。"""
         code_list = _split_codes(codes)
-        return _call(lambda client: client.stock_quote_fields(code_list))
+        return _call(
+            lambda client: client.stock_quote_fields(code_list),
+            retry_transport_once=True,
+        )
 
     @app.get("/api/depth/{code}")
     def depth(code: str, levels: int = 5, market: int = 0) -> dict:
@@ -334,7 +361,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                 code,
                 market=market,
                 ten_levels=levels == 10,
-            )
+            ),
+            retry_transport_once=True,
         )
 
     @app.get("/api/kline/{code}")
@@ -370,11 +398,17 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             # ``latest-wins`` 淘汰旧切股请求时返回 []；协议合法空结果同样是 []。
             # 二者都不能污染同一股票后续 15 秒的 K 线缓存。
             cache_if=bool,
+            # L2 车道被服务端关闭与业务请求竞速时会抛「重试 0 次仍失败:
+            # ConnectionError」（2026-09-09 实测），请求内重建一次即恢复。
+            retry_transport_once=True,
         )
 
     @app.get("/api/timeline/{code}")
     def timeline(code: str, market: int = 0) -> list[dict]:
-        return _call(lambda client: client.timeline(code, market=market))
+        return _call(
+            lambda client: client.timeline(code, market=market),
+            retry_transport_once=True,
+        )
 
     @app.get("/api/history_timeline/{code}")
     def history_timeline(
@@ -383,7 +417,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         market: int = 0,
     ) -> list[dict]:
         return _call(
-            lambda client: client.history_timeline(code, date=date, market=market)
+            lambda client: client.history_timeline(code, date=date, market=market),
+            retry_transport_once=True,
         )
 
     @app.get("/api/auction/{code}")
@@ -394,7 +429,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                     code,
                     market=market,
                     trade_date=trade_date,
-                )
+                ),
+                retry_transport_once=True,
             )
         )
 
@@ -410,7 +446,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                     code,
                     market=market,
                     trade_date=trade_date,
-                )
+                ),
+                retry_transport_once=True,
             )
         )
 
@@ -427,6 +464,10 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                     timeout=_WEB_PROTOCOL_TIMEOUT,
                     retries=0,
                 ),
+                # L2 车道被服务端关闭与业务请求竞速时会抛 ConnectionError
+                # （2026-09-09 日志实测 intraday 502→下一轮 200），请求内
+                # 重建一次即恢复。
+                retry_transport_once=True,
             )
         )
 
@@ -618,9 +659,26 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
         disconnect_task = None
         prepare_task = None
 
+        # 前端按代码前缀推断的市场码不含 ST 规则（如 *ST实达 600734 → 17），
+        # 而沪市 ST 股在 8901 必须用风险警示板码 22，否则服务端不回数据
+        # （2026-09-09 活网实测）。0/17/33 是通用推断值，进入时统一按
+        # 客户端规则（含 ST/指数/北交所）重新解析；调用方显式给的
+        # 16/32/144/151 等专用码原样透传。
+        resolved_market = market
+        if market in (0, 17, 33):
+            try:
+                resolved_market = runtime.call(
+                    lambda client: client._market_for_code(code)
+                )
+            except Exception:
+                resolved_market = market or _market_for_code(code)
+
         def _lane_key() -> str:
-            resolved = market or _market_for_code(code)
-            return "sh_l2" if resolved == 17 else "sz_l2"
+            return (
+                "sh_l2"
+                if resolved_market in (16, 17, 144, 151, 22)
+                else "sz_l2"
+            )
 
         def _lane_healthy() -> bool:
             # 通道心跳不可得时不阻塞自愈；只有明确非 healthy 才跳过，
@@ -639,7 +697,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
             subscriber = await asyncio.to_thread(
                 runtime.subscribe_stock_stream,
                 code,
-                market=market,
+                market=resolved_market,
             )
             await websocket.send_json(
                 {"event": "status", "code": code, "state": "subscribed"}
@@ -663,7 +721,7 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                         asyncio.to_thread(
                             runtime.keepalive_stock_stream,
                             code,
-                            market=market,
+                            market=resolved_market,
                         )
                     )
                     prepare_task.add_done_callback(
@@ -803,7 +861,17 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     @app.get("/api/stock-ready/{code}")
     def stock_ready(code: str, market: int = 0) -> dict:
         """Register one stock once before HTTP panels and WebSocket fan out."""
-        return _jsonable(runtime.prepare_stock_stream(code, market=market))
+        # 必须走 _call：prepare_stock_stream 内部的 L2 建连失败会抛
+        # ChannelUnavailableError，直接调用会裸奔成 500+traceback（2026-09-09
+        # 日志实测）；走 _call 翻译为 502 并做一次请求内重建恢复。
+        return _jsonable(
+            _call(
+                lambda _client: runtime.prepare_stock_stream(
+                    code, market=market
+                ),
+                retry_transport_once=True,
+            )
+        )
 
     @app.get("/api/intraday_auctions/{code}")
     def intraday_auctions(
@@ -818,7 +886,8 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
                     code,
                     market=market,
                     trade_date=trade_date,
-                )
+                ),
+                retry_transport_once=True,
             )
         )
 
@@ -974,23 +1043,54 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
 
     @app.get("/api/board/{code}/constituents")
     def board_constituents(code: str, timeout: float = 45.0) -> list[dict]:
-        return _call(
-            lambda client: client.board_constituents([code], timeout=timeout)
+        return _jsonable(
+            _call(
+                lambda client: client.board_constituents([code], timeout=timeout),
+                retry_transport_once=True,
+            )
         )
 
     @app.get("/api/board/{code}/quotes")
     def board_quotes(code: str, timeout: float = 40.0) -> list[dict]:
-        return _call(
-            lambda client: client.board_quotes([code], timeout=timeout)
+        return _jsonable(
+            _call(lambda client: client.board_quotes([code], timeout=timeout))
         )
 
     @app.get("/api/board/{code}/timeline")
     def board_timeline(code: str, date: str | None = None) -> list[dict]:
-        return _call(lambda client: client.board_timeline(code, date=date))
+        return _jsonable(
+            _call(
+                lambda client: client.board_timeline(code, date=date),
+                # 板块/成分股通道无心跳保活，空闲后首请求可能撞上服务端已
+                # 断开的 socket（502）；一次请求内重建通道即可恢复。
+                retry_transport_once=True,
+            )
+        )
+
+    @app.get("/api/board/{code}/kline")
+    def board_kline(
+        code: str,
+        count: int = 2146,
+        anchor: int = 0,
+        fuquan: str = "Q",
+    ) -> list[dict]:
+        return _jsonable(
+            _cached(
+                ("boardkline", code, count, anchor, fuquan),
+                15.0,
+                lambda client: client.board_kline(
+                    code,
+                    fuquan=fuquan,
+                    count=count,
+                    anchor=anchor,
+                ),
+                retry_transport_once=True,
+            )
+        )
 
     @app.get("/api/board/{code}/auction")
     def board_auction(code: str, date: str | None = None) -> list[dict]:
-        return _call(lambda client: client.board_auction(code, date=date))
+        return _jsonable(_call(lambda client: client.board_auction(code, date=date)))
 
     # ── 自定义板块 / 自选股 ──
     @app.get("/api/groups")
@@ -1018,7 +1118,12 @@ def create_app(runtime: ThsRuntime | None = None) -> FastAPI:
     def hot_boards() -> list[dict]:
         """热点板块全量行情（pageid=12480），codes=None 一次拿全 513 个板块的
         chg_pct/speed_1m/speed_4m/main_inflow/limit_up/up_count/down_count，前端本地排序分页。"""
-        return _jsonable(_call(lambda client: client.hot_boards()))
+        return _jsonable(
+            _call(
+                lambda client: client.hot_boards(),
+                retry_transport_once=True,
+            )
+        )
 
     @app.get("/api/dynamic_plates")
     def dynamic_plates() -> list[dict]:
