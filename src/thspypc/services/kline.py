@@ -30,9 +30,11 @@ def _kline_l2_role(market: int) -> ConnectionRole:
     """Level2 K线连接角色（与 timeline/depth 的 L2 角色一致）。
 
     北交所（151）也走沪 L2（shlv2）：2026-08-15 抓包确认 Level2 客户端在
-    shlv2 上用 pageid=1334 查询 920083 的日K。
+    shlv2 上用 pageid=1334 查询 920083 的日K。沪市风险警示板（22，ST 股）
+    同样走沪 L2：2026-09-09 活网实测 CodeList=17(*ST实达 600734) 服务端
+    超时、CodeList=22 返回日K，与 MAIN 路径 8901 抓包结论一致。
     """
-    if market in (16, 17, 144, 151):
+    if market in (16, 17, 144, 151, 22):
         return ConnectionRole.SH_L2
     if market in (32, 33):
         return ConnectionRole.SZ_L2

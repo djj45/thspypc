@@ -2944,6 +2944,39 @@ class ServiceFacade:
             ),
         )
 
+    def board_kline(
+        self,
+        code: str,
+        *,
+        fuquan: str = "Q",
+        count: int = 2146,
+        anchor: int = 0,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """板块指数日K（period=16384，0x42 日K 表）。
+
+        Args:
+            code: 板块指数代码（如 ``"881121"`` 半导体）。
+            fuquan: 复权（``Q`` 前复权 / ``H`` 后复权 / ``""`` 不复权）。
+            count: 请求根数（服务端返回 count+1 根，受板块发布日截断）。
+            anchor: 0=最新；翻页时设为上一窗口最早一根的 YYYYMMDD。
+            timeout: 单帧读取超时（秒）。
+
+        Returns:
+            list[dict]，每条含 ``time``（datetime）/``open``/``high``/
+            ``low``/``close``/``volume``/``amount``。
+        """
+        return self._run_default_service(
+            (Capability.BASIC_QUOTE,),
+            lambda: self._board_service.board_kline(
+                code,
+                fuquan=fuquan,
+                count=count,
+                anchor=anchor,
+                timeout=timeout,
+            ),
+        )
+
     def board_auction(
         self,
         code: str,
@@ -2979,27 +3012,55 @@ class ServiceFacade:
         """板块成分股行情（L2 0x64；普通账号 0x44/0x50 表）。
 
         0x64 请求本身接收的是**成分股代码列表**，不具备“板块代码服务端展开”
-        语义。门面先用本机系统板块缓存把稳定板块 ID 展开为股票代码，再走 fu4
-        批量取行情。成分股连接独立于板块指数连接：普通/沪侧使用标准身份，
-        Level2 深侧使用 manual 身份。
+        语义（真实客户端同样由本地 BlockUpdate 展开后再发请求，94 页面
+        成分股组件只是路由不同，见 HANDOFF_HOT_BOARD_12480_20260807.md）。
+        门面先把稳定板块 ID 展开为股票代码，再走 fu4 批量取行情。成分股
+        连接独立于板块指数连接：普通/沪侧使用标准身份，Level2 深侧使用
+        manual 身份。
+
+        板块指数代码的展开路径（2026-09-09 实测 513/513 全覆盖）：
+
+        1. 直接命中本地稳定 ID（881xxx 行业板块同号同名）；
+        2. 概念/二级行业指数（882/885/886xxx）在本地 BlockUpdate 里是
+           十六进制 block_id（如 C5FE=培育钻石），走**名称桥接**：
+           name_48 名称组缓存给出指数代码的名称 → 精确匹配本地 A 股
+           类别（行业/概念/地域）板块名 → 取其 block_id 展开。
 
         Args:
-            codes: 稳定板块 ID 列表（如 ``["881121"]``）。
-            timeout: 单帧读取超时（秒）。
+            codes: 稳定板块 ID 或板块指数代码列表（如 ``["881121"]``、
+                ``["885937"]``）。
 
         Returns:
-            list[dict]，每条含 ``code``（6 位股票代码）及 ``dt<N>`` 字段。
+            list[dict]，每条含 ``code``（6 位股票代码）及 ``dt<N>`` 字段；
+            全部无法展开时返回空列表。
         """
+        from ..services.system_blocks import SystemBlocksError
+
         stock_codes: list[str] = []
         stock_markets: dict[str, int | str] = {}
         seen: set[str] = set()
-        for block_id in codes:
+
+        def take(block_id: str) -> None:
             for stock in self.system_blocks.constituents(block_id):
                 if not stock.pattern and stock.code not in seen:
                     seen.add(stock.code)
                     stock_codes.append(stock.code)
                     stock_markets[stock.code] = stock.market
-        return self._run_default_service(
+
+        unresolved: list[str] = []
+        for block_id in codes:
+            key = str(block_id)
+            try:
+                take(key)
+            except SystemBlocksError:
+                unresolved.append(key)
+        for key, block_id in self._bridge_board_names(unresolved).items():
+            take(block_id)
+        if not stock_codes:
+            # 未知板块/名称组缺失：返回空列表，前端显示“暂无数据”，
+            # 不抛 400/500（bridge 失败通常是当日名称组尚未拉取）。
+            return []
+        records = self._run_default_service(
             (
                 Capability.BASIC_QUOTE,
                 Capability.L2_MARKET_ACCESS,
@@ -3010,6 +3071,71 @@ class ServiceFacade:
                 timeout=timeout,
             ),
         )
+        # 通道的 dt66 涨幅收盘后为 0/盘中滞后（2026-09-09 实测），但 dt10/dt6
+        # 现价昨收可靠：本地补算 chg_pct，前端列表到达即完整可排序，
+        # 不必再等 quotes_ext 二跳（对齐真实客户端“一次肥查询带全列”）。
+        for row in records:
+            prev = row.get("dt6")
+            price = row.get("dt10")
+            if prev and price:
+                row["chg_pct"] = (price / prev - 1) * 100
+        return records
+
+    # 桥接仅限 A 股类别：美股/港股/ETF 等本地同名板块（如“港口航运[US]”）
+    # 名称带后缀不会误撞；同名的跨类别板块以先见者为准（categories()
+    # 中 industry 排最前，行业优先）。
+    _BRIDGE_BLOCK_CATEGORIES = frozenset(
+        {"industry", "concept", "region"}
+    )
+
+    def _bridge_board_names(self, board_codes: list[str]) -> dict[str, str]:
+        """板块指数代码 → 本地稳定 block_id（name_48 名称精确匹配）。
+
+        name_48 名称组当日有效（磁盘缓存，命中后无网络请求）；本地
+        板块名表与逐代码解析结果按自然日在进程内累积缓存，多次单代码
+        调用（Web 端点形态）复用同一天的桥接表。名称取不到或本地无
+        同名板块的代码不进入返回值，由调用方决定后续行为。
+        """
+        board_codes = [str(code) for code in board_codes if code]
+        if not board_codes:
+            return {}
+        today = date_type.today()
+        if getattr(self, "_board_name_bridge_day", None) != today:
+            self._board_name_bridge_day = today
+            self._board_name_bridge: dict[str, str] = {}
+            self._board_name_bridge_local: tuple[
+                dict[str, str], dict[str, str]
+            ] | None = None
+        bridge = self._board_name_bridge
+        pending = [code for code in board_codes if code not in bridge]
+        if not pending:
+            return {code: bridge[code] for code in board_codes if code in bridge}
+        if self._board_name_bridge_local is None:
+            try:
+                names = self.fetch_stock_names_full()["names"]
+            except Exception as exc:
+                logger.warning(
+                    "board_constituents: 板块名称桥接失败: %s", exc
+                )
+                return {}
+            local_names: dict[str, str] = {}
+            for block in self.system_blocks.boards():
+                if (
+                    block.category in self._BRIDGE_BLOCK_CATEGORIES
+                    and block.name not in local_names
+                ):
+                    local_names[block.name] = block.block_id
+            self._board_name_bridge_local = (names, local_names)
+        names, local_names = self._board_name_bridge_local
+        for code in pending:
+            if names.get(code, "") in local_names:
+                bridge[code] = local_names[names[code]]
+        logger.info(
+            "board_constituents: 名称桥接新增 %d、累计 %d 个板块指数",
+            len(pending),
+            len(bridge),
+        )
+        return {code: bridge[code] for code in board_codes if code in bridge}
 
     # ── 板块统计计算（9601 statscalc / calcext，独立于 fu4 8901 板块通道）──
 

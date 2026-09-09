@@ -482,11 +482,13 @@ def pick_l2_market(market: int) -> str:
     Raises:
         ValueError: market 非法。
     """
-    if market in (16, 17, 144):
+    # 22=沪市风险警示板（ST 股，8901 各车道统一要求 CodeList=22，
+    # 2026-09-09 活网实测 L2 kline 17 超时/22 返回，见 kline._kline_l2_role）。
+    if market in (16, 17, 144, 22):
         return "sh"
     if market in (32, 33):
         return "sz"
-    raise ValueError(f"market 非法（仅支持 16/17/144=沪, 32/33=深）: {market}")
+    raise ValueError(f"market 非法（仅支持 16/17/144/22=沪, 32/33=深）: {market}")
 
 
 def resolve_l2_hosts_grouped(passport_bytes: bytes) -> dict[str, list[str]]:

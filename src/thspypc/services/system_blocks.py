@@ -53,6 +53,7 @@ from ..features.system_blocks_protocol import (
     build_board_full_list_query,
     build_board_hot_query,
     build_board_hot_sort_query,
+    build_board_kline_query,
     build_board_list_query,
     build_board_timeline_query,
     load_board_full_codes,
@@ -64,6 +65,7 @@ from ..features.system_blocks_protocol import (
     parse_board_hot_sort_response,
     parse_board_timeline_response,
 )
+from ..features.kline_protocol import parse_kline_hd3_response
 from .._transport import ConnectionManager, ConnectionRole, SocketLike
 from ..codecs.framing import read_frame
 from ..errors import ProtocolError
@@ -1092,6 +1094,41 @@ class BoardService:
             baseline["is_baseline"] = True
             return [baseline, *matched]
         return matched
+
+    def board_kline(
+        self,
+        code: str,
+        *,
+        fuquan: str = "Q",
+        count: int = 2146,
+        anchor: int = 0,
+        timeout: float = 12.0,
+    ) -> list[dict]:
+        """板块指数日K（period=16384，响应 0x42 日K 表）。
+
+        ``DateTime=16384(-{count}-{anchor})`` 语义与股票日K 一致：取
+        ``count`` 根、以 ``anchor``（YYYYMMDD，0=最新）为终点，服务端返回
+        ``count+1`` 根（受板块发布日截断）。响应为 0x42 表（字段
+        [1,7,8,9,11,19,13]，dt1=YYYYMMDD），由
+        :func:`parse_kline_hd3_response` 解析为 ``time``/``open``/``high``/
+        ``low``/``close``/``volume``/``amount`` 记录。
+        """
+        request = build_board_kline_query(
+            code,
+            level2=self._is_level2(),
+            fuquan=fuquan,
+            count=count,
+            anchor=anchor,
+        )
+        records = self._request(
+            request,
+            parsers=(parse_kline_hd3_response,),
+            timeout=timeout,
+            accept=lambda records: any(
+                record.get("time") is not None for record in records
+            ),
+        )
+        return [record for record in records if record.get("time") is not None]
 
     def board_auction(
         self,

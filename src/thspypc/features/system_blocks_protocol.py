@@ -114,6 +114,9 @@ _BOARD_FULL_BITRLE_OFFSET = {(0x1C, 11): 8, (0x22, 15): 10}
 _BOARD_SENTINEL_U32 = (0xFFFFFFFF, 0x80000000)
 BOARD_TL_DATATYPE = [13, 19, 10, 23, 22, 1110]          # 当日分时
 BOARD_HISTORY_DATATYPE = [13, 19, 40, 10, 23, 22, 6]    # 历史分时
+# 板块日K（2026-08-02 抓包 0x42 日K 表字段：dt1=YYYYMMDD 日期、
+# dt7/8/9/11=开高低收、dt19=额、dt13=量；parse_kline_hd3_response 解析）
+BOARD_KLINE_DATATYPE = [1, 7, 8, 9, 11, 19, 13]
 BOARD_AUCTION_DATATYPE = [10, 27, 33, 49]               # 集合竞价
 BOARD_CONSTITUENT_DATATYPE = [
     7, 13, 48, 19, 226, 225, 10, 224, 9, 223, 8, 6, 45, 66, 1111,
@@ -648,6 +651,7 @@ def build_board_query(
     history_flag: bool = True,
     query_codes: str | None = None,
     route_base: int | None = None,
+    extra_text: str = "",
 ) -> bytes:
     """构造板块指数查询（双子帧：前缀 + 查询），对齐 2026-08-01 抓包形态。
 
@@ -658,12 +662,14 @@ def build_board_query(
     ``route_base`` 覆盖组件路由（页面实例号）。缺省按 ``pageid`` 查
     ``_ROUTES``；热点板块（12480）等页面用相邻实例号，须显式传入
     （普通 0x003A、Level2 0x0053，见 :func:`build_board_hot_query`）。
+    ``extra_text`` 追加在查询文本首部（如日K 的 ``ReqFuquan`` 行）。
     """
     route = _route_for(pageid) if route_base is None else route_base
     prefix_text = f"CodeList={market}({code},);\r\npageid={pageid}\r\n"
     if query_codes is None:
         query_codes = code
     query_text = (
+        f"{extra_text}"
         f"CodeList={market}({query_codes},);\r\n"
         f"DataType={_datatype_text(datatype)}\r\n"
         f"DateTime={period}({args})\r\n"
@@ -989,6 +995,45 @@ def build_board_timeline_query(
         datatype=BOARD_HISTORY_DATATYPE,
         period=TIMELINE_PERIOD,
         args=f"{bar_start}-{bar_start + 355}",
+    )
+
+
+def build_board_kline_query(
+    code: str,
+    *,
+    level2: bool = False,
+    fuquan: str = "Q",
+    count: int = 2146,
+    anchor: int = 0,
+    seq: int | None = None,
+) -> bytes:
+    """构造板块指数日K查询（period=16384，与分时同一历史 pageid）。
+
+    2026-08-02 抓包离线复核（HANDOFF_SYSTEM_BLOCKS_CAPTURE_20260801.md）：
+    服务端对 ``DateTime=16384`` 查询回 0x42 日K 表（字段 [1,7,8,9,11,19,13]，
+    dt1=YYYYMMDD，596 根/次），由 ``parse_kline_hd3_response`` 解析（见
+    ``tests/test_system_blocks_protocol.py::test_parse_board_daily_k_0x42_fixture``）。
+    请求文本含 ``ReqFuquan``（与股票 K 线一致置于首行）；``DateTime`` 游标
+    语义同股票日K：``-{count}-{anchor}``，anchor=0 取最新。路由/seq 是页面
+    组件实例号（服务端不严格校验），沿用历史分时（6002/4181）路由。
+
+    Args:
+        count: 请求根数（服务端返回 count+1 根，受板块发布日截断）。
+        anchor: 0=最新；翻页时设为上一窗口最早一根的 YYYYMMDD。
+    """
+    pageid = PAGEID_BOARD_HISTORY_L2 if level2 else PAGEID_BOARD_HISTORY
+    if seq is None:
+        seq = 0x1156
+    return build_board_query(
+        code,
+        pageid=pageid,
+        datatype=BOARD_KLINE_DATATYPE,
+        period=KLINE_DAY_PERIOD,
+        args=f"-{count}-{anchor}",
+        lack_time="0,3,0,0,0,0,0,0",
+        seq=seq,
+        history_flag=False,
+        extra_text=f"ReqFuquan={fuquan}\r\n",
     )
 
 
@@ -1717,6 +1762,7 @@ __all__ = [
     "BOARD_QUOTE_DATATYPE_L2",
     "BOARD_TL_DATATYPE",
     "BOARD_HISTORY_DATATYPE",
+    "BOARD_KLINE_DATATYPE",
     "BOARD_AUCTION_DATATYPE",
     "BOARD_CONSTITUENT_DATATYPE",
     "BOARD_CONSTITUENT_DATATYPE_L2",
@@ -1726,6 +1772,7 @@ __all__ = [
     "build_board_query",
     "build_board_list_query",
     "build_board_timeline_query",
+    "build_board_kline_query",
     "build_board_auction_query",
     "build_board_constituents_query",
     "build_board_constituents_page_transition",

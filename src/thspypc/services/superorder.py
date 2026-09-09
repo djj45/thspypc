@@ -110,7 +110,9 @@ def _repair_order_detail_tail(sock, body: bytes, *, period: int) -> bytes:
 
 def _superorder_l2_role(market: int) -> ConnectionRole:
     """7169 走对应市场的 Level2 连接（沪 shlv2 / 深 szlv2）。"""
-    if market in (16, 17, 144):
+    # 22=沪市风险警示板（ST 股，L2 车道同样要求 CodeList=22，2026-09-09
+    # 活网实测见 kline._kline_l2_role）。
+    if market in (16, 17, 144, 22):
         return ConnectionRole.SH_L2
     if market in (32, 33):
         return ConnectionRole.SZ_L2

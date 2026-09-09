@@ -73,7 +73,9 @@ def _require(
 
 
 def _l2_role(market: int) -> ConnectionRole:
-    if market in (16, 17, 144):
+    # 22=沪市风险警示板（ST 股，2026-09-09 活网实测 L2 车道同样要求
+    # CodeList=22，见 kline._kline_l2_role）；151=北交所走沪 L2。
+    if market in (16, 17, 144, 151, 22):
         return ConnectionRole.SH_L2
     if market in (32, 33):
         return ConnectionRole.SZ_L2
