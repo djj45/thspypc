@@ -67,6 +67,8 @@ const stockReadyUntil = new Map<string, number>()
 const groupsInFlight = new Map<string, Promise<StockGroup[]>>()
 const dynamicPlatesInFlight = new Map<string, Promise<DynamicPlate[]>>()
 const selfStocksInFlight = new Map<string, Promise<StockGroup>>()
+const boardConstituentsInFlight = new Map<string, Promise<Quote[]>>()
+const boardKlineInFlight = new Map<string, Promise<Kline[]>>()
 
 // 已返回结果的短 TTL 缓存：快速来回切票/刷新时不再重复请求。
 // 分时/盘口缓存秒级；日 K 稍长（下一根 K 更新前基本不变）。
@@ -86,6 +88,7 @@ const fastViewCache = new Map<string, CacheEntry<MarketViewFast>>()
 const quotesExtCache = new Map<string, CacheEntry<QuoteExt[]>>()
 const intradayCache = new Map<string, CacheEntry<(AuctionPoint & TimelinePoint)[]>>()
 const klineCache = new Map<string, CacheEntry<Kline[]>>()
+const boardKlineCache = new Map<string, CacheEntry<Kline[]>>()
 
 function trimCache<T>(cache: Map<string, CacheEntry<T>>): void {
   if (cache.size <= CACHE_LIMIT) return
@@ -351,6 +354,26 @@ export const api = {
       category ? `/api/boards?category=${category}` : '/api/boards',
     ),
   hotBoards: () => getJson<Board[]>('/api/hot_boards'),
+
+  // 94板块页：成分股（fu4 批量行情，慢路径 45s）、板块分时、板块日K
+  boardConstituents: (code: string) =>
+    dedupe(boardConstituentsInFlight, code, () =>
+      getJson<Quote[]>(`/api/board/${code}/constituents`, 45_000),
+    ),
+  boardTimeline: (code: string) =>
+    getJson<TimelinePoint[]>(`/api/board/${code}/timeline`, 20_000),
+  boardKline: (code: string, count = 320, fuquan = 'Q') =>
+    ttlCached(
+      boardKlineCache,
+      boardKlineInFlight,
+      `${code}|${count}|${fuquan}`,
+      KLINE_DAY_TTL_MS,
+      () =>
+        getJson<Kline[]>(
+          `/api/board/${code}/kline?count=${count}&fuquan=${encodeURIComponent(fuquan)}`,
+          20_000,
+        ),
+    ),
 
   // 排序榜
   stockListRanked: (

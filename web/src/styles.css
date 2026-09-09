@@ -471,6 +471,12 @@ tr.selected {
 .board-row:hover {
   background: #1f2530;
 }
+.board-row.selected {
+  background: #2a3a5a;
+}
+.board-row.selected .bn {
+  color: #e8c36a;
+}
 .board-row .bn {
   text-align: left;
   overflow: hidden;
@@ -495,6 +501,18 @@ a[href*="tradingview.com"] {
   overflow: hidden;
   background: var(--border);
   gap: 1px;
+}
+
+/* 94板块页：2 行 × 3 列——第一列上下两格为板块列表/成分股列表，
+   第二三列上行为板块分时/日K，下行为个股分时/日K。 */
+.boards-page {
+  display: grid;
+  grid-template-columns: minmax(280px, 26%) minmax(280px, 1fr) minmax(280px, 1fr);
+  grid-template-rows: 1fr 1fr;
+}
+.boards-page > .panel {
+  min-width: 0;
+  min-height: 0;
 }
 .timeline-page {
   display: grid;

@@ -86,6 +86,7 @@ export function Header({
         {(
           [
             ['kanpan', '看盘'],
+            ['boards', '94板块'],
             ['timeline', '分时'],
             ['superorder', '超级盘口'],
           ] as const

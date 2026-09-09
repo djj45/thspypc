@@ -17,6 +17,7 @@ import { LeftGrid } from './components/left/LeftGrid'
 import { usePersistedWidth } from './components/left/shared'
 import { TimelinePage } from './pages/TimelinePage'
 import { SuperorderPage } from './pages/SuperorderPage'
+import { BoardsPage } from './pages/BoardsPage'
 import { StockStreamProvider } from './state/StockStreamContext'
 
 // 左栏总宽可拖拽（与中栏图表之间的分隔条），持久化。
@@ -116,7 +117,11 @@ function KanpanPage() {
 
 function readView(): StockPageMode {
   const value = new URLSearchParams(window.location.search).get('view')
-  return value === 'timeline' || value === 'superorder' ? value : 'kanpan'
+  return value === 'boards' ||
+    value === 'timeline' ||
+    value === 'superorder'
+    ? value
+    : 'kanpan'
 }
 
 /** ?period= URL 参数 → 合法 K 线周期（day/week/.../Nmin），非法值忽略。 */
@@ -161,13 +166,14 @@ function RoutedShell({
     <div className="app">
       <Header view={view} onView={onView} />
       <StockNav />
-      {/* 看盘页常驻保活：切到分时/超级盘口时隐藏而非卸载（左栏列表、
+      {/* 看盘页常驻保活：切到94板块/分时/超级盘口时隐藏而非卸载（左栏列表、
           分时/K线图实例与缩放状态、短线精灵流全部保留），返回即时恢复；
           子页按需挂载，保持原卸载语义。 */}
       <div className={view === 'kanpan' ? 'page-slot' : 'page-slot inactive'}>
         <KanpanPage />
       </div>
-      {view !== 'kanpan' && (
+      {view === 'boards' && <BoardsPage />}
+      {view !== 'kanpan' && view !== 'boards' && (
         <StockStreamProvider key={code} code={code} enabled>
           {view === 'timeline' ? <TimelinePage /> : <SuperorderPage />}
         </StockStreamProvider>

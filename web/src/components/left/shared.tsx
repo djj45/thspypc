@@ -543,9 +543,14 @@ const BOARD_COL_WIDTHS = [90, 46, 40, 40, 50, 34, 34, 34]
 export function BoardTable({
   rows,
   initialSort = null,
+  selectedCode,
+  onRowClick,
 }: {
   rows: BoardRowData[]
   initialSort?: ColSort | null
+  /** 选中板块代码（94板块页联动板块分时/日K） */
+  selectedCode?: string
+  onRowClick?: (code: string) => void
 }) {
   const [sort, setSort] = useState<ColSort | null>(initialSort)
   const listRef = useRef<HTMLDivElement>(null)
@@ -610,7 +615,11 @@ export function BoardTable({
       </div>
       <div className="stock-list">
         {display.map((b) => (
-          <div key={b.code} className="board-row">
+          <div
+            key={b.code}
+            className={b.code === selectedCode ? 'board-row selected' : 'board-row'}
+            onClick={onRowClick ? () => onRowClick(b.code) : undefined}
+          >
             {vis.map((ci) => cellOf(b, ci))}
           </div>
         ))}

@@ -203,7 +203,10 @@ function useLaneGate() {
   }, [])
 }
 
-export type StockPageMode = 'kanpan' | 'timeline' | 'superorder'
+export type StockPageMode = 'kanpan' | 'boards' | 'timeline' | 'superorder'
+
+// 需要加载全局选中股票日K的视图（看盘中栏 / 94板块页右下格）。
+const KLINE_VIEWS: readonly StockPageMode[] = ['kanpan', 'boards']
 
 export function normalizeStockCode(
   value: string | null | undefined,
@@ -479,7 +482,7 @@ export function StockProvider({
   // Period/fuquan changes only rerun this lane.  Cached rows remain visible
   // while the lane refreshes them in the background.
   useEffect(() => {
-    if (mode !== 'kanpan') {
+    if (!KLINE_VIEWS.includes(mode)) {
       setKlineLoading(false)
       return
     }

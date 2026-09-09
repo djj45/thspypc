@@ -28,7 +28,7 @@ function timeToX(iso?: string): number | null {
   return Math.min(mins - 660, 240)
 }
 
-function xToLabel(v: number): string {
+export function xToLabel(v: number): string {
   const mins = v < 120 ? 570 + v : 660 + v
   return `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(
     Math.floor(mins % 60),
@@ -37,7 +37,7 @@ function xToLabel(v: number): string {
 
 /** 同花顺式对称涨跌幅坐标：上下对称取整到 N，刻度等分。
  *  例：最大偏离 +3%/-9.8% -> N=10、step=2，刻度 -10,-8,…,0,…,8,10。 */
-function symmetricRange(maxDeflectPct: number): { limit: number; step: number } {
+export function symmetricRange(maxDeflectPct: number): { limit: number; step: number } {
   const steps = [0.25, 0.5, 1, 2, 5, 10, 20]
   for (const step of steps) {
     const limit = Math.max(step, Math.ceil(maxDeflectPct / step) * step)
@@ -47,7 +47,7 @@ function symmetricRange(maxDeflectPct: number): { limit: number; step: number } 
   return { limit: step * 5, step }
 }
 
-function pctColor(pct: number): string {
+export function pctColor(pct: number): string {
   if (pct > 1e-9) return UP
   if (pct < -1e-9) return DOWN
   return FLAT
