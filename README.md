@@ -4,6 +4,23 @@
 
 > 本项目源自对真实 hexin.exe（PC 免费版）的抓包分析。协议参考见 `D:\code\ths_takehome\ths\PROTOCOL.md`。
 
+## 项目定位与状态
+
+thspypc 是**同花顺 Windows PC 免费版行情协议的纯 Python 开源实现**（MIT），并提供配套的 Web 看盘前端。用途有三：
+
+- **协议研究** —— 把 HTTP 鉴权、8901/9601 行情通道、h1.0/hd3.1 编解码整理成分层的 `codecs/` + `features/` 代码，配 `tests/fixtures/` 里的脱敏金样本做离线回归；
+- **可嵌入的行情库** —— `from thspypc import THSClient` 即可在任意 Python ≥ 3.10 环境（Windows / macOS / Linux）登录并查询，无二进制依赖；
+- **自用看盘** —— `src/thspypc/server` + `web/` 提供单用户 REST/WebSocket 与 React 看盘界面。
+
+**范围**：沪深京 A 股行情——登录、K 线、分时、集合竞价、五档/十档盘口、逐笔成交、超级盘口、委托队列、短线精灵（历史 + 实时）、系统板块、代码表与排行，以及 Level2 账号专属字段。
+
+**不在范围**：实盘交易；港股/美股/期货/外汇/期权等非 A 股品种。
+
+> **设计取舍**：优先做**可审计、可嵌入、可离线回归**的源码实现，不引入二进制黑盒依赖——行情协议的全部解读都能在本仓库读到、在离线样本上复现。
+
+**状态**：活跃开发中（最近更新 2026-09）。功能缺口与优先级见 [docs/plans/FEATURE_GAP_ROADMAP.md](docs/plans/FEATURE_GAP_ROADMAP.md)。
+**许可证**：[MIT](LICENSE)。
+
 ## ✅ 已实现
 
 - HTTP 三步鉴权（RSA 公钥 → unified_login → mainverify）
@@ -812,8 +829,16 @@ thspypc/
     └── native/                 # 逆向辅助 C/C++ harness
 ```
 
+## 文档导航
+
+完整文档索引见 [docs/README.md](docs/README.md)，按「手册指南 / 架构解析 / 规划路线图 / 调查记录 / 交接记录」分类。常用入口：
+
+- **架构**：[架构总览](docs/architecture/ARCHITECTURE.md) · [服务器矩阵](docs/architecture/SERVER_MATRIX.md)
+- **指南**：[协议与实现](docs/guides/PROTOCOL_AND_IMPLEMENTATION_GUIDE.md) · [抓包](docs/guides/CAPTURE.md) · [Web API](docs/guides/WEB_API.md)
+- **规划**：[功能缺口路线图](docs/plans/FEATURE_GAP_ROADMAP.md)
+- **交接**：[交接记录](docs/handoffs/README.md)
+
 ## 已知限制
-文档目录：[docs/README.md](docs/README.md)，按「手册指南 / 架构解析 / 规划路线图 / 调查记录 / 交接记录」分类。
 
 - hd3.1 变体（unk=0x36/0x42/0x4a 等非 BitRLE 编码）暂不支持，`parse_hd3_response`
   自动跳过。
@@ -899,4 +924,4 @@ MAIN 普通登录连接在 `VerifyCode=0` 后发送标准 MAIN init，收到服�
 
 ## License
 
-MIT
+本项目采用 **MIT License**，版权归 djj45 所有，详见 [LICENSE](LICENSE)。
