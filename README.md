@@ -1,8 +1,8 @@
 # thspypc — 同花顺 Windows PC 免费版行情协议纯 Python 实现
 
-模仿 [thspy](https://github.com/djj45/thspy)（Mac 版逆向）的登录实现，改成 **Windows PC 免费版协议**，连 **8901** 端口。**已实测登录成功（VerifyCode=0），含 Level2 账号。行情查询已打通（个股列表实时行情）。**
+模仿 thspy（Mac 版逆向，**未公开仓库**）的登录实现，改成 **Windows PC 免费版协议**，连 **8901** 端口。**已实测登录成功（VerifyCode=0），含 Level2 账号。行情查询已打通（个股列表实时行情）。**
 
-> 本项目源自对真实 hexin.exe（PC 免费版）的抓包分析。协议参考见 `D:\code\ths_takehome\ths\PROTOCOL.md`。
+> 本项目源自对真实 hexin.exe（PC 免费版）的抓包分析，协议细节见 [协议与实现指南](docs/guides/PROTOCOL_AND_IMPLEMENTATION_GUIDE.md)。相关来源与致谢见文末「致谢与参考」。
 
 ## 项目定位与状态
 
@@ -42,7 +42,8 @@ thspypc 是**同花顺 Windows PC 免费版行情协议的纯 Python 开源实�
 - **热门股排序查询**（`stock_list_hot`）：DataType=199112 排序查询（同花顺打开 A 股
   列表时发的请求），服务器返回按 SortBy 排序的前 N 条代码
 - **自定义板块/自选股管理**（`blocks`）：分组 CRUD + 成分股增删 + 自选股 +
-  动态板块查询。走标准 HTTPS（cookie 鉴权），移植自 thspy，实测列出 95 个分组。
+  动态板块查询。走标准 HTTPS（cookie 鉴权），源自 thspy，并参考了
+  [sunnysab/ths-favorite](https://github.com/sunnysab/ths-favorite)，实测列出 95 个分组。
 - **短线精灵（异动）**（`dxjl_*`）：9601 端口 qurealorder 历史查询，hq1.0 响应解析。
   实测解出 大笔买入/卖出、涨停封板、打开跌停板 等异动（含金额/涨跌幅）。
 - **心跳保活**（自动）：connect() 后后台线程每 3 秒（8901）/30 秒（9601）发心跳，
@@ -246,7 +247,7 @@ imei 逆向过程见 `ths/HANDOFF_IMEI.md`（通过 hexin 内存 patch 捕获 MD
 4. account+password → full_http_auth → passport → 8901 login
 ```
 
-详见 `PROTOCOL.md` §14。抓包用 mitmproxy + 系统代理（网页版走浏览器可抓明文）。
+登录流程详见 [协议与实现指南](docs/guides/PROTOCOL_AND_IMPLEMENTATION_GUIDE.md) 第 4 章。抓包用 mitmproxy + 系统代理（网页版走浏览器可抓明文）。
 
 ## 逆向过程中的关键发现（thspy Mac 版 → PC 版的 4 处差异）
 
@@ -921,6 +922,13 @@ MAIN 普通登录连接在 `VerifyCode=0` 后发送标准 MAIN init，收到服�
 
 修正后的活网 A/B 验证共 4 轮：关闭心跳 2 轮、开启心跳 2 轮，四轮均完成登录、
 立即查询和等待后二次查询；开启心跳的两轮各发送 2 次心跳后连接仍正常。
+
+## 致谢与参考
+
+- **[panghu11033/thsdk](https://github.com/panghu11033/thsdk)** —— 同花顺 Python 数据接口，thspy 的协议参考；本项目亦以其作为部分字段语义的对照（oracle）。
+- **[sunnysab/ths-favorite](https://github.com/sunnysab/ths-favorite)** —— 同花顺自选 API，自选股与自定义板块（`blocks`）实现时参考。
+
+感谢以上作者的开源工作。
 
 ## License
 
